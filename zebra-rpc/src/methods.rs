@@ -1114,7 +1114,30 @@ where
         let Some(cache) = self.gbt.template_cache() else {
             return Ok(None);
         };
-        let Some(tip_hash) = self.latest_chain_tip.best_tip_hash() else {
+
+        // Skip the tip read when there's nothing to serve: without an updater task, every request
+        // builds its own template anyway.
+        if cache.is_empty() {
+            return Ok(None);
+        }
+
+        // # Correctness
+        //
+        // The tip has to come from the state, not from `latest_chain_tip`. The state's write task
+        // publishes a committed block to the read state before it updates the chain tip channel
+        // (`update_latest_chain_channels()`), so between those two sends the channel still names
+        // the parent of a block the state has already committed. Trusting the channel there would
+        // serve a template for a chain this node has itself extended.
+        //
+        // `ReadRequest::Tip` reads the same non-finalized state channel that
+        // `ReadRequest::ChainInfo` builds templates from, so the two can't disagree about the tip.
+        let ReadResponse::Tip(Some((_, tip_hash))) = self
+            .read_state
+            .clone()
+            .oneshot(ReadRequest::Tip)
+            .await
+            .map_error(server::error::LegacyCode::default())?
+        else {
             return Ok(None);
         };
 
