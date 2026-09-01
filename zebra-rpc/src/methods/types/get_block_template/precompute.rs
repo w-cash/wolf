@@ -301,14 +301,15 @@ where
             mempool_txs,
             mempool_tx_deps,
             Some(&coinbase_cache),
+            None,
         );
 
         // `submit_old` depends on the long poll ID the client sent, so the RPC sets it.
         Some(BlockTemplateResponse::new_internal(
             &network,
-            None,
-            Some(coinbase_cache),
+            &coinbase_cache,
             &miner_params,
+            None,
             &chain_info,
             long_poll_id,
             mempool_txs,

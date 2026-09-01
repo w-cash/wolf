@@ -291,14 +291,51 @@ impl BlockTemplateResponse {
         CAPABILITIES_FIELD.iter().map(ToString::to_string).collect()
     }
 
+    /// Adds one child-specific Wcash commitment to a child-independent
+    /// precomputed parent template.
+    pub(crate) fn with_wcash_aux(
+        mut self,
+        net: &Network,
+        miner_params: &MinerParams,
+        wcash_aux: WcashAuxRequest,
+    ) -> Result<Self, TransactionError> {
+        self.coinbase_txn = self
+            .coinbase_txn
+            .with_wcash_aux(wcash_aux.block_hash().0, wcash_aux.nonce())?;
+
+        let height = Height(self.height);
+        self.default_roots = DefaultRoots::from_transaction_templates(
+            net,
+            height,
+            &self.coinbase_txn,
+            Some(self.default_roots.chain_history_root),
+            &self.transactions,
+        );
+        self.block_commitments_hash = self.default_roots.block_commitments_hash;
+        self.light_client_root_hash = self.default_roots.block_commitments_hash;
+        self.final_sapling_root_hash = self.default_roots.block_commitments_hash;
+        self.wcash_parent_payout_commitment = Some(
+            miner_params
+                .parent_payout_address_commitment()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    TransactionError::CoinbaseConstruction(
+                        "wcashaux requires an attested configured parent payout address"
+                            .to_string(),
+                    )
+                })?,
+        );
+
+        Ok(self)
+    }
+
     /// Returns a new [`BlockTemplateResponse`] struct, based on the supplied arguments and defaults.
     ///
     /// The result of this method only depends on the supplied arguments and constants.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_internal(
         net: &Network,
-        precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,
-        coinbase_cache: Option<CoinbaseCache>,
+        coinbase_cache: &CoinbaseCache,
         miner_params: &MinerParams,
         wcash_aux: Option<WcashAuxRequest>,
         chain_info: &GetBlockTemplateChainInfo,
@@ -355,26 +392,18 @@ impl BlockTemplateResponse {
             .map(|tx| tx.miner_fee)
             .sum::<amount::Result<Amount<NonNegative>>>()?;
 
-        // Prefer the long-poll precomputed coinbase, then the per-block cache, and only build (and
-        // re-prove, for a shielded address) as a last resort — caching the result so subsequent
-        // short-poll requests for the same height and fees reuse it.
-        let coinbase_txn = precomputed_coinbase
-            .or_else(|| {
-                coinbase_cache
-                    .as_ref()
-                    .and_then(|cache| cache.get(height, txs_fee))
-            })
-            .unwrap_or_else(|| {
-                let coinbase_txn =
-                    TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                        .expect("valid coinbase tx");
+        // Reuse the cached coinbase for this height and fee, and only build (and re-prove, for a
+        // shielded address) as a last resort — caching the result so subsequent requests for the
+        // same height and fees reuse it.
+        let coinbase_txn = coinbase_cache.get(height, txs_fee).unwrap_or_else(|| {
+            let coinbase_txn =
+                TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
+                    .expect("valid coinbase tx");
 
-                if let Some(cache) = &coinbase_cache {
-                    cache.store(height, txs_fee, coinbase_txn.clone());
-                }
+            coinbase_cache.store(height, txs_fee, coinbase_txn.clone());
 
-                coinbase_txn
-            });
+            coinbase_txn
+        });
 
         // Always cache the proof-complete, child-independent coinbase above.
         // A Wcash request gets its own cheap authenticated-data mutation, so a

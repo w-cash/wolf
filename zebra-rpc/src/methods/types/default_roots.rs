@@ -5,7 +5,7 @@ use std::iter;
 use derive_getters::Getters;
 use derive_new::new;
 use zebra_chain::{
-    amount::NegativeOrZero,
+    amount::{NegativeOrZero, NonNegative},
     block::{
         self,
         merkle::{self, AuthDataRoot, AUTH_DIGEST_PLACEHOLDER},
@@ -85,6 +85,49 @@ impl DefaultRoots {
         Self {
             merkle_root: iter::once(coinbase.hash)
                 .chain(mempool_txs.iter().map(|tx| tx.transaction.id.mined_id()))
+                .collect(),
+            chain_history_root,
+            auth_data_root,
+            block_commitments_hash: if NetworkUpgrade::current(net, height)
+                == NetworkUpgrade::Heartwood
+                && chain_history_root == block::CHAIN_HISTORY_ACTIVATION_RESERVED.into()
+            {
+                block::CHAIN_HISTORY_ACTIVATION_RESERVED.into()
+            } else {
+                ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                    &chain_history_root,
+                    &auth_data_root,
+                )
+            },
+        }
+    }
+
+    /// Recalculates the roots after changing a precomputed template's coinbase.
+    ///
+    /// This is used by merged mining to add child-specific authenticated data
+    /// without rebuilding the shielded coinbase proof or retaining the full
+    /// verified mempool transaction objects in the template cache.
+    pub fn from_transaction_templates(
+        net: &Network,
+        height: Height,
+        coinbase: &TransactionTemplate<NegativeOrZero>,
+        chain_history_root: Option<ChainHistoryMmrRootHash>,
+        mempool_txs: &[TransactionTemplate<NonNegative>],
+    ) -> Self {
+        let chain_history_root = chain_history_root
+            .or_else(|| {
+                (NetworkUpgrade::Heartwood.activation_height(net) == Some(height))
+                    .then_some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into())
+            })
+            .expect("history root is required for block templates");
+
+        let auth_data_root = iter::once(coinbase.auth_digest)
+            .chain(mempool_txs.iter().map(|tx| tx.auth_digest))
+            .collect();
+
+        Self {
+            merkle_root: iter::once(coinbase.hash)
+                .chain(mempool_txs.iter().map(|tx| tx.hash))
                 .collect(),
             chain_history_root,
             auth_data_root,
