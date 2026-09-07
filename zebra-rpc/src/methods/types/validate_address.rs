@@ -45,14 +45,23 @@ pub fn validate_address(
     network: Network,
     raw_address: String,
 ) -> RpcResult<ValidateAddressResponse> {
-    let Ok(address) = raw_address.parse::<zcash_address::ZcashAddress>() else {
-        return Ok(ValidateAddressResponse::invalid());
+    let uses_wcash_consensus = network.uses_wcash_consensus();
+    let address = if uses_wcash_consensus {
+        let Ok(address) = raw_address.parse::<primitives::WcashAddress>() else {
+            return Ok(ValidateAddressResponse::invalid());
+        };
+        address.convert::<primitives::Address>()
+    } else {
+        let Ok(address) = raw_address.parse::<zcash_address::ZcashAddress>() else {
+            return Ok(ValidateAddressResponse::invalid());
+        };
+        address.convert::<primitives::Address>()
     };
 
-    let address = match address.convert::<primitives::Address>() {
+    let address = match address {
         Ok(address) => address,
         Err(err) => {
-            tracing::debug!(?err, "conversion error");
+            tracing::debug!(?err, "address conversion error");
             return Ok(ValidateAddressResponse::invalid());
         }
     };
@@ -62,11 +71,18 @@ pub fn validate_address(
         return Ok(ValidateAddressResponse::invalid());
     }
 
-    // Testnet & regtest share format; only mainnet differs.
-    let addr_is_mainnet = matches!(address.network(), NetworkKind::Mainnet);
-    let net_is_mainnet = network.kind() == NetworkKind::Mainnet;
+    // Wcash has a distinct Regtest namespace. Zcash transparent Testnet and
+    // Regtest addresses historically share an encoding, so preserve the
+    // existing mainnet/non-mainnet comparison for Zcash consensus.
+    let address_matches_network = if uses_wcash_consensus {
+        address.network() == NetworkKind::Regtest
+    } else {
+        let addr_is_mainnet = matches!(address.network(), NetworkKind::Mainnet);
+        let net_is_mainnet = network.kind() == NetworkKind::Mainnet;
+        addr_is_mainnet == net_is_mainnet
+    };
 
-    if addr_is_mainnet != net_is_mainnet {
+    if !address_matches_network {
         tracing::info!(
             ?network,
             address_network = ?address.network(),
@@ -80,4 +96,39 @@ pub fn validate_address(
         is_valid: true,
         is_script: Some(address.is_script_hash()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zcash_protocol::consensus::NetworkType;
+
+    #[test]
+    fn wcash_consensus_accepts_only_wcash_regtest_transparent_addresses() {
+        let network = Network::new_wcash_regtest();
+        let wcash_regtest =
+            primitives::WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, [0; 20])
+                .encode();
+
+        assert_eq!(
+            validate_address(network.clone(), wcash_regtest.clone()).unwrap(),
+            ValidateAddressResponse {
+                is_valid: true,
+                address: Some(wcash_regtest),
+                is_script: Some(false),
+            }
+        );
+
+        let wcash_mainnet =
+            primitives::WcashAddress::from_transparent_p2pkh(NetworkType::Main, [0; 20]).encode();
+        assert_eq!(
+            validate_address(network.clone(), wcash_mainnet).unwrap(),
+            ValidateAddressResponse::invalid(),
+        );
+
+        assert_eq!(
+            validate_address(network, "tmVqEASZxBNKFTbmASZikGa5fPLkd68iJyx".to_string(),).unwrap(),
+            ValidateAddressResponse::invalid(),
+        );
+    }
 }

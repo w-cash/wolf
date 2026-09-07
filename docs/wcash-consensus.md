@@ -91,6 +91,36 @@ net amount entering the shielded pool. Therefore Wcash provides recipient
 privacy, not secrecy of aggregate issuance or necessarily of the gross reward
 for an individual block.
 
+## Payment-address domains
+
+Wcash reuses Zcash receiver payload formats, but not Zcash payment-address
+strings. Its deliberately separate, compact textual namespaces are:
+
+| Receiver | Mainnet | Testnet | Regtest |
+| --- | --- | --- | --- |
+| Unified | `wu1...` | `wutest1...` | `wuregtest1...` |
+| Sapling | `ws1...` | `wtestsapling1...` | `wregtestsapling1...` |
+| TEX | `wtex1...` | `wtextest1...` | `wtexregtest1...` |
+| Transparent P2PKH | `W1...` | `WT...` | `WR...` |
+| Transparent P2SH | `W3...` | `WU...` | `WS...` |
+
+The mainnet and testnet forms reserve domains for future networks; only regtest
+is active. Unified Addresses include the Wcash human-readable part inside both
+the ZIP 316 jumbling construction and the Bech32m checksum. Replacing the
+visible prefix of a Zcash address does not produce a valid Wcash address.
+
+Wcash RPC and mining interfaces require the Wcash namespace when Wcash
+consensus is active. A mining destination must be a Wcash Unified Address with
+an Orchard receiver; the template builder uses that receiver payload to create
+the mandatory Ironwood reward output. Standalone Sapling, TEX, and transparent
+addresses are never valid coinbase destinations.
+
+This node implements payment-address parsing and encoding only. It does not
+provide a wallet, account derivation, or Wcash-specific encodings for spending
+keys, viewing keys, extended keys, or seeds. Those key domains and wallet
+interoperability remain separate release work and must not be inferred from the
+payment-address prefixes above.
+
 ## Supply auditability
 
 Validators independently check the subsidy for the height, sum transaction

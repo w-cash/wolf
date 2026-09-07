@@ -34,6 +34,14 @@ fees are checked, and the public Ironwood value balance commits to the net value
 entering the pool. This hides the reward recipient, not the protocol-defined
 gross reward amount; parent-pool metadata can also create off-chain correlation.
 
+Payment addresses use Wcash-specific namespaces: Unified `wu...`, Sapling
+`ws...`, TEX `wtex...`, and transparent `W...`, with distinct testnet and
+regtest variants. Wcash mining requires a Wcash Unified Address and rejects an
+inherited Zcash address. The node implements payment-address codecs, not a
+wallet or Wcash-specific spending/viewing-key formats; those remain release
+work. See the [consensus snapshot](docs/wcash-consensus.md#payment-address-domains)
+for the complete prefix table.
+
 ## Run the isolated local network
 
 Install Rust 1.91 or newer plus the native build dependencies required by

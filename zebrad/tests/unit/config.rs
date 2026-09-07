@@ -963,6 +963,40 @@ fn config_wcash_mining_miner_address_from_toml() {
     );
 }
 
+#[test]
+fn config_wcash_regtest_miner_address_uses_wcash_namespace() {
+    let _env = EnvGuard::new();
+
+    let network = Network::new_wcash_regtest();
+    let miner_address = zebra_rpc::config::mining::default_miner_address_for_network(
+        &network,
+        &zebra_rpc::config::mining::MinerAddressType::Unified,
+    );
+    let toml_string = format!(
+        r#"[network]
+        network = "WcashRegtest"
+
+        [mining]
+        miner_address = "{miner_address}""#,
+    );
+
+    let mut file = Builder::new()
+        .suffix(".toml")
+        .tempfile()
+        .expect("create temp file");
+    file.write_all(toml_string.as_bytes())
+        .expect("write temp file");
+
+    let config = ZebradConfig::load(Some(file.path().to_path_buf()))
+        .expect("load Wcash config with a Wcash miner address");
+
+    assert!(config.network.network.uses_wcash_consensus());
+    assert!(matches!(
+        config.mining.miner_address,
+        Some(zebra_rpc::config::mining::MinerAddress::Wcash(_))
+    ));
+}
+
 // --- Sensitive env deny-list behaviour ---
 
 #[test]

@@ -21,7 +21,9 @@ use zebra_chain::{
 };
 
 use crate::client::TransactionTemplate;
-use crate::config::mining::{default_miner_address, MinerAddressType};
+use crate::config::mining::{
+    default_miner_address, default_miner_address_for_network, Config, MinerAddressType,
+};
 
 use super::MinerParams;
 
@@ -120,7 +122,7 @@ fn coinbase_tag_and_limit() {
         MinerParams::new(
             &net,
             Config {
-                miner_address: Some(addr.clone()),
+                miner_address: Some(addr.clone().into()),
                 extra_coinbase_data: extra,
                 ..Default::default()
             },
@@ -400,14 +402,15 @@ fn wcash_coinbase_is_private_and_ironwood_only() {
     use zebra_chain::parameters::subsidy::SubsidyError;
     use zebra_consensus::error::TransactionError;
 
-    use crate::config::mining::Config;
-
     let net = Network::new_wcash_regtest();
     let height = Height(1);
-    let unified_address = default_miner_address(net.kind(), &MinerAddressType::Unified);
-    let miner_params = MinerParams::from(
-        Address::decode(&net, unified_address).expect("hard-coded Unified address is valid"),
-    );
+    let unified_address = default_miner_address_for_network(&net, &MinerAddressType::Unified);
+    let config_for = |address: &str| Config {
+        miner_address: Some(address.parse().expect("hard-coded address parses")),
+        ..Default::default()
+    };
+    let miner_params = MinerParams::new(&net, config_for(&unified_address))
+        .expect("the Wcash Unified miner address is valid");
     let miner_fees = Amount::try_from(12_345).expect("valid fee amount");
 
     let template = TransactionTemplate::new_coinbase(&net, height, &miner_params, miner_fees)
@@ -444,25 +447,26 @@ fn wcash_coinbase_is_private_and_ironwood_only() {
         ),
         Err(TransactionError::CoinbaseOutputsNotDecryptable)
     ));
-    let config_for = |address: &str| Config {
-        miner_address: Some(address.parse().expect("hard-coded address parses")),
-        ..Default::default()
-    };
-    assert!(MinerParams::new(&net, config_for(unified_address)).is_ok());
+    assert!(MinerParams::new(&net, config_for(&unified_address)).is_ok());
+
+    let inherited_zcash_address = default_miner_address(net.kind(), &MinerAddressType::Unified);
+    assert!(matches!(
+        MinerParams::new(&net, config_for(inherited_zcash_address)),
+        Err(super::MinerParamsError::WcashAddressNamespaceRequired)
+    ));
 
     for invalid_type in [MinerAddressType::Sapling, MinerAddressType::Transparent] {
-        let invalid_address = default_miner_address(net.kind(), &invalid_type);
+        let invalid_address = default_miner_address_for_network(&net, &invalid_type);
         assert!(matches!(
-            MinerParams::new(&net, config_for(invalid_address)),
+            MinerParams::new(&net, config_for(&invalid_address)),
             Err(super::MinerParamsError::WcashRequiresIronwoodReceiver)
         ));
 
-        let invalid_params = MinerParams::from(
-            Address::decode(&net, invalid_address).expect("hard-coded address is valid"),
-        );
+        let invalid_params = MinerParams::new(&net, config_for(&invalid_address))
+            .expect_err("the Wcash coinbase policy rejects non-Unified miner addresses");
         assert!(matches!(
-            TransactionTemplate::new_coinbase(&net, height, &invalid_params, Amount::zero()),
-            Err(TransactionError::CoinbaseConstruction(_))
+            invalid_params,
+            super::MinerParamsError::WcashRequiresIronwoodReceiver
         ));
     }
 
@@ -482,10 +486,19 @@ fn wcash_coinbase_is_private_and_ironwood_only() {
 fn wcash_zero_subsidy_tail_stays_private() {
     let net = Network::new_wcash_regtest();
     let height = Height(50_400_001);
-    let unified_address = default_miner_address(net.kind(), &MinerAddressType::Unified);
-    let miner_params = MinerParams::from(
-        Address::decode(&net, unified_address).expect("hard-coded Unified address is valid"),
-    );
+    let unified_address = default_miner_address_for_network(&net, &MinerAddressType::Unified);
+    let miner_params = MinerParams::new(
+        &net,
+        Config {
+            miner_address: Some(
+                unified_address
+                    .parse()
+                    .expect("hard-coded Wcash Unified address is valid"),
+            ),
+            ..Default::default()
+        },
+    )
+    .expect("the Wcash Unified miner address is valid");
 
     for fee_zatoshis in [0i64, 12_345] {
         let fees = Amount::try_from(fee_zatoshis).expect("test fee is representable");

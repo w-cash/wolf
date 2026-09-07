@@ -526,7 +526,9 @@ impl OutputObject {
         network: &Network,
     ) -> Self {
         let lock_script = &output.lock_script;
-        let addresses = output.address(network).map(|addr| vec![addr.to_string()]);
+        let addresses = output
+            .address(network)
+            .map(|address| vec![encode_transparent_address(&address, network)]);
         let req_sigs = addresses.as_ref().map(|a| a.len() as u32);
 
         let script_pub_key = ScriptPubKey::new(
@@ -935,7 +937,7 @@ impl TransactionObject {
                     let (addresses, req_sigs) = output
                         .1
                         .address(network)
-                        .map(|address| (vec![address.to_string()], 1))
+                        .map(|address| (vec![encode_transparent_address(&address, network)], 1))
                         .unzip();
 
                     Output {
@@ -1090,5 +1092,43 @@ impl TransactionObject {
             block_hash,
             block_time,
         }
+    }
+}
+
+/// Encodes a transparent address using the active chain's public address namespace.
+fn encode_transparent_address(
+    address: &zebra_chain::transparent::Address,
+    network: &Network,
+) -> String {
+    if network.uses_wcash_consensus() {
+        address
+            .encode_wcash(network)
+            .expect("transaction output addresses use the supplied network kind")
+    } else {
+        address.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zebra_chain::{parameters::NetworkKind, transparent::Address as TransparentAddress};
+
+    use super::*;
+
+    #[test]
+    fn transaction_outputs_use_the_active_chain_namespace() {
+        let wcash_network = Network::new_wcash_regtest();
+        let wcash_address = TransparentAddress::from_pub_key_hash(NetworkKind::Regtest, [0; 20]);
+        assert_eq!(
+            encode_transparent_address(&wcash_address, &wcash_network),
+            "WR64VqQpZRujxYnAJmqGK4d4fbqQZRZHazG"
+        );
+
+        let zcash_network = Network::new_regtest(Default::default());
+        let zcash_address = TransparentAddress::from_pub_key_hash(NetworkKind::Testnet, [0; 20]);
+        assert_eq!(
+            encode_transparent_address(&zcash_address, &zcash_network),
+            zcash_address.to_string()
+        );
     }
 }

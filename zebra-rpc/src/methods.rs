@@ -1249,7 +1249,7 @@ where
         &self,
         address_strings: GetAddressBalanceRequest,
     ) -> Result<GetAddressBalanceResponse> {
-        let valid_addresses = address_strings.valid_addresses()?;
+        let valid_addresses = address_strings.valid_addresses(&self.network)?;
 
         let request = zebra_state::ReadRequest::AddressBalance(valid_addresses);
         let response = self
@@ -2247,7 +2247,7 @@ where
             best_chain_tip_height(&latest_chain_tip)?,
         )?;
 
-        let valid_addresses = request.valid_addresses()?;
+        let valid_addresses = request.valid_addresses(&self.network)?;
 
         let request = zebra_state::ReadRequest::TransactionIdsByAddresses {
             addresses: valid_addresses,
@@ -2293,7 +2293,7 @@ where
         let mut read_state = self.read_state.clone();
         let mut response_utxos = vec![];
 
-        let valid_addresses = utxos_request.valid_addresses()?;
+        let valid_addresses = utxos_request.valid_addresses(&self.network)?;
 
         // get utxos data for addresses
         let request = zebra_state::ReadRequest::UtxosByAddresses(valid_addresses);
@@ -2326,14 +2326,15 @@ where
                      {last_output_location:?}",
             );
 
-            let entry = Utxo {
+            let entry = Utxo::new_for_network(
                 address,
                 txid,
                 output_index,
                 script,
                 satoshis,
                 height,
-            };
+                &self.network,
+            );
             response_utxos.push(entry);
 
             last_output_location = output_location;
@@ -2450,6 +2451,13 @@ where
         let miner_params = self
             .gbt
             .miner_params()
+            .map_err(|error| {
+                ErrorObject::owned(
+                    server::error::LegacyCode::InvalidParameter.into(),
+                    format!("invalid mining configuration: {error}"),
+                    None::<()>,
+                )
+            })?
             .ok_or_error(0, "miner parameters are required for get_block_template")?;
 
         // - Checks and fetches that can change during long polling
@@ -3071,12 +3079,34 @@ where
         address: String,
     ) -> Result<ZListUnifiedReceiversResponse> {
         use zcash_address::unified::Container;
+        use zebra_chain::primitives::{WcashAddress, WcashAddressKind};
 
-        let (network, unified_address): (
-            zcash_protocol::consensus::NetworkType,
-            zcash_address::unified::Address,
-        ) = zcash_address::unified::Encoding::decode(address.clone().as_str())
-            .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?;
+        let uses_wcash_consensus = self.network.uses_wcash_consensus();
+        let (network, unified_address) = if uses_wcash_consensus {
+            let address = address
+                .parse::<WcashAddress>()
+                .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?;
+            if address.network() != zcash_protocol::consensus::NetworkType::Regtest {
+                return Err(ErrorObject::owned(
+                    0,
+                    "Wcash Unified Address is for the wrong network",
+                    None::<()>,
+                ));
+            }
+
+            let WcashAddressKind::Unified(unified_address) = address.kind() else {
+                return Err(ErrorObject::owned(
+                    0,
+                    "address is not a Wcash Unified Address",
+                    None::<()>,
+                ));
+            };
+
+            (address.network(), unified_address.clone())
+        } else {
+            zcash_address::unified::Encoding::decode(address.as_str())
+                .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
+        };
 
         let mut p2pkh = None;
         let mut p2sh = None;
@@ -3085,27 +3115,58 @@ where
 
         for item in unified_address.items() {
             match item {
-                zcash_address::unified::Receiver::Orchard(_data) => {
+                zcash_address::unified::Receiver::Orchard(data) => {
+                    if Option::<orchard::Address>::from(orchard::Address::from_raw_address_bytes(
+                        &data,
+                    ))
+                    .is_none()
+                    {
+                        return Err(ErrorObject::owned(
+                            server::error::LegacyCode::InvalidParameter.into(),
+                            "Unified Address contains an invalid Orchard receiver",
+                            None::<()>,
+                        ));
+                    }
+
                     let addr = zcash_address::unified::Address::try_from_items(vec![item])
                         .expect("using data already decoded as valid");
-                    orchard = Some(addr.encode(&network));
+                    orchard = Some(if uses_wcash_consensus {
+                        WcashAddress::from_unified(network, addr).encode()
+                    } else {
+                        addr.encode(&network)
+                    });
                 }
                 zcash_address::unified::Receiver::Sapling(data) => {
                     let addr = zebra_chain::primitives::Address::try_from_sapling(network, data)
                         .map_error(server::error::LegacyCode::InvalidParameter)?;
-                    sapling = Some(addr.payment_address().unwrap_or_default());
+
+                    sapling = Some(if uses_wcash_consensus {
+                        WcashAddress::from_sapling(network, data).encode()
+                    } else {
+                        addr.payment_address().unwrap_or_default()
+                    });
                 }
                 zcash_address::unified::Receiver::P2pkh(data) => {
-                    let addr =
-                        zebra_chain::primitives::Address::try_from_transparent_p2pkh(network, data)
-                            .expect("using data already decoded as valid");
-                    p2pkh = Some(addr.payment_address().unwrap_or_default());
+                    p2pkh = Some(if uses_wcash_consensus {
+                        WcashAddress::from_transparent_p2pkh(network, data).encode()
+                    } else {
+                        let addr = zebra_chain::primitives::Address::try_from_transparent_p2pkh(
+                            network, data,
+                        )
+                        .expect("using data already decoded as valid");
+                        addr.payment_address().unwrap_or_default()
+                    });
                 }
                 zcash_address::unified::Receiver::P2sh(data) => {
-                    let addr =
-                        zebra_chain::primitives::Address::try_from_transparent_p2sh(network, data)
-                            .expect("using data already decoded as valid");
-                    p2sh = Some(addr.payment_address().unwrap_or_default());
+                    p2sh = Some(if uses_wcash_consensus {
+                        WcashAddress::from_transparent_p2sh(network, data).encode()
+                    } else {
+                        let addr = zebra_chain::primitives::Address::try_from_transparent_p2sh(
+                            network, data,
+                        )
+                        .expect("using data already decoded as valid");
+                        addr.payment_address().unwrap_or_default()
+                    });
                 }
                 _ => (),
             }
@@ -3793,18 +3854,31 @@ pub type AddressStrings = GetAddressBalanceRequest;
 /// A collection of validatable addresses
 pub trait ValidateAddresses {
     /// Given a list of addresses as strings:
-    /// - check if provided list have all valid transparent addresses.
+    /// - check if the provided list contains only transparent addresses in the
+    ///   active chain's address namespace.
     /// - return valid addresses as a set of `Address`.
-    fn valid_addresses(&self) -> Result<HashSet<Address>> {
+    fn valid_addresses(&self, network: &Network) -> Result<HashSet<Address>> {
         // Reference for the legacy error code:
         // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/misc.cpp#L783-L784>
         let valid_addresses: HashSet<Address> = self
             .addresses()
             .iter()
             .map(|address| {
-                address
-                    .parse()
-                    .map_error(server::error::LegacyCode::InvalidAddressOrKey)
+                if network.uses_wcash_consensus() {
+                    Address::parse_wcash(address, network)
+                        .map(|address| match address {
+                            Address::Tex {
+                                network_kind,
+                                validating_key_hash,
+                            } => Address::from_pub_key_hash(network_kind, validating_key_hash),
+                            address => address,
+                        })
+                        .map_error(server::error::LegacyCode::InvalidAddressOrKey)
+                } else {
+                    address
+                        .parse()
+                        .map_error(server::error::LegacyCode::InvalidAddressOrKey)
+                }
             })
             .collect::<Result<_>>()?;
 
@@ -3821,6 +3895,102 @@ impl ValidateAddresses for GetAddressBalanceRequest {
     }
 }
 
+#[cfg(test)]
+mod wcash_address_validation_tests {
+    use super::*;
+
+    #[test]
+    fn address_index_requests_use_the_active_chain_namespace() {
+        let wcash_network = Network::new_wcash_regtest();
+        let wcash_address =
+            Address::from_pub_key_hash(zebra_chain::parameters::NetworkKind::Regtest, [0; 20]);
+        let wcash_encoded = wcash_address
+            .encode_wcash(&wcash_network)
+            .expect("address and Wcash network use the same network kind");
+        let wcash_request = GetAddressBalanceRequest::new(vec![wcash_encoded.clone()]);
+
+        assert_eq!(
+            wcash_request.valid_addresses(&wcash_network).unwrap(),
+            HashSet::from([wcash_address])
+        );
+
+        let zcash_address =
+            Address::from_pub_key_hash(zebra_chain::parameters::NetworkKind::Testnet, [0; 20]);
+        let zcash_encoded = zcash_address.to_string();
+        assert!(GetAddressBalanceRequest::new(vec![zcash_encoded.clone()])
+            .valid_addresses(&wcash_network)
+            .is_err());
+
+        let zcash_network = Network::new_default_testnet();
+        assert_eq!(
+            GetAddressBalanceRequest::new(vec![zcash_encoded])
+                .valid_addresses(&zcash_network)
+                .unwrap(),
+            HashSet::from([zcash_address])
+        );
+        assert!(GetAddressBalanceRequest::new(vec![wcash_encoded])
+            .valid_addresses(&zcash_network)
+            .is_err());
+    }
+
+    #[test]
+    fn get_address_utxos_serializes_the_active_chain_namespace() {
+        let network = Network::new_wcash_regtest();
+        let address =
+            Address::from_pub_key_hash(zebra_chain::parameters::NetworkKind::Regtest, [0; 20]);
+        let utxo = Utxo::new_for_network(
+            address,
+            transaction::Hash::from([0; 32]),
+            OutputIndex::from_index(0),
+            transparent::Script::new(&[0]),
+            1,
+            Height(1),
+            &network,
+        );
+
+        let value = serde_json::to_value(&utxo).unwrap();
+        assert_eq!(
+            value["address"],
+            serde_json::Value::String("WR64VqQpZRujxYnAJmqGK4d4fbqQZRZHazG".to_string())
+        );
+        assert_eq!(utxo.address(), &address);
+        assert_eq!(serde_json::from_value::<Utxo>(value).unwrap(), utxo);
+    }
+
+    #[test]
+    fn wcash_tex_queries_use_the_equivalent_p2pkh_index_key() {
+        let network = Network::new_wcash_regtest();
+        let receiver = [0x42; 20];
+        let p2pkh =
+            Address::from_pub_key_hash(zebra_chain::parameters::NetworkKind::Regtest, receiver);
+        let indexed_output = transparent::Output::new(
+            Amount::try_from(1u64).expect("one zatoshi is a valid output amount"),
+            p2pkh.script(),
+        );
+        let indexed_address = indexed_output
+            .address(&network)
+            .expect("a P2PKH output has an address-index key");
+
+        let tex = Address::from_tex(zebra_chain::parameters::NetworkKind::Regtest, receiver)
+            .encode_wcash(&network)
+            .expect("address and Wcash network use the same network kind");
+        let balance_request = GetAddressBalanceRequest::new(vec![tex.clone()]);
+        let tx_ids_request = GetAddressTxIdsRequest::new(vec![tex.clone()], None, None);
+        let utxos_request = GetAddressUtxosRequest::new(vec![tex], false);
+
+        for request in [
+            &balance_request as &dyn ValidateAddresses,
+            &tx_ids_request,
+            &utxos_request,
+        ] {
+            assert_eq!(
+                request.valid_addresses(&network).unwrap(),
+                HashSet::from([indexed_address])
+            );
+        }
+    }
+}
+
 impl GetAddressBalanceRequest {
     /// Creates a new `AddressStrings` given a vector.
     pub fn new(addresses: Vec<String>) -> GetAddressBalanceRequest {
@@ -3833,7 +4003,9 @@ impl GetAddressBalanceRequest {
     )]
     pub fn new_valid(addresses: Vec<String>) -> Result<GetAddressBalanceRequest> {
         let req = Self { addresses };
-        req.valid_addresses()?;
+        // This deprecated constructor has no active-network context, so retain its
+        // original Zcash address validation behavior.
+        req.valid_addresses(&Network::Mainnet)?;
         Ok(req)
     }
 }
@@ -4454,13 +4626,90 @@ pub struct GetAddressUtxosResponseObject {
     height: block::Height,
 }
 
+/// A transparent address together with its chain-specific RPC encoding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RpcTransparentAddress {
+    address: transparent::Address,
+    encoded: String,
+}
+
+impl RpcTransparentAddress {
+    fn zcash(address: transparent::Address) -> Self {
+        Self {
+            encoded: address.to_string(),
+            address,
+        }
+    }
+
+    fn for_network(address: transparent::Address, network: &Network) -> Self {
+        if network.uses_wcash_consensus() {
+            Self {
+                encoded: address
+                    .encode_wcash(network)
+                    .expect("state UTXO addresses use the active network kind"),
+                address,
+            }
+        } else {
+            Self::zcash(address)
+        }
+    }
+}
+
+impl serde::Serialize for RpcTransparentAddress {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.encoded)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RpcTransparentAddress {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = <String as serde::Deserialize>::deserialize(deserializer)?;
+        if let Ok(address) = encoded.parse() {
+            return Ok(Self::zcash(address));
+        }
+
+        use zebra_chain::primitives::{WcashAddress, WcashAddressKind};
+
+        let wcash_address = encoded
+            .parse::<WcashAddress>()
+            .map_err(serde::de::Error::custom)?;
+        let network_kind = wcash_address.network().into();
+        let address = match wcash_address.kind() {
+            WcashAddressKind::P2pkh(hash) => {
+                transparent::Address::from_pub_key_hash(network_kind, *hash)
+            }
+            WcashAddressKind::P2sh(hash) => {
+                transparent::Address::from_script_hash(network_kind, *hash)
+            }
+            WcashAddressKind::Tex(hash) => transparent::Address::from_tex(network_kind, *hash),
+            WcashAddressKind::Sapling(_) | WcashAddressKind::Unified(_) => {
+                return Err(serde::de::Error::custom(
+                    "getaddressutxos requires a transparent address",
+                ));
+            }
+        };
+
+        Ok(Self {
+            address,
+            encoded: wcash_address.encode(),
+        })
+    }
+}
+
 /// A UTXO returned by the `getaddressutxos` RPC request.
 ///
 /// See the notes for the [`Rpc::get_address_utxos` method].
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters)]
 pub struct Utxo {
     /// The transparent address, base58check encoded
-    address: transparent::Address,
+    #[getter(skip)]
+    address: RpcTransparentAddress,
 
     /// The output txid, in big-endian order, hex-encoded
     #[serde(with = "hex")]
@@ -4491,21 +4740,64 @@ pub use self::Utxo as GetAddressUtxos;
 
 impl Default for Utxo {
     fn default() -> Self {
-        Self {
-            address: transparent::Address::from_pub_key_hash(
+        Self::new(
+            transparent::Address::from_pub_key_hash(
                 zebra_chain::parameters::NetworkKind::default(),
                 [0u8; 20],
             ),
-            txid: transaction::Hash::from([0; 32]),
-            output_index: OutputIndex::from_u64(0),
-            script: transparent::Script::new(&[0u8; 10]),
-            satoshis: u64::default(),
-            height: Height(0),
-        }
+            transaction::Hash::from([0; 32]),
+            OutputIndex::from_u64(0),
+            transparent::Script::new(&[0u8; 10]),
+            u64::default(),
+            Height(0),
+        )
     }
 }
 
 impl Utxo {
+    /// Constructs a new UTXO using Zcash's transparent address namespace.
+    pub fn new(
+        address: transparent::Address,
+        txid: transaction::Hash,
+        output_index: OutputIndex,
+        script: transparent::Script,
+        satoshis: u64,
+        height: Height,
+    ) -> Self {
+        Self {
+            address: RpcTransparentAddress::zcash(address),
+            txid,
+            output_index,
+            script,
+            satoshis,
+            height,
+        }
+    }
+
+    fn new_for_network(
+        address: transparent::Address,
+        txid: transaction::Hash,
+        output_index: OutputIndex,
+        script: transparent::Script,
+        satoshis: u64,
+        height: Height,
+        network: &Network,
+    ) -> Self {
+        Self {
+            address: RpcTransparentAddress::for_network(address, network),
+            txid,
+            output_index,
+            script,
+            satoshis,
+            height,
+        }
+    }
+
+    /// Returns this UTXO's decoded transparent address.
+    pub fn address(&self) -> &transparent::Address {
+        &self.address.address
+    }
+
     /// Constructs a new instance of [`GetAddressUtxos`].
     #[deprecated(note = "Use `Utxo::new` instead")]
     pub fn from_parts(
@@ -4516,14 +4808,7 @@ impl Utxo {
         satoshis: u64,
         height: Height,
     ) -> Self {
-        Utxo {
-            address,
-            txid,
-            output_index,
-            script,
-            satoshis,
-            height,
-        }
+        Utxo::new(address, txid, output_index, script, satoshis, height)
     }
 
     /// Returns the contents of [`GetAddressUtxos`].
@@ -4538,7 +4823,7 @@ impl Utxo {
         Height,
     ) {
         (
-            self.address,
+            self.address.address,
             self.txid,
             self.output_index,
             self.script.clone(),

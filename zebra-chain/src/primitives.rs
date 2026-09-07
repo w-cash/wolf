@@ -7,8 +7,10 @@
 mod proofs;
 
 mod address;
+mod wcash_address;
 
 pub use address::Address;
+pub use wcash_address::{WcashAddress, WcashAddressKind, WcashAddressParseError};
 
 pub mod byte_array;
 

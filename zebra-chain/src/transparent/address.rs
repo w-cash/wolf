@@ -3,7 +3,8 @@
 use std::{fmt, io};
 
 use crate::{
-    parameters::NetworkKind,
+    parameters::{Network, NetworkKind},
+    primitives::{WcashAddress, WcashAddressKind, WcashAddressParseError},
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
     transparent::{opcodes::OpCode, Script},
 };
@@ -55,6 +56,27 @@ pub enum Address {
         /// 20 bytes specifying the validating key hash.
         validating_key_hash: [u8; 20],
     },
+}
+
+/// An error returned while encoding or parsing a Wcash transparent address.
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub enum WcashTransparentAddressError {
+    /// The address string is not a valid Wcash address.
+    #[error(transparent)]
+    Parse(#[from] WcashAddressParseError),
+
+    /// The address belongs to a different network than the requested network.
+    #[error("Wcash address belongs to {actual}, but {expected} was expected")]
+    IncorrectNetwork {
+        /// The requested network kind.
+        expected: NetworkKind,
+        /// The network kind encoded by the address.
+        actual: NetworkKind,
+    },
+
+    /// The address is a shielded Wcash address, not a transparent address.
+    #[error("expected a Wcash transparent address")]
+    NotTransparent,
 }
 
 impl From<Address> for ZcashAddress {
@@ -241,6 +263,63 @@ impl ZcashDeserialize for Address {
 }
 
 impl Address {
+    /// Encodes this transparent receiver in the Wcash address namespace for `network`.
+    ///
+    /// [`Address`]'s [`fmt::Display`] implementation intentionally remains the Zcash
+    /// encoding. Call this method only at a Wcash wallet or RPC boundary.
+    pub fn encode_wcash(&self, network: &Network) -> Result<String, WcashTransparentAddressError> {
+        let expected = network.kind();
+        let actual = self.network_kind();
+        if actual != expected {
+            return Err(WcashTransparentAddressError::IncorrectNetwork { expected, actual });
+        }
+
+        let network = expected.into();
+        let address = match *self {
+            Address::PayToPublicKeyHash { pub_key_hash, .. } => {
+                WcashAddress::from_transparent_p2pkh(network, pub_key_hash)
+            }
+            Address::PayToScriptHash { script_hash, .. } => {
+                WcashAddress::from_transparent_p2sh(network, script_hash)
+            }
+            Address::Tex {
+                validating_key_hash,
+                ..
+            } => WcashAddress::from_tex(network, validating_key_hash),
+        };
+
+        Ok(address.encode())
+    }
+
+    /// Parses a Wcash transparent address for `network`.
+    ///
+    /// This entry point rejects Zcash address strings and Wcash addresses for other
+    /// networks. [`std::str::FromStr`] intentionally remains Zcash-only.
+    pub fn parse_wcash(
+        encoded: &str,
+        network: &Network,
+    ) -> Result<Self, WcashTransparentAddressError> {
+        let address = WcashAddress::try_from_encoded(encoded)?;
+        let expected = network.kind();
+        let actual = address.network().into();
+        if actual != expected {
+            return Err(WcashTransparentAddressError::IncorrectNetwork { expected, actual });
+        }
+
+        match address.kind() {
+            WcashAddressKind::P2pkh(pub_key_hash) => {
+                Ok(Self::from_pub_key_hash(actual, *pub_key_hash))
+            }
+            WcashAddressKind::P2sh(script_hash) => Ok(Self::from_script_hash(actual, *script_hash)),
+            WcashAddressKind::Tex(validating_key_hash) => {
+                Ok(Self::from_tex(actual, *validating_key_hash))
+            }
+            WcashAddressKind::Sapling(_) | WcashAddressKind::Unified(_) => {
+                Err(WcashTransparentAddressError::NotTransparent)
+            }
+        }
+    }
+
     /// Create an address for the given public key hash and network.
     pub fn from_pub_key_hash(network_kind: NetworkKind, pub_key_hash: [u8; 20]) -> Self {
         Self::PayToPublicKeyHash {
@@ -444,6 +523,93 @@ mod tests {
         assert_eq!(
             format!("{t_addr:?}"),
             "TransparentAddress { network_kind: Mainnet, script_hash: \"7d46a730d31f97b1930d3368a967c309bd4d136a\" }"
+        );
+    }
+
+    #[test]
+    fn wcash_transparent_addresses_use_distinct_network_prefixes() {
+        let _init_guard = zebra_test::init();
+
+        let networks = [
+            (
+                Network::Mainnet,
+                NetworkKind::Mainnet,
+                "W1M7uk1EZYGQGJCwCL5cWTE1FU5CuVSL6bU",
+                "W3MovfYj16AiePNddTBH6srNBcbVd5oHSZQ",
+            ),
+            (
+                Network::new_default_testnet(),
+                NetworkKind::Testnet,
+                "WT6kWkxJzyp4LdwrjtvvuVFRbkMhH2SsBeq",
+                "WUJmKiHCs7MSy6FGzyBvrwdExdsU75uiFgz",
+            ),
+            (
+                Network::new_wcash_regtest(),
+                NetworkKind::Regtest,
+                "WR64VqQpZRujxYnAJmqGK4d4fbqQZRZHazG",
+                "WSJ5JnjiRZT8b15aZr6GGWzt2VMBPapmhBQ",
+            ),
+        ];
+
+        for (network, network_kind, expected_p2pkh, expected_p2sh) in networks {
+            let p2pkh = Address::from_pub_key_hash(network_kind, [0; 20]);
+            let p2sh = Address::from_script_hash(network_kind, [0; 20]);
+
+            let p2pkh_encoded = p2pkh.encode_wcash(&network).unwrap();
+            let p2sh_encoded = p2sh.encode_wcash(&network).unwrap();
+            assert_eq!(p2pkh_encoded, expected_p2pkh);
+            assert_eq!(p2sh_encoded, expected_p2sh);
+            assert_eq!(Address::parse_wcash(&p2pkh_encoded, &network), Ok(p2pkh));
+            assert_eq!(Address::parse_wcash(&p2sh_encoded, &network), Ok(p2sh));
+        }
+    }
+
+    #[test]
+    fn wcash_helpers_do_not_change_or_accept_zcash_encodings() {
+        let _init_guard = zebra_test::init();
+
+        let network = Network::Mainnet;
+        let address = Address::from_pub_key_hash(NetworkKind::Mainnet, [0; 20]);
+
+        // The general-purpose formatter and parser remain Zcash-compatible.
+        let zcash_encoded = address.to_string();
+        assert!(zcash_encoded.starts_with("t1"), "{zcash_encoded}");
+        assert_eq!(zcash_encoded.parse::<Address>().unwrap(), address);
+
+        // Wcash is an explicit, disjoint codec boundary.
+        assert!(matches!(
+            Address::parse_wcash(&zcash_encoded, &network),
+            Err(WcashTransparentAddressError::Parse(
+                WcashAddressParseError::NotWcash
+            ))
+        ));
+        let wcash_encoded = address.encode_wcash(&network).unwrap();
+        assert!(wcash_encoded.parse::<Address>().is_err());
+    }
+
+    #[test]
+    fn wcash_helpers_reject_the_wrong_network_and_shielded_addresses() {
+        let _init_guard = zebra_test::init();
+
+        let mainnet = Network::Mainnet;
+        let regtest = Network::new_wcash_regtest();
+        let address = Address::from_pub_key_hash(NetworkKind::Mainnet, [0; 20]);
+        let encoded = address.encode_wcash(&mainnet).unwrap();
+
+        assert!(matches!(
+            Address::parse_wcash(&encoded, &regtest),
+            Err(WcashTransparentAddressError::IncorrectNetwork {
+                expected: NetworkKind::Regtest,
+                actual: NetworkKind::Mainnet,
+            })
+        ));
+
+        let shielded =
+            WcashAddress::from_sapling(zcash_protocol::consensus::NetworkType::Main, [0; 43])
+                .encode();
+        assert_eq!(
+            Address::parse_wcash(&shielded, &mainnet),
+            Err(WcashTransparentAddressError::NotTransparent)
         );
     }
 }

@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Added a feature-gated internal miner that constructs real Equihash work over
   a synthetic Zcash parent and submits the resulting Wcash block through the
   normal validator.
+- Added distinct Wcash payment-address namespaces for Unified, Sapling, TEX,
+  and transparent receivers, with strict network checks in Wcash mining and RPC
+  paths. Wallet and spending/viewing-key encodings are not included.
 
 ### Changed
 
@@ -32,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   Wcash coinbase outputs are rejected by consensus.
 - Removed founders rewards, funding streams, deferred-pool payments, lockbox
   disbursements, slow start, premine, and protocol development tax from Wcash.
+- Redacted the full configuration and miner payment address from Wcash startup
+  logs.
 
 ### Security
 

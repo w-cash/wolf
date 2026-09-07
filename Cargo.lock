@@ -7394,6 +7394,7 @@ dependencies = [
  "dirs",
  "ed25519-zebra",
  "equihash",
+ "f4jumble",
  "futures",
  "group",
  "halo2_proofs",

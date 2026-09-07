@@ -94,7 +94,9 @@ use tracing_futures::Instrument;
 
 use zebra_chain::block::genesis::{regtest_genesis_block, wcash_regtest_genesis_block};
 use zebra_consensus::router::BackgroundTaskHandles;
-use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
+use zebra_rpc::{
+    methods::RpcImpl, server::RpcServer, MinerParams, MinerParamsError, SubmitBlockChannel,
+};
 
 use crate::{
     application::{build_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
@@ -940,6 +942,15 @@ impl config::Override<ZebradConfig> for StartCmd {
             .into());
         }
 
+        match MinerParams::new(&config.network.network, config.mining.clone()) {
+            Ok(_) | Err(MinerParamsError::MissingAddr) => {}
+            Err(error) => {
+                return Err(
+                    std::io::Error::other(format!("invalid mining configuration: {error}")).into(),
+                )
+            }
+        }
+
         if !self.filters.is_empty() {
             config.tracing.filter = Some(self.filters.join(","));
         }
@@ -1007,6 +1018,36 @@ mod tests {
             .expect_err("the Wcash binary must not run with widened values on Zcash mainnet");
 
         assert!(error.to_string().contains("only supports network"));
+    }
+
+    #[test]
+    fn start_rejects_zcash_miner_address_on_wcash() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        let zcash_address = zebra_rpc::config::mining::default_miner_address(
+            zebra_chain::parameters::NetworkKind::Regtest,
+            &zebra_rpc::config::mining::MinerAddressType::Unified,
+        );
+        config.mining.miner_address = Some(
+            zcash_address
+                .parse()
+                .expect("the inherited Zcash miner-address fixture is valid"),
+        );
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("Wcash startup must reject a Zcash miner-address namespace");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Wcash mining requires a Wcash address"),
+            "startup should explain the miner-address namespace mismatch: {error}"
+        );
     }
 
     #[test]

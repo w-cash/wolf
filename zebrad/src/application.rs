@@ -467,11 +467,17 @@ impl Application for ZebradApp {
                 info!("No config file provided, using default configuration");
             }
 
-            info!("{config:?}");
+            if config.network.network.uses_wcash_consensus() {
+                info!(
+                    network = %config.network.network,
+                    "loaded Wcash configuration (sensitive values redacted)"
+                );
+            } else {
+                info!("{config:?}");
 
-            // Explicitly log the configured miner address so CI can assert env override
-            if let Some(miner_address) = &config.mining.miner_address {
-                info!(%miner_address, "configured miner address");
+                if let Some(miner_address) = &config.mining.miner_address {
+                    info!(%miner_address, "configured miner address");
+                }
             }
         }
 

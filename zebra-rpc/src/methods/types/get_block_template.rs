@@ -486,10 +486,20 @@ impl MinerParams {
     // length-validated), not a recoverable error.
     #[allow(clippy::unwrap_in_result)]
     pub fn new(net: &Network, conf: config::mining::Config) -> Result<Self, MinerParamsError> {
-        let addr = conf
-            .miner_address
-            .map(|addr| Address::try_from_zcash_address(net, addr))
-            .ok_or(MinerParamsError::MissingAddr)??;
+        let configured_address = conf.miner_address.ok_or(MinerParamsError::MissingAddr)?;
+        let addr = match (net.uses_wcash_consensus(), configured_address) {
+            (true, config::mining::MinerAddress::Wcash(address)) => address
+                .convert_if_network::<Address>(zcash_protocol::consensus::NetworkType::Regtest)?,
+            (true, config::mining::MinerAddress::Zcash(_)) => {
+                return Err(MinerParamsError::WcashAddressNamespaceRequired)
+            }
+            (false, config::mining::MinerAddress::Zcash(address)) => {
+                Address::try_from_zcash_address(net, address)?
+            }
+            (false, config::mining::MinerAddress::Wcash(_)) => {
+                return Err(MinerParamsError::ZcashAddressNamespaceRequired)
+            }
+        };
 
         if net.uses_wcash_consensus()
             && !matches!(&addr, Address::Unified(unified) if unified.orchard().is_some())
@@ -558,12 +568,22 @@ impl From<Address> for MinerParams {
 /// Errors that can occur when creating [`MinerParams`].
 #[derive(Debug, thiserror::Error)]
 pub enum MinerParamsError {
+    /// No miner payment address was configured.
     #[error("Missing miner address")]
     MissingAddr,
+    /// The configured address could not be converted into a supported payment address.
     #[error("Invalid miner address: {0}")]
     InvalidAddr(zcash_address::ConversionError<&'static str>),
+    /// A Wcash address does not contain the Orchard receiver used for Ironwood rewards.
     #[error("Wcash miner address must be Unified and contain an Orchard receiver for Ironwood")]
     WcashRequiresIronwoodReceiver,
+    /// A Zcash address was configured while Wcash consensus is active.
+    #[error("Wcash mining requires a Wcash address (w.../W...), not a Zcash address")]
+    WcashAddressNamespaceRequired,
+    /// A Wcash address was configured while Zcash consensus is active.
+    #[error("Zcash mining requires a Zcash address, not a Wcash address")]
+    ZcashAddressNamespaceRequired,
+    /// The configured miner memo is not a valid protocol memo.
     #[error(transparent)]
     InvalidMemo(#[from] zcash_protocol::memo::Error),
 }
@@ -657,7 +677,7 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     /// Miner parameters, including the miner address, data, and memo.
-    miner_params: Option<MinerParams>,
+    miner_params: Result<Option<MinerParams>, Arc<MinerParamsError>>,
 
     /// The chain verifier, used for submitting blocks.
     block_verifier_router: BlockVerifierRouter,
@@ -687,8 +707,14 @@ where
         sync_status: SyncStatus,
         mined_block_sender: Option<mpsc::Sender<(block::Hash, block::Height)>>,
     ) -> Self {
+        let miner_params = match MinerParams::new(net, conf) {
+            Ok(miner_params) => Ok(Some(miner_params)),
+            Err(MinerParamsError::MissingAddr) => Ok(None),
+            Err(error) => Err(Arc::new(error)),
+        };
+
         Self {
-            miner_params: MinerParams::new(net, conf).ok(),
+            miner_params,
             block_verifier_router,
             sync_status,
             mined_block_sender: mined_block_sender
@@ -698,8 +724,11 @@ where
     }
 
     /// Returns the miner parameters, including the address, data, and memo.
-    pub fn miner_params(&self) -> Option<&MinerParams> {
-        self.miner_params.as_ref()
+    pub fn miner_params(&self) -> Result<Option<&MinerParams>, &MinerParamsError> {
+        self.miner_params
+            .as_ref()
+            .map(|params| params.as_ref())
+            .map_err(Arc::as_ref)
     }
 
     /// Overrides the miner parameters used to build coinbase transactions.
@@ -707,7 +736,7 @@ where
     /// Used by the regtest `generatetoaddress` RPC to mine to a caller-specified
     /// address on a cloned handler, without changing the configured default.
     pub fn set_miner_params(&mut self, miner_params: MinerParams) {
-        self.miner_params = Some(miner_params);
+        self.miner_params = Ok(Some(miner_params));
         // Cached coinbases pay the previous miner address, and this handler shares
         // its cache with the handler it was cloned from. Detach to a fresh cache so
         // neither handler can serve a coinbase built for the other's address.
@@ -740,7 +769,7 @@ where
 
     /// Randomizes the coinbase data, if miner parameters are set.
     pub fn randomize_coinbase_data(&mut self) {
-        if let Some(miner_params) = &mut self.miner_params {
+        if let Ok(Some(miner_params)) = &mut self.miner_params {
             miner_params.randomize_data();
             miner_params.randomize_memo();
             // The cached coinbase was built with the previous data, so it's now stale.

@@ -21,10 +21,23 @@ cargo build --release -p wcash-merge-miner --bin wcash-merge-miner
 and chain state is ephemeral. RPC cookie authentication is disabled only to
 make loopback testing simple; never copy that setting to a public listener.
 
-The configured Unified Address is a public regtest fixture with an Orchard
-receiver, which Wcash routes into Ironwood. It is not evidence that you possess
-the spending key. Replace it with your own compatible regtest Unified Address
-before testing reward spends.
+The configured `wuregtest1...` Unified Address is a public regtest fixture with
+an Orchard receiver, which Wcash routes into Ironwood. It is not evidence that
+you possess the spending key. This node does not implement a Wcash wallet,
+account derivation, or Wcash-specific spending/viewing-key encodings, so the
+fixture demonstrates reward creation but not reward recovery or spending.
+
+Wcash payment-address prefixes are compact and disjoint from Zcash: regtest
+uses `wuregtest1...` for Unified, `wregtestsapling1...` for Sapling,
+`wtexregtest1...` for TEX, and `WR...`/`WS...` for transparent P2PKH/P2SH.
+Mining accepts only the Unified form with an Orchard receiver. Do not create a
+Wcash address by editing a Zcash prefix; the checksum and Unified Address
+jumbling bind the Wcash namespace.
+
+For Wcash startup, the node logs that configuration was loaded but redacts the
+full configuration and miner address. The address remains plaintext in the
+local TOML file and may be known to a pool operator; on-chain recipient privacy
+does not make host configuration secret.
 
 `internal_miner = true` uses real Equihash `(200, 9)` to build a synthetic
 Zcash-parent AuxPoW proof and submits the resulting Wcash block through the
@@ -102,6 +115,7 @@ AuxPoW verifier used by consensus. A running node additionally checks the
 Wcash genesis and configuration path.
 
 It does not prove parent Zcash acceptance, production pool compatibility,
-public difficulty behavior, wallet recovery, public network identity, or
-security under adversarial load. Those require the live Zcash GBT/dual-submit
-adapter, public anchor freeze, interoperability testing, and independent audit.
+public difficulty behavior, wallet recovery, key-format interoperability,
+public network identity, or security under adversarial load. Those require the
+live Zcash GBT/dual-submit adapter, a Wcash wallet and key-domain specification,
+public anchor freeze, interoperability testing, and independent audit.
