@@ -299,7 +299,7 @@ fn test_get_block_1() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
         time,
         nonce,
-        solution,
+        solution.clone(),
         bits.map(|d| {
             zebra_chain::work::difficulty::CompactDifficulty::from_bytes_in_display_order(&d)
                 .expect("must work since it was just read")
@@ -378,7 +378,7 @@ fn test_get_block_2() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
         time,
         nonce,
-        solution,
+        solution.clone(),
         bits,
         difficulty,
         chain_supply,
@@ -448,7 +448,7 @@ fn test_get_block_header() -> Result<(), Box<dyn std::error::Error>> {
         sapling_tree_size,
         time,
         nonce,
-        solution,
+        solution.clone(),
         bits,
         difficulty,
         previous_block_hash,

@@ -6659,6 +6659,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "wcash-genesis"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "wcash-merge-miner"
+version = "0.1.0"
+dependencies = [
+ "equihash",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "wcash-zcash-aux",
+ "zebra-chain",
+]
+
+[[package]]
+name = "wcash-zcash-aux"
+version = "0.1.0"
+dependencies = [
+ "equihash",
+ "hex",
+ "sha2 0.10.9",
+ "zebra-chain",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7400,6 +7432,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uint 0.10.0",
+ "wcash-genesis",
  "x25519-dalek",
  "zcash_address",
  "zcash_encoding",
@@ -7452,6 +7485,7 @@ dependencies = [
  "tracing-error",
  "tracing-futures",
  "tracing-subscriber",
+ "wcash-zcash-aux",
  "zcash_primitives",
  "zcash_proofs",
  "zcash_protocol",
@@ -7777,6 +7811,8 @@ dependencies = [
  "tracing-subscriber",
  "tracing-test",
  "vergen-git2",
+ "wcash-merge-miner",
+ "wcash-zcash-aux",
  "zcash_keys",
  "zcash_script",
  "zebra-chain",

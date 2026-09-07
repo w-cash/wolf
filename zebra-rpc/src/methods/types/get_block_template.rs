@@ -35,7 +35,10 @@ use zebra_chain::{
     parameters::Network,
     serialization::{DateTime32, ZcashDeserializeInto},
     transaction::VerifiedUnminedTx,
-    work::difficulty::{CompactDifficulty, ExpandedDifficulty},
+    work::{
+        difficulty::{CompactDifficulty, ExpandedDifficulty},
+        equihash::WCASH_BLOCK_WIRE_VERSION,
+    },
 };
 // Required for trait method `.bytes_in_display_order()` used indirectly in Debug impl
 #[allow(unused_imports)]
@@ -379,7 +382,11 @@ impl BlockTemplateResponse {
         BlockTemplateResponse {
             capabilities,
 
-            version: ZCASH_BLOCK_VERSION,
+            version: if net.uses_wcash_consensus() {
+                WCASH_BLOCK_WIRE_VERSION
+            } else {
+                ZCASH_BLOCK_VERSION
+            },
 
             previous_block_hash: chain_info.tip_hash,
             block_commitments_hash: default_roots.block_commitments_hash,
@@ -484,6 +491,12 @@ impl MinerParams {
             .map(|addr| Address::try_from_zcash_address(net, addr))
             .ok_or(MinerParamsError::MissingAddr)??;
 
+        if net.uses_wcash_consensus()
+            && !matches!(&addr, Address::Unified(unified) if unified.orchard().is_some())
+        {
+            return Err(MinerParamsError::WcashRequiresIronwoodReceiver);
+        }
+
         // Always tag the coinbase with the Zebra marker, even without configured
         // `extra_coinbase_data`, so every block Zebra builds is identifiable. The type of
         // `extra_coinbase_data` bounds its length, so the marker, separator, and data always fit in
@@ -549,6 +562,8 @@ pub enum MinerParamsError {
     MissingAddr,
     #[error("Invalid miner address: {0}")]
     InvalidAddr(zcash_address::ConversionError<&'static str>),
+    #[error("Wcash miner address must be Unified and contain an Orchard receiver for Ironwood")]
+    WcashRequiresIronwoodReceiver,
     #[error(transparent)]
     InvalidMemo(#[from] zcash_protocol::memo::Error),
 }

@@ -92,7 +92,7 @@ use tokio::{
 use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
 
-use zebra_chain::block::genesis::regtest_genesis_block;
+use zebra_chain::block::genesis::{regtest_genesis_block, wcash_regtest_genesis_block};
 use zebra_consensus::router::BackgroundTaskHandles;
 use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
@@ -118,7 +118,7 @@ use crate::components;
 #[derive(Command, Debug, Default, clap::Parser)]
 pub struct StartCmd {
     /// Filter strings which override the config file and defaults
-    #[clap(help = "tracing filters which override the zebrad.toml config")]
+    #[clap(help = "tracing filters which override the wcash.toml config")]
     filters: Vec<String>,
 
     /// Enable zcashd-compat mode.
@@ -647,9 +647,14 @@ impl StartCmd {
                 .state_contains(config.network.network.genesis_hash())
                 .await?
         {
+            let genesis_block = if config.network.network.uses_wcash_consensus() {
+                wcash_regtest_genesis_block()
+            } else {
+                regtest_genesis_block()
+            };
             let genesis_hash = block_verifier_router
                 .clone()
-                .oneshot(zebra_consensus::Request::Commit(regtest_genesis_block()))
+                .oneshot(zebra_consensus::Request::Commit(genesis_block))
                 .await
                 .expect("should validate Regtest genesis block");
 
@@ -661,12 +666,12 @@ impl StartCmd {
         }
         let syncer_task_handle = tokio::spawn(syncer.sync().in_current_span());
 
-        // And finally, spawn the internal Zcash miner, if it is enabled.
+        // And finally, spawn the internal Wcash AuxPoW miner, if it is enabled.
         //
         // TODO: add a config to enable the miner rather than a feature.
         #[cfg(feature = "internal-miner")]
         let miner_task_handle = if config.mining.is_internal_miner_enabled() {
-            info!("spawning Zcash miner");
+            info!("spawning Wcash AuxPoW miner");
             components::miner::spawn_init(&config.metrics, rpc_impl)
         } else {
             tokio::spawn(std::future::pending().in_current_span())
@@ -677,7 +682,7 @@ impl StartCmd {
         let miner_task_handle: tokio::task::JoinHandle<Result<(), Report>> =
             tokio::spawn(std::future::pending().in_current_span());
 
-        info!("spawned initial Zebra tasks");
+        info!("spawned initial Wcash tasks");
 
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
 
@@ -873,7 +878,7 @@ impl StartCmd {
         old_databases_task_handle.abort();
 
         info!(
-            "exiting Zebra: all tasks have been asked to stop, waiting for remaining tasks to finish"
+            "exiting Wcash: all tasks have been asked to stop, waiting for remaining tasks to finish"
         );
 
         exit_status
@@ -903,7 +908,7 @@ impl StartCmd {
 impl Runnable for StartCmd {
     /// Start the application.
     fn run(&self) {
-        info!("Starting zebrad");
+        info!("Starting Wcash");
         let rt = APPLICATION
             .state()
             .components_mut()
@@ -915,7 +920,7 @@ impl Runnable for StartCmd {
         rt.expect("runtime should not already be taken")
             .run(self.start());
 
-        info!("stopping zebrad");
+        info!("stopping Wcash");
     }
 }
 
@@ -924,6 +929,17 @@ impl config::Override<ZebradConfig> for StartCmd {
     // a configuration file using explicit flags taken from command-line
     // arguments.
     fn override_config(&self, mut config: ZebradConfig) -> Result<ZebradConfig, FrameworkError> {
+        // This fork deliberately widens aggregate value-pool accounting for Wcash's
+        // 33.6-million-coin issuance. The inherited Zcash network definitions remain
+        // available to lower-level library tests, but running this binary against a
+        // Zcash network would apply the wrong monetary bounds and is therefore unsafe.
+        if !config.network.network.uses_wcash_consensus() {
+            return Err(std::io::Error::other(
+                "this Wcash node build only supports network = 'WcashRegtest'; inherited Zcash networks are library/test fixtures",
+            )
+            .into());
+        }
+
         if !self.filters.is_empty() {
             config.tracing.filter = Some(self.filters.join(","));
         }
@@ -975,6 +991,23 @@ mod tests {
     use super::StartCmd;
     use crate::components::zcashd_compat;
     use crate::config::ZebradConfig;
+
+    #[test]
+    fn start_rejects_inherited_zcash_networks() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.network.network = zebra_chain::parameters::Network::Mainnet;
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("the Wcash binary must not run with widened values on Zcash mainnet");
+
+        assert!(error.to_string().contains("only supports network"));
+    }
 
     #[test]
     fn zcashd_compat_flag_enables_mode() {

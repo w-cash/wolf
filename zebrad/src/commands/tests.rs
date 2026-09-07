@@ -2,7 +2,7 @@
 
 use clap::Parser;
 
-use crate::commands::ZebradCmd;
+use crate::commands::{ZebradCmd, CONFIG_FILE};
 
 use super::EntryPoint;
 
@@ -44,4 +44,9 @@ fn args_with_subcommand_pass_through() {
 
         assert_eq!(matches!(args.cmd(), ZebradCmd::Start(_)), should_be_start,);
     }
+}
+
+#[test]
+fn default_config_filename_is_isolated_from_zcash() {
+    assert_eq!(CONFIG_FILE, "wcash.toml");
 }

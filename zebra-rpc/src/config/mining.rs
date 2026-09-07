@@ -37,6 +37,8 @@ pub struct Config {
     /// Address for receiving miner subsidy and tx fees.
     ///
     /// Used in coinbase tx constructed in `getblocktemplate` RPC.
+    /// Wcash requires a Unified address containing an Orchard receiver, which is used as the
+    /// recipient for its mandatory Ironwood coinbase output.
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub miner_address: Option<ZcashAddress>,
 
@@ -52,10 +54,11 @@ pub struct Config {
     /// Applies only if [`Self::miner_address`] contains a shielded component.
     pub miner_memo: Option<String>,
 
-    /// Mine blocks using Zebra's internal miner, without an external mining pool or equihash solver.
+    /// Mine blocks using the node's internal solver instead of an external pool.
     ///
-    /// This experimental feature is only supported on regtest as it uses null solutions and skips checking
-    /// for a valid Proof of Work.
+    /// On Wcash regtest this builds a synthetic Zcash parent coinbase, runs the
+    /// real Equihash `(200, 9)` solver, and attaches a fully validated AuxPoW
+    /// witness. It is development tooling, not a live Zcash dual-submit path.
     ///
     /// The internal miner is off by default.
     #[serde(default)]

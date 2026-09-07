@@ -2,7 +2,7 @@
 
 use anyhow::anyhow;
 use std::iter;
-use zebra_chain::amount::Amount;
+use zebra_chain::amount::{Amount, MAX_WCASH_COINBASE_VALUE};
 
 use strum::IntoEnumIterator;
 use zcash_keys::address::Address;
@@ -391,4 +391,170 @@ fn coinbase_at_nu6_3_routes_shielded_output_to_ironwood() {
     );
     zebra_consensus::transaction::check::coinbase_outputs_are_decryptable(&coinbase, &net, height)
         .expect("Ironwood coinbase output is recoverable with the zero outgoing viewing key");
+}
+
+/// Wcash templates pay the entire coinbase reward privately into Ironwood and reject miner
+/// addresses that cannot receive an Ironwood note.
+#[test]
+fn wcash_coinbase_is_private_and_ironwood_only() {
+    use zebra_chain::parameters::subsidy::SubsidyError;
+    use zebra_consensus::error::TransactionError;
+
+    use crate::config::mining::Config;
+
+    let net = Network::new_wcash_regtest();
+    let height = Height(1);
+    let unified_address = default_miner_address(net.kind(), &MinerAddressType::Unified);
+    let miner_params = MinerParams::from(
+        Address::decode(&net, unified_address).expect("hard-coded Unified address is valid"),
+    );
+    let miner_fees = Amount::try_from(12_345).expect("valid fee amount");
+
+    let template = TransactionTemplate::new_coinbase(&net, height, &miner_params, miner_fees)
+        .expect("valid private Wcash coinbase tx");
+    let coinbase: Transaction = template.data.as_ref().zcash_deserialize_into().unwrap();
+
+    assert_eq!(coinbase.version(), 6);
+    assert!(coinbase.is_coinbase());
+    assert!(coinbase.outputs().is_empty());
+    assert!(!coinbase.has_sapling_shielded_data());
+    assert!(!coinbase.has_orchard_shielded_data());
+    assert!(coinbase.ironwood_actions().next().is_some());
+    assert!(
+        zebra_chain::primitives::zcash_note_encryption::ironwood_outputs_are_private_from_zero_ovk(
+            &coinbase, &net, height,
+        ),
+        "every Wcash reward action must reject public recovery with Zcash's zero OVK"
+    );
+    zebra_consensus::transaction::check::wcash_coinbase_outputs_are_private(
+        &coinbase, &net, height,
+    )
+    .expect("the private Wcash coinbase passes its consensus privacy rule");
+    assert_eq!(
+        coinbase
+            .ironwood_value_balance()
+            .ironwood_amount()
+            .zatoshis(),
+        -1_000_012_345
+    );
+
+    assert!(matches!(
+        zebra_consensus::transaction::check::coinbase_outputs_are_decryptable(
+            &coinbase, &net, height
+        ),
+        Err(TransactionError::CoinbaseOutputsNotDecryptable)
+    ));
+    let config_for = |address: &str| Config {
+        miner_address: Some(address.parse().expect("hard-coded address parses")),
+        ..Default::default()
+    };
+    assert!(MinerParams::new(&net, config_for(unified_address)).is_ok());
+
+    for invalid_type in [MinerAddressType::Sapling, MinerAddressType::Transparent] {
+        let invalid_address = default_miner_address(net.kind(), &invalid_type);
+        assert!(matches!(
+            MinerParams::new(&net, config_for(invalid_address)),
+            Err(super::MinerParamsError::WcashRequiresIronwoodReceiver)
+        ));
+
+        let invalid_params = MinerParams::from(
+            Address::decode(&net, invalid_address).expect("hard-coded address is valid"),
+        );
+        assert!(matches!(
+            TransactionTemplate::new_coinbase(&net, height, &invalid_params, Amount::zero()),
+            Err(TransactionError::CoinbaseConstruction(_))
+        ));
+    }
+
+    let excessive_fees = Amount::try_from(MAX_WCASH_COINBASE_VALUE)
+        .expect("the per-transaction cap is representable");
+    assert!(matches!(
+        TransactionTemplate::new_coinbase(&net, height, &miner_params, excessive_fees),
+        Err(TransactionError::Subsidy(
+            SubsidyError::WcashCoinbaseValueTooLarge
+        ))
+    ));
+}
+
+/// Once scheduled issuance reaches zero, Wcash still routes both zero and positive fee totals
+/// through private Ironwood actions rather than falling back to a transparent or empty coinbase.
+#[test]
+fn wcash_zero_subsidy_tail_stays_private() {
+    let net = Network::new_wcash_regtest();
+    let height = Height(50_400_001);
+    let unified_address = default_miner_address(net.kind(), &MinerAddressType::Unified);
+    let miner_params = MinerParams::from(
+        Address::decode(&net, unified_address).expect("hard-coded Unified address is valid"),
+    );
+
+    for fee_zatoshis in [0i64, 12_345] {
+        let fees = Amount::try_from(fee_zatoshis).expect("test fee is representable");
+        let template = TransactionTemplate::new_coinbase(&net, height, &miner_params, fees)
+            .expect("a zero-subsidy Wcash coinbase remains buildable");
+        let coinbase: Transaction = template
+            .data
+            .as_ref()
+            .zcash_deserialize_into()
+            .expect("tail coinbase deserializes");
+
+        assert!(coinbase.outputs().is_empty());
+        assert!(!coinbase.has_sapling_shielded_data());
+        assert!(!coinbase.has_orchard_shielded_data());
+        assert!(coinbase.ironwood_actions().next().is_some());
+        assert_eq!(
+            coinbase
+                .ironwood_value_balance()
+                .ironwood_amount()
+                .zatoshis(),
+            -fee_zatoshis
+        );
+        zebra_consensus::transaction::check::wcash_coinbase_outputs_are_private(
+            &coinbase, &net, height,
+        )
+        .expect("the tail Ironwood actions remain private");
+    }
+}
+
+/// Wcash consensus can distinguish its private Ironwood rewards from a normal
+/// Zcash NU6.3 coinbase that deliberately uses the public all-zero OVK.
+#[test]
+fn wcash_privacy_rule_rejects_public_zero_ovk_ironwood() {
+    let zcash_net = Network::new_default_testnet();
+    let zcash_height = NetworkUpgrade::Nu6_3
+        .activation_height(&zcash_net)
+        .expect("NU6.3 is scheduled on Testnet");
+    let miner_params = MinerParams::from(
+        Address::decode(
+            &zcash_net,
+            default_miner_address(zcash_net.kind(), &MinerAddressType::Unified),
+        )
+        .expect("hard-coded Unified address is valid"),
+    );
+    let public_template =
+        TransactionTemplate::new_coinbase(&zcash_net, zcash_height, &miner_params, Amount::zero())
+            .expect("valid standard Zcash coinbase");
+    let public_coinbase: Transaction = public_template
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("coinbase deserializes");
+
+    let wcash_net = Network::new_wcash_regtest();
+    assert!(
+        !zebra_chain::primitives::zcash_note_encryption::ironwood_outputs_are_private_from_zero_ovk(
+            &public_coinbase,
+            &wcash_net,
+            Height(1),
+        ),
+        "a standard publicly recoverable Zcash coinbase must fail Wcash privacy"
+    );
+
+    assert!(matches!(
+        zebra_consensus::transaction::check::wcash_coinbase_outputs_are_private(
+            &public_coinbase,
+            &wcash_net,
+            Height(1),
+        ),
+        Err(zebra_consensus::error::TransactionError::WcashCoinbaseOutputPubliclyRecoverable)
+    ));
 }

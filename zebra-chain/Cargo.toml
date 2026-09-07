@@ -93,6 +93,7 @@ zcash_protocol.workspace = true
 zcash_address.workspace = true
 zcash_transparent = { workspace = true }
 sinsemilla = { workspace = true }
+wcash-genesis.workspace = true
 
 # Time
 chrono = { workspace = true, features = ["clock", "std", "serde"] }

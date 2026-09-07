@@ -29,10 +29,11 @@ use crate::{
 use super::magic::Magic;
 
 /// Reserved network names that should not be allowed for configured Testnets.
-pub const RESERVED_NETWORK_NAMES: [&str; 6] = [
+pub const RESERVED_NETWORK_NAMES: [&str; 7] = [
     "Mainnet",
     "Testnet",
     "Regtest",
+    "Wcash",
     "MainnetKind",
     "TestnetKind",
     "RegtestKind",
@@ -47,6 +48,10 @@ pub const MAX_HRP_LENGTH: usize = 30;
 /// The block hash of the Regtest genesis block, `zcash-cli -regtest getblockhash 0`
 const REGTEST_GENESIS_HASH: &str =
     "029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327";
+
+/// The deterministic Wcash Regtest P2P network magic.
+const WCASH_REGTEST_NETWORK_MAGIC: Magic =
+    Magic(wcash_genesis::network_identity(wcash_genesis::WcashNetwork::Regtest).p2p_magic());
 
 /// The block hash of the Testnet genesis block, `zcash-cli -testnet getblockhash 0`
 const TESTNET_GENESIS_HASH: &str =
@@ -572,9 +577,13 @@ impl ParametersBuilder {
         mut self,
         network_magic: Magic,
     ) -> Result<Self, ParametersBuilderError> {
-        if [magics::MAINNET, magics::REGTEST]
-            .into_iter()
-            .any(|reserved_magic| network_magic == reserved_magic)
+        if [
+            magics::MAINNET,
+            magics::REGTEST,
+            WCASH_REGTEST_NETWORK_MAGIC,
+        ]
+        .into_iter()
+        .any(|reserved_magic| network_magic == reserved_magic)
         {
             return Err(ParametersBuilderError::ReservedNetworkMagic);
         }
@@ -865,6 +874,7 @@ impl ParametersBuilder {
             temporary_orchard_disabling_soft_fork_height,
         } = self;
         Parameters {
+            consensus_flavor: ConsensusFlavor::Zcash,
             network_name,
             network_magic,
             genesis_hash,
@@ -974,6 +984,9 @@ impl From<ConfiguredActivationHeights> for RegtestParameters {
 /// Network consensus parameters for test networks such as Regtest and the default Testnet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Parameters {
+    /// Selects consensus rules that cannot be enabled through the public configured-Testnet
+    /// builder.
+    consensus_flavor: ConsensusFlavor,
     /// The name of this network to be used by the `Display` trait impl.
     network_name: String,
     /// The network magic, acts as an identifier for the network.
@@ -1005,6 +1018,17 @@ pub struct Parameters {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+}
+
+/// Private consensus rule selection for built-in networks.
+///
+/// This type and the corresponding [`Parameters`] field are intentionally private. Callers can
+/// configure Zcash Testnet parameters, but cannot accidentally turn a configured Testnet into
+/// Wcash by reproducing its public field values.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ConsensusFlavor {
+    Zcash,
+    Wcash,
 }
 
 impl Default for Parameters {
@@ -1061,9 +1085,41 @@ impl Parameters {
         }
 
         Ok(Self {
+            consensus_flavor: ConsensusFlavor::Zcash,
             network_name: "Regtest".to_string(),
             network_magic: magics::REGTEST,
             ..parameters.finish()
+        })
+    }
+
+    /// Creates the built-in local Wcash Regtest parameters.
+    ///
+    /// NU6.3 activates at height 1, so every mined block uses the 75-second post-Blossom target
+    /// spacing and can pay its coinbase reward into Ironwood. Wcash proof-of-work remains enabled
+    /// because its AuxPoW verifier replaces native Equihash validation, including on Regtest.
+    pub(super) fn new_wcash_regtest() -> Result<Self, ParametersBuilderError> {
+        let genesis_hash = block::genesis::wcash_regtest_genesis_block().hash();
+        let parameters = Self::build()
+            .with_genesis_hash(genesis_hash)?
+            .with_target_difficulty_limit(U256::from_big_endian(&[0x0f; 32]))?
+            .with_disable_pow(false)
+            .with_unshielded_coinbase_spends(false)
+            .with_slow_start_interval(Height::MIN)
+            .disable_temporary_orchard_disabling_soft_fork()
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu6_3: Some(1),
+                ..Default::default()
+            })?
+            .clear_funding_streams()
+            .with_lockbox_disbursements(Vec::new())
+            .with_checkpoints(false)?
+            .finish();
+
+        Ok(Self {
+            consensus_flavor: ConsensusFlavor::Wcash,
+            network_name: "Wcash".to_string(),
+            network_magic: WCASH_REGTEST_NETWORK_MAGIC,
+            ..parameters
         })
     }
 
@@ -1074,11 +1130,16 @@ impl Parameters {
 
     /// Returns true if the instance of [`Parameters`] represents Regtest.
     pub fn is_regtest(&self) -> bool {
+        if self.consensus_flavor == ConsensusFlavor::Wcash {
+            return true;
+        }
+
         if self.network_magic != magics::REGTEST {
             return false;
         }
 
         let Self {
+            consensus_flavor: _,
             network_name,
             // Already checked network magic above
             network_magic: _,
@@ -1107,6 +1168,11 @@ impl Parameters {
             && self.disable_pow == disable_pow
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
+    }
+
+    /// Returns true when these parameters select the built-in Wcash consensus rules.
+    pub(super) fn uses_wcash_consensus(&self) -> bool {
+        self.consensus_flavor == ConsensusFlavor::Wcash
     }
 
     /// Returns the network name

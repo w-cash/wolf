@@ -1,4 +1,4 @@
-//! Zebrad Abscissa Application
+//! Wcash node Abscissa application.
 //!
 //! This is the code that starts `zebrad`, and launches its tasks and services.
 //! See [the crate docs](crate) and [the start docs](crate::commands::start) for more details.
@@ -42,7 +42,7 @@ lazy_static::lazy_static! {
     pub static ref LAST_WARN_ERROR_LOG_SENDER: watch::Sender<Option<(String, tracing::Level, chrono::DateTime<chrono::Utc>)>> = watch::Sender::new(None);
 }
 
-/// Returns the `zebrad` version for this build, in SemVer 2.0 format.
+/// Returns the Wcash node version for this build, in SemVer 2.0 format.
 ///
 /// Includes `git describe` build metatata if available:
 /// - the number of commits since the last version tag, and
@@ -64,7 +64,7 @@ pub fn build_version() -> Version {
     vergen_build_version().unwrap_or(fallback_version)
 }
 
-/// Returns the `zebrad` version from this build, if available from `vergen`.
+/// Returns the Wcash node version from this build, if available from `vergen`.
 fn vergen_build_version() -> Option<Version> {
     // VERGEN_GIT_DESCRIBE should be in the format:
     // - v1.0.0-rc.9-6-g319b01bb84
@@ -143,7 +143,7 @@ fn vergen_build_version() -> Option<Version> {
     semver.parse().ok()
 }
 
-/// The Zebra current release version, without any build metadata.
+/// The Wcash current release version, without any build metadata.
 pub fn release_version() -> Version {
     let mut release_version = build_version();
 
@@ -159,10 +159,10 @@ pub fn release_version() -> Version {
 /// [BIP 14]: https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki
 pub fn user_agent() -> String {
     let release_version = release_version();
-    format!("/Zebra:{release_version}/")
+    format!("/Wcash:{release_version}/")
 }
 
-/// Zebrad Application
+/// Wcash node application.
 #[derive(Debug, Default)]
 pub struct ZebradApp {
     /// Application configuration.
@@ -249,7 +249,7 @@ impl Application for ZebradApp {
             Err(_e) if command.cmd().should_ignore_load_config_error() => Default::default(),
             Err(e) => {
                 status_err!(
-                    "Zebra could not load the provided configuration file and/or environment variables.\
+                    "Wcash could not load the provided configuration file and/or environment variables.\
                      This might mean you are using a deprecated format of the file, or are attempting to
                      configure deprecated or unknown fields via environment variables.\
                      You can generate a valid config by running \"zebrad generate\", \
@@ -292,7 +292,7 @@ impl Application for ZebradApp {
             // build-time constant: cargo or git tag + short commit
             ("version", build_version().to_string()),
             // config
-            ("Zcash network", config.network.network.to_string()),
+            ("Wcash network", config.network.network.to_string()),
             // code constant
             (
                 "running state version",
@@ -457,7 +457,7 @@ impl Application for ZebradApp {
             command.cmd().uses_intro(),
         )?));
 
-        // Log git metadata and platform info when zebrad starts up
+        // Log git metadata and platform info when Wcash starts up.
         if is_server {
             info!("{metadata_section}");
 
@@ -484,7 +484,7 @@ impl Application for ZebradApp {
             other_net_name => other_net_name,
         };
         let global_span = if let Some(git_commit) = ZebradApp::git_commit() {
-            error_span!("", zebrad = git_commit, net)
+            error_span!("", wcash = git_commit, net)
         } else {
             error_span!("", net)
         };
@@ -572,4 +572,16 @@ pub fn boot(app_cell: &'static AppCell<ZebradApp>) -> ! {
 
     ZebradApp::run(app_cell, args);
     process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn user_agent_uses_wcash_product_name() {
+        let user_agent = super::user_agent();
+
+        assert!(user_agent.starts_with("/Wcash:"));
+        assert!(user_agent.ends_with('/'));
+        assert!(!user_agent.contains("Zebra"));
+    }
 }

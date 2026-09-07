@@ -52,7 +52,7 @@ pub struct Config {
     /// This can be provided as:
     /// - a TOML array: `zcashd_extra_args = ["-debug=1"]`
     /// - a JSON array string (useful for environment variable overrides):
-    ///   `ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-debug=1"]'`
+    ///   `WCASH_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-debug=1"]'`
     ///
     /// Zebra passes these arguments through unchanged. For first-start bootstrap,
     /// Zebra only infers path overrides from the first valid `-conf=/path` or
@@ -96,7 +96,7 @@ pub struct Config {
     ///
     /// Because environment values cannot express TOML arrays, this also accepts
     /// a JSON array string, e.g.
-    /// `ZEBRA_ZCASHD_COMPAT__BLOCK_GOSSIP_PEER_IPS='["10.0.0.5"]'`.
+    /// `WCASH_ZCASHD_COMPAT__BLOCK_GOSSIP_PEER_IPS='["10.0.0.5"]'`.
     #[serde(default, deserialize_with = "deserialize_block_gossip_peer_ips")]
     pub block_gossip_peer_ips: Vec<IpAddr>,
 

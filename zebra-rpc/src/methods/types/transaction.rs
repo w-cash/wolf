@@ -18,11 +18,13 @@ use zcash_primitives::transaction::{
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis};
 use zebra_chain::{
-    amount::{self, Amount, NegativeAllowed, NegativeOrZero, NonNegative},
+    amount::{
+        self, Amount, NegativeAllowed, NegativeOrZero, NonNegative, MAX_WCASH_COINBASE_VALUE,
+    },
     block::{self, merkle::AUTH_DIGEST_PLACEHOLDER, Height},
     orchard,
     parameters::{
-        subsidy::{block_subsidy, funding_stream_values, miner_subsidy},
+        subsidy::{block_subsidy, funding_stream_values, miner_subsidy, SubsidyError},
         Network, NetworkUpgrade,
     },
     primitives::ed25519,
@@ -132,8 +134,11 @@ impl TransactionTemplate<NegativeOrZero> {
         txs_fee: Amount<NonNegative>,
     ) -> Result<Self, TransactionError> {
         let block_subsidy = block_subsidy(height, net)?;
-        let miner_reward = miner_subsidy(height, net, block_subsidy)? + txs_fee;
-        let miner_reward = Zatoshis::try_from(miner_reward?)?;
+        let miner_reward = (miner_subsidy(height, net, block_subsidy)? + txs_fee)?;
+        if net.uses_wcash_consensus() && miner_reward.zatoshis() > MAX_WCASH_COINBASE_VALUE {
+            return Err(SubsidyError::WcashCoinbaseValueTooLarge.into());
+        }
+        let miner_reward = Zatoshis::try_from(miner_reward)?;
 
         let mut builder = Builder::new(
             net,
@@ -162,10 +167,17 @@ impl TransactionTemplate<NegativeOrZero> {
         // `coinbase_orchard_component_empty` in zebra-consensus). Ironwood outputs use the same
         // Orchard-shaped `orchard::Address` as their recipient, so a unified miner address with an
         // Orchard receiver just gets routed to the Ironwood output builder from NU6.3 onward.
-        let use_ironwood = NetworkUpgrade::current(net, height) >= NetworkUpgrade::Nu6_3;
+        let use_ironwood = net.uses_wcash_consensus()
+            || NetworkUpgrade::current(net, height) >= NetworkUpgrade::Nu6_3;
 
         let add_shielded_reward = |builder: &mut Builder<_, _>, addr: &_| {
-            let ovk = Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32]));
+            // Standard Zcash coinbase outputs are publicly recoverable with the all-zero outgoing
+            // viewing key. Wcash intentionally uses ordinary private note encryption instead.
+            let ovk = if net.uses_wcash_consensus() {
+                None
+            } else {
+                Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32]))
+            };
             if use_ironwood {
                 trace_err!(
                     builder.add_ironwood_output::<String>(ovk, *addr, miner_reward, memo.clone()),
@@ -198,26 +210,38 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        match miner_params.addr() {
-            Address::Unified(addr) => addr
-                .orchard()
-                .and_then(|addr| add_shielded_reward(&mut builder, addr))
-                .or_else(|| {
-                    addr.sapling()
-                        .and_then(|addr| add_sapling_reward(&mut builder, addr))
-                })
-                .or_else(|| {
-                    addr.transparent()
-                        .and_then(|addr| add_transparent_reward(&mut builder, addr))
-                }),
+        if net.uses_wcash_consensus() {
+            match miner_params.addr() {
+                Address::Unified(addr) => addr
+                    .orchard()
+                    .and_then(|addr| add_shielded_reward(&mut builder, addr)),
+                _ => Err(TransactionError::CoinbaseConstruction(
+                    "Wcash miner rewards require a Unified address with an Orchard receiver"
+                        .to_string(),
+                ))?,
+            }
+        } else {
+            match miner_params.addr() {
+                Address::Unified(addr) => addr
+                    .orchard()
+                    .and_then(|addr| add_shielded_reward(&mut builder, addr))
+                    .or_else(|| {
+                        addr.sapling()
+                            .and_then(|addr| add_sapling_reward(&mut builder, addr))
+                    })
+                    .or_else(|| {
+                        addr.transparent()
+                            .and_then(|addr| add_transparent_reward(&mut builder, addr))
+                    }),
 
-            Address::Sapling(addr) => add_sapling_reward(&mut builder, addr),
+                Address::Sapling(addr) => add_sapling_reward(&mut builder, addr),
 
-            Address::Transparent(addr) => add_transparent_reward(&mut builder, addr),
+                Address::Transparent(addr) => add_transparent_reward(&mut builder, addr),
 
-            _ => Err(TransactionError::CoinbaseConstruction(
-                "Address not supported for miner rewards".to_string(),
-            ))?,
+                _ => Err(TransactionError::CoinbaseConstruction(
+                    "Address not supported for miner rewards".to_string(),
+                ))?,
+            }
         }
         .ok_or(TransactionError::CoinbaseConstruction(
             "Could not construct output with miner reward".to_string(),

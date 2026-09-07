@@ -1,11 +1,48 @@
 # CHANGELOG
 
-All notable changes to Zebra are documented in this file.
+All notable changes to Wcash and its Zebra base are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
+
+### Added
+
+- Added the isolated Wcash regtest consensus flavor, deterministic
+  Bitcoin-genesis anchor, Wcash-only P2P identity, 75-second target spacing,
+  10 WCASH initial subsidy, 1,680,000-block halvings, and exact issuance cap.
+- Added a strict bounded Zcash Equihash `(200, 9)` AuxPoW proof format,
+  consensus validation, interoperability vector, real-solver local harness,
+  and loopback JSON-lines mining interface.
+- Added a feature-gated internal miner that constructs real Equihash work over
+  a synthetic Zcash parent and submits the resulting Wcash block through the
+  normal validator.
+
+### Changed
+
+- Made Wcash regtest the only network accepted by the node executable and
+  isolated its configuration, cache, network magic, ports, user agent, and
+  Docker defaults from inherited Zcash networks.
+- Routed every post-genesis coinbase subsidy and fee into private Ironwood
+  actions. Transparent, Sapling, Orchard, and publicly zero-OVK-recoverable
+  Wcash coinbase outputs are rejected by consensus.
+- Removed founders rewards, funding streams, deferred-pool payments, lockbox
+  disbursements, slow start, premine, and protocol development tax from Wcash.
+
+### Security
+
+- Bounded variable Wcash header witnesses and outbound header-message size,
+  and added bounded alternate-peer retries for malleated AuxPoW witnesses.
+- Limited the local mining interface to eight concurrent loopback clients and
+  isolated malformed, oversized, reset, and idle connections from its listener.
+
+### Known limitations
+
+- This release is local pre-testnet software. Public genesis/network/difficulty
+  parameters, a live Zcash coinbase rebuild-and-reproof/dual-submit adapter,
+  wallet maturity-and-spend interoperability, and an independent consensus
+  audit remain release gates.
 
 ## [Zebra 6.3.0](https://github.com/ZcashFoundation/zebra/releases/tag/v6.3.0) - 2026-08-10
 

@@ -23,7 +23,7 @@ fn generate_no_args() -> Result<()> {
     let output = output.assert_success()?;
 
     // First line
-    output.stdout_line_contains("# Default configuration for zebrad")?;
+    output.stdout_line_contains("# Default configuration for Wcash")?;
 
     Ok(())
 }
@@ -51,7 +51,7 @@ fn generate_args() -> Result<()> {
     output.assert_failure()?;
 
     // Add a config file name to tempdir path
-    let generated_config_path = testdir.path().join("zebrad.toml");
+    let generated_config_path = testdir.path().join("wcash.toml");
 
     // Valid
     let child =
@@ -134,7 +134,7 @@ fn start_no_args() -> Result<()> {
     let output = child.wait_with_output()?;
     let output = output.assert_failure()?;
 
-    output.stdout_line_contains("Starting zebrad")?;
+    output.stdout_line_contains("Starting Wcash")?;
 
     // Make sure the command passed the legacy chain check
     output.stdout_line_contains("starting legacy chain check")?;
@@ -236,7 +236,7 @@ fn external_address() -> Result<()> {
     let output = output.assert_failure()?;
 
     // Zebra started
-    output.stdout_line_contains("Starting zebrad")?;
+    output.stdout_line_contains("Starting Wcash")?;
 
     // Make sure we are using external address for Version messages.
     output.stdout_line_contains("using external address for Version messages")?;

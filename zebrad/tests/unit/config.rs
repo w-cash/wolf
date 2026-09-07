@@ -5,7 +5,7 @@ use std::{
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use tempfile::{Builder, TempDir};
 
-use zebra_chain::parameters::Network::*;
+use zebra_chain::parameters::Network;
 use zebra_state;
 use zebra_test::{args, command::to_regex::CollectRegexSet, prelude::*};
 use zebrad::config::ZebradConfig;
@@ -57,7 +57,7 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
 
     let _init_guard = zebra_test::init();
 
-    let mut config = default_test_config(&Mainnet);
+    let mut config = default_test_config(&Network::new_wcash_regtest());
     let run_dir = testdir()?;
 
     let ignored_cache_dir = run_dir.path().join("state");
@@ -163,7 +163,7 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
 /// cache conflicts.
 #[test]
 fn config_tests() -> Result<()> {
-    valid_generated_config("start", "Starting zebrad")?;
+    valid_generated_config("start", "Starting Wcash")?;
 
     // Check what happens when Zebra parses an invalid config
     invalid_generated_config()?;
@@ -171,8 +171,8 @@ fn config_tests() -> Result<()> {
     // Check that we have a current version of the config stored
     last_config_is_stored()?;
 
-    // Check that Zebra's previous configurations still work
-    stored_configs_work()?;
+    // Check that stored configurations follow the Wcash-only runtime policy.
+    stored_configs_follow_runtime_network_policy()?;
 
     // We run the `zebrad` app test after the config tests, to avoid potential port conflicts
     app_no_args()?;
@@ -186,7 +186,8 @@ fn app_no_args() -> Result<()> {
     let _init_guard = zebra_test::init();
 
     // start caches state, so run one of the start tests with persistent state
-    let testdir = testdir()?.with_config(&mut persistent_test_config(&Mainnet)?)?;
+    let testdir =
+        testdir()?.with_config(&mut persistent_test_config(&Network::new_wcash_regtest())?)?;
 
     tracing::info!(?testdir, "running zebrad with no config (default settings)");
 
@@ -199,7 +200,7 @@ fn app_no_args() -> Result<()> {
     let output = child.wait_with_output()?;
     let output = output.assert_failure()?;
 
-    output.stdout_line_contains("Starting zebrad")?;
+    output.stdout_line_contains("Starting Wcash")?;
 
     // Make sure the command passed the legacy chain check
     output.stdout_line_contains("starting legacy chain check")?;
@@ -450,7 +451,7 @@ fn invalid_generated_config() -> Result<()> {
 
     // Check that Zebra produced an informative message.
     output.stderr_contains(
-        "Zebra could not load the provided configuration file and/or environment variables",
+        "Wcash could not load the provided configuration file and/or environment variables",
     )?;
 
     Ok(())
@@ -500,9 +501,12 @@ fn stored_configs_parsed_correctly() -> Result<()> {
     Ok(())
 }
 
-/// Test all versions of `zebrad.toml` we have stored can be parsed by the latest `zebrad`.
+/// Test that stored configs either start Wcash or receive the intentional Zcash-network rejection.
 #[tracing::instrument]
-fn stored_configs_work() -> Result<()> {
+fn stored_configs_follow_runtime_network_policy() -> Result<()> {
+    use abscissa_core::Application;
+    use zebrad::application::ZebradApp;
+
     let old_configs_dir = configs_dir();
 
     tracing::info!(?old_configs_dir, "testing older config parsing");
@@ -536,9 +540,20 @@ fn stored_configs_work() -> Result<()> {
             "testing old config can be parsed by current zebrad"
         );
 
-        // run zebra with stored config
+        let stored_config = ZebradApp::default()
+            .load_config(&stored_config_path)
+            .expect("stored config already passed the parsing compatibility test");
+
+        // Run the node with the stored config.
         let mut child =
             run_dir.spawn_child(args!["-c", stored_config_path.to_str().unwrap(), "start"])?;
+
+        if !stored_config.network.network.uses_wcash_consensus() {
+            let output = child.wait_with_output()?;
+            let output = output.assert_failure()?;
+            output.stderr_contains("only supports network = 'WcashRegtest'")?;
+            continue;
+        }
 
         let success_regexes = [
             // When logs are sent to the terminal, we see the config loading message and path.
@@ -561,7 +576,7 @@ fn stored_configs_work() -> Result<()> {
             .collect_regex_set()
             .expect("regexes are valid");
 
-        // Zebra was able to start with the stored config.
+        // Wcash was able to start with the current stored config.
         child.expect_stdout_line_matches(success_regexes)?;
 
         // finish
@@ -590,7 +605,7 @@ fn non_blocking_logger() -> Result<()> {
     let (done_tx, done_rx) = mpsc::channel();
 
     let test_task_handle: tokio::task::JoinHandle<Result<()>> = rt.spawn(async move {
-        let mut config = os_assigned_rpc_port_config(false, &Mainnet)?;
+        let mut config = os_assigned_rpc_port_config(false, &Network::new_wcash_regtest())?;
         config.tracing.filter = Some("trace".to_string());
         config.tracing.buffer_limit = 100;
 
@@ -645,18 +660,18 @@ fn non_blocking_logger() -> Result<()> {
 // Config loading tests (from config.rs)
 // ---------------------------------------------------------------------------
 
-const ZEBRA_ENV_PREFIX: &str = "ZEBRA_";
+const CONFIG_ENV_PREFIXES: [&str; 2] = ["WCASH_", "ZEBRA_"];
 
 static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
-/// Helper to isolate and manage ZEBRA_* environment variables in tests.
+/// Helper to isolate and manage Wcash and legacy Zebra environment variables in tests.
 struct EnvGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
     original_vars: Vec<(String, String)>,
 }
 
 impl EnvGuard {
-    /// Acquire the global lock and clear all ZEBRA_* env vars, saving originals.
+    /// Acquire the global lock and clear config env vars, saving originals.
     fn new() -> Self {
         // If a test panics, the mutex guard is dropped, but the mutex remains poisoned.
         // We can recover from the poison error and get the lock, because we're going
@@ -664,7 +679,11 @@ impl EnvGuard {
         let guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
         let original_vars: Vec<(String, String)> = env::vars()
-            .filter(|(key, _val)| key.starts_with(ZEBRA_ENV_PREFIX))
+            .filter(|(key, _val)| {
+                CONFIG_ENV_PREFIXES
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+            })
             .collect();
 
         for (key, _) in &original_vars {
@@ -677,7 +696,7 @@ impl EnvGuard {
         }
     }
 
-    /// Set a ZEBRA_* environment variable for this test.
+    /// Set a WCASH_* environment variable for this test.
     fn set_var(&self, key: &str, value: &str) {
         env::set_var(key, value);
     }
@@ -685,9 +704,13 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // Clear any ZEBRA_* set during the test
+        // Clear any config variables set during the test.
         let current_vars: Vec<String> = env::vars()
-            .filter(|(key, _)| key.starts_with(ZEBRA_ENV_PREFIX))
+            .filter(|(key, _)| {
+                CONFIG_ENV_PREFIXES
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+            })
             .map(|(key, _)| key)
             .collect();
         for key in current_vars {
@@ -709,7 +732,7 @@ fn config_load_defaults() {
 
     let config = ZebradConfig::load(None).expect("Should load default config");
 
-    assert_eq!(config.network.network.to_string(), "Mainnet");
+    assert_eq!(config.network.network.to_string(), "Wcash");
     assert_eq!(config.rpc.listen_addr, None); // RPC disabled by default
     assert_eq!(config.metrics.endpoint_addr, None); // Metrics disabled by default
 }
@@ -761,8 +784,8 @@ fn config_nonexistent_file_errors() {
 fn config_env_override_defaults() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_NETWORK__NETWORK", "Testnet");
-    env.set_var("ZEBRA_RPC__LISTEN_ADDR", "127.0.0.1:8232");
+    env.set_var("WCASH_NETWORK__NETWORK", "Testnet");
+    env.set_var("WCASH_RPC__LISTEN_ADDR", "127.0.0.1:8232");
 
     let config = ZebradConfig::load(None).expect("load config with env vars");
 
@@ -790,8 +813,8 @@ listen_addr = "127.0.0.1:8233"
 
     fs::write(&config_path, test_config).expect("write test config");
 
-    env.set_var("ZEBRA_NETWORK__NETWORK", "Testnet");
-    env.set_var("ZEBRA_RPC__LISTEN_ADDR", "127.0.0.1:8232");
+    env.set_var("WCASH_NETWORK__NETWORK", "Testnet");
+    env.set_var("WCASH_RPC__LISTEN_ADDR", "127.0.0.1:8232");
 
     let config = ZebradConfig::load(Some(config_path)).expect("load config");
 
@@ -823,7 +846,7 @@ network = "Testnet"
 fn config_invalid_env_values_error() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_RPC__LISTEN_ADDR", "invalid_address");
+    env.set_var("WCASH_RPC__LISTEN_ADDR", "invalid_address");
 
     ZebradConfig::load(None).expect_err("Should fail with invalid RPC listen address");
 }
@@ -832,32 +855,43 @@ fn config_invalid_env_values_error() {
 fn config_nested_env_vars() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_TRACING__FILTER", "debug");
+    env.set_var("WCASH_TRACING__FILTER", "debug");
 
     let config = ZebradConfig::load(None).expect("load config with nested env vars");
 
     assert_eq!(config.tracing.filter.as_deref(), Some("debug"));
 }
 
+#[test]
+fn config_ignores_legacy_zebra_env_vars() {
+    let env = EnvGuard::new();
+
+    env.set_var("ZEBRA_TRACING__FILTER", "trace");
+
+    let config = ZebradConfig::load(None).expect("load config without legacy Zebra overrides");
+
+    assert_ne!(config.tracing.filter.as_deref(), Some("trace"));
+}
+
 // --- Specific env mappings used in Docker examples ---
 
 #[test]
-fn config_zebra_network_network_env() {
+fn config_wcash_network_network_env() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_NETWORK__NETWORK", "Testnet");
+    env.set_var("WCASH_NETWORK__NETWORK", "Testnet");
 
-    let config = ZebradConfig::load(None).expect("load config with ZEBRA_NETWORK__NETWORK");
+    let config = ZebradConfig::load(None).expect("load config with WCASH_NETWORK__NETWORK");
     assert_eq!(config.network.network.to_string(), "Testnet");
 }
 
 #[test]
-fn config_zebra_rpc_listen_addr_env() {
+fn config_wcash_rpc_listen_addr_env() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_RPC__LISTEN_ADDR", "127.0.0.1:18232");
+    env.set_var("WCASH_RPC__LISTEN_ADDR", "127.0.0.1:18232");
 
-    let config = ZebradConfig::load(None).expect("load config with ZEBRA_RPC__LISTEN_ADDR");
+    let config = ZebradConfig::load(None).expect("load config with WCASH_RPC__LISTEN_ADDR");
     assert_eq!(
         config.rpc.listen_addr.unwrap().to_string(),
         "127.0.0.1:18232"
@@ -865,22 +899,22 @@ fn config_zebra_rpc_listen_addr_env() {
 }
 
 #[test]
-fn config_zebra_state_cache_dir_env() {
+fn config_wcash_state_cache_dir_env() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_STATE__CACHE_DIR", "/test/cache");
+    env.set_var("WCASH_STATE__CACHE_DIR", "/test/cache");
 
-    let config = ZebradConfig::load(None).expect("load config with ZEBRA_STATE__CACHE_DIR");
+    let config = ZebradConfig::load(None).expect("load config with WCASH_STATE__CACHE_DIR");
     assert_eq!(config.state.cache_dir, PathBuf::from("/test/cache"));
 }
 
 #[test]
-fn config_zebra_metrics_endpoint_addr_env() {
+fn config_wcash_metrics_endpoint_addr_env() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_METRICS__ENDPOINT_ADDR", "0.0.0.0:9999");
+    env.set_var("WCASH_METRICS__ENDPOINT_ADDR", "0.0.0.0:9999");
 
-    let config = ZebradConfig::load(None).expect("load config with ZEBRA_METRICS__ENDPOINT_ADDR");
+    let config = ZebradConfig::load(None).expect("load config with WCASH_METRICS__ENDPOINT_ADDR");
     assert_eq!(
         config.metrics.endpoint_addr.unwrap().to_string(),
         "0.0.0.0:9999"
@@ -888,20 +922,20 @@ fn config_zebra_metrics_endpoint_addr_env() {
 }
 
 #[test]
-fn config_zebra_tracing_log_file_env() {
+fn config_wcash_tracing_log_file_env() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_TRACING__LOG_FILE", "/test/zebra.log");
+    env.set_var("WCASH_TRACING__LOG_FILE", "/test/wcash.log");
 
-    let config = ZebradConfig::load(None).expect("load config with ZEBRA_TRACING__LOG_FILE");
+    let config = ZebradConfig::load(None).expect("load config with WCASH_TRACING__LOG_FILE");
     assert_eq!(
         config.tracing.log_file.as_ref().unwrap(),
-        &PathBuf::from("/test/zebra.log")
+        &PathBuf::from("/test/wcash.log")
     );
 }
 
 #[test]
-fn config_zebra_mining_miner_address_from_toml() {
+fn config_wcash_mining_miner_address_from_toml() {
     let _env = EnvGuard::new();
 
     let miner_address = "u1cymdny2u2vllkx7t5jnelp0kde0dgnwu0jzmggzguxvxj6fe7gpuqehywejndlrjwgk9snr6g69azs8jfet78s9zy60uepx6tltk7ee57jlax49dezkhkgvjy2puuue6dvaevt53nah7t2cc2k4p0h0jxmlu9sx58m2xdm5f9sy2n89jdf8llflvtml2ll43e334avu2fwytuna404a";
@@ -936,7 +970,7 @@ fn config_env_unknown_non_sensitive_key_errors() {
     let env = EnvGuard::new();
 
     // Unknown field without sensitive suffix should cause an error
-    env.set_var("ZEBRA_MINING__FOO", "bar");
+    env.set_var("WCASH_MINING__FOO", "bar");
 
     ZebradConfig::load(None)
         .expect_err("Unknown non-sensitive env key should error (deny_unknown_fields)");
@@ -947,7 +981,7 @@ fn config_env_unknown_sensitive_key_errors() {
     let env = EnvGuard::new();
 
     // Unknown field with sensitive suffix should cause an error
-    env.set_var("ZEBRA_MINING__TOKEN", "secret-token");
+    env.set_var("WCASH_MINING__TOKEN", "secret-token");
 
     let result = ZebradConfig::load(None);
     assert!(result.is_err(), "Sensitive env key should cause an error");
@@ -960,7 +994,7 @@ fn config_env_elasticsearch_password_errors() {
     let env = EnvGuard::new();
 
     // This key may or may not exist depending on features. It should be filtered regardless.
-    env.set_var("ZEBRA_STATE__ELASTICSEARCH_PASSWORD", "topsecret");
+    env.set_var("WCASH_STATE__ELASTICSEARCH_PASSWORD", "topsecret");
 
     let result = ZebradConfig::load(None);
     assert!(result.is_err(), "Sensitive env key should cause an error");

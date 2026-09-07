@@ -29,6 +29,17 @@ use constants::{
     POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
 };
 
+/// Wcash starts at 10 WCASH per mined block.
+pub(crate) const WCASH_INITIAL_BLOCK_SUBSIDY: u64 = 10 * amount::COIN as u64;
+
+/// Wcash halves every 1,680,000 blocks, approximately four years at 75 seconds per block.
+pub(crate) const WCASH_HALVING_INTERVAL: HeightDiff = 1_680_000;
+
+/// The first Wcash block paid at half the initial subsidy.
+///
+/// Heights 1 through 1,680,000 inclusive form the initial-subsidy era; genesis has no subsidy.
+pub(crate) const WCASH_FIRST_HALVING_HEIGHT: Height = Height(1_680_001);
+
 /// The funding stream receiver categories.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FundingStreamReceiver {
@@ -237,6 +248,10 @@ pub trait ParameterSubsidy {
 /// Network methods related to Block Subsidy and Funding Streams
 impl ParameterSubsidy for Network {
     fn height_for_first_halving(&self) -> Height {
+        if self.uses_wcash_consensus() {
+            return WCASH_FIRST_HALVING_HEIGHT;
+        }
+
         // First halving on Mainnet is at Canopy
         // while in Testnet is at block constant height of `1_116_000`
         // <https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams>
@@ -257,6 +272,10 @@ impl ParameterSubsidy for Network {
     }
 
     fn post_blossom_halving_interval(&self) -> HeightDiff {
+        if self.uses_wcash_consensus() {
+            return WCASH_HALVING_INTERVAL;
+        }
+
         match self {
             Network::Mainnet => POST_BLOSSOM_HALVING_INTERVAL,
             Network::Testnet(params) => params.post_blossom_halving_interval(),
@@ -264,6 +283,10 @@ impl ParameterSubsidy for Network {
     }
 
     fn pre_blossom_halving_interval(&self) -> HeightDiff {
+        if self.uses_wcash_consensus() {
+            return WCASH_HALVING_INTERVAL;
+        }
+
         match self {
             Network::Mainnet => PRE_BLOSSOM_HALVING_INTERVAL,
             Network::Testnet(params) => params.pre_blossom_halving_interval(),
@@ -309,6 +332,13 @@ pub fn height_for_halving(halving: u32, network: &Network) -> Option<Height> {
         return Some(Height(0));
     }
 
+    if network.uses_wcash_consensus() {
+        let height = halving
+            .checked_mul(WCASH_HALVING_INTERVAL.try_into().ok()?)?
+            .checked_add(1)?;
+        return Height::try_from(height).ok();
+    }
+
     let slow_start_shift = i64::from(network.slow_start_shift().0);
     let blossom_height = i64::from(NetworkUpgrade::Blossom.activation_height(network)?.0);
     let pre_blossom_halving_interval = network.pre_blossom_halving_interval();
@@ -341,6 +371,10 @@ pub fn funding_stream_values(
     expected_block_subsidy: Amount<NonNegative>,
 ) -> Result<HashMap<FundingStreamReceiver, Amount<NonNegative>>, amount::Error> {
     let mut results = HashMap::new();
+
+    if network.uses_wcash_consensus() {
+        return Ok(results);
+    }
 
     if expected_block_subsidy.is_zero() {
         return Ok(results);
@@ -385,6 +419,24 @@ pub enum SubsidyError {
     #[error("miner fees are invalid")]
     InvalidMinerFees,
 
+    #[error("Wcash coinbase transaction has a transparent output")]
+    WcashTransparentCoinbaseOutput,
+
+    #[error("Wcash coinbase transaction has a Sapling component")]
+    WcashSaplingCoinbaseOutput,
+
+    #[error("Wcash coinbase transaction has an Orchard component")]
+    WcashOrchardCoinbaseOutput,
+
+    #[error("Wcash coinbase transaction has no Ironwood output")]
+    WcashIronwoodCoinbaseOutputMissing,
+
+    #[error("Wcash coinbase transaction does not shield its positive reward into Ironwood")]
+    WcashIronwoodValueBalanceNotNegative,
+
+    #[error("Wcash coinbase subsidy plus fees exceeds the supported per-transaction value")]
+    WcashCoinbaseValueTooLarge,
+
     #[error("addition of amounts overflowed")]
     Overflow,
 
@@ -416,6 +468,10 @@ pub fn halving_divisor(height: Height, network: &Network) -> Option<u64> {
 ///
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 pub fn halving(height: Height, network: &Network) -> u32 {
+    if network.uses_wcash_consensus() {
+        return height.0.saturating_sub(1) / (WCASH_HALVING_INTERVAL as u32);
+    }
+
     let slow_start_shift = network.slow_start_shift();
     let blossom_height = NetworkUpgrade::Blossom
         .activation_height(network)
@@ -445,6 +501,17 @@ pub fn halving(height: Height, network: &Network) -> u32 {
 ///
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 pub fn block_subsidy(height: Height, net: &Network) -> Result<Amount<NonNegative>, SubsidyError> {
+    if net.uses_wcash_consensus() {
+        if height == Height::MIN {
+            return Ok(Amount::zero());
+        }
+
+        let amount = WCASH_INITIAL_BLOCK_SUBSIDY
+            .checked_shr(halving(height, net))
+            .unwrap_or(0);
+        return Ok(Amount::try_from(amount)?);
+    }
+
     let Some(halving_div) = halving_divisor(height, net) else {
         return Ok(Amount::zero());
     };
@@ -482,6 +549,10 @@ pub fn miner_subsidy(
     network: &Network,
     expected_block_subsidy: Amount<NonNegative>,
 ) -> Result<Amount<NonNegative>, amount::Error> {
+    if network.uses_wcash_consensus() {
+        return Ok(expected_block_subsidy);
+    }
+
     let founders_reward = founders_reward(network, height);
 
     let funding_streams_sum = funding_stream_values(height, network, expected_block_subsidy)?
@@ -495,6 +566,10 @@ pub fn miner_subsidy(
 ///
 /// [§7.9]: <https://zips.z.cash/protocol/protocol.pdf#foundersreward>
 pub fn founders_reward_address(net: &Network, height: Height) -> Option<transparent::Address> {
+    if net.uses_wcash_consensus() {
+        return None;
+    }
+
     let founders_address_list = net.founder_address_list();
     let num_founder_addresses = u32::try_from(founders_address_list.len()).ok()?;
     let slow_start_shift = u32::from(net.slow_start_shift());
@@ -533,6 +608,10 @@ pub fn founders_reward_address(net: &Network, height: Height) -> Option<transpar
 ///
 /// [§7.8]: <https://zips.z.cash/protocol/protocol.pdf#subsidies>
 pub fn founders_reward(net: &Network, height: Height) -> Amount<NonNegative> {
+    if net.uses_wcash_consensus() {
+        return Amount::zero();
+    }
+
     // The founders reward is 20% of the block subsidy before the first halving, and 0 afterwards.
     //
     // On custom testnets, the first halving can occur later than Canopy, which causes an

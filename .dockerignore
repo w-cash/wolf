@@ -23,7 +23,13 @@
 !*.toml
 !*.lock
 !tower-*
+!wcash-*
 !zebra-*
 !zebrad
 !docker/entrypoint.sh
-!docker/default-zebra-config.toml
+!docker/default-wcash-config.toml
+
+# Never send local Rust build outputs in the Docker context, including outputs
+# under the Wcash workspace crates admitted above.
+**/target
+**/target/**

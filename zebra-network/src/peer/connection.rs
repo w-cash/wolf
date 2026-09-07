@@ -17,7 +17,10 @@ use tracing_futures::Instrument;
 
 use zebra_chain::{
     block::{self, Block},
-    serialization::SerializationError,
+    serialization::{
+        CompactSizeMessage, SerializationError, ZcashSerialize, MAX_HEADERS_PER_MESSAGE,
+        MAX_PROTOCOL_MESSAGE_LEN,
+    },
     transaction::{UnminedTx, UnminedTxId},
 };
 
@@ -46,6 +49,50 @@ mod peer_tx;
 
 #[cfg(test)]
 mod tests;
+
+/// Keeps a `headers` response within both the entry-count and encoded message-body limits.
+///
+/// Native Zcash headers are fixed and small, but Wcash headers carry a variable-size AuxPoW
+/// witness. The count-only 160-header limit is therefore insufficient: a valid sequence of large
+/// Wcash headers can exceed the network codec's message-body limit. Stop at the first header that
+/// would not fit so the response remains a contiguous chain prefix.
+fn headers_within_message_limits(headers: Vec<block::CountedHeader>) -> Vec<block::CountedHeader> {
+    let maximum_count = headers.len().min(MAX_HEADERS_PER_MESSAGE);
+    let mut limited = Vec::with_capacity(maximum_count);
+    let mut encoded_len = compact_size_message_len(0);
+
+    for header in headers.into_iter().take(maximum_count) {
+        let old_count_len = compact_size_message_len(limited.len());
+        let new_count_len = compact_size_message_len(limited.len() + 1);
+        // A CountedHeader is its exact header followed by the one-byte CompactSize encoding of
+        // its fixed zero transaction count.
+        let counted_header_len = header.header.serialized_len() + compact_size_message_len(0);
+        let Some(next_encoded_len) = encoded_len
+            .checked_sub(old_count_len)
+            .and_then(|len| len.checked_add(new_count_len))
+            .and_then(|len| len.checked_add(counted_header_len))
+        else {
+            break;
+        };
+
+        if next_encoded_len > MAX_PROTOCOL_MESSAGE_LEN {
+            break;
+        }
+
+        limited.push(header);
+        encoded_len = next_encoded_len;
+    }
+
+    limited
+}
+
+/// Returns the exact encoded length of one message-bounded CompactSize value.
+fn compact_size_message_len(value: usize) -> usize {
+    let value: CompactSizeMessage = value
+        .try_into()
+        .expect("header response counts are bounded by MAX_HEADERS_PER_MESSAGE");
+    value.zcash_serialized_size()
+}
 
 #[derive(Debug)]
 pub(super) enum Handler {
@@ -1541,6 +1588,7 @@ where
                 }
             }
             Response::BlockHeaders(headers) => {
+                let headers = headers_within_message_limits(headers);
                 if let Err(e) = self.peer_tx.send(Message::Headers(headers)).await {
                     self.fail_with(e).await
                 }

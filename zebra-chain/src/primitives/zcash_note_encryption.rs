@@ -76,3 +76,35 @@ pub fn decrypts_successfully(tx: &Transaction, network: &Network, height: Height
 
     true
 }
+
+/// Returns true only if no Ironwood action can be recovered with Zcash's
+/// conventional all-zero outgoing viewing key.
+///
+/// Wcash uses this as a consensus privacy rule for coinbase transactions. It
+/// checks every action independently: one deliberately public reward cannot be
+/// hidden by adding a private padding action. A transaction conversion failure
+/// returns false so callers fail closed.
+pub fn ironwood_outputs_are_private_from_zero_ovk(
+    tx: &Transaction,
+    network: &Network,
+    height: Height,
+) -> bool {
+    let nu = NetworkUpgrade::current(network, height);
+    let Ok(tx) = tx.to_librustzcash(nu) else {
+        return false;
+    };
+    let zero_ovk = orchard::keys::OutgoingViewingKey::from([0u8; 32]);
+
+    tx.ironwood_bundle().is_none_or(|bundle| {
+        bundle.actions().iter().all(|action| {
+            zcash_note_encryption::try_output_recovery_with_ovk(
+                &orchard::note_encryption::IronwoodDomain::for_action(action),
+                &zero_ovk,
+                action,
+                action.cv_net(),
+                &action.encrypted_note().out_ciphertext,
+            )
+            .is_none()
+        })
+    })
+}

@@ -10,6 +10,7 @@ use zebra_chain::{
     chain_tip::mock::MockChainTip,
     serialization::ZcashDeserializeInto,
 };
+use zebra_consensus::{BlockError, RouterError, VerifyBlockError};
 use zebra_network::{InventoryResponse, PeerSocketAddr};
 use zebra_state::MAX_BLOCK_REORG_HEIGHT;
 use zebra_test::mock_service::{MockService, PanicAssertion};
@@ -100,6 +101,67 @@ fn genesis() -> Arc<Block> {
     zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .expect("hard-coded block vector deserializes")
+}
+
+/// Verifier errors retain their concrete `RouterError` type through the boxed
+/// downloader service boundary, so Wcash witness failures remain classifiable.
+#[tokio::test]
+async fn boxed_wcash_router_error_is_classified_as_invalid() {
+    let _init_guard = zebra_test::init();
+
+    let (mut downloads, mut network, mut verifier, mut state) = mock_downloads(Height(0));
+    let block = block_1();
+    let hash = block.hash();
+    let advertiser: PeerSocketAddr = ADVERTISER.parse().expect("hard-coded address is valid");
+
+    downloads
+        .download_and_verify(hash)
+        .await
+        .expect("download is queued");
+
+    network
+        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((
+            block.clone(),
+            Some(advertiser),
+        ))]));
+
+    let router_error = RouterError::Block {
+        source: Box::new(VerifyBlockError::Block {
+            source: BlockError::MissingWcashAuxPow {
+                height: Height(1),
+                hash,
+            },
+        }),
+    };
+    verifier
+        .expect_request(zebra_consensus::Request::Commit(block))
+        .await
+        .respond_error(Box::new(router_error));
+
+    let error = downloads
+        .next()
+        .await
+        .expect("downloads is non-empty")
+        .expect_err("the verifier rejected the Wcash witness");
+
+    assert!(
+        matches!(
+            &error,
+            BlockDownloadVerifyError::Invalid {
+                error,
+                height: Height(1),
+                hash: error_hash,
+                advertiser_addr: Some(error_advertiser),
+            } if *error_hash == hash
+                && *error_advertiser == advertiser
+                && super::super::is_wcash_auxpow_witness_error(error)
+        ),
+        "a boxed Wcash RouterError must reach the retry classifier, but was: {error:?}"
+    );
+
+    state.expect_no_requests().await;
 }
 
 /// Regression test for GHSA-g95h-hw6g-pvgv: a body whose claimed height contradicts the parent we

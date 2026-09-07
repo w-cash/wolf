@@ -603,11 +603,26 @@ impl Constraint for NegativeOrZero {
     }
 }
 
-/// Number of zatoshis in 1 ZEC
+/// Number of zatoshis in 1 WCASH.
 pub const COIN: i64 = 100_000_000;
 
-/// The maximum zatoshi amount.
-pub const MAX_MONEY: i64 = 21_000_000 * COIN;
+/// The exact maximum Wcash monetary base, in zatoshis.
+///
+/// The 10 WCASH subsidy, 1,680,000-block halving interval, and integer-zatoshi
+/// truncation issue exactly 33,599,999.7816 WCASH. Using the exact terminal
+/// supply here ensures chain value-pool accounting has no rounding headroom.
+pub const MAX_MONEY: i64 = 3_359_999_978_160_000;
+
+/// Maximum value supported by the inherited Zcash transaction libraries for a
+/// single transaction.
+///
+/// `zcash_protocol::value::Zatoshis` and `ZatBalance` limit a single transaction's
+/// value to the Zcash monetary base. Wcash keeps that per-transaction bound even
+/// though its aggregate monetary base is larger.
+pub const MAX_SINGLE_TRANSACTION_VALUE: i64 = 21_000_000 * COIN;
+
+/// Maximum Wcash coinbase value supported by the inherited Zcash transaction libraries.
+pub const MAX_WCASH_COINBASE_VALUE: i64 = MAX_SINGLE_TRANSACTION_VALUE;
 
 /// A trait for defining constraints on `Amount`
 pub trait Constraint {

@@ -12,23 +12,31 @@ members = [
         "zebra-utils",
         "tower-batch-control",
         "tower-fallback",
+        "wcash-genesis",
+        "wcash-zcash-aux",
+        "wcash-merge-miner",
 ]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
 resolver = "2"
 
 [workspace.package]
-authors = ["Zcash Foundation <zebra@zfnd.org>"]
+authors = [
+        "RustNinja <placex.com@gmail.com>",
+        "Zcash Foundation <zebra@zfnd.org>",
+]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/ZcashFoundation/zebra"
-homepage = "https://zfnd.org/zebra/"
-keywords = ["zebra", "zcash"]
+repository = "https://github.com/wcash-project/node"
+homepage = "https://github.com/wcash-project/node"
+keywords = ["wcash", "zcash"]
 rust-version = "1.88"
 edition = "2021"
 
 # `cargo release` settings
 
 [workspace.dependencies]
+wcash-genesis = { path = "wcash-genesis" }
+wcash-zcash-aux = { path = "wcash-zcash-aux" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 orchard = "0.15.0"
 sapling-crypto = "0.7"

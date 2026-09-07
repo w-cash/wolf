@@ -7,16 +7,136 @@ use color_eyre::Report;
 
 use super::Network;
 use crate::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NonNegative, MAX_MONEY},
     block::Height,
     parameters::{
         subsidy::{
-            block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, halving, halving_divisor,
-            height_for_halving, ParameterSubsidy as _,
+            block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, founders_reward,
+            founders_reward_address, funding_stream_values, halving, halving_divisor,
+            height_for_halving, miner_subsidy, ParameterSubsidy as _, WCASH_FIRST_HALVING_HEIGHT,
+            WCASH_HALVING_INTERVAL, WCASH_INITIAL_BLOCK_SUBSIDY,
         },
         NetworkUpgrade,
     },
 };
+
+#[test]
+fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
+    let _init_guard = zebra_test::init();
+    let network = Network::new_wcash_regtest();
+
+    assert!(network.uses_wcash_consensus());
+    assert!(network.is_regtest());
+    assert_eq!(network.to_string(), "Wcash");
+    assert_eq!(network.default_port(), 28233);
+    assert_eq!(
+        network.magic().0,
+        wcash_genesis::network_identity(wcash_genesis::WcashNetwork::Regtest).p2p_magic()
+    );
+    let genesis_hash = crate::block::genesis::wcash_regtest_genesis_block().hash();
+    assert_eq!(network.genesis_hash(), genesis_hash);
+    assert_eq!(
+        network.checkpoint_list().hash(Height::MIN),
+        Some(genesis_hash)
+    );
+    assert!(
+        !network.disable_pow(),
+        "Wcash AuxPoW must be checked on Regtest"
+    );
+    assert_eq!(network.slow_start_interval(), Height::MIN);
+    assert_eq!(network.slow_start_shift(), Height::MIN);
+    assert!(!network.should_allow_unshielded_coinbase_spends());
+    assert!(network.all_funding_streams().is_empty());
+    assert!(network.lockbox_disbursements(Height(1)).is_empty());
+    assert_eq!(
+        network.lockbox_disbursement_total_amount(Height(1)),
+        Amount::<NonNegative>::zero()
+    );
+
+    assert_eq!(
+        NetworkUpgrade::current(&network, Height::MIN),
+        NetworkUpgrade::Genesis
+    );
+    assert_eq!(
+        NetworkUpgrade::current(&network, Height(1)),
+        NetworkUpgrade::Nu6_3
+    );
+    // Zebra treats omitted earlier upgrades as implicit activations at the
+    // first explicitly configured later upgrade. These assertions protect the
+    // history-tree, mandatory-checkpoint, and transaction-invariant callers
+    // that require Heartwood and Canopy activation heights to exist.
+    assert_eq!(
+        NetworkUpgrade::Heartwood.activation_height(&network),
+        Some(Height(1))
+    );
+    assert_eq!(
+        NetworkUpgrade::Canopy.activation_height(&network),
+        Some(Height(1))
+    );
+    assert_eq!(network.mandatory_checkpoint_height(), Height::MIN);
+    assert_eq!(
+        NetworkUpgrade::target_spacing_for_height(&network, Height(1)).num_seconds(),
+        75
+    );
+    assert_eq!(
+        NetworkUpgrade::target_spacing_for_height(&network, Height::MAX).num_seconds(),
+        75
+    );
+
+    let zero = Amount::<NonNegative>::zero();
+    let ten = Amount::<NonNegative>::try_from(WCASH_INITIAL_BLOCK_SUBSIDY)?;
+    let five = Amount::<NonNegative>::try_from(WCASH_INITIAL_BLOCK_SUBSIDY / 2)?;
+    assert_eq!(block_subsidy(Height::MIN, &network)?, zero);
+    assert_eq!(block_subsidy(Height(1), &network)?, ten);
+    assert_eq!(block_subsidy(Height(1_680_000), &network)?, ten);
+    assert_eq!(block_subsidy(WCASH_FIRST_HALVING_HEIGHT, &network)?, five);
+    assert_eq!(halving(Height(1_680_000), &network), 0);
+    assert_eq!(halving(WCASH_FIRST_HALVING_HEIGHT, &network), 1);
+    assert_eq!(
+        height_for_halving(1, &network),
+        Some(WCASH_FIRST_HALVING_HEIGHT)
+    );
+    assert_eq!(
+        network.height_for_first_halving(),
+        WCASH_FIRST_HALVING_HEIGHT
+    );
+    assert_eq!(
+        network.post_blossom_halving_interval(),
+        WCASH_HALVING_INTERVAL
+    );
+    assert_eq!(miner_subsidy(Height(1), &network, ten)?, ten);
+    assert_eq!(founders_reward(&network, Height(1)), zero);
+    assert_eq!(founders_reward_address(&network, Height(1)), None);
+    assert!(funding_stream_values(Height(1), &network, ten)?.is_empty());
+
+    // Integer truncation leaves 1,999,999,987 zatoshi of per-block subsidy across all eras.
+    // Each era contains exactly 1,680,000 blocks, so the scheduled total is
+    // 33,599,999.78160000 WCASH (3,359,999,978,160,000 zatoshi).
+    let per_block_era_sum: u64 = (0..64)
+        .map(|era| WCASH_INITIAL_BLOCK_SUBSIDY.checked_shr(era).unwrap_or(0))
+        .sum();
+    assert_eq!(per_block_era_sum, 1_999_999_987);
+    let scheduled_supply = per_block_era_sum * (WCASH_HALVING_INTERVAL as u64);
+    assert_eq!(scheduled_supply, 3_359_999_978_160_000);
+    assert_eq!(
+        MAX_MONEY,
+        i64::try_from(scheduled_supply).expect("the scheduled Wcash supply fits in i64")
+    );
+    assert!(Amount::<NonNegative>::try_from(MAX_MONEY).is_ok());
+    assert!(Amount::<NonNegative>::try_from(MAX_MONEY + 1).is_err());
+    assert_eq!(block_subsidy(Height(50_400_000), &network)?.zatoshis(), 1);
+    assert_eq!(block_subsidy(Height(50_400_001), &network)?, zero);
+
+    for zcash_network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+    ] {
+        assert!(!zcash_network.uses_wcash_consensus());
+    }
+
+    Ok(())
+}
 
 #[test]
 fn halving_test() -> Result<(), Report> {

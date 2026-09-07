@@ -85,21 +85,23 @@ After checking the boxes, approve and merge the latest commit.
 - If publication stops after merge, run `gh workflow run release.yml --ref main -f operation=resume -f release_pr_number=<PR>`.
 - If published crates, tags, or release channels conflict with the plan, stop and ask a maintainer to investigate.
 
-See the [release process](https://github.com/ZcashFoundation/zebra/blob/main/book/src/dev/release-process.md#release-candidate--release-process) for workflow details and recovery guidance.
+See the release workflows and local documentation in this repository before
+publishing. Wcash public-network releases require the additional launch gates
+documented in `README.md`.
 
 ---
 This PR was generated with [release-plz](https://github.com/release-plz/release-plz/).
 """
 
 # Repository URL.
-repo_url = "https://github.com/ZcashFoundation/zebra"
+repo_url = "https://github.com/wcash-project/node"
 
 [changelog]
 # Keep source-authored entries authoritative. The exact pinned release-plz
 # version represents dependency-only releases as commits with this sentinel ID.
 body = """
 {% if package == "zebrad" %}
-## [Zebra {{ version }}](https://github.com/ZcashFoundation/zebra/releases/tag/v{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+## [Wcash {{ version }}](https://github.com/wcash-project/node/releases/tag/v{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
 {% else %}
 ## [{{ version }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {% endif %}

@@ -83,7 +83,7 @@ impl Tracing {
     /// Try to create a new [`Tracing`] component with the given `config`.
     ///
     /// If `uses_intro` is true, show a welcome message, the `network`,
-    /// and the Zebra logo on startup. (If the terminal supports it.)
+    /// and the inherited Zebra logo on startup. (If the terminal supports it.)
     //
     // This method should only print to stderr, because stdout is for tracing logs.
     #[allow(clippy::print_stdout, clippy::print_stderr, clippy::unwrap_in_result)]
@@ -117,7 +117,7 @@ impl Tracing {
             }
 
             eprintln!(
-                "Thank you for running a {} zebrad {} node!",
+                "Thank you for running a {} Wcash {} node!",
                 network.lowercase_name(),
                 build_version()
             );
@@ -274,7 +274,7 @@ impl Tracing {
         // OpenTelemetry layer - zero overhead when config.opentelemetry_endpoint is None
         #[cfg(feature = "opentelemetry")]
         let (otel_layer, otel_provider, otel_resolved_config) = {
-            // Check standard OTEL_* env vars as fallback (lower precedence than config/ZEBRA_*)
+            // Check standard OTEL_* env vars as fallback (lower precedence than config/WCASH_*).
             let endpoint = config
                 .opentelemetry_endpoint
                 .clone()
@@ -398,7 +398,7 @@ impl Tracing {
             info!(?progress_bar_config, "activated progress bars");
         } else {
             info!(
-                "set 'tracing.progress_bar =\"summary\"' in zebrad.toml to activate progress bars"
+                "set 'tracing.progress_bar =\"summary\"' in wcash.toml to activate progress bars"
             );
         }
 

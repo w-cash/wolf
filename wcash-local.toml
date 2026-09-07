@@ -1,0 +1,29 @@
+# Loopback-only Wcash regtest profile. Never use this file for a public node.
+
+[network]
+network = "WcashRegtest"
+listen_addr = "127.0.0.1:28233"
+initial_mainnet_peers = []
+initial_testnet_peers = []
+cache_dir = false
+peerset_initial_target_size = 1
+max_connections_per_ip = 1
+
+[state]
+ephemeral = true
+
+[rpc]
+listen_addr = "127.0.0.1:28232"
+enable_cookie_auth = false
+# Isolated regtest has no public peers. This bypass is unsafe on public networks.
+debug_force_finished_sync = true
+
+[mining]
+# Public regtest fixture only. Replace it with an address whose keys you control.
+miner_address = "uregtest1efxggx6lduhm2fx5lnrhxv7h7kpztlpa3ahf3n4w0q0zj5epj4av9xjq6ljsja3xk8z7rzd067kc7mgpy9448rdfzpfjz5gq389zdmpgnk6rp4ykk0xk6cmqw6zqcrnmsuaxv3yzsvcwsd4gagtalh0uzrdvy03nhmltjz2eu0232qlcs0zvxuqyut73yucd9gy5jaudnyt7yqhgpqv"
+extra_coinbase_data = "Wcash"
+miner_memo = "Wcash local regtest reward"
+internal_miner = true
+
+[tracing]
+filter = "info"

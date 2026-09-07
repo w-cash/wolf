@@ -1698,7 +1698,7 @@ where
                 sapling_tree_size,
                 time: header.time.timestamp(),
                 nonce,
-                solution: header.solution,
+                solution: header.solution.clone(),
                 bits: header.difficulty_threshold,
                 difficulty,
                 previous_block_hash: header.previous_block_hash,
@@ -4175,7 +4175,6 @@ pub struct BlockObject {
     /// Note: presence of this field in getblock is not documented in zcashd.
     #[serde(with = "opthex")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
     solution: Option<Solution>,
 
     /// The difficulty threshold of the requested block header displayed in compact form.
@@ -4300,7 +4299,6 @@ pub struct BlockHeaderObject {
 
     /// The Equihash solution in the requested block header.
     #[serde(with = "hex")]
-    #[getter(copy)]
     solution: Solution,
 
     /// The difficulty threshold of the requested block header displayed in compact form.

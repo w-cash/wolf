@@ -24,8 +24,8 @@ mod tests;
 
 use ZebradCmd::*;
 
-/// Zebrad Configuration Filename
-pub const CONFIG_FILE: &str = "zebrad.toml";
+/// Wcash configuration filename.
+pub const CONFIG_FILE: &str = "wcash.toml";
 
 /// Zebrad Subcommands
 #[derive(Command, Debug, clap::Subcommand)]
@@ -34,7 +34,7 @@ pub enum ZebradCmd {
     // TODO: hide this command from users in release builds (#3279)
     CopyState(CopyStateCmd),
 
-    /// Generate a default `zebrad.toml` configuration
+    /// Generate a default `wcash.toml` configuration
     Generate(GenerateCmd),
 
     /// Start the application (default command)

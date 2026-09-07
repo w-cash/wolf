@@ -24,7 +24,7 @@ ARG HOME="/home/${USER}"
 ARG CARGO_HOME="${HOME}/.cargo"
 ARG CARGO_TARGET_DIR="${HOME}/target"
 
-# This stage prepares Zebra's build deps and captures build args as env vars.
+# This stage prepares Wcash's build dependencies and captures build args as environment variables.
 # rust:1.91.0-trixie
 FROM rust:${RUST_VERSION}-trixie@sha256:a0dba1c1b2c90585fc44421b55ddf8063323760dc644ba1d35f5b389ad3e8e14 AS deps
 SHELL ["/bin/bash", "-xo", "pipefail", "-c"]
@@ -37,7 +37,7 @@ ARG BUILDPLATFORM
 ARG SOURCE_DATE_EPOCH=0
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 
-# Install zebra build deps
+# Install Wcash build dependencies.
 RUN apt-get -qq update && \
     apt-get -qq install -y --no-install-recommends \
     libclang-dev=1:19.0-* \
@@ -110,7 +110,7 @@ ENV ROCKSDB_LIB_DIR="/usr/lib/"
 # Copy source code first to ensure consistent timestamps
 COPY --link --chown=${UID}:${GID} ./ ${HOME}
 
-# Build Zebra test binaries using nextest, but don't run them.
+# Build the Wcash workspace test binaries using nextest, but don't run them.
 # This also copies the necessary binaries to /usr/local/bin.
 RUN [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
     cargo nextest run --locked --release --no-run --features "${FEATURES}" && \
@@ -132,10 +132,10 @@ COPY --link --chown=${UID}:${GID} ./docker/entrypoint.sh /usr/local/bin/entrypoi
 ENTRYPOINT [ "entrypoint.sh", "test" ]
 CMD [ "cargo", "test" ]
 
-# This stage builds the zebrad release binary.
+# This stage builds the Wcash node's `zebrad` release binary.
 #
 # It also adds `cache mounts` as this stage is completely independent from the
-# `test` stage. The resulting zebrad binary is used in the `runtime` stage.
+# `tests` stage. The resulting binary is used in the `runtime` stage.
 FROM deps AS release
 
 ARG SHORT_SHA
@@ -150,10 +150,13 @@ ARG CARGO_HOME
 ARG CARGO_TARGET_DIR
 
 # Strip absolute build paths from the binary so it doesn't depend on the build layout.
-ENV RUSTFLAGS="--remap-path-prefix=${HOME}=/zebra --remap-path-prefix=${CARGO_HOME}=/cargo"
+ENV RUSTFLAGS="--remap-path-prefix=${HOME}=/wcash --remap-path-prefix=${CARGO_HOME}=/cargo"
 
 RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
     --mount=type=bind,source=tower-fallback,target=tower-fallback \
+    --mount=type=bind,source=wcash-genesis,target=wcash-genesis \
+    --mount=type=bind,source=wcash-merge-miner,target=wcash-merge-miner \
+    --mount=type=bind,source=wcash-zcash-aux,target=wcash-zcash-aux \
     --mount=type=bind,source=zebra-chain,target=zebra-chain \
     --mount=type=bind,source=zebra-consensus,target=zebra-consensus \
     --mount=type=bind,source=zebra-network,target=zebra-network \
@@ -172,7 +175,7 @@ RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
     cargo build --locked --release --features "${FEATURES}" --package zebrad --bin zebrad && \
     cp ${CARGO_TARGET_DIR}/release/zebrad /usr/local/bin
 
-# This stage starts from scratch using Debian and copies the built zebrad binary
+# This stage starts from scratch using Debian and copies the built Wcash node binary
 # from the `release` stage along with other binaries and files.
 # debian:trixie-slim
 FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2 AS runtime
@@ -232,14 +235,8 @@ COPY --link --chown=${UID}:${GID} ./docker/entrypoint.sh /usr/local/bin/entrypoi
 ENTRYPOINT [ "entrypoint.sh" ]
 CMD ["zebrad"]
 
-# TODO: Add a `monitoring` stage
-#
-# This stage will be based on `runtime`, and initially:
-#
-# - run `zebrad` on Testnet
-# - with mining enabled using S-nomp and `nheqminer`.
-#
-# We can add further functionality to this stage for further purposes.
+# TODO: Add a separate development mining stage after the Wcash merge-mining
+# harness has a live Zcash parent GBT/reproof/dual-submit integration.
 
 # zcashd-compat runtime image: the runtime image plus the hash-pinned zcashd
 # wallet sidecar (and its RPC client) from the ZcashFoundation/zcashd

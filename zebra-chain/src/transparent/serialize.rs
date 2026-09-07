@@ -28,6 +28,13 @@ pub const GENESIS_COINBASE_SCRIPT_SIG: [u8; 77] = [
     54, 52, 56, 51, 53, 100, 51, 52,
 ];
 
+/// The exact local Wcash-regtest genesis statement.
+///
+/// Public Wcash networks remain disabled until their future Bitcoin anchors
+/// are frozen, so this local vector deliberately commits to Bitcoin genesis.
+pub const WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 90] =
+    b"06/Sep/2026 Wcash: BTC #0 000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+
 /// Parses the BIP-34 block-height prefix of a non-genesis coinbase script and returns the height
 /// along with the trailing miner data.
 ///
@@ -198,8 +205,10 @@ impl ZcashDeserialize for Input {
             }
             let script_sig = zcash_deserialize_bytes_external_count(len, &mut reader)?;
 
-            let (height, data) = if script_sig.as_slice() == GENESIS_COINBASE_SCRIPT_SIG {
-                (Height::MIN, GENESIS_COINBASE_SCRIPT_SIG.to_vec())
+            let (height, data) = if script_sig.as_slice() == GENESIS_COINBASE_SCRIPT_SIG
+                || script_sig.as_slice() == WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG
+            {
+                (Height::MIN, script_sig)
             } else {
                 parse_coinbase_height(&script_sig)?
             };

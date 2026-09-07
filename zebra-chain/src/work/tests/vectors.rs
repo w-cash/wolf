@@ -104,7 +104,7 @@ fn equihash_solution_rejects_oversize_compactsize_before_allocating() {
     assert!(
         matches!(
             err,
-            SerializationError::Parse("incorrect equihash solution size"),
+            SerializationError::Parse("proof solution exceeds its version-specific size limit"),
         ),
         "expected size-rejection Parse error, got: {err:?}",
     );

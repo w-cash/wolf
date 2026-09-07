@@ -545,34 +545,16 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Config {
-        let mainnet_peers = [
-            "dnsseed.str4d.xyz:8233",
-            "dnsseed.z.cash:8233",
-            "mainnet.seeder.shieldedinfra.net:8233",
-            "mainnet.seeder.zfnd.org:8233",
-            "seeder.zec.rocks:8233",
-        ]
-        .iter()
-        .map(|&s| String::from(s))
-        .collect();
-
-        let testnet_peers = [
-            "dnsseed.testnet.z.cash:18233",
-            "seeder.testnet.zec.rocks:18233",
-            "testnet.seeder.zfnd.org:18233",
-        ]
-        .iter()
-        .map(|&s| String::from(s))
-        .collect();
-
         Config {
-            listen_addr: "[::]:8233"
+            listen_addr: "[::]:28233"
                 .parse()
                 .expect("Hardcoded address should be parseable"),
             external_addr: None,
-            network: Network::Mainnet,
-            initial_mainnet_peers: mainnet_peers,
-            initial_testnet_peers: testnet_peers,
+            network: Network::new_wcash_regtest(),
+            // Never contact Zcash seeders from the Wcash default network. Public Wcash
+            // seeders are added only after the testnet identity is frozen and deployed.
+            initial_mainnet_peers: IndexSet::new(),
+            initial_testnet_peers: IndexSet::new(),
             cache_dir: CacheDir::default(),
             crawl_new_peer_interval: DEFAULT_CRAWL_NEW_PEER_INTERVAL,
 
@@ -623,6 +605,10 @@ struct DTestnetParameters {
 #[serde(untagged)]
 enum DNetwork {
     DefaultForKind(NetworkKind),
+    /// Built-in Wcash local network. A string keeps the generated TOML simple
+    /// (`network = "WcashRegtest"`) without changing Zebra's persisted
+    /// `NetworkKind` representation.
+    WcashRegtest(String),
     ConfiguredRegtest {
         params: Box<DTestnetParameters>,
 
@@ -634,7 +620,7 @@ enum DNetwork {
 
 impl Default for DNetwork {
     fn default() -> Self {
-        DNetwork::DefaultForKind(NetworkKind::Mainnet)
+        DNetwork::WcashRegtest("WcashRegtest".to_string())
     }
 }
 
@@ -732,25 +718,29 @@ impl From<Config> for DConfig {
             max_connections_per_ip,
         }: Config,
     ) -> Self {
-        let dnetwork = match network.kind() {
-            NetworkKind::Testnet => match network
-                .parameters()
-                .filter(|params| !params.is_default_testnet())
-                .map(Into::into)
-            {
-                Some(params) => DNetwork::ConfiguredTestnet(Box::new(params)),
-                None => DNetwork::DefaultForKind(NetworkKind::Testnet),
-            },
-
-            NetworkKind::Regtest => match network.parameters().map(Into::into) {
-                Some(params) => DNetwork::ConfiguredRegtest {
-                    params: Box::new(params),
-                    regtest: Some(true),
+        let dnetwork = if network.uses_wcash_consensus() {
+            DNetwork::WcashRegtest("WcashRegtest".to_string())
+        } else {
+            match network.kind() {
+                NetworkKind::Testnet => match network
+                    .parameters()
+                    .filter(|params| !params.is_default_testnet())
+                    .map(Into::into)
+                {
+                    Some(params) => DNetwork::ConfiguredTestnet(Box::new(params)),
+                    None => DNetwork::DefaultForKind(NetworkKind::Testnet),
                 },
-                None => DNetwork::DefaultForKind(NetworkKind::Regtest),
-            },
 
-            other_kind => DNetwork::DefaultForKind(other_kind),
+                NetworkKind::Regtest => match network.parameters().map(Into::into) {
+                    Some(params) => DNetwork::ConfiguredRegtest {
+                        params: Box::new(params),
+                        regtest: Some(true),
+                    },
+                    None => DNetwork::DefaultForKind(NetworkKind::Regtest),
+                },
+
+                other_kind => DNetwork::DefaultForKind(other_kind),
+            }
         };
 
         DConfig {
@@ -787,6 +777,15 @@ impl<'de> Deserialize<'de> for Config {
         } = DConfig::deserialize(deserializer)?;
 
         let network = match (dnetwork, testnet_parameters) {
+            (DNetwork::WcashRegtest(name), _) => {
+                if !name.eq_ignore_ascii_case("WcashRegtest") && !name.eq_ignore_ascii_case("Wcash")
+                {
+                    return Err(de::Error::custom(format!(
+                        "unknown network {name:?}; expected WcashRegtest"
+                    )));
+                }
+                Network::new_wcash_regtest()
+            }
             (DNetwork::ConfiguredTestnet(params), _) => {
                 build_configured_testnet::<D>(*params, &initial_testnet_peers)?
             }

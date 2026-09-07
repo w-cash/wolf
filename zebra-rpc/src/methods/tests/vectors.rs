@@ -518,7 +518,7 @@ async fn rpc_getblock() {
                 ),
                 previous_block_hash: Some(block.header.previous_block_hash),
                 next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
-                solution: Some(block.header.solution),
+                solution: Some(block.header.solution.clone()),
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
@@ -576,7 +576,7 @@ async fn rpc_getblock() {
                 ),
                 previous_block_hash: Some(block.header.previous_block_hash),
                 next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
-                solution: Some(block.header.solution),
+                solution: Some(block.header.solution.clone()),
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
@@ -653,7 +653,7 @@ async fn rpc_getblock() {
             );
             assert_eq!(previous_block_hash, &Some(block.header.previous_block_hash));
             assert_eq!(next_block_hash, &blocks.get(i + 1).map(|b| b.hash()));
-            assert_eq!(solution, &Some(block.header.solution));
+            assert_eq!(solution, &Some(block.header.solution.clone()));
             assert_eq!(
                 *chain_supply,
                 block_info
@@ -753,7 +753,7 @@ async fn rpc_getblock() {
             );
             assert_eq!(previous_block_hash, &Some(block.header.previous_block_hash));
             assert_eq!(next_block_hash, &blocks.get(i + 1).map(|b| b.hash()));
-            assert_eq!(solution, &Some(block.header.solution));
+            assert_eq!(solution, &Some(block.header.solution.clone()));
             assert_eq!(
                 *chain_supply,
                 block_info
@@ -833,7 +833,7 @@ async fn rpc_getblock() {
                 ),
                 previous_block_hash: Some(block.header.previous_block_hash),
                 next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
-                solution: Some(block.header.solution),
+                solution: Some(block.header.solution.clone()),
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
@@ -890,7 +890,7 @@ async fn rpc_getblock() {
                 ),
                 previous_block_hash: Some(block.header.previous_block_hash),
                 next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
-                solution: Some(block.header.solution),
+                solution: Some(block.header.solution.clone()),
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
@@ -1220,7 +1220,7 @@ async fn rpc_getblockheader() {
             sapling_tree_size: sapling_tree.count(),
             time: block.header.time.timestamp(),
             nonce: expected_nonce,
-            solution: block.header.solution,
+            solution: block.header.solution.clone(),
             bits: block.header.difficulty_threshold,
             difficulty: block
                 .header

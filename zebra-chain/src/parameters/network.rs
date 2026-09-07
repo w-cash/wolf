@@ -188,6 +188,27 @@ impl Network {
         )
     }
 
+    /// Creates the built-in local Wcash Regtest network.
+    ///
+    /// Its anchored genesis block and network magic are local-development values. A shared testnet
+    /// must use separately reviewed production values.
+    pub fn new_wcash_regtest() -> Self {
+        Self::new_configured_testnet(
+            testnet::Parameters::new_wcash_regtest()
+                .expect("built-in Wcash Regtest parameters should always be valid"),
+        )
+    }
+
+    /// Returns true only for the built-in Wcash consensus parameters.
+    ///
+    /// Configured Zcash Testnets cannot enable this flag through [`testnet::ParametersBuilder`].
+    pub fn uses_wcash_consensus(&self) -> bool {
+        match self {
+            Self::Mainnet => false,
+            Self::Testnet(params) => params.uses_wcash_consensus(),
+        }
+    }
+
     /// Returns true if the network is the default Testnet, or false otherwise.
     pub fn is_default_testnet(&self) -> bool {
         if let Self::Testnet(params) = self {
@@ -250,6 +271,7 @@ impl Network {
     pub fn default_port(&self) -> u16 {
         match self {
             Network::Mainnet => 8233,
+            Network::Testnet(params) if params.uses_wcash_consensus() => 28233,
             // TODO: Add a `default_port` field to `testnet::Parameters` to return here. (zcashd uses 18344 for Regtest)
             Network::Testnet(_params) => 18233,
         }

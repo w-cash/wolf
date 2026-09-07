@@ -125,9 +125,14 @@ proptest! {
         let (minimum_peer_version, _best_tip_height) =
             MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
 
-        // Build a peerset
+        // Build a Mainnet peerset, because this test checks fractional broadcasts.
+        // Regtest intentionally broadcasts to every connected peer.
         runtime.block_on(async move {
             let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+                .with_config(Config {
+                    network: Network::Mainnet,
+                    ..Config::default()
+                })
                 .with_discover(discovered_peers)
                 .with_minimum_peer_version(minimum_peer_version.clone())
                 .max_conns_per_ip(usize::MAX)
@@ -312,7 +317,12 @@ fn sidecar_peer_always_receives_block_gossip() {
     let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();
 
-    let config = Config::default();
+    let config = Config {
+        // This test checks normal fractional broadcast selection. Regtest deliberately
+        // broadcasts to every peer, and Wcash Regtest is now the application default.
+        network: Network::Mainnet,
+        ..Config::default()
+    };
     let block_gossip_peer_ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
 
     let mut handles = Vec::with_capacity(TOTAL_PEERS);
