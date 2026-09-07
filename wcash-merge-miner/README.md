@@ -136,12 +136,14 @@ controlled account identity.
 Every accepted network winner is appended and `sync_data`-flushed with its
 exact Wcash and/or Zcash block bytes before either submission RPC is attempted.
 The journal is single-writer locked, mode `0600` on Unix, capped at 1 GiB, and
-recovers one unterminated crash tail. It does not compact automatically; stop
-the coordinator and archive/replace the journal well before the cap. Its parent-
+recovers one unterminated crash tail. On Unix its parent directory must not be
+writable by group or other users, and every append verifies that the pathname
+still names the locked inode. It does not compact automatically; stop the
+coordinator and archive/replace the journal well before the cap. Its parent-
 directory entry is synced before work begins. An append or durability failure,
-or a panic while holding the journal lock, poisons the live writer until
-restart, preventing a later append from completing a corrupt partial line or
-using inconsistent memory. On
+live path replacement, or panic while holding the journal lock poisons the live
+writer until restart, preventing a later append from completing a corrupt
+partial line or using inconsistent memory. On
 restart, each chain is replayed independently. Exact blocks remain in the
 outbox across outages and reorgs until they have 100 best-chain confirmations.
 Zcash confirmation queries the exact winner hash and uses the lowest depth

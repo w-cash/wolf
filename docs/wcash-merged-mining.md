@@ -151,14 +151,16 @@ The native adapter enforces these rules before a job reaches an ASIC:
   atomically; a same-ID conflicting witness is never treated as success.
 - Network winners are appended with exact child and parent block bytes to a
   single-writer, mode-`0600`, 1-GiB-capped JSON-lines outbox and synced before
-  either submission. The journal does not compact automatically. On restart
-  each chain replays independently; blocks survive
+  either submission. On Unix the parent directory must not be group/world
+  writable, and every append verifies that the pathname still names the locked
+  inode. The journal does not compact automatically. On restart each chain
+  replays independently; blocks survive
   ambiguous RPC failures and reorg observation until 100 confirmations. Stable
   share IDs let payout/accounting software deduplicate retries. Any append or
-  durability error or in-lock panic poisons the live journal so no later write
-  can turn inconsistent state or a torn tail into a valid-looking record. The
-  parent-directory entry is synced before mining starts, and restart performs
-  metadata-durable bounded tail recovery.
+  durability error, live pathname replacement, or in-lock panic poisons the
+  live journal so no later write can turn inconsistent state or a torn tail
+  into a valid-looking record. The parent-directory entry is synced before
+  mining starts, and restart performs metadata-durable bounded tail recovery.
 
 The included ZIP-301 listener validates Equihash and both targets locally,
 requires authorization, assigns per-session nonce prefixes, rejects malformed,

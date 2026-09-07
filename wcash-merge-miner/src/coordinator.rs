@@ -3,8 +3,8 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    fs::{self, File, OpenOptions},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -801,6 +801,14 @@ impl ShareJournal {
                     path.display()
                 )));
             }
+            let parent = journal_parent_directory(path);
+            let parent_mode = fs::metadata(parent)?.permissions().mode();
+            if parent_mode & 0o022 != 0 {
+                return Err(MinerError::InvalidRequest(format!(
+                    "share journal parent directory {} must not be writable by group or other users",
+                    parent.display()
+                )));
+            }
         }
         sync_journal_parent_directory(path)?;
         let active_job_ids = HashSet::new();
@@ -944,7 +952,10 @@ impl ShareJournal {
     }
 
     fn activate_job(&mut self, active_job: ActiveJournalJob) -> Result<(), MinerError> {
-        let file = File::open(&self.path)?;
+        let state = self.state.get_mut().map_err(|_| journal_mutex_error())?;
+        verify_locked_journal_path(&state.file, &self.path)?;
+        let mut file = state.file.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
         let mut reader = BufReader::new(file);
         let mut active_job_ids = HashSet::new();
         let mut active_winner_ids = HashSet::new();
@@ -984,7 +995,7 @@ impl ShareJournal {
             }
         }
 
-        let state = self.state.get_mut().map_err(|_| journal_mutex_error())?;
+        verify_locked_journal_path(&state.file, &self.path)?;
         state.active_job_ids = active_job_ids;
         state.active_winner_ids = active_winner_ids;
         self.active_job = Some(active_job);
@@ -1064,7 +1075,7 @@ impl ShareJournal {
         });
         let mut encoded = serde_json::to_vec(&record)?;
         encoded.push(b'\n');
-        append_synced_journal_record(&mut state, &encoded)?;
+        append_synced_journal_record(&mut state, &self.path, &encoded)?;
         if is_network_winner {
             state.active_winner_ids.insert(share_id);
             if let Some(block_bytes) = wcash_block {
@@ -1169,7 +1180,7 @@ impl ShareJournal {
         });
         let mut encoded = serde_json::to_vec(&record)?;
         encoded.push(b'\n');
-        append_synced_journal_record(&mut state, &encoded)?;
+        append_synced_journal_record(&mut state, &self.path, &encoded)?;
         match status {
             WinnerStatus::Observed => {
                 state
@@ -1477,9 +1488,14 @@ fn journal_length_after_append(
 
 fn append_synced_journal_record(
     state: &mut JournalState,
+    path: &Path,
     encoded: &[u8],
 ) -> Result<(), MinerError> {
     let new_length = journal_length_after_append(state, encoded.len())?;
+    if let Err(error) = verify_locked_journal_path(&state.file, path) {
+        state.poisoned = true;
+        return Err(error);
+    }
     if let Err(error) = state
         .file
         .write_all(encoded)
@@ -1488,7 +1504,42 @@ fn append_synced_journal_record(
         state.poisoned = true;
         return Err(MinerError::Io(error));
     }
+    if let Err(error) = verify_locked_journal_path(&state.file, path) {
+        state.poisoned = true;
+        return Err(error);
+    }
     state.bytes_written = new_length;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_locked_journal_path(file: &File, path: &Path) -> Result<(), MinerError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let locked = file.metadata()?;
+    let current = fs::metadata(path).map_err(|_| {
+        MinerError::InvalidRequest(format!(
+            "share journal path {} no longer refers to the locked file; stop the coordinator before rotating it",
+            path.display()
+        ))
+    })?;
+    if locked.dev() != current.dev() || locked.ino() != current.ino() {
+        return Err(MinerError::InvalidRequest(format!(
+            "share journal path {} was replaced while the coordinator was running",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_locked_journal_path(_file: &File, path: &Path) -> Result<(), MinerError> {
+    if !path.is_file() {
+        return Err(MinerError::InvalidRequest(format!(
+            "share journal path {} is no longer a regular file",
+            path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -1507,12 +1558,14 @@ fn coordinator_mutex_error(component: &str) -> MinerError {
 
 #[cfg(unix)]
 fn sync_journal_parent_directory(path: &Path) -> Result<(), MinerError> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    File::open(parent)?.sync_all()?;
+    File::open(journal_parent_directory(path))?.sync_all()?;
     Ok(())
+}
+
+fn journal_parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 #[cfg(not(unix))]
@@ -1833,9 +1886,48 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.poisoned = true;
         let original_length = state.bytes_written;
-        assert!(append_synced_journal_record(&mut state, b"{}\n").is_err());
+        assert!(append_synced_journal_record(&mut state, &path, b"{}\n").is_err());
         assert_eq!(state.bytes_written, original_length);
         assert_eq!(fs::metadata(&path).expect("journal metadata").len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_writable_parent_and_live_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let writable_directory = tempdir().expect("temporary directory");
+        fs::set_permissions(writable_directory.path(), fs::Permissions::from_mode(0o770))
+            .expect("make parent group-writable");
+        let unsafe_path = writable_directory.path().join("unsafe.jsonl");
+        assert!(
+            ShareJournal::open(&unsafe_path).is_err(),
+            "a group-writable parent must be rejected"
+        );
+
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("shares.jsonl");
+        let displaced_path = directory.path().join("displaced.jsonl");
+        let journal = ShareJournal::open(&path).expect("new private journal");
+        fs::rename(&path, &displaced_path).expect("move locked journal inode");
+        fs::write(&path, []).expect("replace journal pathname");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("make replacement private");
+
+        let mut state = journal
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            append_synced_journal_record(&mut state, &path, b"{}\n").is_err(),
+            "an append must never ACK after the locked pathname is replaced"
+        );
+        assert!(state.poisoned);
+        assert_eq!(
+            fs::metadata(&path).expect("replacement metadata").len(),
+            0,
+            "the replacement file must not receive an ACKed record"
+        );
     }
 
     #[test]

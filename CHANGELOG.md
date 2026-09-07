@@ -48,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   and added bounded alternate-peer retries for malleated AuxPoW witnesses.
 - Limited the local mining interface to eight concurrent loopback clients and
   isolated malformed, oversized, reset, and idle connections from its listener.
+- Bound every durable share append to the originally locked journal inode and,
+  on Unix, reject journal directories writable by group or other users.
 
 ### Known limitations
 
