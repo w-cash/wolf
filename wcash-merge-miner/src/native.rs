@@ -580,8 +580,8 @@ impl NativePreparedJob {
                 "parent coinbase does not pay the configured ZCASH_PAYOUT_ADDRESS".to_string(),
             ));
         }
-        let miner_data = coinbase
-            .inputs()
+        let coinbase_inputs = coinbase.inputs();
+        let miner_data = coinbase_inputs
             .first()
             .and_then(|input| input.miner_data())
             .ok_or_else(|| {

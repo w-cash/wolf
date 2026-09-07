@@ -525,14 +525,12 @@ fn funding_stream_validation_failure() -> Result<(), Report> {
         .map(|transaction| {
             let mut output = transaction.outputs()[0].clone();
             output.value = Amount::try_from(i32::MAX).unwrap();
-            Transaction::V4 {
-                inputs: transaction.inputs().to_vec(),
-                outputs: vec![output],
-                lock_time: transaction.lock_time().unwrap_or_else(LockTime::unlocked),
-                expiry_height: Height(0),
-                joinsplit_data: None,
-                sapling_shielded_data: None,
-            }
+            Transaction::test_v4(
+                transaction.inputs().to_vec(),
+                vec![output],
+                transaction.lock_time().unwrap_or_else(LockTime::unlocked),
+                Height(0),
+            )
         })
         .unwrap();
 
@@ -683,16 +681,14 @@ fn wcash_coinbase_rejects_transparent_and_missing_ironwood_outputs() -> Result<(
         )))
     );
 
-    let no_output_coinbase = Transaction::V4 {
-        inputs: transparent_coinbase.inputs().to_vec(),
-        outputs: Vec::new(),
-        lock_time: transparent_coinbase
+    let no_output_coinbase = Transaction::test_v4(
+        transparent_coinbase.inputs(),
+        Vec::new(),
+        transparent_coinbase
             .lock_time()
             .unwrap_or_else(LockTime::unlocked),
-        expiry_height: Height::MIN,
-        joinsplit_data: None,
-        sapling_shielded_data: None,
-    };
+        Height::MIN,
+    );
     assert_eq!(
         check::miner_fees_are_valid(
             &no_output_coinbase,

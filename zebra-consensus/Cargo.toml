@@ -32,6 +32,9 @@ progress-bar = [
 # Test-only features
 proptest-impl = ["proptest", "proptest-derive", "zebra-chain/proptest-impl", "zebra-state/proptest-impl"]
 
+# Exposes `block` (equihash + block::check) to fuzz harnesses; private in normal builds.
+fuzzing = []
+
 [dependencies]
 blake2b_simd = { workspace = true }
 bellman = { workspace = true }
@@ -59,11 +62,11 @@ derive-getters = { workspace = true, features = ["auto_copy_getters"] }
 sapling-crypto = { workspace = true, features = ["multicore"]}
 orchard.workspace = true
 
+zcash_primitives.workspace = true
 zcash_proofs = { workspace = true, features = ["multicore", "bundled-prover"] }
 zcash_transparent = { workspace = true }
 libzcash_script = { workspace = true }
 zcash_script = { workspace = true }
-zcash_primitives = { workspace = true }
 
 tower-fallback = { path = "../tower-fallback/", version = "0.2.43" }
 tower-batch-control = { path = "../tower-batch-control/", version = "1.1.1" }
@@ -87,6 +90,7 @@ proptest-derive = { workspace = true, optional = true }
 color-eyre = { workspace = true }
 
 hex = { workspace = true }
+nonempty = { workspace = true }
 num-integer = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }

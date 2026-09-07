@@ -28,8 +28,8 @@ PRs are welcome, but every PR requires human review time. To make that time coun
 1. **Start with an issue.** Check the [Wcash issue tracker](https://github.com/w-cash/wolf/issues) for existing work or create an issue describing what you want to change and why.
 2. **Coordinate consensus changes.** Discuss consensus, networking, genesis, monetary-policy, privacy, and merged-mining changes in a Wcash issue before opening a PR. These changes require explicit test vectors and independent review.
 3. **Keep PRs focused.** One logical change per PR. If you're planning multiple related PRs, discuss the overall plan with the team first.
-4. **Follow conventional commits.** PRs are squash-merged to main, so the PR title becomes the commit message. Follow the [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) standard.
-5. **Declare breaking changes.** If your change breaks a published crate's public Rust API, add `!` after the type and scope in the PR title (`feat(zebra-chain)!: ...`). The semver-checks gate requires it, and the same marker tells the release to bump the major version.
+4. **Follow conventional commits.** PRs are merged to main with a merge commit, so the PR title becomes the merge commit message and your branch commits are preserved in history. Follow the [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) standard for both.
+5. **Declare breaking changes.** If your change breaks a published crate's public Rust API, add `!` after the type and scope in the PR title (`feat(zebra-chain)!: ...`) **and** in the branch commit that introduces the break. The PR gate reads the title: that is what skips `semver-checks` and requires a `breaking` change fragment. release-plz reads the commits that land on `main`, which now include your branch commits, so the marker belongs on both for the release to bump the major version.
 
 The consensus node should remain narrowly scoped, but Wcash's AuxPoW adapters,
 pool interoperability tooling, wallet compatibility, and audit infrastructure

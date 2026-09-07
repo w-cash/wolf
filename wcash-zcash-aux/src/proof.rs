@@ -608,7 +608,6 @@ mod tests {
         use zebra_chain::{
             amount::{Amount, NonNegative},
             block::Height,
-            parameters::NetworkUpgrade,
             serialization::ZcashSerialize,
             transaction::{LockTime, Transaction},
             transparent::{Input, Output, Script},
@@ -660,23 +659,20 @@ mod tests {
 
         let mut miner_data = b"wcash-vector/".to_vec();
         miner_data.extend_from_slice(&payload);
-        let coinbase = Transaction::V6 {
-            network_upgrade: NetworkUpgrade::Nu6_3,
-            lock_time: LockTime::unlocked(),
-            expiry_height: Height(2_900_000),
-            inputs: vec![Input::Coinbase {
+        let coinbase = Transaction::from_nu63_transparent_parts(
+            vec![Input::Coinbase {
                 height: Height(2_900_000),
                 data: miner_data,
                 sequence: u32::MAX,
             }],
-            outputs: vec![Output::new(
+            vec![Output::new(
                 Amount::<NonNegative>::zero(),
                 Script::new(&[0x51]),
             )],
-            sapling_shielded_data: None,
-            orchard_shielded_data: None,
-            ironwood_shielded_data: None,
-        }
+            LockTime::unlocked(),
+            Height(2_900_000),
+        )
+        .expect("NU6.3 transparent transaction parts are valid")
         .zcash_serialize_to_vec()
         .expect("the v6 vector coinbase serializes canonically");
 

@@ -1,4 +1,4 @@
-# CHANGELOG
+# Changelog
 
 All notable changes to Wcash and its Zebra base are documented in this file.
 

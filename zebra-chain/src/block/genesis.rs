@@ -7,7 +7,6 @@ use hex::FromHex;
 use crate::{
     block::Block,
     serialization::ZcashDeserializeInto,
-    transaction::Transaction,
     transparent::{self, Input},
     work::equihash::{Solution, WCASH_BLOCK_WIRE_VERSION},
 };
@@ -38,17 +37,23 @@ pub fn wcash_regtest_genesis_block() -> Arc<Block> {
             .first_mut()
             .expect("the inherited Regtest genesis block has a coinbase"),
     );
-    let Transaction::V1 { inputs, .. } = coinbase else {
-        panic!("the inherited Regtest genesis coinbase uses transaction version 1")
-    };
+    assert_eq!(
+        coinbase.version(),
+        1,
+        "the inherited Regtest genesis coinbase uses transaction version 1"
+    );
+    let mut inputs = coinbase.inputs();
     let input = inputs
         .first_mut()
         .expect("the inherited Regtest genesis coinbase has an input");
-    let Input::Coinbase { height, data, .. } = input else {
+    let Input::Coinbase { height, .. } = input else {
         panic!("the inherited Regtest genesis input is a coinbase")
     };
     assert!(height.is_min(), "the genesis coinbase height is zero");
-    *data = transparent::WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG.to_vec();
+    *coinbase = coinbase
+        .clone()
+        .with_coinbase_script(transparent::WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG.to_vec())
+        .expect("the inherited Regtest genesis transaction is a single-input coinbase");
 
     let merkle_root = block.transactions.iter().map(|tx| tx.hash()).collect();
     let header = Arc::make_mut(&mut block.header);

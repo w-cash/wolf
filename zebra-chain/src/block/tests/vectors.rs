@@ -7,7 +7,7 @@ use std::{
 use chrono::{DateTime, Duration, LocalResult, TimeZone, Utc};
 
 use crate::{
-    amount::{Amount, DeferredPoolBalanceChange, NonNegative, MAX_MONEY},
+    amount::{Amount, DeferredPoolBalanceChange, NonNegative, MAX_SINGLE_TRANSACTION_VALUE},
     block::{
         serialize::MAX_BLOCK_BYTES, Block, BlockTimeError, Commitment::*, Hash, Header, Height,
     },
@@ -146,21 +146,24 @@ fn wcash_header_round_trip_and_oversized_proof_rejection() {
 fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
     let _init_guard = zebra_test::init();
 
-    let max_money: Amount<NonNegative> = MAX_MONEY.try_into().expect("MAX_MONEY is a valid amount");
-    // Two `MAX_MONEY` transparent outputs make the transaction-level output
-    // sum exceed `MAX_MONEY`, so `value_balance` returns `Err`.
-    let coinbase = Transaction::V1 {
-        inputs: vec![transparent::Input::Coinbase {
+    let max_output: Amount<NonNegative> = MAX_SINGLE_TRANSACTION_VALUE
+        .try_into()
+        .expect("the single-transaction limit is a valid amount");
+    // Two maximum library-compatible transparent outputs exceed the aggregate
+    // monetary cap under both the Zcash and Wcash consensus profiles, so
+    // `value_balance` returns `Err`.
+    let coinbase = Transaction::test_v1(
+        vec![transparent::Input::Coinbase {
             height: Height(1),
             data: vec![],
             sequence: 0xFFFF_FFFF,
         }],
-        outputs: vec![
-            transparent::Output::new(max_money, transparent::Script::new(&[])),
-            transparent::Output::new(max_money, transparent::Script::new(&[])),
+        vec![
+            transparent::Output::new(max_output, transparent::Script::new(&[])),
+            transparent::Output::new(max_output, transparent::Script::new(&[])),
         ],
-        lock_time: LockTime::unlocked(),
-    };
+        LockTime::unlocked(),
+    );
     let utxos = HashMap::new();
 
     assert!(

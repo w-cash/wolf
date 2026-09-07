@@ -63,7 +63,9 @@ pub const WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 95] =
 /// [`zcash_transparent::bundle::TxIn::coinbase`] to build coinbase inputs — and require byte-exact
 /// equality. Any non-canonical input (wrong shape, non-minimal length, oversize, negative,
 /// signed-bit games) fails this check.
-fn parse_coinbase_height(script_sig: &[u8]) -> Result<(Height, Vec<u8>), SerializationError> {
+pub(crate) fn parse_coinbase_height(
+    script_sig: &[u8],
+) -> Result<(Height, Vec<u8>), SerializationError> {
     let parse_err = SerializationError::Parse;
 
     // Read a candidate height directly off the wire. The first byte tells us where the height

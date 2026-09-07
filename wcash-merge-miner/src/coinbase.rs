@@ -6,7 +6,6 @@ use wcash_zcash_aux::{commitment_payload, validate_miner_data_commitment, AuxPow
 use zebra_chain::{
     amount::{Amount, NonNegative},
     block::Height,
-    parameters::NetworkUpgrade,
     serialization::{ZcashDeserialize, ZcashSerialize},
     transaction::{LockTime, Transaction},
     transparent::{Input, Output, Script},
@@ -90,16 +89,13 @@ pub fn build_parent_coinbase(
         outputs.push(Output::new(amount, Script::new(&output.script_pubkey)));
     }
 
-    let transaction = Transaction::V6 {
-        network_upgrade: NetworkUpgrade::Nu6_3,
-        lock_time: LockTime::unlocked(),
-        expiry_height: Height(height),
-        inputs: vec![coinbase_input],
+    let transaction = Transaction::from_nu63_transparent_parts(
+        vec![coinbase_input],
         outputs,
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-        ironwood_shielded_data: None,
-    };
+        LockTime::unlocked(),
+        Height(height),
+    )
+    .ok_or(AuxPowError::InvalidParentCoinbase)?;
 
     let bytes = transaction
         .zcash_serialize_to_vec()

@@ -29,6 +29,7 @@ use zebra_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
 };
+use zebra_consensus::{error::TransactionError, RouterError, VerifyBlockError};
 use zebra_network::{self as zn, PeerSocketAddr};
 use zebra_state as zs;
 
@@ -104,6 +105,10 @@ fn is_wcash_auxpow_witness_error(error: &zebra_consensus::RouterError) -> bool {
         ),
     }
 }
+
+/// The fewest `TransparentInputNotFound` drops without a verified block before the sync
+/// restarts, so a low `full_verify_concurrency_limit` can't disable the #11168 exemption.
+const MIN_UTXO_RACE_DROPS_BEFORE_RESTART: usize = 4;
 
 /// A lower bound on the user-specified checkpoint verification concurrency limit.
 ///
@@ -451,6 +456,10 @@ where
     /// bounded by [`MAX_BLOCK_REOBTAIN_RETRIES`]. Saturated entries are retained
     /// until the block arrives or the sync run restarts, so the bound cannot reset.
     block_reobtain_retries: HashMap<block::Hash, u8>,
+
+    /// `TransparentInputNotFound` drops since the last verified block, bounded by the
+    /// full-verify concurrency limit so a poisoned hash batch can't suppress restarts.
+    utxo_race_drops: usize,
 }
 
 /// Polls the network to determine whether further blocks are available and
@@ -599,6 +608,7 @@ where
             misbehavior_sender,
             reobtain_hashes: IndexSet::new(),
             block_reobtain_retries: HashMap::new(),
+            utxo_race_drops: 0,
         };
 
         (new_syncer, sync_status)
@@ -650,6 +660,7 @@ where
 
         self.reobtain_hashes.clear();
         self.block_reobtain_retries.clear();
+        self.utxo_race_drops = 0;
 
         info!(
             state_tip = ?self.latest_chain_tip.best_tip_height(),
@@ -1228,6 +1239,7 @@ where
 
                 // The block arrived, so forget any re-request bookkeeping for it.
                 self.block_reobtain_retries.remove(&hash);
+                self.utxo_race_drops = 0;
 
                 return Ok(());
             }
@@ -1283,8 +1295,12 @@ where
         //   only applies misbehavior reports in batches.
         // - Wcash AuxPoW witness failures: the witness is deliberately excluded from the block ID,
         //   so a different peer can provide valid witness bytes for the same requested hash.
-        // Other consensus failures (`Invalid`/`ValidationRequestError`) remain excluded —
-        // re-downloading an invalid proof-independent block body is pointless.
+        // - UTXO races (#11168): the block was never rejected, and the state parks its
+        //   children until it arrives, so re-request it instead of waiting for a tip walk.
+        // - Short post-checkpoint verification timeouts (#5125): validation did not complete,
+        //   so retrying the same hash is safe.
+        // Other consensus failures remain excluded because re-downloading a block rejected for
+        // proof-independent data cannot make it valid.
         let is_wcash_auxpow_failure = matches!(
             &response,
             Err(BlockDownloadVerifyError::Invalid { error, .. })
@@ -1299,6 +1315,16 @@ where
             Err(BlockDownloadVerifyError::BehindTipHeightLimit { hash, .. }) => Some(*hash),
             Err(BlockDownloadVerifyError::Invalid { error, hash, .. })
                 if is_wcash_auxpow_witness_error(error) =>
+            {
+                Some(*hash)
+            }
+            Err(e @ BlockDownloadVerifyError::Invalid { hash, .. })
+                if Self::is_utxo_lookup_timeout(e) =>
+            {
+                Some(*hash)
+            }
+            Err(e @ BlockDownloadVerifyError::ValidationRequestError { hash, .. })
+                if Self::is_post_checkpoint_verify_timeout(e) =>
             {
                 Some(*hash)
             }
@@ -1325,6 +1351,25 @@ where
             }
         }
 
+        // A UTXO race resolves as soon as the parent commits. A whole lookahead wave of
+        // timeouts with no commit isn't the race, so restart instead of draining the batch.
+        if let Err(error) = &response {
+            if Self::is_utxo_lookup_timeout(error) {
+                self.utxo_race_drops += 1;
+                if self.utxo_race_drops
+                    >= self
+                        .full_verify_concurrency_limit
+                        .max(MIN_UTXO_RACE_DROPS_BEFORE_RESTART)
+                {
+                    warn!(
+                        drops = self.utxo_race_drops,
+                        "no block verified across a full wave of UTXO lookup timeouts, restarting sync"
+                    );
+                    return response.map(|_| ());
+                }
+            }
+        }
+
         // A Wcash witness failure is nonfatal only while this sync run has a
         // concrete re-download queued. Once its bounded retry budget is
         // exhausted, restart normally instead of silently stalling on a hash
@@ -1334,6 +1379,30 @@ where
         } else {
             Self::handle_response(response)
         }
+    }
+
+    /// Returns `true` for the `AwaitUtxo` timeout that `should_restart_sync` exempts (#11168).
+    fn is_utxo_lookup_timeout(e: &BlockDownloadVerifyError) -> bool {
+        matches!(
+            e,
+            BlockDownloadVerifyError::Invalid {
+                error: RouterError::Block { source },
+                ..
+            } if matches!(
+                **source,
+                VerifyBlockError::Transaction(TransactionError::TransparentInputNotFound)
+            )
+        )
+    }
+
+    /// Returns `true` for the short post-final-checkpoint verify timeout (#5125) that
+    /// `should_restart_sync` exempts; the 8-minute tower timeout is a different type.
+    fn is_post_checkpoint_verify_timeout(e: &BlockDownloadVerifyError) -> bool {
+        matches!(
+            e,
+            BlockDownloadVerifyError::ValidationRequestError { error, .. }
+                if error.is::<tokio::time::error::Elapsed>()
+        )
     }
 
     /// Handles a response to block hash submission, passing through any extra hashes.
@@ -1403,6 +1472,12 @@ where
                 debug!(error = ?e, "block was already verified or committed, possibly from a previous sync run, continuing");
                 false
             }
+            // An `AwaitUtxo` timeout: the spent output is usually in a recent block whose
+            // commit a restart would cancel, looping near the tip (#11168, #11132).
+            e if Self::is_utxo_lookup_timeout(e) => {
+                debug!(error = ?e, "block spends an output that is not in our state yet, re-requesting, continuing");
+                false
+            }
 
             // Structural matches: direct
             BlockDownloadVerifyError::CancelledDuringDownload { .. }
@@ -1453,6 +1528,13 @@ where
                 // TODO: improve this by checking the type (#2908)
                 //       restart after a certain number of NotFound errors?
                 debug!(error = ?e, "block was not found, possibly from a peer that doesn't have the block yet, continuing");
+                false
+            }
+
+            // The short post-final-checkpoint verify timeout is a UTXO race (#5125), not an
+            // invalid block; the 8-minute tower timeout stays in the catch-all (#5709).
+            e if Self::is_post_checkpoint_verify_timeout(e) => {
+                debug!(error = ?e, "initial fully verified block timed out waiting for its parent's outputs, re-requesting, continuing");
                 false
             }
 

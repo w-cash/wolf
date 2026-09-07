@@ -208,7 +208,7 @@ fn wcash_aux_commitment_preserves_shielded_coinbase_and_recomputes_roots() {
         .zcash_deserialize_into()
         .expect("original coinbase deserializes");
     assert_eq!(original_transaction.version(), 6);
-    assert!(original_transaction.ironwood_shielded_data().is_some());
+    assert!(original_transaction.has_ironwood_shielded_data());
 
     let extended = original
         .clone()
@@ -246,10 +246,8 @@ fn wcash_aux_commitment_preserves_shielded_coinbase_and_recomputes_roots() {
     );
     assert_eq!(extended.sigops(), extended_transaction.sigops().unwrap());
 
-    let extended_input = extended_transaction
-        .inputs()
-        .first()
-        .expect("coinbase has one input");
+    let extended_inputs = extended_transaction.inputs();
+    let extended_input = extended_inputs.first().expect("coinbase has one input");
     assert!(
         extended_input.coinbase_script().unwrap().len()
             <= zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN
@@ -278,12 +276,9 @@ fn wcash_aux_commitment_preserves_shielded_coinbase_and_recomputes_roots() {
     restored.drain(commitment_offset..commitment_offset + commitment.len());
     restored[V5_V6_COINBASE_SCRIPT_LENGTH_OFFSET] =
         original_bytes[V5_V6_COINBASE_SCRIPT_LENGTH_OFFSET];
+    // This exact byte equality covers every serialized Ironwood action,
+    // proof, and binding authorization as well as all other coinbase fields.
     assert_eq!(restored, original_bytes);
-    assert_eq!(
-        extended_transaction.ironwood_shielded_data(),
-        original_transaction.ironwood_shielded_data(),
-        "the Ironwood proof and binding authorization are unchanged",
-    );
     let previous_outputs = Arc::new(Vec::new());
     assert_eq!(
         original_transaction
@@ -683,11 +678,11 @@ fn coinbase_at_nu6_3_routes_shielded_output_to_ironwood() {
     // ZIP-229: from NU6.3, coinbase MUST have an empty Orchard component.
     assert_eq!(coinbase.version(), 6, "coinbase is v6 at NU6.3");
     assert!(
-        coinbase.ironwood_shielded_data().is_some(),
+        coinbase.has_ironwood_shielded_data(),
         "coinbase creates an Ironwood output"
     );
     assert!(
-        coinbase.orchard_shielded_data().is_none(),
+        !coinbase.has_orchard_shielded_data(),
         "coinbase must not create Orchard components on NU6.3"
     );
     zebra_consensus::transaction::check::coinbase_outputs_are_decryptable(&coinbase, &net, height)
