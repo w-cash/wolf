@@ -37,7 +37,7 @@ impl Runnable for GenerateCmd {
 #
 # The config format (including a complete list of sections and fields) is
 # documented here:
-# https://github.com/wcash-project/node
+# https://github.com/w-cash/wolf
 #
 # CONFIGURATION SOURCES (in order of precedence, highest to lowest):
 #

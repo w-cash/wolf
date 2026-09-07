@@ -18,14 +18,14 @@ do not apply to Wcash.
 ## Bug Reports
 
 Please create a non-sensitive bug report in the
-[Wcash issue tracker](https://github.com/wcash-project/node/issues). Report
+[Wcash issue tracker](https://github.com/w-cash/wolf/issues). Report
 security-sensitive issues through the private process in [SECURITY.md](SECURITY.md).
 
 ## Pull Requests
 
 PRs are welcome, but every PR requires human review time. To make that time count:
 
-1. **Start with an issue.** Check the [Wcash issue tracker](https://github.com/wcash-project/node/issues) for existing work or create an issue describing what you want to change and why.
+1. **Start with an issue.** Check the [Wcash issue tracker](https://github.com/w-cash/wolf/issues) for existing work or create an issue describing what you want to change and why.
 2. **Coordinate consensus changes.** Discuss consensus, networking, genesis, monetary-policy, privacy, and merged-mining changes in a Wcash issue before opening a PR. These changes require explicit test vectors and independent review.
 3. **Keep PRs focused.** One logical change per PR. If you're planning multiple related PRs, discuss the overall plan with the team first.
 4. **Follow conventional commits.** PRs are squash-merged to main, so the PR title becomes the commit message. Follow the [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) standard.

@@ -94,14 +94,14 @@ This PR was generated with [release-plz](https://github.com/release-plz/release-
 """
 
 # Repository URL.
-repo_url = "https://github.com/wcash-project/node"
+repo_url = "https://github.com/w-cash/wolf"
 
 [changelog]
 # Keep source-authored entries authoritative. The exact pinned release-plz
 # version represents dependency-only releases as commits with this sentinel ID.
 body = """
 {% if package == "zebrad" %}
-## [Wcash {{ version }}](https://github.com/wcash-project/node/releases/tag/v{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+## [Wcash {{ version }}](https://github.com/w-cash/wolf/releases/tag/v{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
 {% else %}
 ## [{{ version }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {% endif %}

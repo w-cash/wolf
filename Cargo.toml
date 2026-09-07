@@ -26,8 +26,8 @@ authors = [
         "Zcash Foundation <zebra@zfnd.org>",
 ]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/wcash-project/node"
-homepage = "https://github.com/wcash-project/node"
+repository = "https://github.com/w-cash/wolf"
+homepage = "https://github.com/w-cash/wolf"
 keywords = ["wcash", "zcash"]
 rust-version = "1.88"
 edition = "2021"
