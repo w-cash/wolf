@@ -10,7 +10,7 @@ use futures::{Future, FutureExt};
 use zebra_chain::{
     block::{self, Block, Height},
     chain_tip::mock::{MockChainTip, MockChainTipSender},
-    parameters::subsidy::SubsidyError,
+    parameters::{subsidy::SubsidyError, Network},
     serialization::ZcashDeserializeInto,
 };
 use zebra_consensus::{
@@ -1776,6 +1776,12 @@ fn setup() -> (
     let state_config = StateConfig::ephemeral();
     let config = ZebradConfig {
         consensus: consensus_config,
+        // This helper feeds the syncer Zcash Mainnet block vectors, while the
+        // Wcash executable defaults to its isolated regtest network.
+        network: zebra_network::Config {
+            network: Network::Mainnet,
+            ..Default::default()
+        },
         state: state_config,
         ..Default::default()
     };
