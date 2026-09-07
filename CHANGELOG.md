@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 ### Added
 
 - Added the isolated Wcash regtest consensus flavor, deterministic
-  Bitcoin-genesis anchor, Wcash-only P2P identity, 75-second target spacing,
+  frozen Bitcoin-block anchor, Wcash-only P2P identity, 75-second target spacing,
   10 WCASH initial subsidy, 1,680,000-block halvings, and exact issuance cap.
 - Added a strict bounded Zcash Equihash `(200, 9)` AuxPoW proof format,
   consensus validation, interoperability vector, real-solver local harness,
@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Reset local regtest genesis to Bitcoin mainnet block 965,910 and rotated the
+  regtest P2P identity to `Wcash/regtest/v2` so nodes on the superseded local
+  chain cannot connect to this chain.
 - Made Wcash regtest the only network accepted by the node executable and
   isolated its configuration, cache, network magic, ports, user agent, and
   Docker defaults from inherited Zcash networks.

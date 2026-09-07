@@ -51,6 +51,11 @@ disables RPC cookie authentication only on that loopback listener. Its miner
 address is a public test fixture; replace it with an address for which you
 control the keys before testing spendability.
 
+This local chain freezes Bitcoin mainnet block 965,910, hash
+`00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146`,
+which was the Blockstream tip snapshot selected for regtest genesis. It replaces
+the earlier local genesis and uses the `Wcash/regtest/v2` P2P identity.
+
 The merge-mining harness can exercise real Equihash solving and proof
 validation, but it is not yet an end-to-end production pool adapter:
 

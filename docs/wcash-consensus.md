@@ -14,10 +14,11 @@ The designated public genesis reference is Bitcoin mainnet block height
 `965,954`. That anchor is intentionally treated as not yet mined/frozen in this
 source tree. Both public anchor constants are `None`; mainnet and public testnet
 therefore fail closed. Local regtest instead anchors its deterministic genesis
-statement to Bitcoin block 0.
+statement to Bitcoin mainnet block 965,910, hash
+`00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146`.
 
 The frozen local-regtest genesis block ID is
-`0f6605368c3b5c6fff3a9defebe77602060d78f7aac6f8f729c87f14f6fd6367`.
+`b0ebe8618354e0563091d10b73ba03842cb3c112a801012616489269e58dbd61`.
 
 Freezing a public anchor requires the exact Bitcoin header and hash, proof-of-work
 verification, sufficient confirmations, independent reproduction, reviewed test

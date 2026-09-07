@@ -32,6 +32,19 @@ pub const GENESIS_TIMESTAMP_TEXT: &str = "06/Sep/2026 Wcash";
 /// Bitcoin mainnet height announced as the future Wcash mainnet anchor.
 pub const DESIGNATED_MAINNET_BITCOIN_HEIGHT: u32 = 965_954;
 
+/// Bitcoin mainnet height frozen into the local Wcash regtest genesis.
+pub const LOCAL_REGTEST_BITCOIN_HEIGHT: u32 = 965_910;
+
+/// Bitcoin header timestamp frozen into the local Wcash regtest genesis.
+pub const LOCAL_REGTEST_BITCOIN_TIME: u32 = 1_788_772_786;
+
+/// Exact Bitcoin wire header frozen into the local Wcash regtest test vector.
+pub const LOCAL_REGTEST_BITCOIN_HEADER_HEX: &str = concat!(
+    "00c02123b4c556cf9cfeadd7419e61a554f2fb4f84aa89bd2c9e010000000000",
+    "00000000ec36381fa721f932e3c24ded1ea557bc0babc74c686c4233f5e6ec92",
+    "ba277d2ab2819e6a5e3502173c197783",
+);
+
 /// Number of confirmations required by the release procedure before freezing a public anchor.
 pub const MIN_PUBLIC_ANCHOR_CONFIRMATIONS: u32 = 100;
 
@@ -47,8 +60,6 @@ pub const ANCHOR_PERSONALIZATION: &[u8; 16] = b"WcashBtcAnchorV1";
 const BITCOIN_MAINNET_SOURCE_ID: u8 = 0;
 const RESERVED_BYTE: u8 = 0;
 const BITCOIN_HEADER_LEN: usize = 80;
-#[cfg(test)]
-const BITCOIN_MAINNET_POW_LIMIT_BITS: u32 = 0x1d00_ffff;
 const BITCOIN_MAINNET_POW_LIMIT: [u8; 32] = [
     0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -166,8 +177,8 @@ pub const fn network_identity(network: WcashNetwork) -> NetworkIdentity {
         },
         WcashNetwork::Regtest => NetworkIdentity {
             network,
-            domain_label: "Wcash/regtest/v1",
-            p2p_magic: [0x99, 0xcc, 0xd2, 0x65],
+            domain_label: "Wcash/regtest/v2",
+            p2p_magic: [0xd5, 0xe2, 0xfc, 0xae],
         },
     }
 }
@@ -246,6 +257,14 @@ impl BitcoinHeader {
     pub fn bits(self) -> u32 {
         let mut bytes = [0_u8; 4];
         bytes.copy_from_slice(&self.0[72..76]);
+        u32::from_le_bytes(bytes)
+    }
+
+    /// Returns the header timestamp as seconds since the Unix epoch.
+    #[must_use]
+    pub fn time(self) -> u32 {
+        let mut bytes = [0_u8; 4];
+        bytes.copy_from_slice(&self.0[68..72]);
         u32::from_le_bytes(bytes)
     }
 
@@ -554,13 +573,13 @@ impl RegtestAnchorOverride {
     }
 }
 
-/// The Bitcoin mainnet genesis block used by default for local Wcash regtest.
+/// The frozen Bitcoin mainnet block used by default for local Wcash regtest.
 pub const REGTEST_ANCHOR: BitcoinAnchor = BitcoinAnchor::frozen(
     WcashNetwork::Regtest,
-    0,
+    LOCAL_REGTEST_BITCOIN_HEIGHT,
     [
-        0x6f, 0xe2, 0x8c, 0x0a, 0xb6, 0xf1, 0xb3, 0x72, 0xc1, 0xa6, 0xa2, 0x46, 0xae, 0x63, 0xf7,
-        0x4f, 0x93, 0x1e, 0x83, 0x65, 0xe1, 0x5a, 0x08, 0x9c, 0x68, 0xd6, 0x19, 0x00, 0x00, 0x00,
+        0x46, 0xb1, 0x46, 0xd1, 0x92, 0x7c, 0x70, 0x4a, 0xd8, 0x5f, 0x0a, 0xde, 0x6f, 0x2c, 0x64,
+        0x98, 0xf0, 0x2f, 0x8d, 0xb2, 0xbd, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00,
     ],
 );
@@ -710,17 +729,13 @@ mod tests {
 
     use super::*;
 
-    const BITCOIN_GENESIS_HEADER: &str = concat!(
-        "0100000000000000000000000000000000000000000000000000000000000000",
-        "000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa",
-        "4b1e5e4a29ab5f49ffff001d1dac2b7c",
-    );
-    const BITCOIN_GENESIS_DISPLAY_HASH: &str =
-        "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+    const LOCAL_REGTEST_BITCOIN_DISPLAY_HASH: &str =
+        "00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146";
+    const LOCAL_REGTEST_BITCOIN_BITS: u32 = 0x1702_355e;
     const REGTEST_ENCODING: &str =
-        "01020000000000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000";
+        "0102000016bd0e0046b146d1927c704ad85f0ade6f2c6498f02f8db2bdbb00000000000000000000";
     const REGTEST_COMMITMENT: &str =
-        "da9850231c2edb7728da1f99d9f31a938f56f3724209953da2ae03a0e767cba9";
+        "87abb83be6bc263c6b1eb58119a4b39ce614bce722b1eb4f7363c5a000289e88";
 
     fn encode_hex(bytes: impl IntoIterator<Item = u8>) -> String {
         bytes.into_iter().fold(String::new(), |mut output, byte| {
@@ -752,17 +767,22 @@ mod tests {
     }
 
     #[test]
-    fn bitcoin_genesis_header_and_hash_are_reproducible() {
-        let header: BitcoinHeader = BITCOIN_GENESIS_HEADER
+    fn local_regtest_bitcoin_header_and_hash_are_reproducible() {
+        let header: BitcoinHeader = LOCAL_REGTEST_BITCOIN_HEADER_HEX
             .parse()
-            .expect("the frozen Bitcoin genesis header is valid hex");
-        let displayed_hash: BitcoinBlockHash = BITCOIN_GENESIS_DISPLAY_HASH
+            .expect("the frozen Bitcoin anchor header is valid hex");
+        let displayed_hash: BitcoinBlockHash = LOCAL_REGTEST_BITCOIN_DISPLAY_HASH
             .parse()
-            .expect("the frozen Bitcoin genesis hash is valid hex");
+            .expect("the frozen Bitcoin anchor hash is valid hex");
 
         assert_eq!(header.block_hash(), displayed_hash);
-        assert_eq!(header.bits(), BITCOIN_MAINNET_POW_LIMIT_BITS);
+        assert_eq!(header.time(), LOCAL_REGTEST_BITCOIN_TIME);
+        assert_eq!(header.bits(), LOCAL_REGTEST_BITCOIN_BITS);
         assert_eq!(header.validate_isolated_mainnet_work(), Ok(()));
+        assert_eq!(
+            REGTEST_ANCHOR.bitcoin_height(),
+            LOCAL_REGTEST_BITCOIN_HEIGHT
+        );
         assert_eq!(REGTEST_ANCHOR.bitcoin_block_hash(), displayed_hash);
     }
 
@@ -777,8 +797,8 @@ mod tests {
         assert_eq!(
             REGTEST_ANCHOR.genesis_statement(),
             concat!(
-                "06/Sep/2026 Wcash: BTC #0 ",
-                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+                "06/Sep/2026 Wcash: BTC #965910 ",
+                "00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146"
             )
         );
         assert!(REGTEST_ANCHOR.genesis_statement().len() <= 100);
@@ -796,11 +816,11 @@ mod tests {
 
     #[test]
     fn explicit_regtest_override_is_local_and_deterministic() {
-        let header: BitcoinHeader = BITCOIN_GENESIS_HEADER
+        let header: BitcoinHeader = LOCAL_REGTEST_BITCOIN_HEADER_HEX
             .parse()
-            .expect("the frozen Bitcoin genesis header is valid hex");
+            .expect("the frozen Bitcoin anchor header is valid hex");
         let anchor_override = RegtestAnchorOverride::from_header(42, header)
-            .expect("the Bitcoin genesis header has valid isolated work");
+            .expect("the Bitcoin anchor header has valid isolated work");
 
         let first = select_anchor(WcashNetwork::Regtest, Some(anchor_override))
             .expect("regtest accepts an explicit override");
@@ -822,9 +842,9 @@ mod tests {
             Err(HexParseError::InvalidLength { .. })
         ));
 
-        let mut header = BITCOIN_GENESIS_HEADER
+        let mut header = LOCAL_REGTEST_BITCOIN_HEADER_HEX
             .parse::<BitcoinHeader>()
-            .expect("the frozen Bitcoin genesis header is valid hex")
+            .expect("the frozen Bitcoin anchor header is valid hex")
             .bytes();
         header[72..76].copy_from_slice(&0_u32.to_le_bytes());
         assert_eq!(
@@ -838,9 +858,9 @@ mod tests {
             Err(BitcoinPowError::ZeroTarget)
         );
 
-        let mut header = BITCOIN_GENESIS_HEADER
+        let mut header = LOCAL_REGTEST_BITCOIN_HEADER_HEX
             .parse::<BitcoinHeader>()
-            .expect("the frozen Bitcoin genesis header is valid hex")
+            .expect("the frozen Bitcoin anchor header is valid hex")
             .bytes();
         header[0] ^= 1;
         assert_eq!(

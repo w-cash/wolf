@@ -57,6 +57,8 @@ delta.
 The state disappears on clean shutdown because this profile sets
 `state.ephemeral = true`. Set it to `false` only if you deliberately want a
 persistent local regtest database under the isolated Wcash cache directory.
+Persistent state created by the superseded regtest genesis is incompatible;
+use a clean cache directory when moving to the `Wcash/regtest/v2` chain.
 
 ## 4. Exercise the proof harness
 

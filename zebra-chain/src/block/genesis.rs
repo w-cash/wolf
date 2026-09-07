@@ -26,10 +26,10 @@ pub fn regtest_genesis_block() -> Arc<Block> {
 
 /// Returns the deterministic local Wcash Regtest genesis block.
 ///
-/// Its coinbase text and header commitment bind the local chain to Bitcoin's
-/// genesis block through [`wcash_genesis::REGTEST_ANCHOR`]. Public Wcash
-/// networks use a separately reviewed future Bitcoin anchor and remain
-/// disabled until that block exists.
+/// Its coinbase text and header commitment bind the local chain to the frozen
+/// Bitcoin block in [`wcash_genesis::REGTEST_ANCHOR`]. Public Wcash networks
+/// use a separately reviewed Bitcoin anchor and remain disabled until it is
+/// finalized.
 pub fn wcash_regtest_genesis_block() -> Arc<Block> {
     let mut block = regtest_genesis_block().as_ref().clone();
     let coinbase = Arc::make_mut(
@@ -55,8 +55,9 @@ pub fn wcash_regtest_genesis_block() -> Arc<Block> {
     header.version = WCASH_BLOCK_WIRE_VERSION;
     header.merkle_root = merkle_root;
     header.commitment_bytes = wcash_genesis::REGTEST_ANCHOR.commitment().into();
-    header.time = chrono::DateTime::from_timestamp(1_788_652_800, 0)
-        .expect("the Wcash genesis timestamp is representable");
+    header.time =
+        chrono::DateTime::from_timestamp(i64::from(wcash_genesis::LOCAL_REGTEST_BITCOIN_TIME), 0)
+            .expect("the Wcash genesis timestamp is representable");
     header.nonce = [0; 32].into();
     header.solution = Solution::for_wcash(Vec::new())
         .expect("an empty Wcash genesis witness is within the size limit");
@@ -93,7 +94,7 @@ mod tests {
             .is_empty());
         assert_eq!(
             block.hash().to_string(),
-            "0f6605368c3b5c6fff3a9defebe77602060d78f7aac6f8f729c87f14f6fd6367",
+            "b0ebe8618354e0563091d10b73ba03842cb3c112a801012616489269e58dbd61",
             "the local Wcash genesis ID is a frozen interoperability vector",
         );
 

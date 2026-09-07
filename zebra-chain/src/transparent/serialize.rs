@@ -30,10 +30,11 @@ pub const GENESIS_COINBASE_SCRIPT_SIG: [u8; 77] = [
 
 /// The exact local Wcash-regtest genesis statement.
 ///
-/// Public Wcash networks remain disabled until their future Bitcoin anchors
-/// are frozen, so this local vector deliberately commits to Bitcoin genesis.
-pub const WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 90] =
-    b"06/Sep/2026 Wcash: BTC #0 000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+/// Public Wcash networks remain disabled until their announced Bitcoin anchors
+/// are frozen. This local vector commits to the independently checked Bitcoin
+/// block 965,910.
+pub const WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 95] =
+    b"06/Sep/2026 Wcash: BTC #965910 00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146";
 
 /// Parses the BIP-34 block-height prefix of a non-genesis coinbase script and returns the height
 /// along with the trailing miner data.

@@ -59,9 +59,10 @@ never activate Wcash mainnet or testnet.
 
 ## Local testing
 
-The default regtest anchor is Bitcoin's known mainnet genesis header at height
-zero. It is deterministic and cannot be confused with a public Wcash anchor
-because the Wcash network byte is part of the commitment.
+The default regtest anchor is the frozen Bitcoin mainnet block at height
+965,910. Its exact 80-byte header and hash are checked by the crate's test
+vectors. It cannot be confused with a public Wcash anchor because the Wcash
+network byte is part of the commitment.
 
 ```sh
 cargo run --manifest-path wcash-genesis/Cargo.toml -- show-regtest

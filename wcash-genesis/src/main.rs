@@ -44,7 +44,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 wcash_genesis::DESIGNATED_MAINNET_BITCOIN_HEIGHT
             );
             println!("testnet: disabled; no reviewed anchor frozen");
-            println!("regtest: enabled; compiled Bitcoin genesis anchor only");
+            println!(
+                "regtest: enabled; frozen Bitcoin block {} anchor",
+                wcash_genesis::LOCAL_REGTEST_BITCOIN_HEIGHT
+            );
         }
         _ => return Err(usage().into()),
     }
