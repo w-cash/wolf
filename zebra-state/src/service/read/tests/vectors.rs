@@ -101,6 +101,13 @@ async fn populated_read_state_responds_correctly() -> Result<()> {
                 Ok(ReadResponse::Block(Some(block.clone()))),
             ),
             (
+                ReadRequest::BlockAndDepth(block.hash()),
+                Ok(ReadResponse::BlockAndDepth(Some((
+                    block.clone(),
+                    tip_height.0 - block.coinbase_height().expect("test block has a height").0,
+                )))),
+            ),
+            (
                 ReadRequest::Block(block.coinbase_height().unwrap().into()),
                 Ok(ReadResponse::Block(Some(block.clone()))),
             ),
@@ -391,6 +398,10 @@ fn empty_state_test_cases() -> Vec<(ReadRequest, Result<ReadResponse, ExpectedTr
         (
             ReadRequest::Block(block.hash().into()),
             Ok(ReadResponse::Block(None)),
+        ),
+        (
+            ReadRequest::BlockAndDepth(block.hash()),
+            Ok(ReadResponse::BlockAndDepth(None)),
         ),
         (
             ReadRequest::Block(block.coinbase_height().unwrap().into()),

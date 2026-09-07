@@ -545,16 +545,47 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Config {
+        #[cfg(not(feature = "wcash-consensus"))]
+        let (listen_addr, network, initial_mainnet_peers, initial_testnet_peers) = {
+            let mainnet_peers = [
+                "dnsseed.str4d.xyz:8233",
+                "dnsseed.z.cash:8233",
+                "mainnet.seeder.shieldedinfra.net:8233",
+                "mainnet.seeder.zfnd.org:8233",
+                "seeder.zec.rocks:8233",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+            let testnet_peers = [
+                "dnsseed.testnet.z.cash:18233",
+                "seeder.testnet.zec.rocks:18233",
+                "testnet.seeder.zfnd.org:18233",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+            ("[::]:8233", Network::Mainnet, mainnet_peers, testnet_peers)
+        };
+
+        #[cfg(feature = "wcash-consensus")]
+        let (listen_addr, network, initial_mainnet_peers, initial_testnet_peers) = (
+            "[::]:28233",
+            Network::new_wcash_regtest(),
+            IndexSet::new(),
+            IndexSet::new(),
+        );
+
         Config {
-            listen_addr: "[::]:28233"
+            listen_addr: listen_addr
                 .parse()
                 .expect("Hardcoded address should be parseable"),
             external_addr: None,
-            network: Network::new_wcash_regtest(),
-            // Never contact Zcash seeders from the Wcash default network. Public Wcash
-            // seeders are added only after the testnet identity is frozen and deployed.
-            initial_mainnet_peers: IndexSet::new(),
-            initial_testnet_peers: IndexSet::new(),
+            network,
+            initial_mainnet_peers,
+            initial_testnet_peers,
             cache_dir: CacheDir::default(),
             crawl_new_peer_interval: DEFAULT_CRAWL_NEW_PEER_INTERVAL,
 
@@ -620,7 +651,15 @@ enum DNetwork {
 
 impl Default for DNetwork {
     fn default() -> Self {
-        DNetwork::WcashRegtest("WcashRegtest".to_string())
+        #[cfg(not(feature = "wcash-consensus"))]
+        {
+            DNetwork::DefaultForKind(NetworkKind::Mainnet)
+        }
+
+        #[cfg(feature = "wcash-consensus")]
+        {
+            DNetwork::WcashRegtest("WcashRegtest".to_string())
+        }
     }
 }
 

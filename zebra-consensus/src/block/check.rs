@@ -466,18 +466,24 @@ pub fn miner_fees_are_valid(
         + expected_deferred_pool_balance_change.value())
     .map_err(|_| SubsidyError::Overflow)?;
 
-    let total_input_value =
-        (expected_block_subsidy + block_miner_fees).map_err(|_| SubsidyError::Overflow)?;
-
     if network.uses_wcash_consensus() && height > Height::MIN {
         // Ironwood's inherited `ZatBalance` representation limits one transaction to the Zcash
         // monetary base, even though Wcash's aggregate monetary base is larger. Make that
         // interoperability limit an explicit consensus rule rather than relying on a later
         // conversion failure in the proof verifier.
-        if total_input_value.zatoshis() > MAX_WCASH_COINBASE_VALUE {
+        let raw_total_input = expected_block_subsidy
+            .zatoshis()
+            .checked_add(block_miner_fees.zatoshis())
+            .ok_or(SubsidyError::Overflow)?;
+        if raw_total_input > MAX_WCASH_COINBASE_VALUE {
             return Err(SubsidyError::WcashCoinbaseValueTooLarge.into());
         }
+    }
 
+    let total_input_value =
+        (expected_block_subsidy + block_miner_fees).map_err(|_| SubsidyError::Overflow)?;
+
+    if network.uses_wcash_consensus() && height > Height::MIN {
         // Wcash coinbase value is created only in Ironwood. The transparent coinbase input remains
         // required, but there must be no transparent outputs and no legacy shielded components.
         if !coinbase_tx.outputs().is_empty() {

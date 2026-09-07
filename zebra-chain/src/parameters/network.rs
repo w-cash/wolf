@@ -209,6 +209,29 @@ impl Network {
         }
     }
 
+    /// Returns true when this network matches the monetary and consensus profile
+    /// selected when `zebra-chain` was compiled.
+    ///
+    /// Wcash's aggregate monetary base exceeds Zcash's 21 million coin ceiling,
+    /// so Cargo feature unification must never let one verifier process the
+    /// opposite profile. Complete state and consensus services call
+    /// [`Self::assert_compatible_with_compiled_consensus`] during initialization.
+    pub fn is_compatible_with_compiled_consensus(&self) -> bool {
+        self.uses_wcash_consensus() == cfg!(feature = "wcash-consensus")
+    }
+
+    /// Panics before service initialization if this network and the compiled
+    /// monetary/consensus profile do not match.
+    ///
+    /// This is an invariant assertion rather than a peer-triggerable consensus
+    /// error: applications must choose the profile when they build the binary.
+    pub fn assert_compatible_with_compiled_consensus(&self) {
+        assert!(
+            self.is_compatible_with_compiled_consensus(),
+            "network {self} is incompatible with this binary's compiled consensus profile; build exactly one of the Zcash or Wcash profiles"
+        );
+    }
+
     /// Returns true if the network is the default Testnet, or false otherwise.
     pub fn is_default_testnet(&self) -> bool {
         if let Self::Testnet(params) = self {

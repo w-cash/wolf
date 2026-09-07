@@ -3,7 +3,7 @@
 name = "zebrad"
 version = "6.3.0"
 authors.workspace = true
-description = "The Wcash consensus node, based on Zebra"
+description = "A Zebra-based node for isolated Wcash and Zcash consensus profiles"
 license.workspace = true
 repository.workspace = true
 
@@ -80,6 +80,12 @@ internal-miner = [
     "zebra-chain/internal-miner",
     # TODO: move common code into zebra-chain or zebra-node-services and remove the RPC dependency
     "zebra-rpc/internal-miner",
+]
+
+# Build a Wcash-only node with Wcash network defaults and monetary bounds.
+wcash-consensus = [
+    "zebra-chain/wcash-consensus",
+    "zebra-network/wcash-consensus",
 ]
 
 # Experimental elasticsearch indexing

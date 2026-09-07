@@ -266,6 +266,11 @@ where
         + 'static,
     Mempool::Future: Send + 'static,
 {
+    // `Amount` and chain value-pool ceilings are selected as one mutually
+    // exclusive compile-time consensus profile. Fail before spawning any
+    // verifier task if an embedding application supplies the other network.
+    network.assert_compatible_with_compiled_consensus();
+
     // Give other tasks priority before spawning the checkpoint task.
     tokio::task::yield_now().await;
 

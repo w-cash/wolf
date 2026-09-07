@@ -22,11 +22,13 @@ use zebra_chain::{
         self, zip317::BLOCK_UNPAID_ACTION_LIMIT, VerifiedUnminedTx, MIN_TRANSPARENT_TX_SIZE,
     },
 };
-use zebra_consensus::MAX_BLOCK_SIGOPS;
+use zebra_consensus::{error::TransactionError, MAX_BLOCK_SIGOPS};
 use zebra_node_services::mempool::TransactionDependencies;
 
 use super::CoinbaseCache;
-use crate::methods::types::transaction::TransactionTemplate;
+use crate::methods::types::{
+    get_block_template::WcashAuxRequest, transaction::TransactionTemplate,
+};
 
 #[cfg(test)]
 mod tests;
@@ -62,23 +64,36 @@ pub fn select_mempool_transactions(
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
     coinbase_cache: Option<&CoinbaseCache>,
-) -> Vec<SelectedMempoolTx> {
+    wcash_aux: Option<WcashAuxRequest>,
+) -> Result<Vec<SelectedMempoolTx>, TransactionError> {
     // Use a fake coinbase transaction to break the dependency between transaction
     // selection, the miner fee, and the fee payment in the coinbase transaction.
     //
     // The fake coinbase only depends on the height and miner parameters (its fee is always zero),
     // so it's constant per block. Reuse the same per-block cache as the real coinbase to avoid
     // re-proving a shielded coinbase on every `getblocktemplate` call just to read its size.
-    let fake_coinbase_tx = coinbase_cache
-        .and_then(|cache| cache.get(height, Amount::zero()))
-        .unwrap_or_else(|| {
-            let cb = TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero())
-                .expect("valid coinbase transaction template");
+    let fake_coinbase_tx = match coinbase_cache.and_then(|cache| cache.get(height, Amount::zero()))
+    {
+        Some(cached) => cached,
+        None => {
+            let coinbase =
+                TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero())?;
             if let Some(cache) = coinbase_cache {
-                cache.store(height, Amount::zero(), cb.clone());
+                cache.store(height, Amount::zero(), coinbase.clone());
             }
-            cb
-        });
+            coinbase
+        }
+    };
+    // Charge the exact child-specific coinbase bytes and sigops before selecting
+    // transactions. The v2 carrier is a raw 44-byte script suffix, so its
+    // arbitrary commitment bytes can affect both limits. Keep the cached
+    // coinbase child-independent and mutate only this per-request clone.
+    let fake_coinbase_tx = match wcash_aux {
+        Some(wcash_aux) => {
+            fake_coinbase_tx.with_wcash_aux(wcash_aux.block_hash().0, wcash_aux.nonce())?
+        }
+        None => fake_coinbase_tx,
+    };
 
     let tx_dependencies = mempool_tx_deps.dependencies();
     let (independent_mempool_txs, mut dependent_mempool_txs): (HashMap<_, _>, HashMap<_, _>) =
@@ -95,19 +110,35 @@ pub fn select_mempool_transactions(
     let mut selected_txs = Vec::new();
 
     // Set up limit tracking
-    let mut remaining_block_bytes: usize = MAX_BLOCK_BYTES.try_into().expect("fits in memory");
+    let mut remaining_block_bytes = usize::try_from(MAX_BLOCK_BYTES).map_err(|_| {
+        TransactionError::CoinbaseConstruction(
+            "the consensus block size limit does not fit in memory".to_string(),
+        )
+    })?;
     let mut remaining_block_sigops = MAX_BLOCK_SIGOPS;
     let mut remaining_block_unpaid_actions: u32 = BLOCK_UNPAID_ACTION_LIMIT;
 
     // `MAX_BLOCK_BYTES` limits the whole serialized block, so reserve space for the block header
     // and the transaction count before budgeting transactions, or the assembled block could
     // exceed the consensus size limit (GHSA-95m2-vx53-v2jw).
-    remaining_block_bytes -= Header::serialized_size(net);
-    remaining_block_bytes -= max_transaction_count_size();
+    remaining_block_bytes = remaining_block_bytes
+        .checked_sub(Header::serialized_size(net))
+        .and_then(|remaining| remaining.checked_sub(max_transaction_count_size()))
+        .and_then(|remaining| remaining.checked_sub(fake_coinbase_tx.data.as_ref().len()))
+        .ok_or_else(|| {
+            TransactionError::CoinbaseConstruction(
+                "the coinbase and block framing exceed the consensus block size limit".to_string(),
+            )
+        })?;
 
-    // Adjust the limits based on the coinbase transaction
-    remaining_block_bytes -= fake_coinbase_tx.data.as_ref().len();
-    remaining_block_sigops -= fake_coinbase_tx.sigops;
+    // Adjust the sigop limit based on the exact coinbase transaction.
+    remaining_block_sigops = remaining_block_sigops
+        .checked_sub(fake_coinbase_tx.sigops)
+        .ok_or_else(|| {
+            TransactionError::CoinbaseConstruction(
+                "the coinbase exceeds the consensus block sigop limit".to_string(),
+            )
+        })?;
 
     // > Repeat while there is any candidate transaction
     // > that pays at least the conventional fee:
@@ -144,7 +175,7 @@ pub fn select_mempool_transactions(
         );
     }
 
-    selected_txs
+    Ok(selected_txs)
 }
 
 /// Returns the maximum possible serialized size of a block's transaction count, in bytes.

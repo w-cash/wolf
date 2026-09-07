@@ -3,39 +3,13 @@
 #[cfg(any(feature = "zebra", test))]
 use crate::AuxPowError;
 
-/// One transparent output extracted from the exact serialized parent coinbase.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransparentOutput {
-    value: u64,
-    script_pubkey: Box<[u8]>,
-}
-
-impl TransparentOutput {
-    /// Creates one parsed transparent output.
-    pub fn new(value: u64, script_pubkey: impl Into<Box<[u8]>>) -> Self {
-        Self {
-            value,
-            script_pubkey: script_pubkey.into(),
-        }
-    }
-
-    /// Returns its zatoshi value.
-    pub const fn value(&self) -> u64 {
-        self.value
-    }
-
-    /// Returns its exact script bytes without a CompactSize prefix.
-    pub fn script_pubkey(&self) -> &[u8] {
-        &self.script_pubkey
-    }
-}
-
 /// Consensus-relevant data authenticated by the crate's Zcash coinbase parser.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg(any(feature = "zebra", test))]
 pub(crate) struct CoinbaseSummary {
     transaction_id: [u8; 32],
-    transparent_outputs: Box<[TransparentOutput]>,
+    authorizing_data_digest: [u8; 32],
+    miner_data: Box<[u8]>,
 }
 
 #[cfg(any(feature = "zebra", test))]
@@ -46,11 +20,13 @@ impl CoinbaseSummary {
     /// never conventional reversed display order.
     pub(crate) fn new(
         transaction_id: [u8; 32],
-        transparent_outputs: impl Into<Box<[TransparentOutput]>>,
+        authorizing_data_digest: [u8; 32],
+        miner_data: impl Into<Box<[u8]>>,
     ) -> Self {
         Self {
             transaction_id,
-            transparent_outputs: transparent_outputs.into(),
+            authorizing_data_digest,
+            miner_data: miner_data.into(),
         }
     }
 
@@ -59,18 +35,23 @@ impl CoinbaseSummary {
         self.transaction_id
     }
 
-    /// Returns every authenticated transparent output in wire order.
-    pub(crate) fn transparent_outputs(&self) -> &[TransparentOutput] {
-        &self.transparent_outputs
+    /// Returns the ZIP-244 authorizing-data digest in raw Merkle byte order.
+    pub(crate) const fn authorizing_data_digest(&self) -> [u8; 32] {
+        self.authorizing_data_digest
+    }
+
+    /// Returns the exact bytes after the canonical coinbase-height prefix.
+    pub(crate) fn miner_data(&self) -> &[u8] {
+        &self.miner_data
     }
 }
 
-/// Adapter for exact, canonical current-Zcash coinbase parsing and txid calculation.
+/// Adapter for exact, canonical current-Zcash coinbase parsing and digests.
 ///
 /// Implementations are consensus-critical: they must parse the supplied bytes
 /// themselves, consume all bytes, prove the transaction is a coinbase, compute
-/// the correct mined txid for its exact transaction version, and return every
-/// transparent output without filtering or reordering.
+/// both ZIP-244 digests for its exact transaction version, and return the exact
+/// miner-data suffix authenticated by the authorizing-data digest.
 #[cfg(any(feature = "zebra", test))]
 pub(crate) trait CoinbaseVerifier {
     /// Authenticates the exact serialized transaction and returns its summary.
@@ -110,20 +91,29 @@ impl CoinbaseVerifier for ZebraCoinbaseVerifier {
             return Err(AuxPowError::NonCanonicalParentCoinbase);
         }
 
-        let outputs = transaction
-            .outputs()
-            .iter()
-            .map(|output| {
-                let value = u64::try_from(output.value.zatoshis())
-                    .map_err(|_| AuxPowError::InvalidParentCoinbase)?;
-                Ok(TransparentOutput::new(
-                    value,
-                    output.lock_script.as_raw_bytes().to_vec(),
-                ))
-            })
-            .collect::<Result<Vec<_>, AuxPowError>>()?;
+        if !matches!(transaction.version(), 5 | 6) {
+            return Err(AuxPowError::UnsupportedParentCoinbaseVersion(
+                transaction.version(),
+            ));
+        }
+        let authorizing_data_digest = transaction
+            .auth_digest()
+            .ok_or(AuxPowError::UnsupportedParentCoinbaseVersion(
+                transaction.version(),
+            ))?
+            .0;
+        let miner_data = transaction
+            .inputs()
+            .first()
+            .and_then(|input| input.miner_data())
+            .ok_or(AuxPowError::MissingParentCoinbaseMinerData)?
+            .clone();
 
-        Ok(CoinbaseSummary::new(transaction.hash().0, outputs))
+        Ok(CoinbaseSummary::new(
+            transaction.hash().0,
+            authorizing_data_digest,
+            miner_data,
+        ))
     }
 }
 
@@ -132,25 +122,19 @@ mod tests {
     use hex::FromHex;
 
     use super::*;
-    use crate::{sha256d_merkle_root, ParentHeader, PARENT_HEADER_BYTES};
+    use crate::PARENT_HEADER_BYTES;
 
     #[test]
-    fn zebra_adapter_authenticates_real_zcash_genesis_coinbase() {
+    fn zebra_adapter_rejects_pre_zip244_zcash_genesis_coinbase() {
         let block = Vec::<u8>::from_hex(
             include_str!("../../zebra-test/src/vectors/block-main-0-000-000.txt").trim(),
         )
         .expect("upstream test vector is hexadecimal");
         assert_eq!(block[PARENT_HEADER_BYTES], 1, "genesis has one transaction");
-        let header =
-            ParentHeader::decode(&block[..PARENT_HEADER_BYTES]).expect("genesis header parses");
         let coinbase = &block[PARENT_HEADER_BYTES + 1..];
-        let summary = ZebraCoinbaseVerifier
-            .verify(coinbase)
-            .expect("pinned Zebra parses its genesis coinbase");
         assert_eq!(
-            sha256d_merkle_root(summary.transaction_id(), &[], 0)
-                .expect("empty branch and index zero are valid"),
-            header.merkle_root()
+            ZebraCoinbaseVerifier.verify(coinbase),
+            Err(AuxPowError::UnsupportedParentCoinbaseVersion(1))
         );
 
         let mut trailing = coinbase.to_vec();

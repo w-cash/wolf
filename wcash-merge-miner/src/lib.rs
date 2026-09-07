@@ -15,10 +15,20 @@
 #![forbid(unsafe_code)]
 
 mod coinbase;
+mod coordinator;
 mod error;
 mod job;
+pub mod native;
 pub mod protocol;
+pub mod rpc;
+pub mod zip301;
 
 pub use coinbase::{build_parent_coinbase, ParentOutput};
+pub use coordinator::{CoordinatorConfig, NativeMiningCoordinator, WinnerOutboxStatus};
 pub use error::MinerError;
 pub use job::{JobConfig, PreparedJob, SolvedAuxPow, EQUIHASH_SOLUTION_BYTES};
+pub use native::{
+    NativePreparedJob, NativeZcashConfig, NativeZcashProvider, ParentNodeOutcome,
+    ParentSubmissionReport, ValidatedNativeShare,
+};
+pub use zip301::{serve_zip301_loopback, ShareProcessor, Zip301Config};

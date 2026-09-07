@@ -20,4 +20,5 @@ pub use methods::types::{
         fetch_chain_info, proposal::proposal_block_from_template, MinerParams, MinerParamsError,
     },
     submit_block::SubmitBlockChannel,
+    wcash_aux_block::{AuxPowHex, AuxPowHexError, CreateAuxBlockResponse},
 };

@@ -1,7 +1,7 @@
 //! Deterministic identity and Bitcoin-anchored genesis data for Wcash.
 //!
 //! Public-network anchors are deliberately unavailable until their Bitcoin
-//! blocks have been mined, confirmed, independently checked, and frozen in a
+//! headers and confirmation history are independently checked and frozen in a
 //! reviewed release. Consensus code never fetches data from the network.
 
 #![forbid(unsafe_code)]
@@ -29,7 +29,7 @@ pub const USER_AGENT_PREFIX: &str = "/Wcash:";
 /// Human-readable timestamp prefix embedded in every Wcash genesis statement.
 pub const GENESIS_TIMESTAMP_TEXT: &str = "06/Sep/2026 Wcash";
 
-/// Bitcoin mainnet height announced as the future Wcash mainnet anchor.
+/// Bitcoin mainnet height designated for a possible Wcash mainnet anchor.
 pub const DESIGNATED_MAINNET_BITCOIN_HEIGHT: u32 = 965_954;
 
 /// Bitcoin mainnet height frozen into the local Wcash regtest genesis.

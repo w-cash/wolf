@@ -17,6 +17,7 @@ use zcash_primitives::transaction::{
 };
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis};
+use zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN;
 use zebra_chain::{
     amount::{
         self, Amount, NegativeAllowed, NegativeOrZero, NonNegative, MAX_WCASH_COINBASE_VALUE,
@@ -29,7 +30,7 @@ use zebra_chain::{
     },
     primitives::ed25519,
     sapling::ValueCommitment,
-    serialization::ZcashSerialize,
+    serialization::{ZcashDeserializeInto, ZcashSerialize},
     transaction::{self, SerializedTransaction, Transaction, VerifiedUnminedTx},
     transparent::Script,
 };
@@ -134,10 +135,21 @@ impl TransactionTemplate<NegativeOrZero> {
         txs_fee: Amount<NonNegative>,
     ) -> Result<Self, TransactionError> {
         let block_subsidy = block_subsidy(height, net)?;
-        let miner_reward = (miner_subsidy(height, net, block_subsidy)? + txs_fee)?;
-        if net.uses_wcash_consensus() && miner_reward.zatoshis() > MAX_WCASH_COINBASE_VALUE {
-            return Err(SubsidyError::WcashCoinbaseValueTooLarge.into());
+        let miner_subsidy = miner_subsidy(height, net, block_subsidy)?;
+        if net.uses_wcash_consensus() {
+            // Check the inherited per-transaction limit before constrained
+            // Amount addition. In a standard Zcash build the Amount ceiling is
+            // also 21 million coins, so adding a positive subsidy to a
+            // limit-sized fee would otherwise surface as a generic overflow.
+            let raw_miner_reward = miner_subsidy
+                .zatoshis()
+                .checked_add(txs_fee.zatoshis())
+                .ok_or(SubsidyError::Overflow)?;
+            if raw_miner_reward > MAX_WCASH_COINBASE_VALUE {
+                return Err(SubsidyError::WcashCoinbaseValueTooLarge.into());
+            }
         }
+        let miner_reward = (miner_subsidy + txs_fee)?;
         let miner_reward = Zatoshis::try_from(miner_reward)?;
 
         let mut builder = Builder::new(
@@ -288,6 +300,202 @@ impl TransactionTemplate<NegativeOrZero> {
             sigops: tx.sigops()?,
             required: true,
         })
+    }
+
+    /// Appends the canonical Wcash AuxPoW commitment to a completed v5/v6
+    /// Zcash coinbase transaction.
+    ///
+    /// ZIP-244 excludes the coinbase input script from the transaction ID but
+    /// commits it through the authorizing-data digest. This lets a parent node
+    /// preserve an already-generated shielded coinbase (including its proofs
+    /// and binding authorization), while producing the exact auth-data root
+    /// required by the returned block template.
+    ///
+    /// This method deliberately fails closed on every transaction format other
+    /// than the two formats whose transparent prefix is defined identically by
+    /// ZIP-244. The wire splice is round-trip checked before any updated
+    /// template fields are returned.
+    pub(crate) fn with_wcash_aux(
+        mut self,
+        auxiliary_block_hash: [u8; 32],
+        nonce: u32,
+    ) -> Result<Self, TransactionError> {
+        const V5_V6_TRANSPARENT_PREFIX_BYTES: usize = 20;
+        const NULL_PREVOUT_BYTES: usize = 36;
+
+        fn construction_error(message: impl Into<String>) -> TransactionError {
+            TransactionError::CoinbaseConstruction(message.into())
+        }
+
+        let commitment =
+            wcash_zcash_aux::miner_data_commitment(auxiliary_block_hash, &[], 0, nonce).map_err(
+                |error| construction_error(format!("invalid Wcash AuxPoW request: {error}")),
+            )?;
+
+        let original_bytes = self.data.as_ref();
+        let original_transaction: Transaction = original_bytes
+            .zcash_deserialize_into()
+            .map_err(|error| construction_error(format!("could not parse coinbase: {error}")))?;
+
+        if !matches!(
+            &original_transaction,
+            Transaction::V5 { .. } | Transaction::V6 { .. }
+        ) {
+            return Err(construction_error(
+                "Wcash AuxPoW commitments require a v5 or v6 Zcash coinbase",
+            ));
+        }
+        if !original_transaction.is_coinbase() {
+            return Err(construction_error(
+                "Wcash AuxPoW commitment target is not a coinbase transaction",
+            ));
+        }
+
+        // Reject trailing bytes and any future alternative encoding before
+        // relying on the fixed transparent prefix shared by transaction v5 and
+        // v6.
+        let canonical_original = original_transaction.zcash_serialize_to_vec()?;
+        if canonical_original.as_slice() != original_bytes {
+            return Err(construction_error(
+                "coinbase transaction is not canonically encoded",
+            ));
+        }
+        if original_transaction.hash() != self.hash
+            || original_transaction.auth_digest() != Some(self.auth_digest)
+        {
+            return Err(construction_error(
+                "coinbase template identifiers do not match its serialized transaction",
+            ));
+        }
+
+        let input = original_transaction
+            .inputs()
+            .first()
+            .ok_or_else(|| construction_error("coinbase input is missing"))?;
+        let miner_data = input
+            .miner_data()
+            .ok_or_else(|| construction_error("coinbase miner data is missing"))?;
+        let coinbase_script = input
+            .coinbase_script()
+            .ok_or_else(|| construction_error("coinbase script is invalid"))?;
+        let extended_script_len = coinbase_script
+            .len()
+            .checked_add(commitment.len())
+            .ok_or_else(|| construction_error("coinbase script length overflow"))?;
+        if extended_script_len > MAX_COINBASE_SCRIPT_LEN {
+            return Err(construction_error(format!(
+                "Wcash AuxPoW commitment would make the coinbase script {extended_script_len} bytes; maximum is {MAX_COINBASE_SCRIPT_LEN}"
+            )));
+        }
+
+        let mut extended_miner_data = miner_data.clone();
+        extended_miner_data.extend_from_slice(&commitment);
+        wcash_zcash_aux::validate_miner_data_commitment(
+            &extended_miner_data,
+            auxiliary_block_hash,
+            &[],
+            0,
+        )
+        .map_err(|error| {
+            construction_error(format!(
+                "coinbase miner data cannot carry a canonical Wcash AuxPoW commitment: {error}"
+            ))
+        })?;
+
+        // v5 and v6 both encode the five u32 prefix fields before their
+        // transparent input vector. A canonical coinbase then has a one-byte
+        // input count, a null prevout, and a one-byte (2..=100) script length.
+        // Consensus bounds guarantee both the old and new script lengths stay
+        // below the CompactSize discriminator, so changing the length never
+        // changes the width of this field.
+        let input_count_offset = V5_V6_TRANSPARENT_PREFIX_BYTES;
+        let script_length_offset = input_count_offset + 1 + NULL_PREVOUT_BYTES;
+        let script_start = script_length_offset + 1;
+        if original_bytes.get(input_count_offset) != Some(&1) {
+            return Err(construction_error(
+                "coinbase input count is not canonically encoded as one",
+            ));
+        }
+        if original_bytes.get(input_count_offset + 1..input_count_offset + 1 + 32)
+            != Some(&[0; 32][..])
+            || original_bytes.get(input_count_offset + 1 + 32..script_length_offset)
+                != Some(&u32::MAX.to_le_bytes()[..])
+        {
+            return Err(construction_error(
+                "coinbase transaction does not contain the expected null prevout",
+            ));
+        }
+        if original_bytes.get(script_length_offset).copied()
+            != u8::try_from(coinbase_script.len()).ok()
+        {
+            return Err(construction_error(
+                "coinbase script length does not match the parsed transaction",
+            ));
+        }
+        let script_end = script_start
+            .checked_add(coinbase_script.len())
+            .ok_or_else(|| construction_error("coinbase script offset overflow"))?;
+        if original_bytes.get(script_start..script_end) != Some(coinbase_script.as_slice()) {
+            return Err(construction_error(
+                "coinbase script bytes do not match the parsed transaction",
+            ));
+        }
+
+        let mut extended_bytes = Vec::with_capacity(original_bytes.len() + commitment.len());
+        extended_bytes.extend_from_slice(&original_bytes[..script_length_offset]);
+        extended_bytes.push(
+            u8::try_from(extended_script_len)
+                .map_err(|_| construction_error("coinbase script length is not CompactSize"))?,
+        );
+        extended_bytes.extend_from_slice(&original_bytes[script_start..script_end]);
+        extended_bytes.extend_from_slice(&commitment);
+        extended_bytes.extend_from_slice(&original_bytes[script_end..]);
+
+        let extended_transaction: Transaction = extended_bytes
+            .as_slice()
+            .zcash_deserialize_into()
+            .map_err(|error| {
+                construction_error(format!("extended coinbase could not be parsed: {error}"))
+            })?;
+        if extended_transaction.zcash_serialize_to_vec()? != extended_bytes {
+            return Err(construction_error(
+                "extended coinbase failed canonical round-trip validation",
+            ));
+        }
+        if extended_transaction.hash() != self.hash
+            || extended_transaction.hash() != original_transaction.hash()
+        {
+            return Err(construction_error(
+                "Wcash AuxPoW coinbase mutation unexpectedly changed the transaction ID",
+            ));
+        }
+
+        let extended_input = extended_transaction
+            .inputs()
+            .first()
+            .ok_or_else(|| construction_error("extended coinbase input is missing"))?;
+        wcash_zcash_aux::validate_miner_data_commitment(
+            extended_input
+                .miner_data()
+                .ok_or_else(|| construction_error("extended coinbase miner data is missing"))?,
+            auxiliary_block_hash,
+            &[],
+            0,
+        )
+        .map_err(|error| {
+            construction_error(format!(
+                "extended coinbase commitment failed validation: {error}"
+            ))
+        })?;
+
+        self.data = extended_bytes.into();
+        self.hash = extended_transaction.hash();
+        self.auth_digest = extended_transaction.auth_digest().ok_or_else(|| {
+            construction_error("extended coinbase does not have a ZIP-244 auth digest")
+        })?;
+        self.sigops = extended_transaction.sigops()?;
+
+        Ok(self)
     }
 }
 

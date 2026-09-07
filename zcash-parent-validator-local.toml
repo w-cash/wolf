@@ -1,0 +1,33 @@
+# Independent loopback Zcash regtest proposal validator for Wcash integration tests.
+# Build `zebrad` without the `wcash-consensus` feature for this profile.
+
+[network]
+network = "Regtest"
+listen_addr = "127.0.0.1:18243"
+initial_mainnet_peers = []
+initial_testnet_peers = []
+cache_dir = false
+peerset_initial_target_size = 1
+max_connections_per_ip = 1
+
+[network.testnet_parameters.activation_heights]
+# Must exactly match the template node's parent consensus schedule.
+"NU6.3" = 1
+
+[state]
+ephemeral = true
+
+[rpc]
+listen_addr = "127.0.0.1:18242"
+enable_cookie_auth = false
+# Isolated regtest has no public peers. Never use this bypass publicly.
+debug_force_finished_sync = true
+
+[mining]
+# Must exactly equal ZCASH_PAYOUT_ADDRESS and the template-node address so the
+# coordinator can independently compare the parent payout policy.
+miner_address = "uregtest1efxggx6lduhm2fx5lnrhxv7h7kpztlpa3ahf3n4w0q0zj5epj4av9xjq6ljsja3xk8z7rzd067kc7mgpy9448rdfzpfjz5gq389zdmpgnk6rp4ykk0xk6cmqw6zqcrnmsuaxv3yzsvcwsd4gagtalh0uzrdvy03nhmltjz2eu0232qlcs0zvxuqyut73yucd9gy5jaudnyt7yqhgpqv"
+extra_coinbase_data = "WcashParent"
+
+[tracing]
+filter = "info"

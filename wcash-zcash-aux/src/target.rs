@@ -34,6 +34,12 @@ impl Target {
         }
         true
     }
+
+    /// Returns true when this target is numerically easier than or equal to
+    /// `other`, so every hash meeting `other` also meets this target.
+    pub fn includes(self, other: Self) -> bool {
+        self.is_met_by_le_hash(other.0)
+    }
 }
 
 #[cfg(test)]
@@ -55,6 +61,9 @@ mod tests {
         let mut higher = bytes;
         higher[2] = 1;
         assert!(!target.is_met_by_le_hash(higher));
+        assert!(Target::MAX.includes(target));
+        assert!(target.includes(target));
+        assert!(!target.includes(Target::MAX));
         assert_eq!(Target::from_le_bytes([0; 32]), Err(AuxPowError::ZeroTarget));
     }
 }

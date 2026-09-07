@@ -1,8 +1,11 @@
 //! Tests for types and functions for the `getblocktemplate` RPC.
 
 use anyhow::anyhow;
-use std::iter;
-use zebra_chain::amount::{Amount, MAX_WCASH_COINBASE_VALUE};
+use std::{iter, sync::Arc};
+use zebra_chain::{
+    amount::{Amount, MAX_WCASH_COINBASE_VALUE},
+    block,
+};
 
 use strum::IntoEnumIterator;
 use zcash_keys::address::Address;
@@ -17,15 +20,20 @@ use zebra_chain::{
         Network, NetworkUpgrade,
     },
     serialization::ZcashDeserializeInto,
-    transaction::Transaction,
+    transaction::{HashType, Transaction},
 };
+use zebra_script::Sigops;
 
 use crate::client::TransactionTemplate;
 use crate::config::mining::{
     default_miner_address, default_miner_address_for_network, Config, MinerAddressType,
 };
+use crate::methods::{hex_data::HexData, types::long_poll::LONG_POLL_ID_LENGTH};
 
-use super::MinerParams;
+use super::{
+    check_parameters, DefaultRoots, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
+    MinerParams, WcashAuxRequest,
+};
 
 /// Tests that coinbase transactions can be generated.
 ///
@@ -148,6 +156,297 @@ fn coinbase_tag_and_limit() {
             .concat()
             .as_bytes()
     );
+}
+
+#[test]
+fn parent_payout_attestation_is_canonical_and_redacted() {
+    let net = Network::new_default_testnet();
+    let encoded = default_miner_address(net.kind(), &MinerAddressType::Unified);
+    let params = MinerParams::new(
+        &net,
+        Config {
+            miner_address: Some(encoded.parse().expect("valid configured address")),
+            ..Default::default()
+        },
+    )
+    .expect("valid miner parameters");
+    let expected = hex::encode(wcash_zcash_aux::parent_payout_address_commitment(encoded));
+    assert_eq!(
+        params.parent_payout_address_commitment(),
+        Some(expected.as_str())
+    );
+    let debug = format!("{params:?}");
+    assert!(!debug.contains(encoded));
+    assert!(!debug.contains(&expected));
+    assert!(debug.contains("[REDACTED]"));
+}
+
+/// A Wcash parent-template request mutates only authenticated coinbase miner
+/// data, keeps the ZIP-244 transaction ID and shielded authorization intact,
+/// and updates the two header roots that commit to authorizing data.
+#[test]
+fn wcash_aux_commitment_preserves_shielded_coinbase_and_recomputes_roots() {
+    let net = Network::new_default_testnet();
+    let height = NetworkUpgrade::Nu6_3
+        .activation_height(&net)
+        .expect("Nu6.3 is scheduled on Testnet");
+    let miner_params = MinerParams::from(
+        Address::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Unified),
+        )
+        .expect("hard-coded Unified address is valid"),
+    );
+    let block_hash = std::array::from_fn(|index| u8::try_from(index).expect("index fits in u8"));
+    let nonce = 7;
+
+    let original = TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero())
+        .expect("valid shielded v6 coinbase");
+    let original_bytes = original.data().as_ref().to_vec();
+    let original_transaction: Transaction = original_bytes
+        .as_slice()
+        .zcash_deserialize_into()
+        .expect("original coinbase deserializes");
+    assert_eq!(original_transaction.version(), 6);
+    assert!(original_transaction.ironwood_shielded_data().is_some());
+
+    let extended = original
+        .clone()
+        .with_wcash_aux(block_hash, nonce)
+        .expect("the canonical commitment fits in ordinary miner data");
+    let extended_bytes = extended.data().as_ref().to_vec();
+    let extended_transaction: Transaction = extended_bytes
+        .as_slice()
+        .zcash_deserialize_into()
+        .expect("extended coinbase deserializes");
+    let commitment =
+        wcash_zcash_aux::miner_data_commitment(block_hash, &[], 0, nonce).expect("valid leaf");
+    assert_eq!(
+        hex::encode(commitment),
+        "fabe6d6d828c9a504f6f9792169ae8c5751624ce48aa43476dd83ca2e481a01cdd5980b30100000007000000",
+        "the parent hook freezes the v2 domain, chain ID, root byte order, tree size, and nonce encoding",
+    );
+
+    assert_eq!(
+        extended_bytes.len(),
+        original_bytes.len() + commitment.len()
+    );
+    assert_eq!(
+        extended.hash(),
+        original.hash(),
+        "ZIP-244 txid is unchanged"
+    );
+    assert_eq!(extended.hash(), extended_transaction.hash());
+    assert_ne!(extended.auth_digest(), original.auth_digest());
+    assert_eq!(
+        extended.auth_digest(),
+        extended_transaction
+            .auth_digest()
+            .expect("v6 has an auth digest")
+    );
+    assert_eq!(extended.sigops(), extended_transaction.sigops().unwrap());
+
+    let extended_input = extended_transaction
+        .inputs()
+        .first()
+        .expect("coinbase has one input");
+    assert!(
+        extended_input.coinbase_script().unwrap().len()
+            <= zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN
+    );
+    assert!(extended_input
+        .miner_data()
+        .expect("coinbase has miner data")
+        .ends_with(&commitment));
+    wcash_zcash_aux::validate_miner_data_commitment(
+        extended_input.miner_data().unwrap(),
+        block_hash,
+        &[],
+        0,
+    )
+    .expect("the committed child and nonce round-trip");
+
+    // The original proof-bearing suffix is bit-for-bit preserved. Restoring
+    // the one-byte script length and removing the appended carrier reconstructs
+    // the exact original transaction.
+    const V5_V6_COINBASE_SCRIPT_LENGTH_OFFSET: usize = 20 + 1 + 36;
+    let commitment_offset = extended_bytes
+        .windows(commitment.len())
+        .position(|window| window == commitment)
+        .expect("the complete commitment occurs in the serialized coinbase");
+    let mut restored = extended_bytes.clone();
+    restored.drain(commitment_offset..commitment_offset + commitment.len());
+    restored[V5_V6_COINBASE_SCRIPT_LENGTH_OFFSET] =
+        original_bytes[V5_V6_COINBASE_SCRIPT_LENGTH_OFFSET];
+    assert_eq!(restored, original_bytes);
+    assert_eq!(
+        extended_transaction.ironwood_shielded_data(),
+        original_transaction.ironwood_shielded_data(),
+        "the Ironwood proof and binding authorization are unchanged",
+    );
+    let previous_outputs = Arc::new(Vec::new());
+    assert_eq!(
+        original_transaction
+            .sighash(
+                NetworkUpgrade::Nu6_3,
+                HashType::ALL,
+                previous_outputs.clone(),
+                None,
+            )
+            .expect("original shielded signature hash is defined"),
+        extended_transaction
+            .sighash(NetworkUpgrade::Nu6_3, HashType::ALL, previous_outputs, None,)
+            .expect("extended shielded signature hash is defined"),
+        "coinbase miner data is authorizing data but not part of the shielded signature hash",
+    );
+    zebra_consensus::transaction::check::coinbase_outputs_are_decryptable(
+        &extended_transaction,
+        &net,
+        height,
+    )
+    .expect("the unchanged shielded coinbase authorization remains valid");
+
+    let history_root = Some([0x55; 32].into());
+    let original_roots = DefaultRoots::from_coinbase(&net, height, &original, history_root, &[]);
+    let extended_roots = DefaultRoots::from_coinbase(&net, height, &extended, history_root, &[]);
+    assert_eq!(
+        original_roots.merkle_root(),
+        extended_roots.merkle_root(),
+        "the txid Merkle root stays unchanged",
+    );
+    assert_ne!(
+        original_roots.auth_data_root(),
+        extended_roots.auth_data_root(),
+        "the auth-data root commits to the new miner data",
+    );
+    assert_ne!(
+        original_roots.block_commitments_hash(),
+        extended_roots.block_commitments_hash(),
+        "the header commitment is rebuilt from the new auth-data root",
+    );
+}
+
+#[test]
+fn wcash_aux_commitment_rejects_an_oversized_coinbase_script() {
+    use zcash_address::ZcashAddress;
+
+    use crate::config::mining::{ExtraCoinbaseData, MAX_USER_COINBASE_DATA_LEN};
+
+    let net = Network::Mainnet;
+    let height = NetworkUpgrade::Nu5
+        .activation_height(&net)
+        .expect("Nu5 is active on Mainnet");
+    let address: ZcashAddress = default_miner_address(net.kind(), &MinerAddressType::Transparent)
+        .parse()
+        .expect("hard-coded transparent address parses");
+    let miner_params = MinerParams::new(
+        &net,
+        Config {
+            miner_address: Some(address.into()),
+            extra_coinbase_data: Some(
+                ExtraCoinbaseData::try_from("x".repeat(MAX_USER_COINBASE_DATA_LEN))
+                    .expect("maximum configured tag is valid"),
+            ),
+            ..Default::default()
+        },
+    )
+    .expect("valid maximum-length miner configuration");
+    let coinbase = TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero())
+        .expect("base coinbase fits the consensus limit");
+
+    let error = coinbase
+        .with_wcash_aux([0x42; 32], 0)
+        .expect_err("the 44-byte commitment must not overflow the 100-byte script limit");
+    assert!(error.to_string().contains("maximum is 100"));
+}
+
+#[test]
+fn wcash_aux_commitment_supports_v5_and_rejects_pre_zip244_coinbases() {
+    let net = Network::Mainnet;
+    let miner_params = MinerParams::from(
+        Address::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Transparent),
+        )
+        .expect("hard-coded transparent address is valid"),
+    );
+    let block_hash = [0x42; 32];
+
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&net)
+        .expect("Nu5 is active on Mainnet");
+    let v5 = TransactionTemplate::new_coinbase(&net, nu5_height, &miner_params, Amount::zero())
+        .expect("valid v5 coinbase");
+    let extended_v5 = v5
+        .clone()
+        .with_wcash_aux(block_hash, 11)
+        .expect("v5 uses the ZIP-244 transparent prefix");
+    let extended_transaction: Transaction = extended_v5
+        .data()
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("extended v5 coinbase deserializes");
+    assert_eq!(extended_transaction.version(), 5);
+    assert_eq!(extended_v5.hash(), v5.hash());
+    assert_ne!(extended_v5.auth_digest(), v5.auth_digest());
+    wcash_zcash_aux::validate_miner_data_commitment(
+        extended_transaction.inputs()[0].miner_data().unwrap(),
+        block_hash,
+        &[],
+        0,
+    )
+    .expect("v5 carries the exact requested commitment");
+
+    let sapling_height = NetworkUpgrade::Sapling
+        .activation_height(&net)
+        .expect("Sapling is active on Mainnet");
+    let v4 = TransactionTemplate::new_coinbase(&net, sapling_height, &miner_params, Amount::zero())
+        .expect("valid historical v4 coinbase");
+    let error = v4
+        .with_wcash_aux(block_hash, 11)
+        .expect_err("pre-ZIP-244 formats are rejected rather than wire-spliced");
+    assert!(error.to_string().contains("require a v5 or v6"));
+}
+
+#[test]
+fn wcash_aux_parameters_are_fresh_zcash_templates_only() {
+    let aux = WcashAuxRequest::new(block::Hash([0x42; 32]), 9);
+    let standard_template = GetBlockTemplateParameters::new(
+        GetBlockTemplateRequestMode::Template,
+        None,
+        vec![],
+        None,
+        None,
+    );
+    assert!(check_parameters(&Some(standard_template.clone()), &Network::Mainnet).is_ok());
+
+    let aux_template = standard_template.clone().with_wcash_aux(aux);
+    assert!(check_parameters(&Some(aux_template.clone()), &Network::Mainnet).is_ok());
+    assert!(check_parameters(&Some(aux_template), &Network::new_wcash_regtest()).is_err());
+
+    let proposal = GetBlockTemplateParameters::new(
+        GetBlockTemplateRequestMode::Proposal,
+        Some(HexData(vec![0])),
+        vec![],
+        None,
+        None,
+    )
+    .with_wcash_aux(aux);
+    assert!(check_parameters(&Some(proposal), &Network::Mainnet).is_err());
+
+    let long_poll_id = "0"
+        .repeat(LONG_POLL_ID_LENGTH)
+        .parse()
+        .expect("zero long-poll id is valid");
+    let long_poll = GetBlockTemplateParameters::new(
+        GetBlockTemplateRequestMode::Template,
+        None,
+        vec![],
+        Some(long_poll_id),
+        None,
+    )
+    .with_wcash_aux(aux);
+    assert!(check_parameters(&Some(long_poll), &Network::Mainnet).is_err());
 }
 
 /// Tests that the coinbase cache reuses a previously built coinbase for the same height and fees,
@@ -368,12 +667,12 @@ fn coinbase_at_nu6_3_routes_shielded_output_to_ironwood() {
     let height = NetworkUpgrade::Nu6_3
         .activation_height(&net)
         .expect("Nu6.3 is scheduled on Testnet");
+    let encoded_address = default_miner_address(net.kind(), &MinerAddressType::Unified);
+    let expected_address: zcash_address::ZcashAddress = encoded_address
+        .parse()
+        .expect("hard-coded Unified address is valid");
     let miner_params = MinerParams::from(
-        Address::decode(
-            &net,
-            default_miner_address(net.kind(), &MinerAddressType::Unified),
-        )
-        .expect("hard-coded Unified address is valid"),
+        Address::decode(&net, encoded_address).expect("hard-coded Unified address is valid"),
     );
 
     let template = TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero())
@@ -393,6 +692,26 @@ fn coinbase_at_nu6_3_routes_shielded_output_to_ironwood() {
     );
     zebra_consensus::transaction::check::coinbase_outputs_are_decryptable(&coinbase, &net, height)
         .expect("Ironwood coinbase output is recoverable with the zero outgoing viewing key");
+    assert!(
+        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_shielded_value_to(
+            &coinbase,
+            &expected_address,
+        )
+        .is_some_and(|value| value > 0),
+        "the exact serialized coinbase pays a positive value to the configured UA"
+    );
+    let different_address: zcash_address::ZcashAddress =
+        default_miner_address(net.kind(), &MinerAddressType::Transparent)
+            .parse()
+            .expect("hard-coded transparent address is valid");
+    assert_eq!(
+        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_shielded_value_to(
+            &coinbase,
+            &different_address,
+        ),
+        None,
+        "a different payout receiver must not match the serialized Ironwood note"
+    );
 }
 
 /// Wcash templates pay the entire coinbase reward privately into Ironwood and reject miner
@@ -416,6 +735,19 @@ fn wcash_coinbase_is_private_and_ironwood_only() {
     let template = TransactionTemplate::new_coinbase(&net, height, &miner_params, miner_fees)
         .expect("valid private Wcash coinbase tx");
     let coinbase: Transaction = template.data.as_ref().zcash_deserialize_into().unwrap();
+
+    let inherited_zcash_address = default_miner_address(net.kind(), &MinerAddressType::Unified);
+    let public_zcash_address: zcash_address::ZcashAddress = inherited_zcash_address
+        .parse()
+        .expect("hard-coded Zcash address is valid");
+    assert_eq!(
+        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_shielded_value_to(
+            &coinbase,
+            &public_zcash_address,
+        ),
+        None,
+        "the deliberately private Wcash coinbase must not pass the Zcash payout recovery check"
+    );
 
     assert_eq!(coinbase.version(), 6);
     assert!(coinbase.is_coinbase());
@@ -449,7 +781,6 @@ fn wcash_coinbase_is_private_and_ironwood_only() {
     ));
     assert!(MinerParams::new(&net, config_for(&unified_address)).is_ok());
 
-    let inherited_zcash_address = default_miner_address(net.kind(), &MinerAddressType::Unified);
     assert!(matches!(
         MinerParams::new(&net, config_for(inherited_zcash_address)),
         Err(super::MinerParamsError::WcashAddressNamespaceRequired)

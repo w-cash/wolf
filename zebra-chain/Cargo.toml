@@ -33,6 +33,9 @@ async-error = [
 # Experimental internal miner support
 internal-miner = ["equihash/solver"]
 
+# Select Wcash aggregate monetary bounds.
+wcash-consensus = []
+
 # Experimental elasticsearch support
 elasticsearch = []
 

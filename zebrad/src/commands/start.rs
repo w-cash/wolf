@@ -120,7 +120,7 @@ use crate::components;
 #[derive(Command, Debug, Default, clap::Parser)]
 pub struct StartCmd {
     /// Filter strings which override the config file and defaults
-    #[clap(help = "tracing filters which override the wcash.toml config")]
+    #[clap(help = "tracing filters which override the node TOML configuration")]
     filters: Vec<String>,
 
     /// Enable zcashd-compat mode.
@@ -668,12 +668,16 @@ impl StartCmd {
         }
         let syncer_task_handle = tokio::spawn(syncer.sync().in_current_span());
 
-        // And finally, spawn the internal Wcash AuxPoW miner, if it is enabled.
+        // And finally, spawn the internal miner, if it is enabled.
         //
         // TODO: add a config to enable the miner rather than a feature.
         #[cfg(feature = "internal-miner")]
         let miner_task_handle = if config.mining.is_internal_miner_enabled() {
-            info!("spawning Wcash AuxPoW miner");
+            if config.network.network.uses_wcash_consensus() {
+                info!("spawning Wcash AuxPoW miner");
+            } else {
+                info!("spawning Zcash miner");
+            }
             components::miner::spawn_init(&config.metrics, rpc_impl)
         } else {
             tokio::spawn(std::future::pending().in_current_span())
@@ -684,7 +688,7 @@ impl StartCmd {
         let miner_task_handle: tokio::task::JoinHandle<Result<(), Report>> =
             tokio::spawn(std::future::pending().in_current_span());
 
-        info!("spawned initial Wcash tasks");
+        info!("spawned initial Zebra tasks");
 
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
 
@@ -880,7 +884,7 @@ impl StartCmd {
         old_databases_task_handle.abort();
 
         info!(
-            "exiting Wcash: all tasks have been asked to stop, waiting for remaining tasks to finish"
+            "exiting Zebra: all tasks have been asked to stop, waiting for remaining tasks to finish"
         );
 
         exit_status
@@ -910,7 +914,11 @@ impl StartCmd {
 impl Runnable for StartCmd {
     /// Start the application.
     fn run(&self) {
-        info!("Starting Wcash");
+        if cfg!(feature = "wcash-consensus") {
+            info!("Starting Wcash");
+        } else {
+            info!("Starting zebrad");
+        }
         let rt = APPLICATION
             .state()
             .components_mut()
@@ -922,7 +930,11 @@ impl Runnable for StartCmd {
         rt.expect("runtime should not already be taken")
             .run(self.start());
 
-        info!("stopping Wcash");
+        if cfg!(feature = "wcash-consensus") {
+            info!("stopping Wcash");
+        } else {
+            info!("stopping zebrad");
+        }
     }
 }
 
@@ -931,13 +943,18 @@ impl config::Override<ZebradConfig> for StartCmd {
     // a configuration file using explicit flags taken from command-line
     // arguments.
     fn override_config(&self, mut config: ZebradConfig) -> Result<ZebradConfig, FrameworkError> {
-        // This fork deliberately widens aggregate value-pool accounting for Wcash's
-        // 33.6-million-coin issuance. The inherited Zcash network definitions remain
-        // available to lower-level library tests, but running this binary against a
-        // Zcash network would apply the wrong monetary bounds and is therefore unsafe.
+        #[cfg(feature = "wcash-consensus")]
         if !config.network.network.uses_wcash_consensus() {
             return Err(std::io::Error::other(
-                "this Wcash node build only supports network = 'WcashRegtest'; inherited Zcash networks are library/test fixtures",
+                "this Wcash consensus build only supports network = 'WcashRegtest'; inherited Zcash networks use different monetary bounds",
+            )
+            .into());
+        }
+
+        #[cfg(not(feature = "wcash-consensus"))]
+        if config.network.network.uses_wcash_consensus() {
+            return Err(std::io::Error::other(
+                "this Zcash consensus build does not support Wcash networks; rebuild with --features wcash-consensus",
             )
             .into());
         }
@@ -1003,6 +1020,7 @@ mod tests {
     use crate::components::zcashd_compat;
     use crate::config::ZebradConfig;
 
+    #[cfg(feature = "wcash-consensus")]
     #[test]
     fn start_rejects_inherited_zcash_networks() {
         let cmd = StartCmd {
@@ -1020,6 +1038,54 @@ mod tests {
         assert!(error.to_string().contains("only supports network"));
     }
 
+    #[cfg(not(feature = "wcash-consensus"))]
+    #[test]
+    fn start_rejects_wcash_networks() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.network.network = zebra_chain::parameters::Network::new_wcash_regtest();
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("the Zcash binary must not use Wcash monetary bounds");
+
+        assert!(error
+            .to_string()
+            .contains("does not support Wcash networks"));
+    }
+
+    #[test]
+    fn start_accepts_default_network_for_selected_consensus() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+
+        let config = cmd
+            .override_config(ZebradConfig::default())
+            .expect("the default network must match the selected consensus build");
+
+        assert_eq!(
+            config.network.network.uses_wcash_consensus(),
+            cfg!(feature = "wcash-consensus")
+        );
+
+        #[cfg(not(feature = "wcash-consensus"))]
+        assert_eq!(
+            zebra_chain::amount::MAX_MONEY,
+            21_000_000 * zebra_chain::amount::COIN
+        );
+
+        #[cfg(feature = "wcash-consensus")]
+        assert_eq!(zebra_chain::amount::MAX_MONEY, 3_359_999_978_160_000);
+    }
+
+    #[cfg(feature = "wcash-consensus")]
     #[test]
     fn start_rejects_zcash_miner_address_on_wcash() {
         let cmd = StartCmd {

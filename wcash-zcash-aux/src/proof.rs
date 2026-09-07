@@ -4,14 +4,15 @@ use crate::{
     codec::{encode_compact_size, Reader},
     merkle::auxiliary_tree_size,
     AuxPowError, ParentHeader, ValidatedCommitment, ValidatedParentWork,
-    MAX_AUXILIARY_BRANCH_DEPTH, MAX_COINBASE_BYTES, MAX_PARENT_BRANCH_DEPTH, MAX_PROOF_BYTES,
-    PARENT_HEADER_BYTES, PROOF_MAGIC, PROOF_VERSION,
+    MAX_AUTH_DATA_BRANCH_DEPTH, MAX_AUXILIARY_BRANCH_DEPTH, MAX_COINBASE_BYTES,
+    MAX_PARENT_BRANCH_DEPTH, MAX_PROOF_BYTES, PARENT_HEADER_BYTES, PROOF_MAGIC, PROOF_VERSION,
 };
 
 #[cfg(any(feature = "zebra", test))]
 use crate::{
-    commitment::validate_commitment, merkle::sha256d_merkle_root, CoinbaseSummary,
-    CoinbaseVerifier, Equihash200_9, EquihashVerifier, Target,
+    commitment::validate_miner_data_commitment,
+    merkle::{auth_data_merkle_root, block_commitments_hash, sha256d_merkle_root},
+    CoinbaseSummary, CoinbaseVerifier, Equihash200_9, EquihashVerifier, Target,
 };
 
 /// Structurally decoded Zcash-parent AuxPoW proof.
@@ -25,6 +26,9 @@ pub struct AuxPowProof {
     coinbase_bytes: Box<[u8]>,
     parent_merkle_branch: Box<[[u8; 32]]>,
     parent_coinbase_index: u32,
+    auth_data_merkle_branch: Box<[[u8; 32]]>,
+    auth_data_coinbase_index: u32,
+    chain_history_root: [u8; 32],
     auxiliary_merkle_branch: Box<[[u8; 32]]>,
     auxiliary_index: u32,
     parent_header: ParentHeader,
@@ -37,6 +41,9 @@ impl AuxPowProof {
         coinbase_bytes: impl Into<Box<[u8]>>,
         parent_merkle_branch: impl Into<Box<[[u8; 32]]>>,
         parent_coinbase_index: u32,
+        auth_data_merkle_branch: impl Into<Box<[[u8; 32]]>>,
+        auth_data_coinbase_index: u32,
+        chain_history_root: [u8; 32],
         auxiliary_merkle_branch: impl Into<Box<[[u8; 32]]>>,
         auxiliary_index: u32,
         parent_header: ParentHeader,
@@ -45,6 +52,9 @@ impl AuxPowProof {
             coinbase_bytes: coinbase_bytes.into(),
             parent_merkle_branch: parent_merkle_branch.into(),
             parent_coinbase_index,
+            auth_data_merkle_branch: auth_data_merkle_branch.into(),
+            auth_data_coinbase_index,
+            chain_history_root,
             auxiliary_merkle_branch: auxiliary_merkle_branch.into(),
             auxiliary_index,
             parent_header,
@@ -94,6 +104,10 @@ impl AuxPowProof {
         let parent_merkle_branch: Box<[[u8; 32]]> =
             read_branch(&mut reader, "parent", MAX_PARENT_BRANCH_DEPTH)?.into();
         let parent_coinbase_index = reader.read_u32_le("parent coinbase index")?;
+        let auth_data_merkle_branch: Box<[[u8; 32]]> =
+            read_branch(&mut reader, "auth-data", MAX_AUTH_DATA_BRANCH_DEPTH)?.into();
+        let auth_data_coinbase_index = reader.read_u32_le("auth-data coinbase index")?;
+        let chain_history_root = reader.read_array("chain-history root")?;
         let auxiliary_merkle_branch: Box<[[u8; 32]]> =
             read_branch(&mut reader, "auxiliary", MAX_AUXILIARY_BRANCH_DEPTH)?.into();
         let auxiliary_index = reader.read_u32_le("auxiliary index")?;
@@ -107,6 +121,9 @@ impl AuxPowProof {
             coinbase_bytes,
             parent_merkle_branch,
             parent_coinbase_index,
+            auth_data_merkle_branch,
+            auth_data_coinbase_index,
+            chain_history_root,
             auxiliary_merkle_branch,
             auxiliary_index,
             parent_header,
@@ -131,6 +148,9 @@ impl AuxPowProof {
         output.extend_from_slice(&self.coinbase_bytes);
         write_branch(&self.parent_merkle_branch, &mut output);
         output.extend_from_slice(&self.parent_coinbase_index.to_le_bytes());
+        write_branch(&self.auth_data_merkle_branch, &mut output);
+        output.extend_from_slice(&self.auth_data_coinbase_index.to_le_bytes());
+        output.extend_from_slice(&self.chain_history_root);
         write_branch(&self.auxiliary_merkle_branch, &mut output);
         output.extend_from_slice(&self.auxiliary_index.to_le_bytes());
         output.extend_from_slice(self.parent_header.as_bytes());
@@ -195,8 +215,9 @@ impl AuxPowProof {
         self.parent_header.check_target(required_target)?;
         let coinbase = coinbase_verifier.verify(&self.coinbase_bytes)?;
         self.validate_parent_merkle_path(&coinbase)?;
-        let commitment = validate_commitment(
-            coinbase.transparent_outputs(),
+        let auth_data_root = self.validate_parent_auth_data_path(&coinbase)?;
+        let commitment = validate_miner_data_commitment(
+            coinbase.miner_data(),
             auxiliary_block_hash,
             &self.auxiliary_merkle_branch,
             self.auxiliary_index,
@@ -208,6 +229,9 @@ impl AuxPowProof {
         Ok(ValidatedAuxPow {
             parent_work,
             coinbase_transaction_id: coinbase.transaction_id(),
+            coinbase_authorizing_data_digest: coinbase.authorizing_data_digest(),
+            auth_data_root,
+            chain_history_root: self.chain_history_root,
             commitment,
         })
     }
@@ -225,6 +249,21 @@ impl AuxPowProof {
     /// Returns the explicit parent coinbase index, which must be zero.
     pub const fn parent_coinbase_index(&self) -> u32 {
         self.parent_coinbase_index
+    }
+
+    /// Returns the parent authorizing-data Merkle branch.
+    pub fn auth_data_merkle_branch(&self) -> &[[u8; 32]] {
+        &self.auth_data_merkle_branch
+    }
+
+    /// Returns the authorizing-data index, which must be coinbase slot zero.
+    pub const fn auth_data_coinbase_index(&self) -> u32 {
+        self.auth_data_coinbase_index
+    }
+
+    /// Returns the raw parent chain-history root committed by the header.
+    pub const fn chain_history_root(&self) -> [u8; 32] {
+        self.chain_history_root
     }
 
     /// Returns the auxiliary Merkle branch.
@@ -260,6 +299,35 @@ impl AuxPowProof {
         Ok(())
     }
 
+    #[cfg(any(feature = "zebra", test))]
+    fn validate_parent_auth_data_path(
+        &self,
+        coinbase: &CoinbaseSummary,
+    ) -> Result<[u8; 32], AuxPowError> {
+        if self.auth_data_coinbase_index != 0 {
+            return Err(AuxPowError::ParentAuthDataIndexNotZero(
+                self.auth_data_coinbase_index,
+            ));
+        }
+        if self.parent_merkle_branch.len() != self.auth_data_merkle_branch.len() {
+            return Err(AuxPowError::ParentMerkleDepthMismatch {
+                transaction: self.parent_merkle_branch.len(),
+                auth_data: self.auth_data_merkle_branch.len(),
+            });
+        }
+
+        let auth_data_root = auth_data_merkle_root(
+            coinbase.authorizing_data_digest(),
+            &self.auth_data_merkle_branch,
+            self.auth_data_coinbase_index,
+        )?;
+        let expected = block_commitments_hash(self.chain_history_root, auth_data_root);
+        if expected != self.parent_header.block_commitments_hash() {
+            return Err(AuxPowError::ParentBlockCommitmentsMismatch);
+        }
+        Ok(auth_data_root)
+    }
+
     fn check_bounds(&self) -> Result<(), AuxPowError> {
         if self.coinbase_bytes.len() > MAX_COINBASE_BYTES {
             return Err(AuxPowError::CoinbaseTooLarge {
@@ -273,6 +341,11 @@ impl AuxPowProof {
             MAX_PARENT_BRANCH_DEPTH,
         )?;
         check_branch(
+            "auth-data",
+            self.auth_data_merkle_branch.len(),
+            MAX_AUTH_DATA_BRANCH_DEPTH,
+        )?;
+        check_branch(
             "auxiliary",
             self.auxiliary_merkle_branch.len(),
             MAX_AUXILIARY_BRANCH_DEPTH,
@@ -281,6 +354,17 @@ impl AuxPowProof {
             return Err(AuxPowError::ParentCoinbaseIndexNotZero(
                 self.parent_coinbase_index,
             ));
+        }
+        if self.auth_data_coinbase_index != 0 {
+            return Err(AuxPowError::ParentAuthDataIndexNotZero(
+                self.auth_data_coinbase_index,
+            ));
+        }
+        if self.parent_merkle_branch.len() != self.auth_data_merkle_branch.len() {
+            return Err(AuxPowError::ParentMerkleDepthMismatch {
+                transaction: self.parent_merkle_branch.len(),
+                auth_data: self.auth_data_merkle_branch.len(),
+            });
         }
         let tree_size = auxiliary_tree_size(self.auxiliary_merkle_branch.len())?;
         if self.auxiliary_index >= tree_size {
@@ -297,7 +381,8 @@ impl AuxPowProof {
         let branch_bytes = self
             .parent_merkle_branch
             .len()
-            .checked_add(self.auxiliary_merkle_branch.len())
+            .checked_add(self.auth_data_merkle_branch.len())
+            .and_then(|nodes| nodes.checked_add(self.auxiliary_merkle_branch.len()))
             .and_then(|nodes| nodes.checked_mul(32))
             .ok_or(AuxPowError::EncodingLengthOverflow)?;
         PROOF_MAGIC
@@ -310,6 +395,11 @@ impl AuxPowProof {
             })
             .and_then(|length| length.checked_add(branch_bytes))
             .and_then(|length| length.checked_add(4))
+            .and_then(|length| {
+                length.checked_add(compact_size_len(self.auth_data_merkle_branch.len()))
+            })
+            .and_then(|length| length.checked_add(4))
+            .and_then(|length| length.checked_add(32))
             .and_then(|length| {
                 length.checked_add(compact_size_len(self.auxiliary_merkle_branch.len()))
             })
@@ -325,6 +415,9 @@ impl AuxPowProof {
 pub struct ValidatedAuxPow {
     parent_work: ValidatedParentWork,
     coinbase_transaction_id: [u8; 32],
+    coinbase_authorizing_data_digest: [u8; 32],
+    auth_data_root: [u8; 32],
+    chain_history_root: [u8; 32],
     commitment: ValidatedCommitment,
 }
 
@@ -337,6 +430,21 @@ impl ValidatedAuxPow {
     /// Returns the authenticated parent coinbase transaction ID.
     pub const fn coinbase_transaction_id(&self) -> [u8; 32] {
         self.coinbase_transaction_id
+    }
+
+    /// Returns the authenticated coinbase ZIP-244 authorizing-data digest.
+    pub const fn coinbase_authorizing_data_digest(&self) -> [u8; 32] {
+        self.coinbase_authorizing_data_digest
+    }
+
+    /// Returns the authenticated ZIP-244 authorizing-data Merkle root.
+    pub const fn auth_data_root(&self) -> [u8; 32] {
+        self.auth_data_root
+    }
+
+    /// Returns the chain-history root used to authenticate `hashBlockCommitments`.
+    pub const fn chain_history_root(&self) -> [u8; 32] {
+        self.chain_history_root
     }
 
     /// Returns the validated merge-mining commitment.
@@ -392,8 +500,7 @@ const fn compact_size_len(value: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use crate::{
-        commitment_script, expected_auxiliary_index, merkle::sha256d, CoinbaseSummary,
-        TransparentOutput,
+        expected_auxiliary_index, merkle::sha256d, miner_data_commitment, CoinbaseSummary,
     };
 
     #[cfg(feature = "zebra")]
@@ -428,10 +535,11 @@ mod tests {
         }
     }
 
-    fn header_with_merkle_root(root: [u8; 32]) -> ParentHeader {
+    fn header_with_roots(merkle_root: [u8; 32], block_commitments: [u8; 32]) -> ParentHeader {
         let mut bytes = vec![0; PARENT_HEADER_BYTES];
         bytes[..4].copy_from_slice(&4u32.to_le_bytes());
-        bytes[36..68].copy_from_slice(&root);
+        bytes[36..68].copy_from_slice(&merkle_root);
+        bytes[68..100].copy_from_slice(&block_commitments);
         bytes[104..108].copy_from_slice(&0x1f07_ffffu32.to_le_bytes());
         bytes[140..143].copy_from_slice(&[0xfd, 0x40, 0x05]);
         ParentHeader::decode(&bytes).expect("fixture header has canonical framing")
@@ -441,27 +549,35 @@ mod tests {
         let auxiliary_branch = vec![[0x11; 32], [0x22; 32], [0x33; 32]];
         let auxiliary_index = expected_auxiliary_index(AUX_NONCE, auxiliary_branch.len())
             .expect("fixture depth is valid");
-        let script = commitment_script(AUX_HASH, &auxiliary_branch, auxiliary_index, AUX_NONCE)
-            .expect("fixture commitment is valid");
+        let payload =
+            miner_data_commitment(AUX_HASH, &auxiliary_branch, auxiliary_index, AUX_NONCE)
+                .expect("fixture commitment is valid");
+        let mut miner_data = b"fixture-pool".to_vec();
+        miner_data.extend_from_slice(&payload);
         let txid = sha256d(COINBASE);
         let parent_branch = vec![[0x55; 32]];
         let parent_root =
             sha256d_merkle_root(txid, &parent_branch, 0).expect("fixture parent branch is valid");
-        let header = header_with_merkle_root(parent_root);
+        let authorizing_data_digest = [0x66; 32];
+        let auth_data_branch = vec![[0x77; 32]];
+        let auth_data_root = auth_data_merkle_root(authorizing_data_digest, &auth_data_branch, 0)
+            .expect("fixture auth-data branch is valid");
+        let chain_history_root = [0x88; 32];
+        let header = header_with_roots(
+            parent_root,
+            block_commitments_hash(chain_history_root, auth_data_root),
+        );
         let coinbase_verifier = FixtureCoinbase {
             expected_bytes: COINBASE.to_vec(),
-            summary: CoinbaseSummary::new(
-                txid,
-                vec![
-                    TransparentOutput::new(50, vec![0x51]),
-                    TransparentOutput::new(0, script),
-                ],
-            ),
+            summary: CoinbaseSummary::new(txid, authorizing_data_digest, miner_data),
         };
         let proof = AuxPowProof::new(
             COINBASE.to_vec(),
             parent_branch,
             0,
+            auth_data_branch,
+            0,
+            chain_history_root,
             auxiliary_branch,
             auxiliary_index,
             header,
@@ -489,6 +605,14 @@ mod tests {
     #[test]
     fn raw_byte_order_interoperability_vector() {
         use sha2::{Digest, Sha256};
+        use zebra_chain::{
+            amount::{Amount, NonNegative},
+            block::Height,
+            parameters::NetworkUpgrade,
+            serialization::ZcashSerialize,
+            transaction::{LockTime, Transaction},
+            transparent::{Input, Output, Script},
+        };
 
         const AUXILIARY_BLOCK_ID: [u8; 32] = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
@@ -505,16 +629,16 @@ mod tests {
         let leaf = auxiliary_leaf(AUXILIARY_BLOCK_ID);
         assert_eq!(
             hex::encode(leaf),
-            "02738bd4cbffaecb1ac3265b1dccb2018cd2b4d64277a41509734167c0b28257"
+            "b38059dd1ca081e4a23cd86d4743aa48ce241675c5e89a1692976f4f509a8c82"
         );
         let auxiliary_root = sha256d_merkle_root(leaf, &auxiliary_branch, auxiliary_index)
             .expect("the vector's auxiliary position is valid");
         assert_eq!(
             hex::encode(auxiliary_root),
-            "9b48d0cb7ba1925f0ef43d4c401d50a6f129c8aa98a032db880df56285a84cc2"
+            "8d5950951d66307c42153ca11df77463bb828206cc18a1711a24b0e346781b92"
         );
 
-        let script = commitment_script(
+        let payload = miner_data_commitment(
             AUXILIARY_BLOCK_ID,
             &auxiliary_branch,
             auxiliary_index,
@@ -522,8 +646,8 @@ mod tests {
         )
         .expect("the vector has a valid deterministic slot");
         assert_eq!(
-            hex::encode(&script),
-            "6a2cfabe6d6dc24ca88562f50d88db32a098aac829f1a6501d404c3df40e5f92a17bcbd0489b040000000a0b0c0d"
+            hex::encode(payload),
+            "fabe6d6d921b7846e3b0241a71a118cc068282bb6374f71da13c15427c30661d9550598d040000000a0b0c0d"
         );
 
         let mut display_order_id = AUXILIARY_BLOCK_ID;
@@ -534,37 +658,38 @@ mod tests {
             "display-order hashes are not valid substitutes for raw block IDs"
         );
 
-        // Canonical V1 Zcash coinbase at height 1 with the exact zero-value
-        // commitment output. V1 keeps this independently reproducible without
-        // importing a network-upgrade-specific transaction builder.
-        let mut coinbase = Vec::new();
-        coinbase.extend_from_slice(&1u32.to_le_bytes());
-        coinbase.push(1);
-        coinbase.extend_from_slice(&[0; 32]);
-        coinbase.extend_from_slice(&u32::MAX.to_le_bytes());
-        coinbase.extend_from_slice(&[2, 0x51, 0xab]);
-        coinbase.extend_from_slice(&u32::MAX.to_le_bytes());
-        coinbase.push(1);
-        coinbase.extend_from_slice(&0u64.to_le_bytes());
-        coinbase.push(46);
-        coinbase.extend_from_slice(&script);
-        coinbase.extend_from_slice(&0u32.to_le_bytes());
-        assert_eq!(coinbase.len(), 108);
-        assert_eq!(
-            hex::encode(&coinbase),
-            concat!(
-                "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0251abffffffff",
-                "0100000000000000002e6a2cfabe6d6dc24ca88562f50d88db32a098aac829f1a6501d404c3df40e5f92a17bcbd0489b",
-                "040000000a0b0c0d00000000",
-            )
-        );
+        let mut miner_data = b"wcash-vector/".to_vec();
+        miner_data.extend_from_slice(&payload);
+        let coinbase = Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu6_3,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(2_900_000),
+            inputs: vec![Input::Coinbase {
+                height: Height(2_900_000),
+                data: miner_data,
+                sequence: u32::MAX,
+            }],
+            outputs: vec![Output::new(
+                Amount::<NonNegative>::zero(),
+                Script::new(&[0x51]),
+            )],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+        }
+        .zcash_serialize_to_vec()
+        .expect("the v6 vector coinbase serializes canonically");
 
         let coinbase_summary = crate::ZebraCoinbaseVerifier
             .verify(&coinbase)
             .expect("the pinned Zebra parser accepts the canonical vector coinbase");
         assert_eq!(
             hex::encode(coinbase_summary.transaction_id()),
-            "c3b6b1e87d678d15dcc4a33ea1483733c41395fa10b1661633a872b3822643a3"
+            "4de1adc9e0576890004dc1f70468fb06877dd5d64fb2a99fdeeb1bacab672ff0"
+        );
+        assert_eq!(
+            hex::encode(coinbase_summary.authorizing_data_digest()),
+            "065d4020b28e88546e8059198691348d3ab5175285bbdd26009e87e9420eed15"
         );
 
         let parent_branch = [ascending_bytes::<32>(0x60)];
@@ -572,14 +697,31 @@ mod tests {
             .expect("the vector coinbase is at parent index zero");
         assert_eq!(
             hex::encode(parent_root),
-            "4bc36b65591db52f240d1030dd12e8131532e9c3d4389ffd2d0cc988025acf9c"
+            "99b2b282e8c6d72ea1caf8ca540cee4ea12cacc56958c578b4e7611cce93ff5e"
+        );
+        let auth_data_branch = [ascending_bytes::<32>(0x70)];
+        let auth_data_root = auth_data_merkle_root(
+            coinbase_summary.authorizing_data_digest(),
+            &auth_data_branch,
+            0,
+        )
+        .expect("the vector auth-data path is valid");
+        assert_eq!(
+            hex::encode(auth_data_root),
+            "57d3d3462d84ed7d862dd4660b5b1ab90af5992eada5a28a5b4db93cb2795644"
+        );
+        let chain_history_root = ascending_bytes::<32>(0xa0);
+        let parent_block_commitments = block_commitments_hash(chain_history_root, auth_data_root);
+        assert_eq!(
+            hex::encode(parent_block_commitments),
+            "c8c145287afb11de88a57e1f5efe5026855684f906dbfb7c8bcd4ea96b86b165"
         );
 
         let mut header_bytes = vec![0; PARENT_HEADER_BYTES];
         header_bytes[..4].copy_from_slice(&4u32.to_le_bytes());
         header_bytes[4..36].copy_from_slice(&ascending_bytes::<32>(0x80));
         header_bytes[36..68].copy_from_slice(&parent_root);
-        header_bytes[68..100].copy_from_slice(&ascending_bytes::<32>(0xa0));
+        header_bytes[68..100].copy_from_slice(&parent_block_commitments);
         header_bytes[100..104].copy_from_slice(&0x0102_0304u32.to_le_bytes());
         header_bytes[104..108].copy_from_slice(&0x1f07_ffffu32.to_le_bytes());
         header_bytes[108..140].copy_from_slice(&ascending_bytes::<32>(0xc0));
@@ -592,21 +734,23 @@ mod tests {
             coinbase,
             parent_branch,
             0,
+            auth_data_branch,
+            0,
+            chain_history_root,
             auxiliary_branch,
             auxiliary_index,
             parent_header,
         )
         .expect("the interoperability proof is structurally valid");
         let encoded = proof.encode().expect("the bounded proof encodes");
-        assert_eq!(encoded.len(), 1_707);
-
+        assert_eq!(encoded.len(), 1_806);
         assert_eq!(
             hex::encode(&encoded),
-            include_str!("../test-vectors/auxpow-v1-non-palindromic.hex").trim()
+            include_str!("../test-vectors/auxpow-v2-non-palindromic.hex").trim()
         );
         assert_eq!(
             hex::encode(Sha256::digest(&encoded)),
-            "38d7a19f0627a850b76f77920e7422e54935001b5ce50bc3372e8193226f556b"
+            "d94e88abf717c604db33e42ea319f727bc072b86f7e7e0077d2ab5b7d40c18cf"
         );
         assert_eq!(
             AuxPowProof::decode(&encoded),
@@ -627,6 +771,38 @@ mod tests {
             coinbase_summary.transaction_id()
         );
         assert_eq!(validated.commitment().auxiliary_root(), auxiliary_root);
+
+        // ZIP-244 deliberately leaves coinbase miner data outside the mined
+        // transaction ID. Prove that v2 still rejects a byte-for-byte valid
+        // alternative coinbase through the independently authenticated digest.
+        let mut changed_authorizing_data = proof.clone();
+        let pool_tag_offset = changed_authorizing_data
+            .coinbase_bytes
+            .windows(b"wcash-vector/".len())
+            .position(|window| window == b"wcash-vector/")
+            .expect("the vector contains its pool tag");
+        changed_authorizing_data.coinbase_bytes[pool_tag_offset] ^= 1;
+        let changed_summary = crate::ZebraCoinbaseVerifier
+            .verify(changed_authorizing_data.coinbase_bytes())
+            .expect("the length-preserving mutation remains a canonical v6 coinbase");
+        assert_eq!(
+            changed_summary.transaction_id(),
+            coinbase_summary.transaction_id(),
+            "authorizing data is not part of a ZIP-244 mined transaction ID"
+        );
+        assert_ne!(
+            changed_summary.authorizing_data_digest(),
+            coinbase_summary.authorizing_data_digest()
+        );
+        assert_eq!(
+            changed_authorizing_data.validate_with_verifiers(
+                AUXILIARY_BLOCK_ID,
+                Target::MAX,
+                &crate::ZebraCoinbaseVerifier,
+                &AcceptFixtureEquihash,
+            ),
+            Err(AuxPowError::ParentBlockCommitmentsMismatch)
+        );
     }
 
     #[test]
@@ -666,10 +842,17 @@ mod tests {
         ));
 
         let mut unknown_version = bytes.clone();
-        unknown_version[PROOF_MAGIC.len()] = 2;
+        unknown_version[PROOF_MAGIC.len()] = 3;
         assert_eq!(
             AuxPowProof::decode(&unknown_version),
-            Err(AuxPowError::UnsupportedProofVersion(2))
+            Err(AuxPowError::UnsupportedProofVersion(3))
+        );
+
+        let mut retired_v1 = bytes.clone();
+        retired_v1[PROOF_MAGIC.len()] = 1;
+        assert_eq!(
+            AuxPowProof::decode(&retired_v1),
+            Err(AuxPowError::UnsupportedProofVersion(1))
         );
 
         let mut noncanonical = bytes.clone();
@@ -705,6 +888,9 @@ mod tests {
                 proof.coinbase_bytes.clone(),
                 proof.parent_merkle_branch.clone(),
                 1,
+                proof.auth_data_merkle_branch.clone(),
+                proof.auth_data_coinbase_index,
+                proof.chain_history_root,
                 proof.auxiliary_merkle_branch.clone(),
                 proof.auxiliary_index,
                 proof.parent_header.clone(),
@@ -712,12 +898,45 @@ mod tests {
             Err(AuxPowError::ParentCoinbaseIndexNotZero(1))
         );
 
+        assert_eq!(
+            AuxPowProof::new(
+                proof.coinbase_bytes.clone(),
+                proof.parent_merkle_branch.clone(),
+                0,
+                proof.auth_data_merkle_branch.clone(),
+                1,
+                proof.chain_history_root,
+                proof.auxiliary_merkle_branch.clone(),
+                proof.auxiliary_index,
+                proof.parent_header.clone(),
+            ),
+            Err(AuxPowError::ParentAuthDataIndexNotZero(1))
+        );
+
+        assert!(matches!(
+            AuxPowProof::new(
+                proof.coinbase_bytes.clone(),
+                proof.parent_merkle_branch.clone(),
+                0,
+                Vec::<[u8; 32]>::new(),
+                0,
+                proof.chain_history_root,
+                proof.auxiliary_merkle_branch.clone(),
+                proof.auxiliary_index,
+                proof.parent_header.clone(),
+            ),
+            Err(AuxPowError::ParentMerkleDepthMismatch { .. })
+        ));
+
         let too_long = vec![[0; 32]; MAX_PARENT_BRANCH_DEPTH + 1];
         assert!(matches!(
             AuxPowProof::new(
                 COINBASE.to_vec(),
                 too_long,
                 0,
+                Vec::<[u8; 32]>::new(),
+                0,
+                proof.chain_history_root,
                 Vec::<[u8; 32]>::new(),
                 0,
                 proof.parent_header.clone(),
@@ -738,6 +957,30 @@ mod tests {
                 &AcceptFixtureEquihash,
             ),
             Err(AuxPowError::ParentMerkleRootMismatch)
+        );
+
+        let mut wrong_auth_branch = proof.clone();
+        wrong_auth_branch.auth_data_merkle_branch[0][0] ^= 1;
+        assert_eq!(
+            wrong_auth_branch.validate_with_verifiers(
+                AUX_HASH,
+                Target::MAX,
+                &coinbase,
+                &AcceptFixtureEquihash,
+            ),
+            Err(AuxPowError::ParentBlockCommitmentsMismatch)
+        );
+
+        let mut wrong_history_root = proof.clone();
+        wrong_history_root.chain_history_root[0] ^= 1;
+        assert_eq!(
+            wrong_history_root.validate_with_verifiers(
+                AUX_HASH,
+                Target::MAX,
+                &coinbase,
+                &AcceptFixtureEquihash,
+            ),
+            Err(AuxPowError::ParentBlockCommitmentsMismatch)
         );
 
         let hash = proof.parent_header.block_hash().into_le_bytes();

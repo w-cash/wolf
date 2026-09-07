@@ -81,6 +81,11 @@ impl ParentHeader {
         copy_array(&self.bytes[36..68])
     }
 
+    /// Returns the raw NU5-and-later Zcash `hashBlockCommitments` field.
+    pub fn block_commitments_hash(&self) -> [u8; 32] {
+        copy_array(&self.bytes[68..100])
+    }
+
     /// Returns the parent block hash in little-endian numeric order.
     pub fn block_hash(&self) -> ParentBlockHash {
         ParentBlockHash(sha256d(self.as_bytes()))

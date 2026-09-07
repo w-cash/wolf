@@ -20,7 +20,7 @@ pub use crate::methods::{
         get_block_template::{
             BlockProposalResponse, BlockTemplateResponse, BlockTemplateTimeSource,
             GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
-            GetBlockTemplateResponse,
+            GetBlockTemplateResponse, WcashAuxRequest,
         },
         get_blockchain_info::GetBlockchainInfoBalance,
         get_mining_info::GetMiningInfoResponse,
@@ -35,6 +35,7 @@ pub use crate::methods::{
         },
         unified_address::ZListUnifiedReceiversResponse,
         validate_address::ValidateAddressResponse,
+        wcash_aux_block::{AuxPowHex, AuxPowHexError, CreateAuxBlockResponse},
         z_validate_address::{ZValidateAddressResponse, ZValidateAddressType},
     },
     AddressStrings, BlockHeaderObject, BlockObject, EndOfService, GetAddressBalanceRequest,

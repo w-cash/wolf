@@ -603,14 +603,19 @@ impl Constraint for NegativeOrZero {
     }
 }
 
-/// Number of zatoshis in 1 WCASH.
+/// Number of zatoshis in 1 ZEC or WCASH.
 pub const COIN: i64 = 100_000_000;
+
+/// The maximum Zcash amount, in zatoshis.
+#[cfg(not(feature = "wcash-consensus"))]
+pub const MAX_MONEY: i64 = 21_000_000 * COIN;
 
 /// The exact maximum Wcash monetary base, in zatoshis.
 ///
 /// The 10 WCASH subsidy, 1,680,000-block halving interval, and integer-zatoshi
 /// truncation issue exactly 33,599,999.7816 WCASH. Using the exact terminal
 /// supply here ensures chain value-pool accounting has no rounding headroom.
+#[cfg(feature = "wcash-consensus")]
 pub const MAX_MONEY: i64 = 3_359_999_978_160_000;
 
 /// Maximum value supported by the inherited Zcash transaction libraries for a

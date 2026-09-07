@@ -98,6 +98,7 @@ where
 {
     /// Creates a new block transaction verifier.
     pub fn new(network: &Network, state: ZS) -> Self {
+        network.assert_compatible_with_compiled_consensus();
         Self {
             network: network.clone(),
             state: Timeout::new(state, UTXO_LOOKUP_TIMEOUT),
@@ -133,6 +134,7 @@ where
 {
     /// Creates a new mempool transaction verifier.
     pub fn new(network: &Network, state: ZS, mempool_setup_rx: oneshot::Receiver<Mempool>) -> Self {
+        network.assert_compatible_with_compiled_consensus();
         Self {
             network: network.clone(),
             state: Timeout::new(state, UTXO_LOOKUP_TIMEOUT),

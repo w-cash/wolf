@@ -35,7 +35,8 @@ use zebra_rpc::client::{
     Orchard, OrchardAction, OrchardFlags, Output, ScriptPubKey, ScriptSig,
     SendRawTransactionResponse, ShieldedOutput, ShieldedSpend, SubmitBlockErrorResponse,
     SubmitBlockResponse, SubtreeRpcData, TransactionObject, TransactionTemplate, Treestate, Utxo,
-    ValidateAddressResponse, ZListUnifiedReceiversResponse, ZValidateAddressResponse,
+    ValidateAddressResponse, WcashAuxRequest, ZListUnifiedReceiversResponse,
+    ZValidateAddressResponse,
 };
 
 #[test]
@@ -1075,6 +1076,49 @@ fn test_get_block_template_request() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_get_block_template_wcash_aux_request() -> Result<(), Box<dyn std::error::Error>> {
+    let json = r#"{"mode":"template","wcashaux":{"blockhash":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","nonce":7}}"#;
+
+    let request: GetBlockTemplateParameters = serde_json::from_str(json)?;
+    let wcash_aux = request
+        .wcash_aux()
+        .expect("wcashaux is present in the request");
+    assert_eq!(wcash_aux.nonce(), 7);
+    assert_eq!(
+        wcash_aux.block_hash().0,
+        std::array::from_fn(|index| u8::try_from(31 - index).expect("index fits in u8")),
+        "JSON hashes use conventional display order while the typed hash stores raw order",
+    );
+    assert_eq!(serde_json::to_string(&request)?, json);
+
+    let rebuilt = GetBlockTemplateParameters::new(
+        GetBlockTemplateRequestMode::Template,
+        None,
+        vec![],
+        None,
+        None,
+    )
+    .with_wcash_aux(WcashAuxRequest::new(
+        wcash_aux.block_hash(),
+        wcash_aux.nonce(),
+    ));
+    assert_eq!(rebuilt, request);
+
+    for invalid in [
+        r#"{"mode":"template","wcashaux":{"blockhash":"00","nonce":7}}"#,
+        r#"{"mode":"template","wcashaux":{"blockhash":"gg0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","nonce":7}}"#,
+        r#"{"mode":"template","wcashaux":{"blockhash":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","nonce":7,"extra":true}}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<GetBlockTemplateParameters>(invalid).is_err(),
+            "malformed wcashaux object must be rejected: {invalid}",
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_get_block_template_response() -> Result<(), Box<dyn std::error::Error>> {
     let json = GET_BLOCK_TEMPLATE_RESPONSE_TEMPLATE;
     let obj: GetBlockTemplateResponse = serde_json::from_str(json)?;
@@ -1162,6 +1206,7 @@ fn test_get_block_template_response() -> Result<(), Box<dyn std::error::Error>> 
         height,
         max_time,
         submit_old,
+        None,
     )));
 
     assert_eq!(obj, new_obj);

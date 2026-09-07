@@ -2,7 +2,7 @@
 
 use equihash::tromp::solve_200_9;
 use sha2::{Digest, Sha256};
-use wcash_zcash_aux::{AuxPowProof, Target};
+use wcash_zcash_aux::{block_commitments_hash, AuxPowProof, ParentHeader, Target};
 use zebra_chain::{
     block::Header,
     work::{
@@ -29,8 +29,8 @@ pub struct JobConfig {
     pub parent_version: u32,
     /// Raw wire-order parent previous-block hash.
     pub previous_block_hash: [u8; 32],
-    /// Raw wire-order parent hashFinalSaplingRoot/commitments field.
-    pub hash_final_sapling_root: [u8; 32],
+    /// Raw wire-order parent chain-history root used by ZIP-244 commitments.
+    pub chain_history_root: [u8; 32],
     /// Parent header timestamp.
     pub timestamp: u32,
     /// Parent header `nBits`, retained as diagnostic parent data only.
@@ -49,7 +49,7 @@ impl Default for JobConfig {
             parent_height: 1,
             parent_version: 4,
             previous_block_hash: [0; 32],
-            hash_final_sapling_root: [0; 32],
+            chain_history_root: [0; 32],
             timestamp: 0,
             // This field is diagnostic in Wcash validation. The local default is
             // the familiar regtest-style compact target, not a target authority.
@@ -70,6 +70,9 @@ pub struct PreparedJob {
     coinbase_bytes: Vec<u8>,
     coinbase_transaction_id: [u8; 32],
     parent_header_input: [u8; HEADER_INPUT_BYTES],
+    parent_merkle_branch: Vec<[u8; 32]>,
+    auth_data_merkle_branch: Vec<[u8; 32]>,
+    chain_history_root: [u8; 32],
     auxiliary_nonce: u32,
 }
 
@@ -121,7 +124,9 @@ impl PreparedJob {
         parent_header_input[4..36].copy_from_slice(&config.previous_block_hash);
         // A one-transaction Merkle tree has the coinbase txid as its root.
         parent_header_input[36..68].copy_from_slice(&coinbase.transaction_id);
-        parent_header_input[68..100].copy_from_slice(&config.hash_final_sapling_root);
+        let block_commitments =
+            block_commitments_hash(config.chain_history_root, coinbase.authorizing_data_digest);
+        parent_header_input[68..100].copy_from_slice(&block_commitments);
         parent_header_input[100..104].copy_from_slice(&config.timestamp.to_le_bytes());
         parent_header_input[104..108].copy_from_slice(&config.advertised_n_bits.to_le_bytes());
 
@@ -130,6 +135,9 @@ impl PreparedJob {
             required_target,
             &parent_header_input,
             &coinbase_bytes,
+            &[],
+            &[],
+            config.chain_history_root,
         );
 
         Ok(Self {
@@ -139,7 +147,56 @@ impl PreparedJob {
             coinbase_bytes,
             coinbase_transaction_id: coinbase.transaction_id,
             parent_header_input,
+            parent_merkle_branch: Vec::new(),
+            auth_data_merkle_branch: Vec::new(),
+            chain_history_root: config.chain_history_root,
             auxiliary_nonce: config.auxiliary_nonce,
+        })
+    }
+
+    /// Constructs a frozen job from a proposal-validated native Zcash template.
+    ///
+    /// This constructor is deliberately crate-private: callers must use
+    /// [`crate::native::NativeZcashProvider`], which checks the complete parent
+    /// block and all roots before providing these components.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_live_template(
+        child_block_hash: [u8; 32],
+        required_target: Target,
+        coinbase_bytes: Vec<u8>,
+        parent_header_input: [u8; HEADER_INPUT_BYTES],
+        parent_merkle_branch: Vec<[u8; 32]>,
+        auth_data_merkle_branch: Vec<[u8; 32]>,
+        chain_history_root: [u8; 32],
+        auxiliary_nonce: u32,
+    ) -> Result<Self, MinerError> {
+        if parent_merkle_branch.len() != auth_data_merkle_branch.len() {
+            return Err(MinerError::InvalidParentTemplate(
+                "transaction and auth-data branches have different depths".to_string(),
+            ));
+        }
+        let coinbase = canonical_parent_coinbase(&coinbase_bytes)?;
+        let job_id = job_id(
+            child_block_hash,
+            required_target,
+            &parent_header_input,
+            &coinbase_bytes,
+            &parent_merkle_branch,
+            &auth_data_merkle_branch,
+            chain_history_root,
+        );
+
+        Ok(Self {
+            child_block_hash,
+            required_target,
+            job_id,
+            coinbase_bytes,
+            coinbase_transaction_id: coinbase.transaction_id,
+            parent_header_input,
+            parent_merkle_branch,
+            auth_data_merkle_branch,
+            chain_history_root,
+            auxiliary_nonce,
         })
     }
 
@@ -178,11 +235,8 @@ impl PreparedJob {
         self.auxiliary_nonce
     }
 
-    /// Validates submitted `(200,9)` work and constructs the canonical proof.
-    ///
-    /// Validation uses `AuxPowProof::validate`, including Zebra coinbase parsing,
-    /// both Merkle bindings, the authenticated Wcash target, and real Equihash.
-    pub fn finalize(&self, nonce: &[u8], solution: &[u8]) -> Result<SolvedAuxPow, MinerError> {
+    /// Builds and structurally checks the exact parent header submitted by a solver.
+    pub fn parent_header(&self, nonce: &[u8], solution: &[u8]) -> Result<ParentHeader, MinerError> {
         if nonce.len() != HEADER_NONCE_BYTES {
             return Err(MinerError::InvalidNonceLength(nonce.len()));
         }
@@ -200,12 +254,23 @@ impl PreparedJob {
         header_bytes.extend_from_slice(nonce);
         header_bytes.extend_from_slice(&SOLUTION_COMPACT_SIZE);
         header_bytes.extend_from_slice(solution);
-        let parent_header = wcash_zcash_aux::ParentHeader::decode(&header_bytes)?;
+        Ok(ParentHeader::decode(&header_bytes)?)
+    }
+
+    /// Validates submitted `(200,9)` work and constructs the canonical proof.
+    ///
+    /// Validation uses `AuxPowProof::validate`, including Zebra coinbase parsing,
+    /// both Merkle bindings, the authenticated Wcash target, and real Equihash.
+    pub fn finalize(&self, nonce: &[u8], solution: &[u8]) -> Result<SolvedAuxPow, MinerError> {
+        let parent_header = self.parent_header(nonce, solution)?;
 
         let proof = AuxPowProof::new(
             self.coinbase_bytes.clone(),
-            Vec::<[u8; 32]>::new(),
+            self.parent_merkle_branch.clone(),
             0,
+            self.auth_data_merkle_branch.clone(),
+            0,
+            self.chain_history_root,
             Vec::<[u8; 32]>::new(),
             0,
             parent_header,
@@ -369,13 +434,23 @@ fn job_id(
     target: Target,
     header_input: &[u8; HEADER_INPUT_BYTES],
     coinbase: &[u8],
+    parent_merkle_branch: &[[u8; 32]],
+    auth_data_merkle_branch: &[[u8; 32]],
+    chain_history_root: [u8; 32],
 ) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"Wcash/ZcashAuxPoW/local-job/v1\0");
+    hash.update(b"Wcash/ZcashAuxPoW/job/v2\0");
     hash.update(child_block_hash);
     hash.update(target.to_le_bytes());
     hash.update(header_input);
     hash.update(coinbase);
+    for node in parent_merkle_branch {
+        hash.update(node);
+    }
+    for node in auth_data_merkle_branch {
+        hash.update(node);
+    }
+    hash.update(chain_history_root);
     hex::encode(hash.finalize())
 }
 

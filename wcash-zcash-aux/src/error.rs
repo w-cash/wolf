@@ -79,10 +79,25 @@ pub enum AuxPowError {
     NonCanonicalParentCoinbase,
     /// The parent transaction is not structurally a coinbase transaction.
     ParentTransactionIsNotCoinbase,
+    /// Proof v2 requires a ZIP-244 transaction with an authorizing-data digest.
+    UnsupportedParentCoinbaseVersion(u32),
+    /// A parsed coinbase did not expose its authenticated miner data.
+    MissingParentCoinbaseMinerData,
     /// The explicit parent Merkle index is not the required coinbase slot zero.
     ParentCoinbaseIndexNotZero(u32),
     /// Coinbase transaction path does not reach the parent header root.
     ParentMerkleRootMismatch,
+    /// The explicit authorizing-data Merkle index is not coinbase slot zero.
+    ParentAuthDataIndexNotZero(u32),
+    /// Transaction-ID and authorizing-data paths imply different tree depths.
+    ParentMerkleDepthMismatch {
+        /// Transaction-ID Merkle-path depth.
+        transaction: usize,
+        /// Authorizing-data Merkle-path depth.
+        auth_data: usize,
+    },
+    /// Coinbase authorizing-data path is not bound by the parent header.
+    ParentBlockCommitmentsMismatch,
     /// Auxiliary branch cannot form a bounded power-of-two tree.
     AuxiliaryTreeDepthTooLarge(usize),
     /// A Merkle index lies outside the tree implied by its branch depth.
@@ -108,28 +123,12 @@ pub enum AuxPowError {
         /// Index derived from chain ID and nonce.
         expected: u32,
     },
-    /// Coinbase exposes too many transparent outputs.
-    TooManyTransparentOutputs {
-        /// Supplied output count.
-        actual: usize,
-        /// Consensus maximum.
-        max: usize,
-    },
-    /// A transparent output script exceeds the scan bound.
-    TransparentScriptTooLarge {
-        /// Supplied script byte length.
-        actual: usize,
-        /// Consensus maximum.
-        max: usize,
-    },
-    /// No transparent output contains the required marker.
-    MissingCommitmentOutput,
+    /// No version-2 commitment occurs in the coinbase miner data.
+    MissingMinerDataCommitment,
+    /// The marker-bearing version-2 carrier is not the exact miner-data suffix.
+    CommitmentNotMinerDataSuffix,
     /// More than one marker occurrence makes the carrier ambiguous.
     DuplicateCommitmentMarker,
-    /// Marker-bearing output is not the exact frozen script.
-    CommitmentScriptMismatch,
-    /// Commitment output has nonzero value.
-    CommitmentOutputNotZero(u64),
     /// Committed auxiliary root differs from the proof.
     AuxiliaryRootMismatch,
 }
@@ -194,12 +193,32 @@ impl fmt::Display for AuxPowError {
             Self::ParentTransactionIsNotCoinbase => {
                 f.write_str("parent transaction is not a coinbase")
             }
+            Self::UnsupportedParentCoinbaseVersion(version) => write!(
+                f,
+                "Zcash AuxPoW v2 requires a version 5 or 6 parent coinbase, got version {version}"
+            ),
+            Self::MissingParentCoinbaseMinerData => {
+                f.write_str("parent coinbase input has no authenticated miner data")
+            }
             Self::ParentCoinbaseIndexNotZero(index) => {
                 write!(f, "parent coinbase Merkle index is {index}, expected zero")
             }
             Self::ParentMerkleRootMismatch => {
                 f.write_str("coinbase branch does not match the parent header Merkle root")
             }
+            Self::ParentAuthDataIndexNotZero(index) => {
+                write!(f, "parent coinbase auth-data index is {index}, expected zero")
+            }
+            Self::ParentMerkleDepthMismatch {
+                transaction,
+                auth_data,
+            } => write!(
+                f,
+                "parent transaction Merkle depth {transaction} differs from auth-data depth {auth_data}"
+            ),
+            Self::ParentBlockCommitmentsMismatch => f.write_str(
+                "coinbase auth-data branch and chain-history root do not match the parent block-commitments hash",
+            ),
             Self::AuxiliaryTreeDepthTooLarge(depth) => {
                 write!(f, "auxiliary branch depth {depth} is unsupported")
             }
@@ -221,25 +240,14 @@ impl fmt::Display for AuxPowError {
                     "auxiliary index is {actual}, deterministic slot is {expected}"
                 )
             }
-            Self::TooManyTransparentOutputs { actual, max } => write!(
-                f,
-                "coinbase has {actual} transparent outputs, maximum is {max}"
-            ),
-            Self::TransparentScriptTooLarge { actual, max } => write!(
-                f,
-                "transparent output script is {actual} bytes, maximum is {max}"
-            ),
-            Self::MissingCommitmentOutput => {
-                f.write_str("Zcash coinbase commitment output is missing")
+            Self::MissingMinerDataCommitment => {
+                f.write_str("Zcash coinbase miner-data commitment is missing")
+            }
+            Self::CommitmentNotMinerDataSuffix => {
+                f.write_str("Zcash coinbase commitment is not the exact miner-data suffix")
             }
             Self::DuplicateCommitmentMarker => {
                 f.write_str("merged-mining commitment marker is duplicated or ambiguous")
-            }
-            Self::CommitmentScriptMismatch => {
-                f.write_str("marker-bearing output is not the exact commitment script")
-            }
-            Self::CommitmentOutputNotZero(value) => {
-                write!(f, "commitment output value is {value}, expected zero")
             }
             Self::AuxiliaryRootMismatch => {
                 f.write_str("committed auxiliary root does not match the proof")

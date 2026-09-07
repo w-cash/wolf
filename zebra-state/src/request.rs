@@ -1123,6 +1123,19 @@ pub enum ReadRequest {
     /// [`block::Height`] using `.into()`.
     Block(HashOrHeight),
 
+    /// Atomically looks up a block and its depth in the current best chain.
+    ///
+    /// Returns
+    ///
+    /// * [`ReadResponse::BlockAndDepth(Some((Arc<Block>, depth)))`](ReadResponse::BlockAndDepth)
+    ///   if the block is in the best chain;
+    /// * [`ReadResponse::BlockAndDepth(None)`](ReadResponse::BlockAndDepth) otherwise.
+    ///
+    /// The block bytes and depth are derived from the same non-finalized chain
+    /// snapshot. This matters for block formats whose identifier does not bind
+    /// every serialized header field.
+    BlockAndDepth(block::Hash),
+
     /// Looks up a block by hash in any current chain or by height in the current best chain.
     ///
     /// Returns
@@ -1479,6 +1492,7 @@ impl ReadRequest {
             ReadRequest::BlockInfo(_) => "block_info",
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",
+            ReadRequest::BlockAndDepth(_) => "block_and_depth",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",
             ReadRequest::BlockAndSize(_) => "block_and_size",
             ReadRequest::BlockHeader(_) => "block_header",

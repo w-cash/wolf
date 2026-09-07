@@ -18,8 +18,14 @@ use crate::{
 fn parse_config_listen_addr() {
     let _init_guard = zebra_test::init();
 
+    #[cfg(not(feature = "wcash-consensus"))]
+    let (default_ipv4, default_ipv6) = ("0.0.0.0:8233", "[::]:8233");
+
+    #[cfg(feature = "wcash-consensus")]
+    let (default_ipv4, default_ipv6) = ("0.0.0.0:28233", "[::]:28233");
+
     let fixtures = vec![
-        ("listen_addr = '0.0.0.0'", "0.0.0.0:28233"),
+        ("listen_addr = '0.0.0.0'", default_ipv4),
         ("listen_addr = '0.0.0.0:9999'", "0.0.0.0:9999"),
         (
             "listen_addr = '0.0.0.0'\nnetwork = 'Testnet'",
@@ -29,7 +35,7 @@ fn parse_config_listen_addr() {
             "listen_addr = '0.0.0.0:8233'\nnetwork = 'Testnet'",
             "0.0.0.0:8233",
         ),
-        ("listen_addr = '[::]'", "[::]:28233"),
+        ("listen_addr = '[::]'", default_ipv6),
         ("listen_addr = '[::]:9999'", "[::]:9999"),
         ("listen_addr = '[::]'\nnetwork = 'Testnet'", "[::]:18233"),
         (
@@ -87,16 +93,34 @@ fn default_config_uses_ipv6() {
     let _init_guard = zebra_test::init();
     let config = Config::default();
 
-    assert_eq!(config.listen_addr.to_string(), "[::]:28233");
     assert!(config.listen_addr.is_ipv6());
-    assert!(config.network.uses_wcash_consensus());
-    assert!(config.initial_mainnet_peers.is_empty());
-    assert!(config.initial_testnet_peers.is_empty());
+
+    #[cfg(not(feature = "wcash-consensus"))]
+    {
+        assert_eq!(config.listen_addr.to_string(), "[::]:8233");
+        assert_eq!(config.network, Network::Mainnet);
+        assert_eq!(config.initial_mainnet_peers.len(), 5);
+        assert_eq!(config.initial_testnet_peers.len(), 3);
+    }
+
+    #[cfg(feature = "wcash-consensus")]
+    {
+        assert_eq!(config.listen_addr.to_string(), "[::]:28233");
+        assert!(config.network.uses_wcash_consensus());
+        assert!(config.initial_mainnet_peers.is_empty());
+        assert!(config.initial_testnet_peers.is_empty());
+    }
 }
 
 #[test]
 fn wcash_network_config_round_trip() {
-    let config = Config::default();
+    let config = Config {
+        listen_addr: "[::]:28233".parse().expect("hard-coded address is valid"),
+        network: Network::new_wcash_regtest(),
+        initial_mainnet_peers: [].into(),
+        initial_testnet_peers: [].into(),
+        ..Config::default()
+    };
     let encoded = toml::to_string(&config).expect("Wcash config serializes");
     assert!(encoded.contains("network = \"WcashRegtest\""));
 

@@ -159,7 +159,11 @@ pub fn release_version() -> Version {
 /// [BIP 14]: https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki
 pub fn user_agent() -> String {
     let release_version = release_version();
-    format!("/Wcash:{release_version}/")
+    if cfg!(feature = "wcash-consensus") {
+        format!("/Wcash:{release_version}/")
+    } else {
+        format!("/Zebra:{release_version}/")
+    }
 }
 
 /// Wcash node application.
@@ -249,7 +253,7 @@ impl Application for ZebradApp {
             Err(_e) if command.cmd().should_ignore_load_config_error() => Default::default(),
             Err(e) => {
                 status_err!(
-                    "Wcash could not load the provided configuration file and/or environment variables.\
+                    "The node could not load the provided configuration file and/or environment variables.\
                      This might mean you are using a deprecated format of the file, or are attempting to
                      configure deprecated or unknown fields via environment variables.\
                      You can generate a valid config by running \"zebrad generate\", \
@@ -288,11 +292,16 @@ impl Application for ZebradApp {
                 }
             };
 
+        let network_label = if cfg!(feature = "wcash-consensus") {
+            "Wcash network"
+        } else {
+            "Zcash network"
+        };
         let app_metadata = [
             // build-time constant: cargo or git tag + short commit
             ("version", build_version().to_string()),
             // config
-            ("Wcash network", config.network.network.to_string()),
+            (network_label, config.network.network.to_string()),
             // code constant
             (
                 "running state version",
@@ -475,8 +484,8 @@ impl Application for ZebradApp {
             } else {
                 info!("{config:?}");
 
-                if let Some(miner_address) = &config.mining.miner_address {
-                    info!(%miner_address, "configured miner address");
+                if config.mining.miner_address.is_some() {
+                    info!(configured = true, "configured miner address (redacted)");
                 }
             }
         }
@@ -490,7 +499,7 @@ impl Application for ZebradApp {
             other_net_name => other_net_name,
         };
         let global_span = if let Some(git_commit) = ZebradApp::git_commit() {
-            error_span!("", wcash = git_commit, net)
+            error_span!("", node = git_commit, net)
         } else {
             error_span!("", net)
         };
@@ -583,11 +592,16 @@ pub fn boot(app_cell: &'static AppCell<ZebradApp>) -> ! {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn user_agent_uses_wcash_product_name() {
+    fn user_agent_matches_the_selected_consensus_profile() {
         let user_agent = super::user_agent();
 
-        assert!(user_agent.starts_with("/Wcash:"));
         assert!(user_agent.ends_with('/'));
-        assert!(!user_agent.contains("Zebra"));
+        if cfg!(feature = "wcash-consensus") {
+            assert!(user_agent.starts_with("/Wcash:"));
+            assert!(!user_agent.contains("Zebra"));
+        } else {
+            assert!(user_agent.starts_with("/Zebra:"));
+            assert!(!user_agent.contains("Wcash"));
+        }
     }
 }

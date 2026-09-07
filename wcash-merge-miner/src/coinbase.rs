@@ -2,7 +2,7 @@
 
 use std::io::Cursor;
 
-use wcash_zcash_aux::{commitment_script, validate_commitment, AuxPowError, TransparentOutput};
+use wcash_zcash_aux::{commitment_payload, validate_miner_data_commitment, AuxPowError};
 use zebra_chain::{
     amount::{Amount, NonNegative},
     block::Height,
@@ -29,16 +29,17 @@ pub struct ParentOutput {
 /// Canonical data read back from a locally constructed parent coinbase.
 pub(crate) struct CanonicalCoinbase {
     pub(crate) transaction_id: [u8; 32],
-    pub(crate) transparent_outputs: Vec<TransparentOutput>,
+    pub(crate) authorizing_data_digest: [u8; 32],
+    pub(crate) miner_data: Vec<u8>,
 }
 
 /// Constructs a canonical NU6.3/v6 Zcash coinbase carrying one Wcash commitment.
 ///
-/// Supplied outputs are preserved in order and the exact zero-value AuxPoW
-/// `OP_RETURN` is appended last. This function proves structural coinbase
-/// canonicality with Zebra's parser, but it cannot prove the transaction pays
-/// the context-dependent Zcash subsidy and funding streams. A production pool
-/// must derive those outputs from its parent `getblocktemplate`.
+/// The v2 commitment is appended to the coinbase miner data, which is covered
+/// by ZIP-244's authorizing-data root without changing the v5/v6 transaction
+/// ID. Supplied outputs are preserved exactly. This synthetic helper proves
+/// structural canonicality only; a native production job must derive its full
+/// coinbase and funding-stream outputs from the parent `getblocktemplate`.
 pub fn build_parent_coinbase(
     height: u32,
     extra_data: &[u8],
@@ -50,9 +51,18 @@ pub fn build_parent_coinbase(
         return Err(MinerError::ZeroParentHeight);
     }
 
+    let auxiliary_branch = [];
+    let mut miner_data = extra_data.to_vec();
+    miner_data.extend_from_slice(&commitment_payload(
+        auxiliary_block_hash,
+        &auxiliary_branch,
+        0,
+        auxiliary_nonce,
+    )?);
+
     let coinbase_input = Input::Coinbase {
         height: Height(height),
-        data: extra_data.to_vec(),
+        data: miner_data,
         sequence: u32::MAX,
     };
     let coinbase_script_len = coinbase_input
@@ -64,7 +74,7 @@ pub fn build_parent_coinbase(
     }
 
     let mut total = 0u64;
-    let mut outputs = Vec::with_capacity(parent_outputs.len().saturating_add(1));
+    let mut outputs = Vec::with_capacity(parent_outputs.len());
     for output in parent_outputs {
         if output.value_zatoshis > MAX_PARENT_MONEY {
             return Err(MinerError::InvalidParentAmount(output.value_zatoshis));
@@ -79,14 +89,6 @@ pub fn build_parent_coinbase(
             .map_err(|_| MinerError::InvalidParentAmount(output.value_zatoshis))?;
         outputs.push(Output::new(amount, Script::new(&output.script_pubkey)));
     }
-
-    let auxiliary_branch = [];
-    let commitment =
-        commitment_script(auxiliary_block_hash, &auxiliary_branch, 0, auxiliary_nonce)?;
-    outputs.push(Output::new(
-        Amount::<NonNegative>::zero(),
-        Script::new(&commitment),
-    ));
 
     let transaction = Transaction::V6 {
         network_upgrade: NetworkUpgrade::Nu6_3,
@@ -107,8 +109,8 @@ pub fn build_parent_coinbase(
     // This is template hygiene only; final work still goes through the pinned
     // production parser inside `AuxPowProof::validate`.
     let summary = canonical_parent_coinbase(&bytes)?;
-    validate_commitment(
-        &summary.transparent_outputs,
+    validate_miner_data_commitment(
+        &summary.miner_data,
         auxiliary_block_hash,
         &auxiliary_branch,
         0,
@@ -139,33 +141,33 @@ pub(crate) fn canonical_parent_coinbase(
         return Err(AuxPowError::NonCanonicalParentCoinbase.into());
     }
 
-    let transparent_outputs = transaction
-        .outputs()
-        .iter()
-        .map(|output| {
-            let value = u64::try_from(output.value.zatoshis())
-                .map_err(|_| AuxPowError::InvalidParentCoinbase)?;
-            Ok(TransparentOutput::new(
-                value,
-                output.lock_script.as_raw_bytes().to_vec(),
-            ))
-        })
-        .collect::<Result<Vec<_>, AuxPowError>>()?;
-
+    let authorizing_data_digest = transaction
+        .auth_digest()
+        .ok_or(AuxPowError::UnsupportedParentCoinbaseVersion(
+            transaction.version(),
+        ))?
+        .0;
+    let miner_data = transaction
+        .inputs()
+        .first()
+        .and_then(Input::miner_data)
+        .ok_or(AuxPowError::MissingParentCoinbaseMinerData)?
+        .clone();
     Ok(CanonicalCoinbase {
         transaction_id: transaction.hash().0,
-        transparent_outputs,
+        authorizing_data_digest,
+        miner_data,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use wcash_zcash_aux::{validate_commitment, AuxPowError};
+    use wcash_zcash_aux::{validate_miner_data_commitment, AuxPowError};
 
     use super::*;
 
     #[test]
-    fn nu63_coinbase_is_canonical_and_has_exact_zero_value_carrier() {
+    fn nu63_coinbase_is_canonical_and_has_exact_miner_data_carrier() {
         let child_hash = [0x42; 32];
         let bytes = build_parent_coinbase(
             2_900_000,
@@ -181,9 +183,7 @@ mod tests {
         let summary =
             canonical_parent_coinbase(&bytes).expect("Zebra accepts its canonical serialization");
 
-        assert_eq!(summary.transparent_outputs.len(), 2);
-        assert_eq!(summary.transparent_outputs[1].value(), 0);
-        validate_commitment(&summary.transparent_outputs, child_hash, &[], 0)
+        validate_miner_data_commitment(&summary.miner_data, child_hash, &[], 0)
             .expect("commitment is exact and unambiguous");
     }
 
@@ -210,12 +210,9 @@ mod tests {
     #[test]
     fn exact_commitment_rejects_marker_in_an_extra_output() {
         let child_hash = [0x24; 32];
-        let duplicate = ParentOutput {
-            value_zatoshis: 0,
-            script_pubkey: wcash_zcash_aux::commitment_script(child_hash, &[], 0, 1)
-                .expect("fixture commitment"),
-        };
-        let error = build_parent_coinbase(1, b"x", &[duplicate], child_hash, 1)
+        let duplicate =
+            wcash_zcash_aux::commitment_payload(child_hash, &[], 0, 1).expect("fixture commitment");
+        let error = build_parent_coinbase(1, &duplicate, &[], child_hash, 1)
             .expect_err("Zebra parsing alone accepts the coinbase");
         assert!(matches!(
             error,

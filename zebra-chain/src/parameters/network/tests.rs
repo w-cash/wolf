@@ -21,6 +21,33 @@ use crate::{
 };
 
 #[test]
+fn compiled_consensus_profile_is_mutually_exclusive() {
+    let zcash = Network::Mainnet;
+    let wcash = Network::new_wcash_regtest();
+
+    assert_eq!(
+        zcash.is_compatible_with_compiled_consensus(),
+        !cfg!(feature = "wcash-consensus")
+    );
+    assert_eq!(
+        wcash.is_compatible_with_compiled_consensus(),
+        cfg!(feature = "wcash-consensus")
+    );
+
+    if cfg!(feature = "wcash-consensus") {
+        wcash.assert_compatible_with_compiled_consensus();
+        assert!(
+            std::panic::catch_unwind(|| zcash.assert_compatible_with_compiled_consensus()).is_err()
+        );
+    } else {
+        zcash.assert_compatible_with_compiled_consensus();
+        assert!(
+            std::panic::catch_unwind(|| wcash.assert_compatible_with_compiled_consensus()).is_err()
+        );
+    }
+}
+
+#[test]
 fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
     let _init_guard = zebra_test::init();
     let network = Network::new_wcash_regtest();
@@ -118,12 +145,26 @@ fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
     assert_eq!(per_block_era_sum, 1_999_999_987);
     let scheduled_supply = per_block_era_sum * (WCASH_HALVING_INTERVAL as u64);
     assert_eq!(scheduled_supply, 3_359_999_978_160_000);
-    assert_eq!(
-        MAX_MONEY,
-        i64::try_from(scheduled_supply).expect("the scheduled Wcash supply fits in i64")
-    );
-    assert!(Amount::<NonNegative>::try_from(MAX_MONEY).is_ok());
-    assert!(Amount::<NonNegative>::try_from(MAX_MONEY + 1).is_err());
+
+    #[cfg(feature = "wcash-consensus")]
+    {
+        assert_eq!(
+            MAX_MONEY,
+            i64::try_from(scheduled_supply).expect("the scheduled Wcash supply fits in i64")
+        );
+        assert!(Amount::<NonNegative>::try_from(MAX_MONEY).is_ok());
+        assert!(Amount::<NonNegative>::try_from(MAX_MONEY + 1).is_err());
+    }
+
+    #[cfg(not(feature = "wcash-consensus"))]
+    {
+        assert_eq!(MAX_MONEY, 21_000_000 * crate::amount::COIN);
+        assert!(scheduled_supply > u64::try_from(MAX_MONEY).expect("MAX_MONEY is positive"));
+        assert!(Amount::<NonNegative>::try_from(
+            i64::try_from(scheduled_supply).expect("the scheduled Wcash supply fits in i64")
+        )
+        .is_err());
+    }
     assert_eq!(block_subsidy(Height(50_400_000), &network)?.zatoshis(), 1);
     assert_eq!(block_subsidy(Height(50_400_001), &network)?, zero);
 

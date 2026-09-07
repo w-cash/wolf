@@ -35,8 +35,8 @@ Neither consensus validation nor the generator performs HTTP requests.
 
 ## Fail-closed public launch
 
-The announced Wcash mainnet anchor is future Bitcoin mainnet block 965,954.
-Its hash cannot be compiled before the block exists. Mainnet and testnet therefore both
+Bitcoin mainnet block 965,954 is designated for a possible Wcash mainnet
+anchor, but it is not frozen by this source tree. Mainnet and testnet both
 return an error from `select_anchor`; only local regtest works today.
 
 Freezing a public anchor requires a reviewed source release that does all of

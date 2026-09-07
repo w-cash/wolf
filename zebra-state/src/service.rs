@@ -314,6 +314,11 @@ impl StateService {
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
     ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
+        // Chain value-pool amount bounds are selected as one mutually exclusive
+        // compile-time profile. Refuse an incompatible network before opening a
+        // database or spawning the writer.
+        network.assert_compatible_with_compiled_consensus();
+
         let (finalized_state, finalized_tip, timer) = {
             let config = config.clone();
             let network = network.clone();
@@ -1450,6 +1455,18 @@ impl Service<ReadRequest> for ReadStateService {
                 &state.db,
                 hash_or_height,
             ))),
+
+            ReadRequest::BlockAndDepth(hash) => {
+                // Keep the exact block bytes and depth on one immutable
+                // non-finalized chain snapshot. Finalized state can only add
+                // overlapping blocks while this synchronous query runs.
+                let best_chain = state.latest_best_chain();
+                let block = read::block(best_chain.clone(), &state.db, hash.into());
+                let block_and_depth = block.and_then(|block| {
+                    read::depth(best_chain, &state.db, hash).map(|depth| (block, depth))
+                });
+                Ok(ReadResponse::BlockAndDepth(block_and_depth))
+            }
 
             ReadRequest::AnyChainBlock(hash_or_height) => Ok(ReadResponse::Block(read::any_block(
                 state.latest_non_finalized_state().chain_iter(),

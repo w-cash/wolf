@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Added distinct Wcash payment-address namespaces for Unified, Sapling, TEX,
   and transparent receivers, with strict network checks in Wcash mining and RPC
   paths. Wallet and spending/viewing-key encodings are not included.
+- Added a native three-node merged-mining coordinator that reconstructs exact
+  Zcash work, requires independent proposal validation, verifies the shielded
+  parent payout policy, exposes a loopback ZIP-301 backend, and durably replays
+  Wcash and Zcash winners independently.
 
 ### Changed
 
@@ -48,9 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 ### Known limitations
 
 - This release is local pre-testnet software. Public genesis/network/difficulty
-  parameters, a live Zcash coinbase rebuild-and-reproof/dual-submit adapter,
-  wallet maturity-and-spend interoperability, and an independent consensus
-  audit remain release gates.
+  parameters, wallet maturity-and-spend interoperability, vendor ASIC testing,
+  adversarial multi-node soak/reorg testing, an independently reviewed
+  consensus specification and implementation, and an operated TLS,
+  authentication, variable-difficulty, accounting, payout, and monitoring edge
+  remain release gates.
 
 ## [Zebra 6.3.0](https://github.com/ZcashFoundation/zebra/releases/tag/v6.3.0) - 2026-08-10
 

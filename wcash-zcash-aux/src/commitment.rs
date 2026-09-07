@@ -1,24 +1,22 @@
-//! Exact zero-value transparent-output commitment carrier.
+//! Canonical Zcash coinbase carriers for Wcash auxiliary commitments.
 
 use sha2::{Digest, Sha256};
 
 use crate::{
-    coinbase::TransparentOutput,
     expected_auxiliary_index,
     merkle::{auxiliary_tree_size, sha256d_merkle_root},
-    AuxPowError, MAX_AUXILIARY_BRANCH_DEPTH, MAX_TRANSPARENT_OUTPUTS, MAX_TRANSPARENT_SCRIPT_BYTES,
-    MERGED_MINING_MARKER, WCASH_AUXILIARY_CHAIN_ID,
+    AuxPowError, MAX_AUXILIARY_BRANCH_DEPTH, MERGED_MINING_MARKER, WCASH_AUXILIARY_CHAIN_ID,
 };
 
-/// Hash-domain tag used before every Wcash auxiliary block hash.
-pub const AUXILIARY_LEAF_DOMAIN: &[u8] = b"Wcash/ZcashAuxPoW/leaf/v1\0";
+/// Hash-domain tag used before every version-2 Wcash auxiliary block hash.
+pub const AUXILIARY_LEAF_DOMAIN: &[u8] = b"Wcash/ZcashAuxPoW/leaf/v2\0";
 
-const OP_RETURN: u8 = 0x6a;
-const PUSH_44: u8 = 44;
-const SCRIPT_BYTES: usize = 46;
-const ROOT_START: usize = 2 + MERGED_MINING_MARKER.len();
-const ROOT_END: usize = ROOT_START + 32;
-const TREE_SIZE_END: usize = ROOT_END + 4;
+const MINER_ROOT_START: usize = MERGED_MINING_MARKER.len();
+const MINER_ROOT_END: usize = MINER_ROOT_START + 32;
+const MINER_TREE_SIZE_END: usize = MINER_ROOT_END + 4;
+
+/// Exact byte length of the version-2 coinbase miner-data commitment suffix.
+pub const MINER_DATA_COMMITMENT_BYTES: usize = 44;
 
 /// Domain-separates a Wcash auxiliary block ID before Merkle-tree insertion.
 ///
@@ -29,16 +27,18 @@ pub fn auxiliary_leaf(auxiliary_block_hash: [u8; 32]) -> [u8; 32] {
     auxiliary_leaf_for_chain(WCASH_AUXILIARY_CHAIN_ID, auxiliary_block_hash)
 }
 
-/// Constructs the one canonical merge-mining commitment script for a pool.
+/// Constructs the canonical version-2 coinbase miner-data commitment suffix.
 ///
-/// The block ID and every node in `auxiliary_branch` use raw serialized order,
-/// never conventional reversed display order.
-pub fn commitment_script(
+/// The returned bytes must be appended directly to the coinbase input's inert
+/// miner data. They are not wrapped in a script push opcode. A canonical v2
+/// carrier is the final 44 bytes of that miner data, and the merged-mining
+/// marker must occur nowhere else in the coinbase miner data.
+pub fn miner_data_commitment(
     auxiliary_block_hash: [u8; 32],
     auxiliary_branch: &[[u8; 32]],
     auxiliary_index: u32,
     nonce: u32,
-) -> Result<Vec<u8>, AuxPowError> {
+) -> Result<[u8; MINER_DATA_COMMITMENT_BYTES], AuxPowError> {
     check_auxiliary_position(auxiliary_branch, auxiliary_index, nonce)?;
     let tree_size = auxiliary_tree_size(auxiliary_branch.len())?;
     let mut root = sha256d_merkle_root(
@@ -49,13 +49,32 @@ pub fn commitment_script(
     // Namecoin-compatible carriers store the internal/raw root in reverse order.
     root.reverse();
 
-    let mut script = Vec::with_capacity(SCRIPT_BYTES);
-    script.extend_from_slice(&[OP_RETURN, PUSH_44]);
-    script.extend_from_slice(&MERGED_MINING_MARKER);
-    script.extend_from_slice(&root);
-    script.extend_from_slice(&tree_size.to_le_bytes());
-    script.extend_from_slice(&nonce.to_le_bytes());
-    Ok(script)
+    let mut commitment = [0; MINER_DATA_COMMITMENT_BYTES];
+    commitment[..MINER_ROOT_START].copy_from_slice(&MERGED_MINING_MARKER);
+    commitment[MINER_ROOT_START..MINER_ROOT_END].copy_from_slice(&root);
+    commitment[MINER_ROOT_END..MINER_TREE_SIZE_END].copy_from_slice(&tree_size.to_le_bytes());
+    commitment[MINER_TREE_SIZE_END..].copy_from_slice(&nonce.to_le_bytes());
+    Ok(commitment)
+}
+
+/// Constructs the canonical version-2 coinbase miner-data commitment payload.
+///
+/// This allocation-friendly producer API returns exactly 44 bytes. It is
+/// equivalent to [`miner_data_commitment`] and is intended for parent-template
+/// builders that append the payload to existing pool-identification data.
+pub fn commitment_payload(
+    auxiliary_block_hash: [u8; 32],
+    auxiliary_branch: &[[u8; 32]],
+    auxiliary_index: u32,
+    nonce: u32,
+) -> Result<Vec<u8>, AuxPowError> {
+    Ok(miner_data_commitment(
+        auxiliary_block_hash,
+        auxiliary_branch,
+        auxiliary_index,
+        nonce,
+    )?
+    .to_vec())
 }
 
 /// A commitment whose exact carrier, root, tree size, and slot were checked.
@@ -89,23 +108,19 @@ impl ValidatedCommitment {
     }
 }
 
-/// Validates the exact Wcash carrier in authenticated transparent outputs.
+/// Validates the canonical version-2 commitment in authenticated coinbase data.
 ///
-/// Every marker occurrence is counted across every bounded script. Alternate
-/// push opcodes, prefixes, suffixes, nonzero value, and duplicate markers all
-/// fail closed.
-pub fn validate_commitment(
-    outputs: &[TransparentOutput],
+/// The commitment must be the exact final 44 bytes of `miner_data`, with no
+/// script push wrapper. Exactly one merged-mining marker may occur across the
+/// complete miner data. Rejecting alternate locations and duplicates prevents
+/// parsers from authenticating different auxiliary roots from the same parent
+/// coinbase.
+pub fn validate_miner_data_commitment(
+    miner_data: &[u8],
     auxiliary_block_hash: [u8; 32],
     auxiliary_branch: &[[u8; 32]],
     auxiliary_index: u32,
 ) -> Result<ValidatedCommitment, AuxPowError> {
-    if outputs.len() > MAX_TRANSPARENT_OUTPUTS {
-        return Err(AuxPowError::TooManyTransparentOutputs {
-            actual: outputs.len(),
-            max: MAX_TRANSPARENT_OUTPUTS,
-        });
-    }
     if auxiliary_branch.len() > MAX_AUXILIARY_BRANCH_DEPTH {
         return Err(AuxPowError::BranchTooLong {
             branch: "auxiliary",
@@ -114,36 +129,38 @@ pub fn validate_commitment(
         });
     }
 
-    let mut carrier = None;
-    for output in outputs {
-        if output.script_pubkey().len() > MAX_TRANSPARENT_SCRIPT_BYTES {
-            return Err(AuxPowError::TransparentScriptTooLarge {
-                actual: output.script_pubkey().len(),
-                max: MAX_TRANSPARENT_SCRIPT_BYTES,
-            });
-        }
-        for window in output.script_pubkey().windows(MERGED_MINING_MARKER.len()) {
-            if window == MERGED_MINING_MARKER && carrier.replace(output).is_some() {
-                return Err(AuxPowError::DuplicateCommitmentMarker);
-            }
-        }
+    match count_markers(miner_data) {
+        0 => return Err(AuxPowError::MissingMinerDataCommitment),
+        1 => {}
+        _ => return Err(AuxPowError::DuplicateCommitmentMarker),
     }
 
-    let carrier = carrier.ok_or(AuxPowError::MissingCommitmentOutput)?;
-    let script = carrier.script_pubkey();
-    if script.len() != SCRIPT_BYTES
-        || script[0] != OP_RETURN
-        || script[1] != PUSH_44
-        || script[2..ROOT_START] != MERGED_MINING_MARKER
-    {
-        return Err(AuxPowError::CommitmentScriptMismatch);
-    }
-    if carrier.value() != 0 {
-        return Err(AuxPowError::CommitmentOutputNotZero(carrier.value()));
+    let carrier = miner_data
+        .get(miner_data.len().saturating_sub(MINER_DATA_COMMITMENT_BYTES)..)
+        .filter(|carrier| carrier.len() == MINER_DATA_COMMITMENT_BYTES)
+        .ok_or(AuxPowError::CommitmentNotMinerDataSuffix)?;
+    if carrier[..MINER_ROOT_START] != MERGED_MINING_MARKER {
+        return Err(AuxPowError::CommitmentNotMinerDataSuffix);
     }
 
-    let committed_tree_size = u32::from_le_bytes(copy_array(&script[ROOT_END..TREE_SIZE_END]));
-    let nonce = u32::from_le_bytes(copy_array(&script[TREE_SIZE_END..SCRIPT_BYTES]));
+    validate_miner_data_carrier(
+        carrier,
+        auxiliary_block_hash,
+        auxiliary_branch,
+        auxiliary_index,
+    )
+}
+
+fn validate_miner_data_carrier(
+    carrier: &[u8],
+    auxiliary_block_hash: [u8; 32],
+    auxiliary_branch: &[[u8; 32]],
+    auxiliary_index: u32,
+) -> Result<ValidatedCommitment, AuxPowError> {
+    debug_assert_eq!(carrier.len(), MINER_DATA_COMMITMENT_BYTES);
+    let committed_tree_size =
+        u32::from_le_bytes(copy_array(&carrier[MINER_ROOT_END..MINER_TREE_SIZE_END]));
+    let nonce = u32::from_le_bytes(copy_array(&carrier[MINER_TREE_SIZE_END..]));
     check_auxiliary_position(auxiliary_branch, auxiliary_index, nonce)?;
     let expected_tree_size = auxiliary_tree_size(auxiliary_branch.len())?;
     if committed_tree_size != expected_tree_size {
@@ -158,7 +175,7 @@ pub fn validate_commitment(
         auxiliary_branch,
         auxiliary_index,
     )?;
-    let mut committed_root = copy_array::<32>(&script[ROOT_START..ROOT_END]);
+    let mut committed_root = copy_array::<32>(&carrier[MINER_ROOT_START..MINER_ROOT_END]);
     committed_root.reverse();
     if committed_root != auxiliary_root {
         return Err(AuxPowError::AuxiliaryRootMismatch);
@@ -170,6 +187,13 @@ pub fn validate_commitment(
         nonce,
         auxiliary_index,
     })
+}
+
+fn count_markers(bytes: &[u8]) -> usize {
+    bytes
+        .windows(MERGED_MINING_MARKER.len())
+        .filter(|window| *window == MERGED_MINING_MARKER)
+        .count()
 }
 
 fn check_auxiliary_position(
@@ -216,18 +240,6 @@ mod tests {
     const AUX_HASH: [u8; 32] = [0x42; 32];
     const NONCE: u32 = 7;
 
-    fn valid_case() -> (Vec<[u8; 32]>, u32, Vec<TransparentOutput>) {
-        let branch = vec![[0x11; 32], [0x22; 32], [0x33; 32]];
-        let index = expected_auxiliary_index(NONCE, branch.len()).expect("valid depth");
-        let script = commitment_script(AUX_HASH, &branch, index, NONCE)
-            .expect("valid commitment parameters");
-        let outputs = vec![
-            TransparentOutput::new(50, vec![0x51]),
-            TransparentOutput::new(0, script),
-        ];
-        (branch, index, outputs)
-    }
-
     #[test]
     fn leaf_is_domain_and_chain_separated() {
         assert_ne!(auxiliary_leaf(AUX_HASH), AUX_HASH);
@@ -239,135 +251,87 @@ mod tests {
     }
 
     #[test]
-    fn exact_zero_value_carrier_validates() {
-        let (branch, index, outputs) = valid_case();
+    fn exact_v2_miner_data_suffix_validates_and_is_unambiguous() {
+        let branch = vec![[0x11; 32], [0x22; 32], [0x33; 32]];
+        let index = expected_auxiliary_index(NONCE, branch.len()).expect("valid depth");
+        let payload =
+            miner_data_commitment(AUX_HASH, &branch, index, NONCE).expect("valid v2 commitment");
         assert_eq!(
-            hex::encode(outputs[1].script_pubkey()),
-            "6a2cfabe6d6dfd3ef87a4d51f460ac00d7ddc60430b5e9c210ed62e82d1984942ba8ad1de63e0800000007000000"
+            hex::encode(payload),
+            "fabe6d6dcf52029358e363beb6a9da300e10e137cc5e6f1f9cb8a71bff3aac48d27c8fd30800000007000000"
         );
-        let commitment = validate_commitment(&outputs, AUX_HASH, &branch, index)
-            .expect("exact carrier validates");
-        assert_eq!(commitment.nonce(), NONCE);
-        assert_eq!(commitment.tree_size(), 8);
-        assert_eq!(commitment.auxiliary_index(), index);
-    }
-
-    #[test]
-    fn alternate_and_duplicate_carriers_fail_closed() {
-        let (branch, index, outputs) = valid_case();
-
-        let mut prefixed = outputs.clone();
-        let mut script = prefixed[1].script_pubkey().to_vec();
-        script.insert(0, 0);
-        prefixed[1] = TransparentOutput::new(0, script);
         assert_eq!(
-            validate_commitment(&prefixed, AUX_HASH, &branch, index),
-            Err(AuxPowError::CommitmentScriptMismatch)
+            commitment_payload(AUX_HASH, &branch, index, NONCE),
+            Ok(payload.to_vec())
         );
 
-        let mut suffixed = outputs.clone();
-        let mut script = suffixed[1].script_pubkey().to_vec();
-        script.push(0);
-        suffixed[1] = TransparentOutput::new(0, script);
+        let mut miner_data = b"/pool/".to_vec();
+        miner_data.extend_from_slice(&payload);
+        let validated = validate_miner_data_commitment(&miner_data, AUX_HASH, &branch, index)
+            .expect("exact final suffix validates");
+        assert_eq!(validated.nonce(), NONCE);
+        assert_eq!(validated.tree_size(), 8);
+        assert_eq!(validated.auxiliary_index(), index);
+
+        let mut trailing = miner_data.clone();
+        trailing.push(0);
         assert_eq!(
-            validate_commitment(&suffixed, AUX_HASH, &branch, index),
-            Err(AuxPowError::CommitmentScriptMismatch)
+            validate_miner_data_commitment(&trailing, AUX_HASH, &branch, index),
+            Err(AuxPowError::CommitmentNotMinerDataSuffix)
         );
 
-        let mut alternate_push = outputs.clone();
-        let mut script = alternate_push[1].script_pubkey().to_vec();
-        script[1] = 0x4c;
-        alternate_push[1] = TransparentOutput::new(0, script);
+        let mut duplicate = MERGED_MINING_MARKER.to_vec();
+        duplicate.extend_from_slice(&miner_data);
         assert_eq!(
-            validate_commitment(&alternate_push, AUX_HASH, &branch, index),
-            Err(AuxPowError::CommitmentScriptMismatch)
-        );
-
-        let mut duplicate = outputs.clone();
-        duplicate.push(outputs[1].clone());
-        assert_eq!(
-            validate_commitment(&duplicate, AUX_HASH, &branch, index),
+            validate_miner_data_commitment(&duplicate, AUX_HASH, &branch, index),
             Err(AuxPowError::DuplicateCommitmentMarker)
         );
 
-        let mut double_marker = outputs;
-        let mut script = double_marker[1].script_pubkey().to_vec();
-        script.extend_from_slice(&MERGED_MINING_MARKER);
-        double_marker[1] = TransparentOutput::new(0, script);
         assert_eq!(
-            validate_commitment(&double_marker, AUX_HASH, &branch, index),
-            Err(AuxPowError::DuplicateCommitmentMarker)
+            validate_miner_data_commitment(b"/pool/no-commitment", AUX_HASH, &branch, index),
+            Err(AuxPowError::MissingMinerDataCommitment)
         );
-    }
-
-    #[test]
-    fn every_commitment_binding_is_enforced() {
-        let (branch, index, outputs) = valid_case();
-
-        let mut nonzero = outputs.clone();
-        nonzero[1] = TransparentOutput::new(1, nonzero[1].script_pubkey().to_vec());
         assert_eq!(
-            validate_commitment(&nonzero, AUX_HASH, &branch, index),
-            Err(AuxPowError::CommitmentOutputNotZero(1))
-        );
-
-        assert_eq!(
-            validate_commitment(&outputs, [0x41; 32], &branch, index),
+            validate_miner_data_commitment(&miner_data, [0x43; 32], &branch, index),
             Err(AuxPowError::AuxiliaryRootMismatch)
         );
 
-        let mut wrong_size = outputs.clone();
-        let mut script = wrong_size[1].script_pubkey().to_vec();
-        script[ROOT_END..TREE_SIZE_END].copy_from_slice(&4u32.to_le_bytes());
-        wrong_size[1] = TransparentOutput::new(0, script);
+        let suffix_start = miner_data.len() - MINER_DATA_COMMITMENT_BYTES;
+        let mut wrong_size = miner_data.clone();
+        wrong_size[suffix_start + MINER_ROOT_END..suffix_start + MINER_TREE_SIZE_END]
+            .copy_from_slice(&4u32.to_le_bytes());
         assert!(matches!(
-            validate_commitment(&wrong_size, AUX_HASH, &branch, index),
+            validate_miner_data_commitment(&wrong_size, AUX_HASH, &branch, index),
             Err(AuxPowError::AuxiliaryTreeSizeMismatch { .. })
         ));
 
         let wrong_index = (index + 1) % 8;
         assert!(matches!(
-            validate_commitment(&outputs, AUX_HASH, &branch, wrong_index),
+            validate_miner_data_commitment(&miner_data, AUX_HASH, &branch, wrong_index),
             Err(AuxPowError::AuxiliaryIndexMismatch { .. })
         ));
 
-        let mut wrong_branch = branch;
+        let mut wrong_branch = branch.clone();
         wrong_branch[0][0] ^= 1;
         assert_eq!(
-            validate_commitment(&outputs, AUX_HASH, &wrong_branch, index),
+            validate_miner_data_commitment(&miner_data, AUX_HASH, &wrong_branch, index),
             Err(AuxPowError::AuxiliaryRootMismatch)
         );
-    }
 
-    #[test]
-    fn missing_and_oversized_carriers_fail_before_scanning_unbounded_data() {
-        let (branch, index, _) = valid_case();
+        let oversized_branch = vec![[0; 32]; MAX_AUXILIARY_BRANCH_DEPTH + 1];
+        assert!(matches!(
+            validate_miner_data_commitment(&miner_data, AUX_HASH, &oversized_branch, index),
+            Err(AuxPowError::BranchTooLong {
+                branch: "auxiliary",
+                ..
+            })
+        ));
+
+        let mut marker_without_carrier = b"/pool/".to_vec();
+        marker_without_carrier.extend_from_slice(&MERGED_MINING_MARKER);
         assert_eq!(
-            validate_commitment(
-                &[TransparentOutput::new(0, vec![OP_RETURN, 0])],
-                AUX_HASH,
-                &branch,
-                index,
-            ),
-            Err(AuxPowError::MissingCommitmentOutput)
+            validate_miner_data_commitment(&marker_without_carrier, AUX_HASH, &branch, index,),
+            Err(AuxPowError::CommitmentNotMinerDataSuffix)
         );
-
-        let oversized_script = vec![0; MAX_TRANSPARENT_SCRIPT_BYTES + 1];
-        assert!(matches!(
-            validate_commitment(
-                &[TransparentOutput::new(0, oversized_script)],
-                AUX_HASH,
-                &branch,
-                index,
-            ),
-            Err(AuxPowError::TransparentScriptTooLarge { .. })
-        ));
-
-        let outputs =
-            vec![TransparentOutput::new(0, Vec::<u8>::new()); MAX_TRANSPARENT_OUTPUTS + 1];
-        assert!(matches!(
-            validate_commitment(&outputs, AUX_HASH, &branch, index),
-            Err(AuxPowError::TooManyTransparentOutputs { .. })
-        ));
     }
 }

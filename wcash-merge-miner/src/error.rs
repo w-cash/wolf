@@ -117,4 +117,90 @@ pub enum MinerError {
     /// JSON encoding or decoding failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+
+    /// A parent-node RPC endpoint or quorum setting is unsafe or malformed.
+    #[error("invalid parent RPC configuration: {0}")]
+    RpcConfiguration(String),
+
+    /// A parent-node RPC request failed before a valid JSON-RPC response arrived.
+    #[error("parent RPC transport failed: {0}")]
+    RpcTransport(#[source] reqwest::Error),
+
+    /// A parent-node RPC endpoint returned a non-successful HTTP status.
+    #[error("parent RPC returned HTTP status {0}")]
+    RpcHttpStatus(reqwest::StatusCode),
+
+    /// A parent-node RPC response exceeded the fixed wire-size limit.
+    #[error("parent RPC response exceeds {0} bytes")]
+    RpcResponseTooLarge(usize),
+
+    /// A parent-node response violated JSON-RPC framing.
+    #[error("invalid parent RPC response: {0}")]
+    RpcProtocol(String),
+
+    /// A parent node returned a well-formed JSON-RPC error object.
+    #[error(
+        "parent RPC endpoint {endpoint} returned error {code}: {message}",
+        code = code.map_or_else(|| "unknown".to_string(), |code| code.to_string())
+    )]
+    RpcError {
+        /// Credential-free endpoint label.
+        endpoint: String,
+        /// Numeric JSON-RPC error code, when supplied by the node.
+        code: Option<i64>,
+        /// Node-provided diagnostic message.
+        message: String,
+    },
+
+    /// An exact candidate parent block failed proposal validation.
+    #[error("parent proposal rejected by {endpoint}: {reason}")]
+    ParentProposalRejected {
+        /// Redacted endpoint label used for operational diagnosis.
+        endpoint: String,
+        /// Node-provided rejection reason.
+        reason: String,
+    },
+
+    /// Parent nodes did not agree on the exact chain tip used by the job.
+    #[error("parent tip mismatch: expected {expected}, {endpoint} returned {actual}")]
+    ParentTipMismatch {
+        /// Expected parent tip in conventional display order.
+        expected: String,
+        /// Redacted endpoint label.
+        endpoint: String,
+        /// Actual parent tip in conventional display order.
+        actual: String,
+    },
+
+    /// The Wcash candidate became stale while its parent proposal was checked.
+    #[error("Wcash tip mismatch: expected {expected}, {endpoint} returned {actual}")]
+    ChildTipMismatch {
+        /// Expected Wcash tip in conventional display order.
+        expected: String,
+        /// Redacted endpoint label.
+        endpoint: String,
+        /// Actual Wcash tip in conventional display order.
+        actual: String,
+    },
+
+    /// An RPC endpoint is serving a chain with a different genesis block.
+    #[error(
+        "network identity mismatch: expected genesis {expected}, {endpoint} returned {actual}"
+    )]
+    NetworkIdentityMismatch {
+        /// Operator-pinned genesis hash in conventional display order.
+        expected: String,
+        /// Redacted endpoint label.
+        endpoint: String,
+        /// Endpoint's height-zero block hash.
+        actual: String,
+    },
+
+    /// A frozen native job exceeded its lifetime or was deactivated by a tip change.
+    #[error("stale native merged-mining job: {0}")]
+    StaleNativeJob(String),
+
+    /// The live parent template failed a local invariant before reaching miners.
+    #[error("invalid parent template: {0}")]
+    InvalidParentTemplate(String),
 }

@@ -116,8 +116,13 @@ impl Tracing {
                 );
             }
 
+            let product = if network.uses_wcash_consensus() {
+                "Wcash"
+            } else {
+                "Zcash"
+            };
             eprintln!(
-                "Thank you for running a {} Wcash {} node!",
+                "Thank you for running a {} {product} {} node!",
                 network.lowercase_name(),
                 build_version()
             );

@@ -57,11 +57,12 @@ use tokio::{
 use tower::ServiceExt;
 use tracing::Instrument;
 
+use wcash_zcash_aux::AuxPowProof;
 use zcash_address::{unified::Encoding, TryFromAddress};
 use zcash_protocol::consensus::{self, Parameters};
 use zebra_chain::{
-    amount::{Amount, NegativeAllowed},
-    block::{self, Block, Commitment, Height, SerializedBlock, TryIntoHeight},
+    amount::{Amount, NegativeAllowed, NonNegative},
+    block::{self, Block, Commitment, Height, SerializedBlock, TryIntoHeight, MAX_BLOCK_BYTES},
     chain_sync_status::ChainSyncStatus,
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
     parameters::{
@@ -108,6 +109,7 @@ use crate::{
 pub(crate) mod hex_data;
 pub(crate) mod trees;
 pub(crate) mod types;
+mod wcash_aux_block;
 
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
@@ -134,7 +136,13 @@ use types::{
     transaction::TransactionObject,
     unified_address::ZListUnifiedReceiversResponse,
     validate_address::ValidateAddressResponse,
+    wcash_aux_block::{AuxPowHex, CreateAuxBlockResponse, GetAuxBlockStatusResponse},
     z_validate_address::ZValidateAddressResponse,
+};
+use wcash_aux_block::{
+    classify_committed_wcash_submission, is_invalid_wcash_auxpow, maximum_completed_block_size,
+    AuxBlockCandidateCache, CandidateChainState, CandidateInsertError, CandidateLookupError,
+    CandidateSubmissionState, AUX_BLOCK_VERIFY_TIMEOUT,
 };
 
 include!(concat!(env!("OUT_DIR"), "/rpc_openrpc.rs"));
@@ -163,6 +171,7 @@ pub(super) const PARAM_ADDRESS_DESC: &str = "The address to return.";
 pub(super) const PARAM_ADDRESS_STRINGS_DESC: &str = "The addresses to return.";
 pub(super) const PARAM_ADDR_DESC: &str = "The address to return.";
 pub(super) const PARAM_HEX_DATA_DESC: &str = "The hex-encoded data to return.";
+pub(super) const PARAM_AUX_POW_DESC: &str = "The hex-encoded Wcash AuxPoW proof.";
 pub(super) const PARAM_TXID_DESC: &str = "The transaction ID to return.";
 pub(super) const PARAM_HASH_OR_HEIGHT_DESC: &str = "The block hash or height to return.";
 pub(super) const PARAM_PARAMETERS_DESC: &str = "The parameters for the command.";
@@ -551,6 +560,35 @@ pub trait Rpc {
         parameters: Option<GetBlockTemplateParameters>,
     ) -> Result<GetBlockTemplateResponse>;
 
+    /// Creates and caches one exact proof-independent Wcash child-block
+    /// candidate for Zcash-parent merged mining.
+    ///
+    /// `address` must be a Wcash Unified Address with the receiver required for
+    /// a private Ironwood coinbase. A parent pool commits to the returned
+    /// `hash`, then supplies the same hash and its AuxPoW to
+    /// [`Self::submit_aux_block`]. This method is rejected on Zcash networks.
+    #[method(name = "createauxblock")]
+    async fn create_aux_block(&self, address: String) -> Result<CreateAuxBlockResponse>;
+
+    /// Attaches a canonical Zcash-parent AuxPoW proof to an exact cached Wcash
+    /// candidate, then submits it through normal consensus validation.
+    ///
+    /// Unknown and expired candidate IDs are rejected rather than reconstructing
+    /// a block from current mutable template state. Unexpired candidates whose
+    /// parent remains in any committed chain can be submitted across a shallow
+    /// reorg.
+    #[method(name = "submitauxblock")]
+    async fn submit_aux_block(&self, block_hash: String, aux_pow: AuxPowHex) -> Result<bool>;
+
+    /// Returns the exact witness-bound chain state and, when applicable, the
+    /// atomic best-chain confirmation count for a Wcash auxiliary block.
+    #[method(name = "getauxblockstatus")]
+    async fn get_aux_block_status(
+        &self,
+        block_hash: String,
+        aux_pow: AuxPowHex,
+    ) -> Result<GetAuxBlockStatusResponse>;
+
     /// Submits block to the node to be validated and committed.
     /// Returns the [`SubmitBlockResponse`] for the operation, as a JSON string.
     ///
@@ -889,6 +927,9 @@ where
 
     /// Handler for the `getblocktemplate` RPC.
     gbt: GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
+
+    /// Exact proof-independent Wcash candidates issued by `createauxblock`.
+    wcash_aux_blocks: AuxBlockCandidateCache,
 }
 
 /// A type alias for the last event logged by the server.
@@ -985,6 +1026,7 @@ where
             address_book,
             last_warn_error_log_rx,
             gbt,
+            wcash_aux_blocks: AuxBlockCandidateCache::default(),
         };
 
         // run the process queue
@@ -1008,6 +1050,200 @@ where
     pub fn with_end_of_support_height(mut self, end_of_support_height: Option<Height>) -> Self {
         self.end_of_support_height = end_of_support_height;
         self
+    }
+
+    /// Returns an exact state-service classification for a submitted Wcash
+    /// candidate, including in-progress queue and write-channel locations.
+    ///
+    /// The read service is authoritative for committed chain membership.
+    /// `KnownBlock` must only be a pending fallback: its sent-hash cache is
+    /// checked before chain state and can report `WriteChannel` for a block that
+    /// has already been committed.
+    async fn wcash_candidate_chain_state(&self, hash: block::Hash) -> Result<CandidateChainState> {
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(zebra_state::ReadRequest::AnyChainTransactionIdsForBlock(
+                hash.into(),
+            ))
+            .await
+            .map_err(|error| {
+                ErrorObject::owned(
+                    ErrorCode::InternalError.code(),
+                    format!("failed to query committed Wcash candidate state: {error}"),
+                    None::<()>,
+                )
+            })?;
+        match response {
+            zebra_state::ReadResponse::AnyChainTransactionIdsForBlock(Some((_, is_best_chain))) => {
+                return Ok(CandidateChainState::committed(is_best_chain));
+            }
+            zebra_state::ReadResponse::AnyChainTransactionIdsForBlock(None) => {}
+            _ => {
+                return Err(ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "read state returned an unexpected Wcash candidate response",
+                    None,
+                ));
+            }
+        }
+
+        let response = self
+            .state
+            .clone()
+            .oneshot(zebra_state::Request::KnownBlock(hash))
+            .await
+            .map_err(|error| {
+                ErrorObject::owned(
+                    ErrorCode::InternalError.code(),
+                    format!("failed to query Wcash candidate state: {error}"),
+                    None::<()>,
+                )
+            })?;
+        let zebra_state::Response::KnownBlock(location) = response else {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "state returned an unexpected Wcash candidate response",
+                None,
+            ));
+        };
+        Ok(location.into())
+    }
+
+    /// Reads the exact witness-bound submission state without inferring success
+    /// from the proof-independent Wcash ID alone.
+    ///
+    /// A best-chain block read is the only success basis because it observes
+    /// chain membership and witness bytes in one state snapshot. The any-chain
+    /// fallback is deliberately never promoted to success: a concurrent reorg
+    /// can move that block from side to best between the two reads, and the
+    /// caller can safely retry.
+    async fn wcash_submission_state(
+        &self,
+        hash: block::Hash,
+        witness: &[u8],
+    ) -> Result<CandidateSubmissionState> {
+        Ok(self
+            .wcash_submission_state_with_depth(hash, witness)
+            .await?
+            .0)
+    }
+
+    /// Reads exact witness state and best-chain depth from one state snapshot.
+    async fn wcash_submission_state_with_depth(
+        &self,
+        hash: block::Hash,
+        witness: &[u8],
+    ) -> Result<(CandidateSubmissionState, Option<u32>)> {
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(zebra_state::ReadRequest::BlockAndDepth(hash))
+            .await
+            .map_err(|error| {
+                ErrorObject::owned(
+                    ErrorCode::InternalError.code(),
+                    format!("failed to read committed Wcash candidate: {error}"),
+                    None::<()>,
+                )
+            })?;
+        let zebra_state::ReadResponse::BlockAndDepth(best_chain_block) = response else {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "read state returned an unexpected Wcash block-and-depth response",
+                None,
+            ));
+        };
+        if let Some((block, depth)) = best_chain_block {
+            let state = classify_committed_wcash_submission(block, witness, true);
+            let depth = matches!(state, CandidateSubmissionState::BestChain(_)).then_some(depth);
+            return Ok((state, depth));
+        }
+
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(zebra_state::ReadRequest::AnyChainBlock(hash.into()))
+            .await
+            .map_err(|error| {
+                ErrorObject::owned(
+                    ErrorCode::InternalError.code(),
+                    format!("failed to read any-chain Wcash candidate: {error}"),
+                    None::<()>,
+                )
+            })?;
+        let zebra_state::ReadResponse::Block(any_chain_block) = response else {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "read state returned an unexpected any-chain Wcash block response",
+                None,
+            ));
+        };
+        if let Some(block) = any_chain_block {
+            return Ok((
+                classify_committed_wcash_submission(block, witness, false),
+                None,
+            ));
+        }
+
+        let response = self
+            .state
+            .clone()
+            .oneshot(zebra_state::Request::KnownBlock(hash))
+            .await
+            .map_err(|error| {
+                ErrorObject::owned(
+                    ErrorCode::InternalError.code(),
+                    format!("failed to query pending Wcash candidate state: {error}"),
+                    None::<()>,
+                )
+            })?;
+        let zebra_state::Response::KnownBlock(location) = response else {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "state returned an unexpected pending Wcash candidate response",
+                None,
+            ));
+        };
+
+        // If chain membership appeared only after both read snapshots, the
+        // exact witness is unknown. Conservatively require a retry just like a
+        // genuinely queued/write-channel block.
+        Ok((
+            if location.is_some() {
+                CandidateSubmissionState::Pending
+            } else {
+                CandidateSubmissionState::Unknown
+            },
+            None,
+        ))
+    }
+
+    /// Queues an exact best-chain block snapshot for gossip and returns its
+    /// committed height.
+    fn advertise_wcash_best_chain_block(
+        &self,
+        expected_hash: block::Hash,
+        block: &Block,
+    ) -> Result<Height> {
+        if block.hash() != expected_hash {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "read state returned a different Wcash block ID",
+                None,
+            ));
+        }
+        let height = block.coinbase_height().ok_or_error(
+            ErrorCode::InternalError,
+            "committed Wcash candidate coinbase height not found",
+        )?;
+        self.gbt
+            .advertise_mined_block(expected_hash, height)
+            .map_error_with_prefix(
+                ErrorCode::InternalError,
+                "accepted Wcash block could not be queued for gossip; retry the same submission",
+            )?;
+        Ok(height)
     }
 }
 
@@ -2423,6 +2659,13 @@ where
             validate_block_proposal, zip317::select_mempool_transactions,
         };
 
+        // Validate extensions before proposal dispatch so `wcashaux` can never
+        // bypass its template-only and parent-network restrictions.
+        check_parameters(&parameters, &self.network)?;
+        let wcash_aux = parameters
+            .as_ref()
+            .and_then(GetBlockTemplateParameters::wcash_aux);
+
         // Clone Services
         let mempool = self.mempool.clone();
         let mut latest_chain_tip = self.latest_chain_tip.clone();
@@ -2444,8 +2687,6 @@ where
         }
 
         // To implement long polling correctly, we split this RPC into multiple phases.
-        check_parameters(&parameters)?;
-
         let client_long_poll_id = parameters.as_ref().and_then(|params| params.long_poll_id);
 
         let miner_params = self
@@ -2664,17 +2905,23 @@ where
                     // Respond instantly with an empty block upon a chain tip change so that
                     // the miner doesn't waste their effort trying to extend a shorter
                     // chain.
-                    return Ok(BlockTemplateResponse::new_internal(
+                    let response = BlockTemplateResponse::new_internal(
                         &self.network,
                         precomputed_coinbase,
                         None,
                         miner_params,
+                        wcash_aux,
                         &chain_info,
                         server_long_poll_id,
                         vec![],
                         submit_old,
                     )
-                    .into())
+                    .map_error_with_prefix(
+                        ErrorCode::InvalidParams,
+                        "invalid wcashaux parent-template request",
+                    )?;
+
+                    return Ok(response.into())
                 }
 
                 // The max time does not elapse during normal operation on mainnet,
@@ -2719,7 +2966,12 @@ where
             mempool_txs,
             mempool_tx_deps,
             Some(&coinbase_cache),
-        );
+            wcash_aux,
+        )
+        .map_error_with_prefix(
+            ErrorCode::InvalidParams,
+            "invalid wcashaux parent-template request",
+        )?;
 
         tracing::debug!(
             selected_mempool_tx_hashes = ?mempool_txs
@@ -2731,17 +2983,23 @@ where
 
         // - After this point, the template only depends on the previously fetched data.
 
-        Ok(BlockTemplateResponse::new_internal(
+        let response = BlockTemplateResponse::new_internal(
             &self.network,
             None,
             Some(self.gbt.coinbase_cache()),
             miner_params,
+            wcash_aux,
             &chain_info,
             server_long_poll_id,
             mempool_txs,
             submit_old,
         )
-        .into())
+        .map_error_with_prefix(
+            ErrorCode::InvalidParams,
+            "invalid wcashaux parent-template request",
+        )?;
+
+        Ok(response.into())
     }
 
     async fn submit_block(
@@ -2836,6 +3094,560 @@ where
         };
 
         Ok(response.into())
+    }
+
+    async fn create_aux_block(&self, address: String) -> Result<CreateAuxBlockResponse> {
+        if !self.network.uses_wcash_consensus() {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InvalidRequest.code(),
+                "createauxblock is only available on a Wcash network",
+                None,
+            ));
+        }
+
+        // A pool chooses its Wcash payout destination on every request, as in
+        // the established createauxblock API. MinerParams applies Wcash's
+        // stronger rule: only a Unified Address capable of receiving the
+        // private Ironwood coinbase is accepted.
+        let miner_address =
+            address
+                .parse()
+                .map_err(|error: config::mining::MinerAddressParseError| {
+                    ErrorObject::owned(
+                        ErrorCode::InvalidParams.code(),
+                        format!("invalid Wcash coinbase address: {error}"),
+                        None::<()>,
+                    )
+                })?;
+        let miner_params = MinerParams::new(
+            &self.network,
+            config::mining::Config {
+                miner_address: Some(miner_address),
+                ..Default::default()
+            },
+        )
+        .map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                format!("invalid Wcash coinbase address: {error}"),
+                None::<()>,
+            )
+        })?;
+
+        // Reuse the production template path with an isolated miner-address
+        // override. Its coinbase cache is detached by set_miner_params, while
+        // the exact AuxPoW candidate cache remains shared by RpcImpl clones.
+        let mut candidate_rpc = self.clone();
+        candidate_rpc.gbt.set_miner_params(miner_params);
+        let template = candidate_rpc
+            .get_block_template(None)
+            .await?
+            .try_into_template()
+            .ok_or_else(|| {
+                ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "createauxblock unexpectedly received a proposal response",
+                    None,
+                )
+            })?;
+
+        let height = Height(template.height);
+        let tx_fees = template
+            .transactions
+            .iter()
+            .try_fold(Amount::<NonNegative>::zero(), |total, transaction| {
+                total + transaction.fee
+            })
+            .map_error_with_prefix(
+                ErrorCode::InternalError,
+                "failed to total Wcash candidate transaction fees",
+            )?;
+        let subsidy = block_subsidy(height, &self.network).map_error_with_prefix(
+            ErrorCode::InternalError,
+            "failed to calculate Wcash block subsidy",
+        )?;
+        let coinbase_value =
+            (miner_subsidy(height, &self.network, subsidy).map_error_with_prefix(
+                ErrorCode::InternalError,
+                "failed to calculate Wcash miner subsidy",
+            )? + tx_fees)
+                .map_error_with_prefix(
+                    ErrorCode::InternalError,
+                    "Wcash coinbase value is out of range",
+                )?
+                .zatoshis();
+
+        let candidate = Arc::new(
+            proposal_block_from_template(&template, None, &self.network).map_err(|error| {
+                ErrorObject::owned(
+                    ErrorCode::InternalError.code(),
+                    format!("failed to construct Wcash auxiliary block: {error}"),
+                    None::<()>,
+                )
+            })?,
+        );
+        let hash = candidate.hash();
+        let candidate_height = candidate.coinbase_height().ok_or_error(
+            ErrorCode::InternalError,
+            "candidate coinbase height not found",
+        )?;
+        if candidate_height != height {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "candidate height does not match its template",
+                None,
+            ));
+        }
+        let bits = candidate.header.difficulty_threshold;
+        let target = bits.to_expanded().ok_or_else(|| {
+            ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "candidate contains an invalid difficulty target",
+                None,
+            )
+        })?;
+
+        let expected_tip = self.latest_chain_tip.best_tip_hash().ok_or_else(|| {
+            ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "no Wcash chain tip is available",
+                None,
+            )
+        })?;
+        if candidate.header.previous_block_hash != expected_tip {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "Wcash tip changed while constructing the candidate; retry createauxblock",
+                None,
+            ));
+        }
+
+        // Validate every proof-independent rule before publishing an ID that a
+        // parent miner may spend work committing to.
+        let mut block_verifier_router = self.gbt.block_verifier_router();
+        let proposal_validation = tokio::time::timeout(AUX_BLOCK_VERIFY_TIMEOUT, async {
+            block_verifier_router
+                .ready()
+                .await?
+                .call(zebra_consensus::Request::CheckProposal(Arc::clone(
+                    &candidate,
+                )))
+                .await
+        })
+        .await
+        .map_err(|_| {
+            ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "Wcash candidate proposal validation timed out; retry createauxblock",
+                None,
+            )
+        })?;
+        let validated_hash = proposal_validation.map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InternalError.code(),
+                format!("generated Wcash candidate failed proposal validation: {error}"),
+                None::<()>,
+            )
+        })?;
+        if validated_hash != hash {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "proposal validation returned a different Wcash block ID",
+                None,
+            ));
+        }
+
+        // Proposal validation is asynchronous, so close the tip-change race
+        // again before making this candidate externally visible.
+        if self.latest_chain_tip.best_tip_hash() != Some(expected_tip) {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "Wcash tip changed while validating the candidate; retry createauxblock",
+                None,
+            ));
+        }
+
+        if !candidate
+            .header
+            .solution
+            .as_wcash()
+            .is_some_and(|witness| witness.is_empty())
+            || candidate.header.solution.serialized_len() != Solution::WCASH_MIN_SERIALIZED_SIZE
+        {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "generated Wcash auxiliary candidate is not proof-free",
+                None,
+            ));
+        }
+        let candidate_data = candidate.zcash_serialize_to_vec().map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InternalError.code(),
+                format!("failed to serialize Wcash auxiliary block: {error}"),
+                None::<()>,
+            )
+        })?;
+        let maximum_completed_size = maximum_completed_block_size(candidate_data.len())
+            .ok_or_else(|| {
+                ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "Wcash auxiliary block size calculation overflowed",
+                    None,
+                )
+            })?;
+        if u64::try_from(maximum_completed_size).unwrap_or(u64::MAX) > MAX_BLOCK_BYTES {
+            return Err(ErrorObject::owned(
+                ErrorCode::InternalError.code(),
+                "Wcash auxiliary candidate leaves insufficient space for its AuxPoW witness",
+                None::<()>,
+            ));
+        }
+
+        // Serialize and size-check before consuming a bounded cache slot, then
+        // pin publication to the same tip on both sides of the insertion.
+        if self.latest_chain_tip.best_tip_hash() != Some(expected_tip) {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "Wcash tip changed before publishing the candidate; retry createauxblock",
+                None,
+            ));
+        }
+        let cached_hash = self
+            .wcash_aux_blocks
+            .insert(Arc::clone(&candidate))
+            .map_err(|error| match error {
+                CandidateInsertError::Full => ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "Wcash auxiliary candidate cache is full of active jobs; retry after a job expires",
+                    None,
+                ),
+            })?;
+        debug_assert_eq!(cached_hash, hash);
+        if self.latest_chain_tip.best_tip_hash() != Some(expected_tip) {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "Wcash tip changed while publishing the candidate; retry createauxblock",
+                None,
+            ));
+        }
+
+        Ok(CreateAuxBlockResponse::new(
+            hash,
+            candidate_data,
+            candidate.header.previous_block_hash,
+            coinbase_value,
+            target,
+            bits,
+            height.0,
+        ))
+    }
+
+    async fn get_aux_block_status(
+        &self,
+        block_hash: String,
+        aux_pow: AuxPowHex,
+    ) -> Result<GetAuxBlockStatusResponse> {
+        if !self.network.uses_wcash_consensus() {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InvalidRequest.code(),
+                "getauxblockstatus is only available on a Wcash network",
+                None,
+            ));
+        }
+
+        let block_hash = block::Hash::from_hex(block_hash).map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                format!("invalid Wcash auxiliary block hash: {error}"),
+                None::<()>,
+            )
+        })?;
+
+        let aux_pow = aux_pow.into_bytes();
+        AuxPowProof::decode(&aux_pow).map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                format!("invalid Wcash AuxPoW encoding: {error}"),
+                None::<()>,
+            )
+        })?;
+
+        let (state, depth) = self
+            .wcash_submission_state_with_depth(block_hash, &aux_pow)
+            .await?;
+        match state {
+            CandidateSubmissionState::BestChain(_) => {
+                let confirmations =
+                    depth
+                        .and_then(|depth| depth.checked_add(1))
+                        .ok_or_else(|| {
+                            ErrorObject::borrowed(
+                                ErrorCode::InternalError.code(),
+                                "Wcash best-chain confirmation count overflowed",
+                                None,
+                            )
+                        })?;
+                Ok(GetAuxBlockStatusResponse::BestChain { confirmations })
+            }
+            CandidateSubmissionState::SideChain => Ok(GetAuxBlockStatusResponse::SideChain),
+            CandidateSubmissionState::ConflictingWitness => {
+                Ok(GetAuxBlockStatusResponse::ConflictingWitness)
+            }
+            CandidateSubmissionState::Pending => Ok(GetAuxBlockStatusResponse::Pending),
+            CandidateSubmissionState::Unknown => Ok(GetAuxBlockStatusResponse::Unknown),
+        }
+    }
+
+    async fn submit_aux_block(&self, block_hash: String, aux_pow: AuxPowHex) -> Result<bool> {
+        if !self.network.uses_wcash_consensus() {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InvalidRequest.code(),
+                "submitauxblock is only available on a Wcash network",
+                None,
+            ));
+        }
+
+        let block_hash = block::Hash::from_hex(block_hash).map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                format!("invalid Wcash auxiliary block hash: {error}"),
+                None::<()>,
+            )
+        })?;
+
+        let aux_pow = aux_pow.into_bytes();
+        // Decode before any idempotent-state shortcut. Otherwise a caller can
+        // submit arbitrary bytes for a known witness-independent block ID and
+        // receive a misleading success response.
+        AuxPowProof::decode(&aux_pow).map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                format!("invalid Wcash AuxPoW encoding: {error}"),
+                None::<()>,
+            )
+        })?;
+
+        match self.wcash_submission_state(block_hash, &aux_pow).await? {
+            CandidateSubmissionState::BestChain(committed) => {
+                self.advertise_wcash_best_chain_block(block_hash, &committed)?;
+                self.wcash_aux_blocks.remove(block_hash);
+                return Ok(true);
+            }
+            CandidateSubmissionState::SideChain => {
+                return Err(ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "Wcash candidate is currently committed only to a side chain; retry after the next tip update",
+                    None,
+                ));
+            }
+            CandidateSubmissionState::ConflictingWitness => {
+                return Err(ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "Wcash block ID is already committed with a different AuxPoW witness",
+                    None,
+                ));
+            }
+            CandidateSubmissionState::Pending => {
+                return Err(ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "Wcash candidate submission is still in progress; retry the same submission",
+                    None,
+                ));
+            }
+            CandidateSubmissionState::Unknown => {}
+        }
+        let candidate = self
+            .wcash_aux_blocks
+            .get(block_hash)
+            .map_err(|error| {
+                let message = match error {
+                    CandidateLookupError::Unknown => {
+                        "Wcash auxiliary block ID is not in the local active-job cache; submission status is inconclusive"
+                    }
+                    CandidateLookupError::Expired => {
+                        "Wcash auxiliary block ID expired from the local active-job cache; submission status is inconclusive"
+                    }
+                };
+                // A prior request can be queued in state while `KnownBlock`
+                // still reports None, so a cache miss is never proof that the
+                // submitted work was rejected. Keep this response retryable.
+                ErrorObject::owned(ErrorCode::InternalError.code(), message, None::<()>)
+            })?;
+
+        // Do not enqueue a block whose parent is absent: the state service can
+        // wait indefinitely for missing parents. A committed side-chain parent
+        // is deliberately allowed so solved work can survive a shallow reorg.
+        match self
+            .wcash_candidate_chain_state(candidate.header.previous_block_hash)
+            .await?
+        {
+            CandidateChainState::BestChain | CandidateChainState::SideChain => {}
+            CandidateChainState::Pending => {
+                return Err(ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "Wcash candidate parent is still being committed; retry the same submission",
+                    None,
+                ));
+            }
+            CandidateChainState::Unknown => {
+                return Err(ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "Wcash candidate parent is not currently visible in a committed chain; retry the same submission",
+                    None,
+                ));
+            }
+        }
+
+        let mut completed_block = candidate.as_ref().clone();
+        Arc::make_mut(&mut completed_block.header).solution = Solution::for_wcash(aux_pow.clone())
+            .map_err(|error| {
+                ErrorObject::owned(
+                    ErrorCode::InvalidParams.code(),
+                    format!("invalid Wcash AuxPoW witness: {error}"),
+                    None::<()>,
+                )
+            })?;
+
+        // Wcash IDs exclude only the witness. Any accidental mutation of the
+        // cached candidate is a hard internal error, not a submission of a
+        // different block under the caller's ID.
+        if completed_block.hash() != block_hash {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "attaching AuxPoW changed the proof-independent Wcash block ID",
+                None,
+            ));
+        }
+
+        let height = completed_block.coinbase_height().ok_or_error(
+            ErrorCode::InternalError,
+            "candidate coinbase height not found",
+        )?;
+        let mut block_verifier_router = self.gbt.block_verifier_router();
+        let verification = match tokio::time::timeout(AUX_BLOCK_VERIFY_TIMEOUT, async {
+            block_verifier_router
+                .ready()
+                .await?
+                .call(zebra_consensus::Request::Commit(Arc::new(completed_block)))
+                .await
+        })
+        .await
+        {
+            Ok(verification) => verification,
+            Err(_) => {
+                // State commits are non-cancellable. The timed-out request may
+                // already have succeeded, so query authoritative state and only
+                // report success for this exact best-chain witness.
+                if let CandidateSubmissionState::BestChain(committed) =
+                    self.wcash_submission_state(block_hash, &aux_pow).await?
+                {
+                    let committed_height =
+                        self.advertise_wcash_best_chain_block(block_hash, &committed)?;
+                    if committed_height != height {
+                        return Err(ErrorObject::borrowed(
+                            ErrorCode::InternalError.code(),
+                            "committed Wcash candidate height differs from its cached candidate",
+                            None,
+                        ));
+                    }
+                    self.wcash_aux_blocks.remove(block_hash);
+                    return Ok(true);
+                }
+
+                return Err(ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "Wcash candidate verification timed out and remains inconclusive; retry the same submission",
+                    None,
+                ));
+            }
+        };
+
+        let submission_state = self.wcash_submission_state(block_hash, &aux_pow).await?;
+        if let Ok(hash) = &verification {
+            if *hash != block_hash {
+                return Err(ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "Wcash consensus returned a different committed block ID",
+                    None,
+                ));
+            }
+        }
+
+        match (verification, submission_state) {
+            (verification, CandidateSubmissionState::BestChain(committed)) => {
+                let committed_height =
+                    self.advertise_wcash_best_chain_block(block_hash, &committed)?;
+                if committed_height != height {
+                    return Err(ErrorObject::borrowed(
+                        ErrorCode::InternalError.code(),
+                        "committed Wcash candidate height differs from its cached candidate",
+                        None,
+                    ));
+                }
+                self.wcash_aux_blocks.remove(block_hash);
+                // Best-chain inclusion is authoritative even if this call raced
+                // an identical submission and received a duplicate error.
+                tracing::info!(
+                    ?block_hash,
+                    ?height,
+                    duplicate = verification
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.downcast_ref::<RouterError>())
+                        .is_some_and(RouterError::is_duplicate_request),
+                    "submitauxblock confirmed Wcash block on the best chain"
+                );
+                Ok(true)
+            }
+            (_, CandidateSubmissionState::SideChain) => {
+                tracing::info!(
+                    ?block_hash,
+                    ?height,
+                    "submitauxblock committed Wcash block only to a side chain"
+                );
+                Err(ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "Wcash candidate is currently committed only to a side chain; retry after the next tip update",
+                    None,
+                ))
+            }
+            (_, CandidateSubmissionState::ConflictingWitness) => Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "Wcash block ID is already committed with a different AuxPoW witness",
+                None,
+            )),
+            (_, CandidateSubmissionState::Pending) => Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "Wcash candidate submission is still in progress; retry the same submission",
+                None,
+            )),
+            (Ok(_), CandidateSubmissionState::Unknown) => Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "Wcash consensus completed but state has not exposed the candidate; retry the same submission",
+                None,
+            )),
+            (Err(error), CandidateSubmissionState::Unknown) => {
+                let invalid_auxpow = error
+                    .downcast_ref::<RouterError>()
+                    .is_some_and(is_invalid_wcash_auxpow);
+                tracing::warn!(
+                    ?error,
+                    ?block_hash,
+                    ?height,
+                    invalid_auxpow,
+                    "submitauxblock ended without a definitive state result"
+                );
+                if invalid_auxpow {
+                    Ok(false)
+                } else {
+                    Err(ErrorObject::owned(
+                        ErrorCode::InternalError.code(),
+                        "Wcash candidate submission was inconclusive; retry the same submission",
+                        None::<()>,
+                    ))
+                }
+            }
+        }
     }
 
     async fn get_mining_info(&self) -> Result<GetMiningInfoResponse> {

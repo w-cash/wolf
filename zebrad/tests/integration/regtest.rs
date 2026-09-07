@@ -661,6 +661,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         block_template.height(),
         block_template.max_time(),
         block_template.submit_old(),
+        None,
     );
 
     let proposal_block = proposal_block_from_template(&block_template, None, &net)?;
@@ -726,6 +727,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         block_template.height(),
         block_template.max_time(),
         block_template.submit_old(),
+        None,
     );
 
     let proposal_block = proposal_block_from_template(&block_template, None, &net)?;

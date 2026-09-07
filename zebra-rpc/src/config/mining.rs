@@ -93,7 +93,7 @@ pub enum MinerAddressParseError {
 
 /// Mining configuration section.
 #[serde_as]
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Address for receiving miner subsidy and tx fees.
@@ -125,6 +125,24 @@ pub struct Config {
     /// The internal miner is off by default.
     #[serde(default)]
     pub internal_miner: bool,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field(
+                "miner_address",
+                &self.miner_address.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("extra_coinbase_data", &self.extra_coinbase_data)
+            .field(
+                "miner_memo",
+                &self.miner_memo.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("internal_miner", &self.internal_miner)
+            .finish()
+    }
 }
 
 impl Config {
@@ -255,4 +273,24 @@ lazy_static::lazy_static! {
             (MinerAddressType::Transparent, "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"),
         ].into()),
     ].into();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mining_config_debug_redacts_payout_material() {
+        let address = "t1T92bmyoPM7PTSWUnaWnLGcxkF6Jp1AwMY";
+        let memo = "private-miner-memo";
+        let config = Config {
+            miner_address: Some(address.parse().expect("valid fixture address")),
+            miner_memo: Some(memo.to_string()),
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(address));
+        assert!(!debug.contains(memo));
+        assert!(debug.contains("[REDACTED]"));
+    }
 }

@@ -48,7 +48,7 @@ Install Rust 1.91 or newer plus the native build dependencies required by
 Zebra, then run:
 
 ```sh
-cargo build --release -p zebrad --features internal-miner --bin zebrad
+cargo build --release -p zebrad --features wcash-consensus,internal-miner --bin zebrad
 cargo build --release -p wcash-merge-miner --bin wcash-merge-miner
 ./target/release/zebrad -c wcash-local.toml start
 ```
@@ -64,8 +64,11 @@ This local chain freezes Bitcoin mainnet block 965,910, hash
 which was the Blockstream tip snapshot selected for regtest genesis. It replaces
 the earlier local genesis and uses the `Wcash/regtest/v2` P2P identity.
 
-The merge-mining harness can exercise real Equihash solving and proof
-validation, but it is not yet an end-to-end production pool adapter:
+The native merge-mining coordinator can create a private Wcash candidate,
+request a commitment-aware Zcash template, obtain independent proposal
+validation, expose a ZIP-301 backend for Equihash ASIC interoperability testing,
+and durably submit winners to both nodes. It is intentionally loopback-only and
+is not a public pool edge:
 
 ```sh
 cargo run --release -p wcash-merge-miner -- --help
@@ -79,13 +82,14 @@ See:
 
 ## Release blockers
 
-The designated Bitcoin mainnet anchor height, `965,954`, is intentionally
-treated as not yet mined/frozen. The mainnet and public-testnet anchor constants
-remain unset, so public activation fails closed. A public release also requires
+The mainnet and public-testnet Bitcoin anchor constants remain deliberately
+unset, so public activation fails closed. Any designated anchor height and hash
+must be independently verified and frozen in a reviewed release. A public release also requires
 an independently reviewed consensus specification and implementation, stable
-public network/address domains, adversarial testing, and a production pool
-adapter that starts from live Zcash `getblocktemplate` data and correctly
-submits qualifying work to both chains.
+public network/address domains, adversarial multi-node soak and reorg testing,
+Wcash wallet/key support, and an operated TLS/authentication, variable-
+difficulty, accounting, payout, and monitoring layer in front of the included
+loopback ZIP-301 service.
 
 ## Upstream attribution and license
 
