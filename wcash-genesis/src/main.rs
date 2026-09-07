@@ -40,8 +40,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             reject_extra_arguments(arguments)?;
             println!("project: Wcash (WCASH)");
             println!(
-                "mainnet: disabled; requested Bitcoin height {}",
-                wcash_genesis::REQUESTED_MAINNET_BITCOIN_HEIGHT
+                "mainnet: disabled; designated Bitcoin anchor height {}",
+                wcash_genesis::DESIGNATED_MAINNET_BITCOIN_HEIGHT
             );
             println!("testnet: disabled; no reviewed anchor frozen");
             println!("regtest: enabled; compiled Bitcoin genesis anchor only");

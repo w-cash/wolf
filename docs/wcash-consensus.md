@@ -10,7 +10,7 @@ Only `Network::new_wcash_regtest()` activates Wcash consensus. It has a distinct
 local genesis block and P2P magic, activates NU6.3 at height 1, and uses the
 Ironwood transaction format for every mined block.
 
-The requested public genesis reference is Bitcoin mainnet block height
+The designated public genesis reference is Bitcoin mainnet block height
 `965,954`. That anchor is intentionally treated as not yet mined/frozen in this
 source tree. Both public anchor constants are `None`; mainnet and public testnet
 therefore fail closed. Local regtest instead anchors its deterministic genesis

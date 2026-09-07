@@ -30,7 +30,7 @@ pub const USER_AGENT_PREFIX: &str = "/Wcash:";
 pub const GENESIS_TIMESTAMP_TEXT: &str = "06/Sep/2026 Wcash";
 
 /// Bitcoin mainnet height announced as the future Wcash mainnet anchor.
-pub const REQUESTED_MAINNET_BITCOIN_HEIGHT: u32 = 965_954;
+pub const DESIGNATED_MAINNET_BITCOIN_HEIGHT: u32 = 965_954;
 
 /// Number of confirmations required by the release procedure before freezing a public anchor.
 pub const MIN_PUBLIC_ANCHOR_CONFIRMATIONS: u32 = 100;
@@ -791,7 +791,7 @@ mod tests {
                 .expect_err("public anchors must stay unavailable before review");
             assert_eq!(error.network(), network);
         }
-        assert_eq!(REQUESTED_MAINNET_BITCOIN_HEIGHT, 965_954);
+        assert_eq!(DESIGNATED_MAINNET_BITCOIN_HEIGHT, 965_954);
     }
 
     #[test]

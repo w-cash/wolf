@@ -66,7 +66,7 @@ See:
 
 ## Release blockers
 
-The requested Bitcoin mainnet anchor height, `965,954`, is intentionally
+The designated Bitcoin mainnet anchor height, `965,954`, is intentionally
 treated as not yet mined/frozen. The mainnet and public-testnet anchor constants
 remain unset, so public activation fails closed. A public release also requires
 an independently reviewed consensus specification and implementation, stable
