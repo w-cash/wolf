@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: breaking
+body: "Add Wcash-aware mining addresses, coinbase construction, templates, proposal checks, and submissions. Mining configuration now uses the network-aware `MinerAddress` type ([#1](https://github.com/w-cash/wolf/pull/1))."
+time: 2026-09-08T09:31:13.000000005Z

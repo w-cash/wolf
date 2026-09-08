@@ -19,7 +19,8 @@ use crate::common::{
     check::{EphemeralCheck, EphemeralConfig},
     config::{
         config_file_full_path, configs_dir, default_test_config, os_assigned_rpc_port_config,
-        persistent_test_config, read_listen_addr_from_logs, testdir,
+        persistent_test_config, read_listen_addr_from_logs, start_message_for_consensus,
+        test_network_for_consensus, testdir,
     },
     launch::{ZebradTestDirExt, EXTENDED_LAUNCH_DELAY, LAUNCH_DELAY},
     sync::TINY_CHECKPOINT_TIMEOUT,
@@ -62,7 +63,7 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
 
     let _init_guard = zebra_test::init();
 
-    let mut config = default_test_config(&Network::new_wcash_regtest());
+    let mut config = default_test_config(&test_network_for_consensus());
     let run_dir = testdir()?;
 
     let ignored_cache_dir = run_dir.path().join("state");
@@ -303,7 +304,7 @@ fn dir_is_populated(dir: &Path) -> bool {
 /// cache conflicts.
 #[test]
 fn config_tests() -> Result<()> {
-    valid_generated_config("start", "Starting Wcash")?;
+    valid_generated_config("start", start_message_for_consensus())?;
 
     // Check what happens when Zebra parses an invalid config
     invalid_generated_config()?;
@@ -327,7 +328,7 @@ fn app_no_args() -> Result<()> {
 
     // start caches state, so run one of the start tests with persistent state
     let testdir =
-        testdir()?.with_config(&mut persistent_test_config(&Network::new_wcash_regtest())?)?;
+        testdir()?.with_config(&mut persistent_test_config(&test_network_for_consensus())?)?;
 
     tracing::info!(?testdir, "running zebrad with no config (default settings)");
 
@@ -340,7 +341,7 @@ fn app_no_args() -> Result<()> {
     let output = child.wait_with_output()?;
     let output = output.assert_failure()?;
 
-    output.stdout_line_contains("Starting Wcash")?;
+    output.stdout_line_contains(start_message_for_consensus())?;
 
     // Make sure the command passed the legacy chain check
     output.stdout_line_contains("starting legacy chain check")?;
@@ -591,13 +592,24 @@ fn invalid_generated_config() -> Result<()> {
 
     // Check that Zebra produced an informative message.
     output.stderr_contains(
-        "Wcash could not load the provided configuration file and/or environment variables",
+        "The node could not load the provided configuration file and/or environment variables",
     )?;
 
     Ok(())
 }
 
-/// Test all versions of `zebrad.toml` we have stored can be parsed by the latest `zebrad`.
+/// Returns `true` for intentional Wcash-profile rejections of legacy Zcash network settings.
+fn is_expected_wcash_legacy_config_rejection(error: &impl std::fmt::Debug) -> bool {
+    if !cfg!(feature = "wcash-consensus") {
+        return false;
+    }
+
+    let error = format!("{error:?}");
+    error.contains("Wcash networks cannot use built-in Zcash DNS seeds or initial peers")
+        || error.contains("built-in Wcash networks reject configured Zcash testnet parameters")
+}
+
+/// Test that every stored `zebrad.toml` either parses or hits an intentional safety boundary.
 #[tracing::instrument]
 #[test]
 fn stored_configs_parsed_correctly() -> Result<()> {
@@ -633,15 +645,23 @@ fn stored_configs_parsed_correctly() -> Result<()> {
             "testing old config can be parsed by current zebrad"
         );
 
-        ZebradApp::default()
-            .load_config(&config_file_path)
-            .expect("config should parse");
+        if let Err(error) = ZebradApp::default().load_config(&config_file_path) {
+            assert!(
+                is_expected_wcash_legacy_config_rejection(&error),
+                "config should parse: {error:?}"
+            );
+            tracing::info!(
+                ?config_file_path,
+                ?error,
+                "legacy Zcash settings were rejected by the Wcash-only profile"
+            );
+        }
     }
 
     Ok(())
 }
 
-/// Test that stored configs either start Wcash or receive the intentional Zcash-network rejection.
+/// Test that stored configs either start under the selected profile or fail at a safety boundary.
 #[tracing::instrument]
 fn stored_configs_follow_runtime_network_policy() -> Result<()> {
     use abscissa_core::Application;
@@ -680,18 +700,45 @@ fn stored_configs_follow_runtime_network_policy() -> Result<()> {
             "testing old config can be parsed by current zebrad"
         );
 
-        let stored_config = ZebradApp::default()
-            .load_config(&stored_config_path)
-            .expect("stored config already passed the parsing compatibility test");
+        let stored_config = match ZebradApp::default().load_config(&stored_config_path) {
+            Ok(stored_config) => stored_config,
+            Err(error) if is_expected_wcash_legacy_config_rejection(&error) => {
+                tracing::info!(
+                    ?stored_config_path,
+                    ?error,
+                    "legacy Zcash settings were rejected by the Wcash-only profile"
+                );
+                continue;
+            }
+            Err(error) => panic!("stored config should parse: {error:?}"),
+        };
 
         // Run the node with the stored config.
         let mut child =
             run_dir.spawn_child(args!["-c", stored_config_path.to_str().unwrap(), "start"])?;
 
-        if !stored_config.network.network.uses_wcash_consensus() {
+        let network_profile_mismatch = stored_config.network.network.uses_wcash_consensus()
+            != cfg!(feature = "wcash-consensus");
+        if network_profile_mismatch {
             let output = child.wait_with_output()?;
             let output = output.assert_failure()?;
-            output.stderr_contains("only supports network = 'WcashTestnet' or 'WcashRegtest'")?;
+            let rejection = if cfg!(feature = "wcash-consensus") {
+                "only supports network = 'WcashTestnet' or 'WcashRegtest'"
+            } else {
+                "does not support Wcash networks"
+            };
+            output.stderr_contains(rejection)?;
+            continue;
+        }
+
+        // This historical fixture configured a Mainnet miner address on Testnet. The hardened
+        // startup validation must reject that unsafe combination instead of preserving the old
+        // behavior, while every other profile-compatible stored config must still start.
+        if config_file_name == "v1.9.0-internal-miner.toml" {
+            let output = child.wait_with_output()?;
+            let output = output.assert_failure()?;
+            output.stderr_contains("invalid mining configuration: Invalid miner address")?;
+            output.stderr_contains("Address is for Main but we expected Test")?;
             continue;
         }
 
@@ -716,7 +763,7 @@ fn stored_configs_follow_runtime_network_policy() -> Result<()> {
             .collect_regex_set()
             .expect("regexes are valid");
 
-        // Wcash was able to start with the current stored config.
+        // The selected consensus build was able to start with the stored config.
         child.expect_stdout_line_matches(success_regexes)?;
 
         // finish
@@ -745,7 +792,7 @@ fn non_blocking_logger() -> Result<()> {
     let (done_tx, done_rx) = mpsc::channel();
 
     let test_task_handle: tokio::task::JoinHandle<Result<()>> = rt.spawn(async move {
-        let mut config = os_assigned_rpc_port_config(false, &Network::new_wcash_regtest())?;
+        let mut config = os_assigned_rpc_port_config(false, &test_network_for_consensus())?;
         config.tracing.filter = Some("trace".to_string());
         config.tracing.buffer_limit = 100;
 

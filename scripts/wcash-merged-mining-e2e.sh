@@ -206,7 +206,7 @@ assert all(value == 0 for name,value in pools.items() if name != "ironwood")
 '
 
 export WCASH_STRATUM_PASSWORD=local-test-password-change-me
-export WCASH_SHARE_TARGET="$(python3 - "$runtime_dir/native-job.json" <<'PY'
+WCASH_SHARE_TARGET="$(python3 - "$runtime_dir/native-job.json" <<'PY'
 import json
 import sys
 
@@ -218,6 +218,7 @@ assert child_target == parent_target, (child_target, parent_target)
 print(child_target)
 PY
 )"
+export WCASH_SHARE_TARGET
 export WCASH_VALIDATION_LIMIT=4
 export WCASH_AUTHENTICATION_LIMIT=2
 worker_password_hash="$(

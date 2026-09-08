@@ -591,7 +591,6 @@ impl ParametersBuilder {
     ) -> Result<Self, ParametersBuilderError> {
         if [
             magics::MAINNET,
-            magics::TESTNET,
             magics::REGTEST,
             WCASH_REGTEST_NETWORK_MAGIC,
             WCASH_TESTNET_NETWORK_MAGIC,

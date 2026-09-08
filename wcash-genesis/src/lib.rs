@@ -875,11 +875,13 @@ mod tests {
             select_anchor(WcashNetwork::Testnet, None),
             Ok(TESTNET_ANCHOR)
         );
-        assert!(
-            PUBLIC_TESTNET_VERIFICATION_HEIGHT - PUBLIC_TESTNET_BITCOIN_HEIGHT + 1
-                >= MIN_PUBLIC_ANCHOR_CONFIRMATIONS,
-            "the frozen audit height must record at least the release minimum confirmations"
-        );
+        const {
+            assert!(
+                PUBLIC_TESTNET_VERIFICATION_HEIGHT - PUBLIC_TESTNET_BITCOIN_HEIGHT + 1
+                    >= MIN_PUBLIC_ANCHOR_CONFIRMATIONS,
+                "the frozen audit height must record at least the release minimum confirmations"
+            );
+        }
     }
 
     #[test]

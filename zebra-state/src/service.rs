@@ -1471,9 +1471,7 @@ impl Service<ReadRequest> for ReadStateService {
                 // overlapping blocks while this synchronous query runs.
                 let best_chain = state.latest_best_chain();
                 let block = read::block(best_chain.clone(), &state.db, hash.into());
-                let block_and_depth = block.and_then(|block| {
-                    read::depth(best_chain, &state.db, hash).map(|depth| (block, depth))
-                });
+                let block_and_depth = block.zip(read::depth(best_chain, &state.db, hash));
                 Ok(ReadResponse::BlockAndDepth(block_and_depth))
             }
 

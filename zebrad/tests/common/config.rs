@@ -25,8 +25,30 @@ use zebrad::{
 
 use crate::common::cached_state::DATABASE_FORMAT_CHECK_INTERVAL;
 
+/// Returns a test network accepted by the selected consensus build.
+pub fn test_network_for_consensus() -> Network {
+    #[cfg(feature = "wcash-consensus")]
+    {
+        Network::new_wcash_regtest()
+    }
+
+    #[cfg(not(feature = "wcash-consensus"))]
+    {
+        Network::Mainnet
+    }
+}
+
+/// Returns the startup log message emitted by the selected consensus build.
+pub const fn start_message_for_consensus() -> &'static str {
+    if cfg!(feature = "wcash-consensus") {
+        "Starting Wcash"
+    } else {
+        "Starting zebrad"
+    }
+}
+
 /// Returns a config with:
-/// - a Zcash listener on an unused port on IPv4 localhost, and
+/// - a node listener on an unused port on IPv4 localhost, and
 /// - an ephemeral state,
 /// - the minimum syncer lookahead limit, and
 /// - shorter task intervals, to improve test coverage.

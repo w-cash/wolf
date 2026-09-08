@@ -1,0 +1,4 @@
+project: zebra-state
+kind: breaking
+body: "Add atomic block-and-depth state requests used to pin AuxPoW parent validation; the exhaustive `ReadRequest` and `ReadResponse` enums gain `BlockAndDepth` variants ([#1](https://github.com/w-cash/wolf/pull/1))."
+time: 2026-09-08T09:31:13.000000004Z

@@ -1,0 +1,4 @@
+project: zebra-chain
+kind: breaking
+body: "Add Wcash network, address, subsidy, private coinbase, and AuxPoW types. Block headers are no longer `Copy`, and exhaustive consensus enums gain Wcash variants ([#1](https://github.com/w-cash/wolf/pull/1))."
+time: 2026-09-08T09:31:13.000000001Z

@@ -1,0 +1,4 @@
+project: zebra-network
+kind: breaking
+body: "Add isolated Wcash Testnet and regtest peer identities, wire limits, and sidecar block-gossip support for merged-mining deployments ([#1](https://github.com/w-cash/wolf/pull/1))."
+time: 2026-09-08T09:31:13.000000003Z
