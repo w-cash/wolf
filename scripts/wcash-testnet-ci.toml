@@ -1,0 +1,27 @@
+# CI-only Wcash Testnet profile for the native merged-mining smoke test.
+# It deliberately has no peers and no debug sync override. Zebra's normal
+# test-network policy still permits an isolated node to issue templates; do not
+# copy this profile or its unauthenticated RPC setting into pool operations.
+
+[network]
+network = "WcashTestnet"
+listen_addr = "127.0.0.1:38233"
+initial_mainnet_peers = []
+initial_testnet_peers = []
+cache_dir = false
+peerset_initial_target_size = 1
+max_connections_per_ip = 1
+
+[state]
+ephemeral = true
+
+[rpc]
+listen_addr = "127.0.0.1:38232"
+enable_cookie_auth = false
+
+[mining]
+extra_coinbase_data = "WcashTestnetCI"
+internal_miner = false
+
+[tracing]
+filter = "info"

@@ -1,0 +1,35 @@
+# Safe baseline for the built-in public Wcash Testnet.
+#
+# This first-seed profile never contacts Zcash DNS seeds. Until project-owned
+# Wcash seeds are published, add explicit Wcash peers to
+# `initial_testnet_peers` or allow inbound peers on the P2P listener.
+
+[network]
+network = "WcashTestnet"
+listen_addr = "[::]:38233"
+# Set this to the node's reachable address when it is behind NAT or a load balancer.
+# external_addr = "203.0.113.10:38233"
+initial_mainnet_peers = []
+initial_testnet_peers = []
+cache_dir = true
+max_connections_per_ip = 1
+
+[state]
+# Persistent by default. The database is isolated below the platform cache
+# root as `wcash/state/vN/wcashtestnet`; it does not share Zcash or regtest state.
+ephemeral = false
+
+[rpc]
+# Keep RPC on loopback. The node creates and requires a cookie by default.
+listen_addr = "127.0.0.1:38232"
+enable_cookie_auth = true
+debug_force_finished_sync = false
+
+[mining]
+# Pool software supplies an exact Wcash Testnet Unified Address to
+# `createauxblock`; no transparent or Zcash address is accepted.
+internal_miner = false
+extra_coinbase_data = "WcashTestnet"
+
+[tracing]
+filter = "info"

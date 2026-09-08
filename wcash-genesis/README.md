@@ -33,11 +33,46 @@ announcement timestamp, is:
 
 Neither consensus validation nor the generator performs HTTP requests.
 
-## Fail-closed public launch
+## Frozen public testnet anchor
+
+The public engineering testnet freezes Bitcoin mainnet block 965,900:
+
+```text
+hash:   0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851
+header: 00203220700b5cbd51c3511db177feb5891754ee7e3ec5f4849a010000000000000000000444905fd34cdb083f512a1957ec2c7ffedf3a7ff5098d1f20a5aed9c8484b46c5719e6a5e35021706442381
+time:   1788768709
+nBits:  0x1702355e
+nonce:  2166572038
+```
+
+At the frozen audit snapshot, the [Blockstream API](https://blockstream.info/api/block-height/965900)
+and [mempool.space API](https://mempool.space/api/block-height/965900)
+independently reported the same exact header, hash, height, and best-chain status
+at tip 966,011. [Blockchain.com](https://www.blockchain.com/explorer/blocks/btc/965900)
+independently agreed on the height, display hash, timestamp, compact target, and
+nonce. Counting the anchor block, this was 112 confirmations. A local
+reproduction double-SHA256 hashed the 80-byte header to the displayed hash,
+decoded `nBits`, and verified that the header hash satisfies the encoded Bitcoin
+target.
+
+Height 966,011 is provenance for this review only. It is frozen in a test vector
+and is never consulted as consensus or runtime input. Node consensus uses only
+the immutable anchor fields, Wcash network discriminator, genesis statement,
+commitment, and complete serialized Wcash genesis block.
+
+The public testnet is intentionally mining-only while Wcash still inherits the
+Zcash NU6.3 transaction signature domain. Consensus rejects every non-coinbase
+transaction in both blocks and the mempool. Testnet rewards cannot be transferred
+and have no value; a reset or explicit consensus upgrade is required before
+value-bearing tests.
+
+## Fail-closed mainnet launch
 
 Bitcoin mainnet block 965,954 is designated for a possible Wcash mainnet
-anchor, but it is not frozen by this source tree. Mainnet and testnet both
-return an error from `select_anchor`; only local regtest works today.
+anchor, but it is not frozen by this source tree. At audit tip 966,011 it had
+only 58 confirmations counting the block itself, below the required 100.
+Mainnet therefore returns an error from `select_anchor`; command-line input
+cannot activate or replace it.
 
 Freezing a public anchor requires a reviewed source release that does all of
 the following:
@@ -47,7 +82,7 @@ the following:
    Bitcoin Core node and at least two independent block-data providers.
 3. Recomputes double SHA-256 over the header, checks its `nBits` target and
    proof of work, and confirms all sources agree on byte order.
-4. Replaces exactly one applicable `None` anchor constant in `src/lib.rs` with
+4. Replaces the mainnet `None` anchor constant in `src/lib.rs` with
    the reviewed height and raw digest bytes.
 5. Freezes the encoding, statement, commitment, and complete Wcash genesis
    block as test vectors reproduced by a second implementation.
@@ -55,7 +90,7 @@ the following:
 
 Checking an isolated Bitcoin header is not proof of its claimed height,
 confirmations, or best-chain membership. This is why command-line input can
-never activate Wcash mainnet or testnet.
+never activate or replace a public Wcash anchor.
 
 ## Local testing
 
@@ -65,6 +100,7 @@ vectors. It cannot be confused with a public Wcash anchor because the Wcash
 network byte is part of the commitment.
 
 ```sh
+cargo run --manifest-path wcash-genesis/Cargo.toml -- show-testnet
 cargo run --manifest-path wcash-genesis/Cargo.toml -- show-regtest
 cargo run --manifest-path wcash-genesis/Cargo.toml -- status
 ```
@@ -77,7 +113,7 @@ cargo run --manifest-path wcash-genesis/Cargo.toml -- \
   derive-regtest HEIGHT 160_HEX_CHARACTERS
 ```
 
-This command does not alter the node's compiled genesis block. The current node
-always uses `REGTEST_ANCHOR`; selecting a different local anchor requires an
-explicit source change and rebuild. Public mainnet and testnet configuration
-cannot override their anchors.
+This command does not alter a compiled genesis block. An explicitly selected
+`WcashRegtest` always uses `REGTEST_ANCHOR` unless the source is changed and
+rebuilt. `WcashTestnet` always uses the frozen `TESTNET_ANCHOR` and public-network
+configuration cannot override it.

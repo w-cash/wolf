@@ -1,14 +1,22 @@
 # Wcash
 
 Wcash is an experimental privacy-focused auxiliary proof-of-work chain written
-in Rust. It is based on the Zcash Foundation's Zebra v6.3.0 codebase and its
-Ironwood/NU6.3 implementation. Wcash borrows Equihash `(200, 9)` work from a
-Zcash parent block while maintaining its own blocks, difficulty target,
-transactions, and shielded value pool.
+in Rust. It is based on the Zcash Foundation's Zebra `main` history through
+[`d1fd7adfd`](https://github.com/ZcashFoundation/zebra/commit/d1fd7adfd366bddfb8f38ce70b417a5e3408799b)
+(188 commits after v6.3.0), including its latest Ironwood/NU6.3 fixes. Wcash
+borrows Equihash `(200, 9)` work from a Zcash parent block while maintaining its
+own blocks, difficulty target, transactions, and shielded value pool.
 
-> **Development status:** this repository is regtest/pre-testnet software. It is
-> not production ready, no public Wcash network is active, and it must not be
-> used with funds of real value.
+> **Development status:** this repository enables a public Wcash Testnet for
+> engineering and mining interoperability, plus an isolated local regtest. It
+> is not production ready, no Wcash mainnet is active, and it must not be used
+> with funds of real value.
+
+The current public Testnet is deliberately mining-only. Consensus rejects every
+non-coinbase transaction until Wcash has a chain-specific NU6.3 signature and
+branch-ID domain wired through the cryptographic dependencies. Mined rewards
+cannot be transferred. A testnet reset and consensus upgrade are required
+before any value-bearing transaction test.
 
 ## Current consensus snapshot
 
@@ -21,7 +29,8 @@ transactions, and shielded value pool.
 | Scheduled issuance | Exactly 33,599,999.78160000 WCASH |
 | Development allocation | None: no founders reward, funding stream, lockbox, or developer tax |
 | Coinbase destination | Ironwood only after genesis |
-| Public networks | Disabled until a reviewed Bitcoin anchor is frozen |
+| Public networks | Mining-only engineering Testnet enabled; mainnet disabled |
+| Testnet transfers | Disabled by consensus; coinbase transactions only |
 
 Every post-genesis coinbase must create its reward in Ironwood. Transparent,
 Sapling, and Orchard coinbase outputs are rejected. Unlike the standard Zcash
@@ -48,8 +57,9 @@ Install Rust 1.91 or newer plus the native build dependencies required by
 Zebra, then run:
 
 ```sh
-cargo build --release -p zebrad --features wcash-consensus,internal-miner --bin zebrad
-cargo build --release -p wcash-merge-miner --bin wcash-merge-miner
+cargo build --locked --release -p zebrad --bin zebrad \
+  --features wcash-consensus,internal-miner
+cargo build --locked --release -p wcash-merge-miner --bin wcash-merge-miner
 ./target/release/zebrad -c wcash-local.toml start
 ```
 
@@ -79,17 +89,18 @@ See:
 - [Consensus and monetary policy](docs/wcash-consensus.md)
 - [Zcash merged-mining design](docs/wcash-merged-mining.md)
 - [Local regtest guide](docs/wcash-local.md)
+- [Public Testnet identity and operator boundary](docs/wcash-testnet.md)
 
 ## Release blockers
 
-The mainnet and public-testnet Bitcoin anchor constants remain deliberately
-unset, so public activation fails closed. Any designated anchor height and hash
-must be independently verified and frozen in a reviewed release. A public release also requires
-an independently reviewed consensus specification and implementation, stable
-public network/address domains, adversarial multi-node soak and reorg testing,
-Wcash wallet/key support, and an operated TLS/authentication, variable-
-difficulty, accounting, payout, and monitoring layer in front of the included
-loopback ZIP-301 service.
+The mainnet Bitcoin anchor remains deliberately unset, so mainnet activation
+fails closed. The enabled Testnet is an engineering network, not evidence that
+a community pool or value-bearing mainnet is ready. Promotion requires an
+independently reviewed consensus specification and implementation, adversarial
+multi-node soak and reorg testing, Wcash wallet/key support, project-controlled
+seed infrastructure, physical ASIC interoperability, and an operated TLS,
+variable-difficulty, accounting, payout, and monitoring layer in front of the
+included loopback ZIP-301 service.
 
 ## Upstream attribution and license
 

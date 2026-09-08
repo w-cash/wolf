@@ -54,7 +54,9 @@ jobs:
       - name: Test Wcash consensus-specific paths
         run: |
           cargo test --locked -p zebra-chain --lib --features wcash-consensus
-          cargo test --locked -p zebra-consensus --lib --features zebra-chain/wcash-consensus wcash
+          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash
+          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash_testnet_transfer_gate_covers_block_and_mempool_verifiers
+          cargo test --locked -p zebra-rpc --lib wcash
           cargo test --locked -p zebra-rpc --lib --features zebra-chain/wcash-consensus wcash
 
       - name: Test parent RPC payout attestation and serialization
@@ -73,6 +75,16 @@ jobs:
           cargo test --locked -p zebrad --lib --features wcash-consensus start_accepts_default_network_for_selected_consensus
           cargo test --locked -p zebrad --lib user_agent_matches_the_selected_consensus_profile
           cargo test --locked -p zebrad --lib --features wcash-consensus user_agent_matches_the_selected_consensus_profile
+
+      - name: Test frozen Wcash Testnet identity and isolation
+        run: |
+          cargo test --locked -p wcash-genesis public_testnet
+          cargo test --locked -p zebra-chain --lib --features wcash-consensus wcash_testnet
+          cargo test --locked -p zebra-network --lib --features wcash-consensus wcash_
+          cargo test --locked -p zebra-state --lib --features zebra-chain/wcash-consensus wcash_height_one_uses_candidate_height
+          cargo test --locked -p zebra-state --lib --features zebra-chain/wcash-consensus zcash_activation_boundary_uses_candidate_height
+          cargo test --locked -p zebrad --lib --features wcash-consensus local_genesis_bootstrap_selects_exact_built_in_chain
+          cargo test --locked -p zebrad --lib --features wcash-consensus start_accepts_both_built_in_wcash_networks
 
       - name: Compile the complete Wcash node graph
         run: cargo check --locked --release -p zebrad --bin zebrad --no-default-features --features wcash-consensus
@@ -93,3 +105,17 @@ jobs:
 
       - name: Mine both chains through two ZIP-301 pool generations
         run: scripts/wcash-merged-mining-e2e.sh
+
+      - name: Boot and mine the frozen Wcash Testnet genesis
+        run: scripts/wcash-testnet-e2e.sh
+
+      - name: Upload merged-mining diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wcash-merged-mining-failure-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/wcash-*-e2e.*/*.log
+            /tmp/wcash-*-e2e.*/*.log
+          if-no-files-found: warn
+          retention-days: 7

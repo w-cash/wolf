@@ -1,29 +1,56 @@
 # Wcash consensus snapshot
 
 This document describes the rules currently implemented on the built-in Wcash
-regtest network. It is an implementation snapshot for review, not a claim that
-mainnet or public testnet parameters are final.
+Testnet and regtest networks. It is an implementation snapshot for review, not
+a claim that mainnet or community-pool infrastructure is production ready.
 
 ## Activation status
 
-Only `Network::new_wcash_regtest()` activates Wcash consensus. It has a distinct
-local genesis block and P2P magic, activates NU6.3 at height 1, and uses the
-Ironwood transaction format for every mined block.
+`Network::new_wcash_testnet()` and `Network::new_wcash_regtest()` activate Wcash
+consensus. Each has a distinct genesis block, P2P magic, default P2P/RPC ports,
+and peer-cache domain. Both activate NU6.3 at height 1 and use the Ironwood
+transaction format for every mined block.
 
-The designated public genesis reference is Bitcoin mainnet block height
-`965,954`. That anchor is intentionally not frozen in this source tree. Both
-public anchor constants are `None`; mainnet and public testnet therefore fail
-closed. Local regtest instead anchors its deterministic genesis
-statement to Bitcoin mainnet block 965,910, hash
+Public Testnet freezes Bitcoin mainnet block 965,900, hash
+`0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851`.
+The release vector records Bitcoin height 966,011, or 112 confirmations counting
+the anchor block. Its complete Wcash genesis block ID is
+`78b292284bc7b03c6a16b62e29a3ab2015c40d6414cbc27ddcee878225600f10`.
+Its P2P magic is `69c75fba`; its default P2P and recommended loopback RPC
+ports are 38233 and 38232. It never inherits Zcash's DNS seeds.
+
+The designated mainnet reference is Bitcoin height 965,954, but that anchor is
+intentionally not frozen and mainnet fails closed. Local regtest anchors its
+deterministic genesis statement to Bitcoin mainnet block 965,910, hash
 `00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146`.
 
 The frozen local-regtest genesis block ID is
 `b0ebe8618354e0563091d10b73ba03842cb3c112a801012616489269e58dbd61`.
 
-Freezing a public anchor requires the exact Bitcoin header and hash, proof-of-work
-verification, sufficient confirmations, independent reproduction, reviewed test
-vectors, and a release that makes the values immutable. Runtime network access
-must never select or replace a consensus anchor.
+The Testnet source freezes the exact Bitcoin header and hash, verifies its proof
+of work, records sufficient confirmations, and reproduces the complete genesis
+bytes in reviewed test vectors. Runtime network access never selects or replaces
+a consensus anchor.
+
+At audit tip 966,011, Blockstream and mempool.space agreed on the exact header,
+hash, height, and best-chain status; Blockchain.com independently agreed on the
+decoded timestamp, compact target, and nonce. Local SHA256d and `nBits` checks
+reproduced the hash and verified its work. The audit tip is frozen provenance,
+not a consensus or runtime input.
+
+### Mining-only transaction gate
+
+Wcash Testnet currently inherits Zcash NU6.3's transaction branch ID and
+signature-hash domain. Distinct addresses, genesis, and P2P magic do not prevent
+cryptographic replay of an otherwise equivalent signed transaction. Consensus
+therefore rejects every non-coinbase transaction on Wcash Testnet through the
+shared block and mempool verifier path.
+
+This network is for AuxPoW, pool, difficulty, and shielded-coinbase engineering
+only. Its rewards are test-only and cannot be transferred. Enabling value-bearing
+tests requires a Wcash-specific branch ID wired through parsing, sighash, proof,
+wallet, RPC, and light-client dependencies, with two-way cross-chain rejection
+vectors, followed by a network reset or explicit consensus upgrade.
 
 ## Monetary policy
 
@@ -31,6 +58,9 @@ Genesis at height 0 has no subsidy. Heights 1 through 1,680,000 inclusive each
 create 10 WCASH. The first halved block is height 1,680,001, and every later era
 contains exactly 1,680,000 blocks. Subsidies are integer zatoshi values and each
 era uses a right shift, so fractional zatoshi are discarded.
+
+The inherited genesis transaction contains one zero-valued transparent output.
+It creates no spendable coins, and the chain supply at height 0 is exactly zero.
 
 The last non-zero subsidy is 1 zatoshi at height 50,400,000. Subsidy is zero
 from height 50,400,001 onward. Summing every era gives exactly:
@@ -55,12 +85,16 @@ belongs to the miner coinbase and is subject to the shielded-output rules below.
 
 ## Block timing and difficulty
 
-The target spacing is 75 seconds. The current Wcash network is regtest, where
-the inherited contextual difficulty logic deliberately uses the fixed regtest
-proof-of-work limit rather than retargeting. This is suitable for isolated
-testing only. Public-network difficulty limits, retarget behavior, launch
-minimum work, and emergency rules require a separate specification and audit
-before activation.
+The target spacing is 75 seconds. Regtest deliberately uses its fixed
+proof-of-work limit. Public Testnet starts at compact target `0x2007ffff`
+(`2^251 - 1`) and uses the inherited damped 17-block retarget from launch. A
+candidate strictly more than 450 seconds after its predecessor may use the
+testnet proof-of-work limit; exactly 450 seconds does not trigger the rule.
+The maximum block-time rule is enforced from height 1, and template construction
+evaluates both rules using the candidate height, including the height-1 boundary.
+These public-testnet boundary conditions have frozen unit tests, but long-running
+multi-node difficulty and timestamp behavior still requires adversarial soak
+testing before a mainnet design is selected.
 
 The compact difficulty field in the Wcash header is authoritative for Wcash.
 The Zcash parent header's `nBits` is retained only as diagnostic data and cannot
@@ -104,10 +138,10 @@ strings. Its deliberately separate, compact textual namespaces are:
 | Transparent P2PKH | `W1...` | `WT...` | `WR...` |
 | Transparent P2SH | `W3...` | `WU...` | `WS...` |
 
-The mainnet and testnet forms reserve domains for future networks; only regtest
-is active. Unified Addresses include the Wcash human-readable part inside both
-the ZIP 316 jumbling construction and the Bech32m checksum. Replacing the
-visible prefix of a Zcash address does not produce a valid Wcash address.
+The Testnet and regtest forms are active; the mainnet forms remain reserved.
+Unified Addresses include the Wcash human-readable part inside both the ZIP 316
+jumbling construction and the Bech32m checksum. Replacing the visible prefix of
+a Zcash address does not produce a valid Wcash address.
 
 Wcash RPC and mining interfaces require the Wcash namespace when Wcash
 consensus is active. A mining destination must be a Wcash Unified Address with
@@ -144,6 +178,8 @@ valid Zcash headers and Wcash headers unambiguous. The node runtime still reject
 every inherited Zcash network configuration because Wcash uses different
 monetary bounds; those definitions remain only for upstream library tests.
 
-No public deployment should occur until the public anchor and network domains
-are frozen, full-node and pool interoperability tests pass, and an external
-security/consensus audit is complete.
+Wcash Testnet has a frozen identity for public engineering interoperability.
+It is not a production or value-bearing network: wallet/key derivation,
+project-operated seeds, multi-node and pool soak testing, physical ASIC runs,
+and an external security/consensus audit remain required before any mainnet or
+community payout service. See [`wcash-testnet.md`](wcash-testnet.md).

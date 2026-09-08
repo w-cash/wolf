@@ -12,18 +12,21 @@ preserve one default Zcash binary before building the feature-isolated Wcash
 binary:
 
 ```sh
-cargo build --release -p zebrad --bin zebrad
+cargo build --locked --release -p zebrad --bin zebrad --no-default-features
 cp target/release/zebrad target/release/zcash-zebrad
 
-cargo build --release -p zebrad --bin zebrad --features wcash-consensus
+cargo build --locked --release -p zebrad --bin zebrad \
+  --no-default-features --features wcash-consensus
 cp target/release/zebrad target/release/wcash-zebrad
 
-cargo build --release -p wcash-merge-miner --bin wcash-merge-miner
+cargo build --locked --release -p wcash-merge-miner --bin wcash-merge-miner
 ```
 
 The feature boundary is deliberate. A Wcash-consensus binary rejects inherited
 Zcash networks, and a default Zcash binary rejects `WcashRegtest`, preventing
-the widened Wcash monetary range from being used on a Zcash node.
+the widened Wcash monetary range from being used on a Zcash node. `--locked`
+also makes this local build use the dependency graph reviewed and exercised by
+the release gate instead of silently rewriting `Cargo.lock`.
 
 ## 2. Start the three nodes
 
@@ -271,7 +274,7 @@ generations and checks the resulting journal aggregate.
 It does not prove wallet recovery, vendor-by-vendor ASIC interoperability,
 public variable-difficulty behavior, payout correctness, Internet-facing
 security, long-running reorg behavior, or independent consensus-review results.
-No physical ASIC model or firmware is certified. Those remain public-testnet
+No physical ASIC model or firmware is certified. Those remain community-pool
 release gates.
 
 Wcash payment namespaces are disjoint from Zcash: Unified `wu...`, Sapling

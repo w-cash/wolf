@@ -174,10 +174,15 @@ multi-generation grace window as well as TLS, per-account authentication, rate
 limiting, variable difficulty, payout accounting, and monitoring in front of
 the listener.
 
-The built-in password is shared and worker names are self-asserted labels, so
-the journal alone is not an authenticated payout ledger. Anyone holding that
-password can impersonate another worker label. A public edge must bind each
-connection to its own account identity before using shares for payouts.
+The native listener requires a private exact-worker credential registry. Each
+accepted login is verified against that worker's Argon2id PHC hash, and the
+canonical authenticated identity is recorded with every accepted share.
+Unknown worker names and incorrect passwords receive the same failure response.
+This makes the journal suitable as authenticated input to a separately reviewed
+accounting system, but it is not itself a balance, payout, or settlement engine.
+The loopback protocol also has no transport encryption or source-IP controls;
+a public edge must provide both without weakening the coordinator's template
+and proposal-validation boundary.
 
 ## Why an unchanged third-party pool cannot be proxied
 
@@ -221,10 +226,13 @@ silently weaken the parent reward check.
 
 ## Release boundary
 
-The consensus and exact native dual-submit path are implemented and pass local
-three-node regtest. A public testnet still requires a frozen public genesis
-anchor, stable bootstrapping/network parameters, Wcash wallet key support, an
-independently reviewed consensus specification, multi-node soak and reorg
-tests, vendor ASIC interoperability, and an operated pool edge with payout
-accounting. Do not call the pre-testnet branch production-ready or use it with
-funds of real value.
+The consensus and exact native dual-submit path pass local three-node regtest.
+The frozen public Testnet identity has a separate automated gate that boots a
+clean height-zero node without the debug sync override, obtains a child
+candidate, mines through the ZIP-301 listener, and requires Wcash plus two
+Zcash processes to accept the resulting work. A community-facing testnet pool
+still needs project-operated seeds, Wcash wallet/key support, an independently
+reviewed consensus specification, multi-node soak and reorg tests, vendor ASIC
+interoperability, and an operated TLS/variable-difficulty edge with payout
+accounting. Do not call this engineering testnet production-ready or use it
+with funds of real value.
