@@ -817,6 +817,23 @@ mod tests {
     }
 
     #[test]
+    fn proof_is_bound_to_the_exact_auxiliary_block_id() {
+        let (proof, coinbase) = valid_case();
+        let mut different_network_block_id = AUX_HASH;
+        different_network_block_id[0] ^= 1;
+
+        assert_eq!(
+            proof.validate_with_verifiers(
+                different_network_block_id,
+                Target::MAX,
+                &coinbase,
+                &AcceptFixtureEquihash,
+            ),
+            Err(AuxPowError::AuxiliaryRootMismatch)
+        );
+    }
+
+    #[test]
     fn builtin_equihash_never_accepts_fixture_placeholder_work() {
         let (proof, coinbase) = valid_case();
         assert_eq!(

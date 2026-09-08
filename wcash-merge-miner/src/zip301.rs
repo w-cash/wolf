@@ -352,7 +352,7 @@ fn serve_zip301_generation(
                 if let Err(error) = monitor_state.processor.check_job_health() {
                     *monitor_reason
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
                     monitor_shutdown.store(true, Ordering::Release);
                     break;
                 }
@@ -369,12 +369,12 @@ fn serve_zip301_generation(
         .join()
         .map_err(|_| MinerError::InvalidRequest("native job monitor panicked".to_string()))?;
     result?;
-    if let Some(reason) = shutdown_reason
+    if let Some(error) = shutdown_reason
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take()
     {
-        return Err(MinerError::StaleNativeJob(reason));
+        return Err(error);
     }
     Ok(())
 }

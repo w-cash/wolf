@@ -72,7 +72,7 @@ done
 rpc_call() {
   local url=$1
   local method=$2
-  curl --fail --silent --show-error --max-time 5 \
+  curl --fail --silent --show-error --max-time 5 --noproxy '*' \
     --header 'content-type: application/json' \
     --data-binary "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":[]}" \
     "$url"

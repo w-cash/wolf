@@ -412,8 +412,8 @@ fn run_native_server(
 
         let processor: Arc<dyn ShareProcessor> = Arc::new(coordinator);
         match listener.serve(job, zip301.clone(), processor) {
-            Err(MinerError::StaleNativeJob(reason)) if automatic_rotation => {
-                eprintln!("rotating stale native job: {reason}");
+            Err(error) if automatic_rotation && is_retryable_native_preparation_error(&error) => {
+                eprintln!("rotating/retrying native job after a transient failure: {error}");
             }
             Err(error) => return Err(error.into()),
             Ok(()) => return Ok(()),
@@ -421,8 +421,8 @@ fn run_native_server(
     }
 }
 
-/// Returns `true` only when preparing the next frozen generation failed for a
-/// reason that can safely change without an operator or software correction.
+/// Returns `true` only when preparing or monitoring a frozen generation failed
+/// for a reason that can safely change without an operator or software correction.
 ///
 /// This list is intentionally exhaustive. In particular, malformed templates,
 /// proposal rejections, identity/payout mismatches, journal failures, invalid

@@ -148,6 +148,11 @@ impl ZebraRpcClient {
         let client = Client::builder()
             .timeout(timeout)
             .connect_timeout(timeout.min(Duration::from_secs(10)))
+            // RPC endpoints are explicit operator-pinned security boundaries.
+            // In particular, a literal loopback template URL must never be
+            // rerouted through an ambient HTTP(S)_PROXY and expose credentials,
+            // payout-sensitive templates, or block submissions off-host.
+            .no_proxy()
             .redirect(Policy::none())
             .build()
             .map_err(MinerError::RpcTransport)?;
