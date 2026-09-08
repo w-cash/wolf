@@ -23,7 +23,7 @@ The audit baseline is 8 September 2026:
 
 | Client or protocol | Current status | Evidence and boundary |
 |---|---|---|
-| Canonical ZIP-301 client | Supported and tested | The server implements newline-framed JSON-RPC, `mining.subscribe`, `mining.authorize`, `mining.set_target`, the eight-field `mining.notify`, and five-field `mining.submit`. The native end-to-end gate exercises the same proposal-validated Wcash/Zcash job used by the listener. |
+| Canonical ZIP-301 client | Supported and tested | The server implements newline-framed JSON-RPC, `mining.subscribe`, exact-worker `mining.authorize`, `mining.set_target`, the eight-field `mining.notify`, and five-field `mining.submit`. The bundled reference client reconstructs work only from those messages, solves real Equihash, and the native end-to-end gate submits winners to both chains through the persistent listener across two job generations. |
 | NiceHash `nheqminer` ZIP-301 client | Source-compatible; runtime test pending | Its [Stratum client](https://github.com/nicehash/nheqminer/blob/b9900ff8e3c6f8e5a46af18db454f2a2082d9f46/nheqminer/libstratum/StratumClient.cpp) accepts an eight-or-more-field notification, consumes a big-endian 256-bit target, uses the subscribed nonce prefix, and submits a CompactSize-prefixed 1,344-byte Equihash `(200, 9)` solution. It probes `mining.extranonce.subscribe`; this backend now returns the extension's documented negative response. The archived miner still needs a reproducible Linux build/run in CI before this row can be called tested. |
 | S-NOMP/Z-NOMP-style Equihash client | Wire-compatible canonical subset; simulator or hardware test pending | S-NOMP uses a [four-byte nonce prefix and canonical submit tuple](https://github.com/s-nomp/node-stratum-pool/blob/aa3deddc8caa3ba5dfcff92c7db0f5360e812c10/lib/stratum.js). As a server it [appends optional algorithm and personalization fields](https://github.com/s-nomp/node-stratum-pool/blob/aa3deddc8caa3ba5dfcff92c7db0f5360e812c10/lib/blockTemplate.js#L284-L301) to `mining.notify`; Wcash emits only ZIP-301's canonical eight fields. A client that incorrectly requires S-NOMP's extra fields needs an adapter. |
 | BITMAIN Antminer Z9/Z11/Z15 family | Candidate hardware; not certified | Z15 documentation confirms Equihash/Zcash support and pool URL, worker, and password configuration, but does not publish a complete wire contract. A physical device or a vendor firmware simulator must pass the acceptance test below. The built-in listener is loopback-only, so hardware also requires a separately secured LAN test edge. |
@@ -31,7 +31,7 @@ The audit baseline is 8 September 2026:
 | Unmodified S-NOMP or another ordinary Zcash pool server | Not a valid Wcash template source | An ordinary pool [requests its own GBT and constructs the job](https://github.com/s-nomp/node-stratum-pool/blob/aa3deddc8caa3ba5dfcff92c7db0f5360e812c10/lib/pool.js#L475-L493). It does not request the private `wcashaux` extension or preserve this coordinator's proposal bytes. Its miner-facing ideas can be reused in a new edge, but placing it between this coordinator and the Zcash node would break the authenticated child commitment. |
 | Bitcoin-style Stratum V1 (`mining.set_difficulty` and Bitcoin coinbase/extranonce jobs) | Not compatible | Its job and nonce construction are different from ZIP-301. Translating a difficulty number alone is insufficient. Only an adapter that terminates the client protocol and constructs the exact Zcash header could bridge it. |
 | Stratum V2 | Not implemented | Stratum V2 is a different binary, channel-based protocol. It is not required to validate the Wcash AuxPoW design and should be implemented as a separate authenticated edge if demanded by miners. |
-| Public TLS pool with accounting and payouts | Not implemented by the ZIP-301 backend | The native listener is a loopback, fixed-target backend. Internet-facing TLS, account authentication, variable difficulty, share accounting, payouts, monitoring, and abuse controls belong in a pool edge in front of it. |
+| Public TLS pool with accounting and payouts | Local auth/accounting only; public pool not implemented | The native listener is a loopback, fixed-target backend with exact-worker Argon2id authentication and an authoritative journal plus offline aggregate report. Internet-facing TLS, source-IP/account abuse controls, variable difficulty, balance calculation, payouts, and production monitoring belong in a separately reviewed pool edge and settlement system. |
 
 `Source-compatible` means that the published client source and this server agree
 on every field needed to construct and submit a header. It is deliberately
@@ -44,8 +44,11 @@ The sequence for a new connection is:
 
 1. The miner sends `mining.subscribe`. The server returns
    `[null, NONCE_1]`. Session resumption is not offered.
-2. The miner sends `mining.authorize` with a worker and the configured shared
-   backend password.
+2. The miner sends `mining.authorize` with an exact worker name and that
+   worker's password. The server verifies it against the Argon2id PHC hash in
+   the private version-1 registry and binds accepted shares to the canonical
+   authenticated identity. Unknown workers and incorrect passwords receive the
+   same failure response.
 3. The server returns authorization success, then sends `mining.set_target`
    with one 64-hex-character, big-endian target.
 4. The server sends `mining.notify` with job ID, little-endian version,
@@ -69,12 +72,21 @@ string rather than ZIP-301's integer. Security decisions do not use those
 untrusted fields.
 
 Automatic `native-serve` limits an advertised generation to 45 seconds. It
-then retires the listener, disconnects its sessions, and prepares and proposal-
-validates a genuinely fresh child and parent job before accepting miners again.
-This stays below S-NOMP's documented 55-second liveness rebroadcast interval
-without pretending that the same frozen header is new work. `native-serve-once`
-intentionally does not rotate on age because it is a bounded integration-test
-command.
+disconnects that generation's sessions but keeps one loopback socket bound,
+then prepares and proposal-validates a genuinely fresh child and parent job
+before accepting miners again on the same port. This stays below S-NOMP's
+documented 55-second liveness rebroadcast interval without pretending that the
+same frozen header is new work and without rebinding through `TIME_WAIT`.
+`native-serve-once` intentionally does not rotate on age because it is a
+bounded integration-test command.
+
+Both native serve modes require `WCASH_WORKER_CREDENTIALS`, a private regular,
+non-symlink version-1 JSON registry containing exact worker names and Argon2id
+PHC hashes. `worker-password-hash` creates the accepted hash format from the
+selected plaintext `WCASH_STRATUM_PASSWORD`; the server itself never reads that
+environment variable. Argon2id verification has a separately configurable
+global concurrency bound via `WCASH_AUTHENTICATION_LIMIT` (default 4, maximum
+256), in addition to per-connection authentication limits.
 
 ## Physical ASIC acceptance test
 
@@ -113,15 +125,22 @@ The following are release gates for a community-facing pool, not consensus
 changes:
 
 - a reachable TLS edge with individual account credentials and source-IP
-  controls;
+  controls; the backend's exact-worker credentials authenticate local clients
+  but do not provide transport security or Internet abuse controls;
 - bounded variable difficulty with old-target grace tied to each job;
 - in-session delivery of fresh generations plus a bounded grace window for
   recently retired jobs; the local backend's 45-second disconnect-and-reconnect
   rotation stays below the [55-second S-NOMP liveness interval](https://github.com/s-nomp/node-stratum-pool/blob/aa3deddc8caa3ba5dfcff92c7db0f5360e812c10/README.md#L179-L182),
   but a production edge should avoid reconnect churn while never replaying a
   frozen header as fake new work;
-- durable, authenticated share accounting and a separately reviewed payout
-  engine;
+- a separately reviewed balance, payout, and settlement engine consuming
+  snapshots from the authoritative version-2 journal; `accounting-report`
+  validates and aggregates shares with explicit authentication provenance only
+  after the pool releases its exclusive journal lock;
+- checkpointed startup recovery and controlled journal segment rotation; the
+  long-lived local supervisor replays once and rotates generations without a
+  rescan, but startup cost and the 1 GiB hard ceiling still make an unsegmented
+  journal unsuitable for sustained public share volume;
 - vendor-by-vendor hardware runs, including reconnect and failover behavior;
 - metrics for active workers, accepted/rejected shares, validation saturation,
   stale generations, journal health, and independent node submission results;
@@ -131,4 +150,6 @@ None of these gaps allows an invalid AuxPoW block to pass consensus. They affect
 miner reachability, payout correctness, availability, and operational safety.
 The coordinator must continue to validate the exact parent proposal and both
 network targets locally; an edge must never be allowed to replace that trust
-boundary.
+boundary. The bundled `zip301-mine` client and automated two-generation test
+cover the real socket and Equihash submission path, but they do not certify any
+physical ASIC model or firmware.

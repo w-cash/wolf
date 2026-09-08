@@ -135,12 +135,46 @@ can still disclose its own viewing data voluntarily.
 
 ## 5. Exercise the ASIC protocol
 
-For local protocol testing only, use the easiest possible share target:
+Both native serving commands require an exact-worker credential registry.
+Generate a distinct password hash for the local `rig01` worker and write a
+private version-1 registry next to the journal:
 
 ```sh
 export WCASH_STRATUM_PASSWORD='local-test-password-change-me'
+WORKER_PASSWORD_HASH="$(
+  ./target/release/wcash-merge-miner worker-password-hash |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["password_hash"])'
+)"
+export WCASH_WORKER_CREDENTIALS="$WCASH_JOURNAL_DIR/workers.json"
+python3 - "$WCASH_WORKER_CREDENTIALS" "$WORKER_PASSWORD_HASH" <<'PY'
+import json
+import os
+import sys
+
+path, password_hash = sys.argv[1:]
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as output:
+    json.dump({
+        "version": 1,
+        "workers": [{"name": "rig01", "password_hash": password_hash}],
+    }, output, separators=(",", ":"))
+    output.write("\n")
+PY
+unset WORKER_PASSWORD_HASH WCASH_STRATUM_PASSWORD
+```
+
+The server rejects a symlink or non-regular registry, a file accessible by
+group or other users, and (on Unix) a parent directory writable by group or
+other users. Generate a separate hash entry for each exact worker name; do not
+reuse one pool-wide password.
+
+For local protocol testing only, use the easiest possible share target and
+start the persistent loopback listener:
+
+```sh
 export WCASH_SHARE_TARGET=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 export WCASH_VALIDATION_LIMIT=4
+export WCASH_AUTHENTICATION_LIMIT=4
 
 ./target/release/wcash-merge-miner native-serve \
   http://127.0.0.1:28232 \
@@ -153,44 +187,92 @@ export WCASH_VALIDATION_LIMIT=4
 Configure a ZIP-301-compatible Equihash miner with:
 
 - pool: `stratum+tcp://127.0.0.1:28237`;
-- worker: any non-empty local identifier such as `rig01`;
-- password: the exact `WCASH_STRATUM_PASSWORD` value.
+- worker: the exact registered identifier `rig01`;
+- password: the plaintext password whose hash is registered for `rig01`.
+
+The server does not read `WCASH_STRATUM_PASSWORD`. That variable is only a
+non-command-line input to `worker-password-hash` and the bundled reference
+miner. To perform a real Equihash solve and submit a canonical share over the
+ZIP-301 socket, open another terminal with the coordinator environment and run:
+
+```sh
+export WCASH_STRATUM_PASSWORD='local-test-password-change-me'
+./target/release/wcash-merge-miner zip301-mine \
+  127.0.0.1:28237 rig01 64 0
+```
+
+This reference client constructs the 108-byte pre-nonce header and assigned
+four-byte nonce prefix exclusively from ZIP-301 messages, solves Equihash
+`(200, 9)`, and submits the five-field ZIP-301 share. A successful response
+exercises the pool path rather than the direct `native-mine` path.
 
 That address works only for an on-host software client. On a physical ASIC,
 `127.0.0.1` means the ASIC itself. Hardware must connect to a separately
 operated LAN or Internet-facing TCP/TLS edge that authenticates and rate-limits
 miners before forwarding to this loopback backend.
 
-The backend applies a sliding cap of 64 submissions per second per connection,
-globally limits concurrent Equihash validation with `WCASH_VALIDATION_LIMIT`,
-and serializes durable journal writes. The maximum share target shown here
-would create unusable disk traffic on real hardware; an operated edge must
-assign a meaningful variable-difficulty target.
+The backend applies sliding per-connection authentication and submission caps,
+globally limits concurrent memory-hard Argon2id verification with
+`WCASH_AUTHENTICATION_LIMIT`, globally limits concurrent Equihash validation
+with `WCASH_VALIDATION_LIMIT`, and serializes durable journal writes. The
+maximum share target shown here would create unusable disk traffic on real
+hardware; an operated edge must assign a meaningful variable-difficulty target.
+It exercises ordinary share submission but does not make every share a block.
+The automated E2E gate instead reads the equal local child/parent network target
+from `native-job` so each accepted reference-client solution is a dual winner.
 
-Both chain rewards go to the operator-configured addresses. The worker label is
-only an accounting label, and the built-in password is shared; anyone holding
-it can claim another worker name. Never pay directly from that journal field.
-A trusted edge must authenticate individual accounts and bind their worker
-labels before payout accounting. The journal has a 1 GiB safety ceiling and no
-automatic compaction, so archive and replace it under a controlled shutdown
-well before reaching that limit.
+Both chain rewards go to the operator-configured addresses. A successful login
+binds the exact registered worker identity to its journal records, but the
+coordinator neither calculates balances nor sends payouts. The journal has a
+1 GiB safety ceiling and no automatic compaction, so archive and replace it
+under a controlled shutdown well before reaching that limit. The supervisor
+locks and replays it once at startup, then durably records each unique job
+activation and rotates the in-memory active generation without rescanning old
+shares. A public service still needs checkpointed startup recovery and
+controlled journal segments before it can sustain pool-scale share history.
 
-The supervisor proposal-checks every generation and rotates it when either tip
-changes or the Wcash candidate expires. Rotation closes existing sessions, so
-miners reconnect for the new job. A public accounting edge should additionally
-retain a bounded grace window for late shares from recently retired jobs.
+The supervisor keeps one loopback socket bound across generations. It
+proposal-checks fresh work and rotates after at most 45 seconds, or earlier when
+either tip changes or the Wcash candidate expires. Rotation closes existing
+sessions, so miners reconnect on the same port for the new job. Keeping the
+socket open avoids a rebind failure while old connections pass through
+`TIME_WAIT`. A public accounting edge should additionally retain a bounded
+grace window for late shares from recently retired jobs.
 
-## 6. What this proves
+## 6. Inspect authenticated share accounting
+
+Stop `native-serve` before taking a final accounting snapshot. The running
+coordinator holds an exclusive lock on the authoritative version-2 journal, so
+the offline reporter intentionally fails rather than race the writer:
+
+```sh
+./target/release/wcash-merge-miner accounting-report \
+  "$WCASH_SHARE_JOURNAL"
+```
+
+The command validates the complete journal and aggregates accepted shares,
+Wcash winners, Zcash winners, exact-target buckets, and authentication provenance
+under each worker name. It validates unique `job_activated` records but excludes
+them from share totals. Older records without provenance are reported as
+`legacy_unknown`. Identical duplicate records are counted once; conflicting or
+terminated corrupt records fail closed. This single journal is also the
+crash-safe winner outbox, avoiding a second-accounting-ledger durability gap.
+The report is evidence for later accounting review, not a payout instruction.
+
+## 7. What this proves
 
 A successful run proves that this checkout can construct a private Wcash
 coinbase, authenticate AuxPoW v2 through both Zcash transaction commitments,
 solve real Equihash, pass an unmodified Zcash proposal validator, submit exact
-blocks to both chains, and deliver a canonical ZIP-301 job.
+blocks to both chains, and accept a canonical ZIP-301 share bound to an exact
+authenticated worker. The automated native E2E test mines through two ZIP-301
+generations and checks the resulting journal aggregate.
 
 It does not prove wallet recovery, vendor-by-vendor ASIC interoperability,
-public difficulty behavior, payout accounting, Internet-facing security,
-long-running reorg behavior, or independent consensus-review results. Those
-remain public-testnet release gates.
+public variable-difficulty behavior, payout correctness, Internet-facing
+security, long-running reorg behavior, or independent consensus-review results.
+No physical ASIC model or firmware is certified. Those remain public-testnet
+release gates.
 
 Wcash payment namespaces are disjoint from Zcash: Unified `wu...`, Sapling
 `ws...`, TEX `wtex...`, and transparent `W...`, with separate testnet and
