@@ -398,6 +398,16 @@ fn serve_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Result<()
                     write_message(&mut stream, &set_target(state.config.share_target))?;
                 }
             }
+            "mining.extranonce.subscribe" => {
+                // NiceHash-derived clients commonly probe this Bitcoin Stratum
+                // extension after authorization. ZIP-301 puts the server nonce
+                // prefix in the block-header nonce rather than the coinbase, and
+                // this listener rotates it by reconnecting, so changing it on an
+                // active connection is deliberately unsupported. Return the
+                // extension's documented negative response instead of treating a
+                // harmless capability probe as an unknown method.
+                write_message(&mut stream, &unsupported_extension(id))?;
+            }
             "mining.submit" => {
                 let response = if !subscribed {
                     rpc_error(id, 25, "not subscribed")
@@ -643,6 +653,10 @@ fn rpc_error(id: Value, code: i32, message: impl Into<String>) -> Value {
     json!({"id": id, "result": Value::Null, "error": [code, message.into(), Value::Null]})
 }
 
+fn unsupported_extension(id: Value) -> Value {
+    json!({"id": id, "result": false, "error": [20, "Not supported.", Value::Null]})
+}
+
 fn write_message(stream: &mut TcpStream, message: &Value) -> Result<(), MinerError> {
     serde_json::to_writer(&mut *stream, message)?;
     stream.write_all(b"\n")?;
@@ -848,6 +862,18 @@ mod tests {
         );
         let exhausted = AtomicU32::new(u32::MAX);
         assert!(allocate_session_nonce(&exhausted).is_err());
+    }
+
+    #[test]
+    fn extranonce_subscription_probe_has_the_standard_negative_response() {
+        assert_eq!(
+            unsupported_extension(json!(17)),
+            json!({
+                "id": 17,
+                "result": false,
+                "error": [20, "Not supported.", Value::Null],
+            })
+        );
     }
 
     #[test]
