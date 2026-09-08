@@ -103,13 +103,17 @@ exactly 450 seconds is not enough.
 
 ## Start a node
 
-Build the feature-isolated Wcash binary from the reviewed lockfile:
+Build the feature-isolated node binaries from the reviewed lockfile:
 
 ```sh
-cargo build --locked --release -p zebrad --bin zebrad \
-  --no-default-features --features wcash-consensus
-./target/release/zebrad -c wcash-testnet.toml start
+scripts/build-wcash-testnet-binaries.sh
+./target/release/wcash-zebrad -c wcash-testnet.toml start
 ```
+
+The build script uses separate Cargo target directories for the Zcash and
+Wcash consensus profiles and refuses to publish them if their executable bytes
+are identical. This prevents Cargo's shared top-level `zebrad` artifact from
+being copied under the wrong profile name after a cached feature build.
 
 The checked-in `wcash-testnet.toml` is a safe first-seed baseline. It exposes
 P2P on port 38233, keeps RPC on loopback port 38232 with cookie authentication,
@@ -152,15 +156,7 @@ Bounded template retries cover asynchronous RPC, state, mempool, and
 proposal-service startup.
 
 ```sh
-cargo build --locked --release -p zebrad --bin zebrad --no-default-features
-cp target/release/zebrad target/release/zcash-zebrad
-
-cargo build --locked --release -p zebrad --bin zebrad \
-  --no-default-features --features wcash-consensus
-cp target/release/zebrad target/release/wcash-zebrad
-
-cargo build --locked --release -p wcash-merge-miner --bin wcash-merge-miner
-cargo build --locked --release -p wcash-wallet --bin wcash-wallet
+scripts/build-wcash-testnet-binaries.sh
 scripts/wcash-testnet-e2e.sh
 ```
 

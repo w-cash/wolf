@@ -8,27 +8,22 @@ controlled wallet-spend phase. Neither is a public Testnet deployment.
 
 ## 1. Build separate consensus binaries
 
-Install Rust 1.91 or newer and Zebra's native build dependencies. Build and
-preserve one default Zcash binary before building the feature-isolated Wcash
-binary:
+Install Rust 1.91 or newer and Zebra's native build dependencies. Build the
+default Zcash and feature-isolated Wcash binaries in separate Cargo target
+directories:
 
 ```sh
-cargo build --locked --release -p zebrad --bin zebrad --no-default-features
-cp target/release/zebrad target/release/zcash-zebrad
-
-cargo build --locked --release -p zebrad --bin zebrad \
-  --no-default-features --features wcash-consensus
-cp target/release/zebrad target/release/wcash-zebrad
-
-cargo build --locked --release -p wcash-merge-miner --bin wcash-merge-miner
-cargo build --locked --release -p wcash-wallet --bin wcash-wallet
+scripts/build-wcash-testnet-binaries.sh
 ```
 
 The feature boundary is deliberate. A Wcash-consensus binary rejects inherited
 Zcash networks, and a default Zcash binary rejects `WcashRegtest`, preventing
 either consensus profile from being used on the wrong chain. `--locked` also
 makes this local build use the dependency graph reviewed and exercised by
-the release gate instead of silently rewriting `Cargo.lock`.
+the release gate instead of silently rewriting `Cargo.lock`. Separate target
+directories also prevent a cached shared `target/release/zebrad` artifact from
+being copied under the wrong consensus-profile name; the script fails if the
+two published executables are byte-identical.
 
 ## 2. Start the three nodes
 
