@@ -24,8 +24,8 @@ cargo build --locked --release -p wcash-merge-miner --bin wcash-merge-miner
 
 The feature boundary is deliberate. A Wcash-consensus binary rejects inherited
 Zcash networks, and a default Zcash binary rejects `WcashRegtest`, preventing
-the widened Wcash monetary range from being used on a Zcash node. `--locked`
-also makes this local build use the dependency graph reviewed and exercised by
+either consensus profile from being used on the wrong chain. `--locked` also
+makes this local build use the dependency graph reviewed and exercised by
 the release gate instead of silently rewriting `Cargo.lock`.
 
 ## 2. Start the three nodes
@@ -130,8 +130,8 @@ The two Zcash nodes should report the same tip because a parent winner is
 broadcast to the template node and proposal validator independently.
 
 `getblockchaininfo` on the Wcash node exposes deterministic chain supply and
-public value-pool totals. A mined 10-WCASH child block increases Ironwood by 10
-while transparent, Sapling, and Orchard coinbase value remain zero. The
+public value-pool totals. A mined 6.25-WCASH child block increases Ironwood by
+6.25 while transparent, Sapling, and Orchard coinbase value remain zero. The
 recipient and note contents are not publicly recoverable with the conventional
 zero outgoing-viewing key; gross protocol issuance remains auditable. A miner
 can still disclose its own viewing data voluntarily.
@@ -268,8 +268,13 @@ A successful run proves that this checkout can construct a private Wcash
 coinbase, authenticate AuxPoW v2 through both Zcash transaction commitments,
 solve real Equihash, pass an unmodified Zcash proposal validator, submit exact
 blocks to both chains, and accept a canonical ZIP-301 share bound to an exact
-authenticated worker. The automated native E2E test mines through two ZIP-301
+authenticated worker. The local native E2E test mines through two ZIP-301
 generations and checks the resulting journal aggregate.
+
+Because these scripts perform real proof-of-work solving, they are mandatory
+local release checks and are intentionally excluded from GitHub Actions. Hosted
+CI compiles the same components and validates fixed Equihash/AuxPoW vectors,
+consensus rules, RPC behavior, and profile isolation without solving work.
 
 It does not prove wallet recovery, vendor-by-vendor ASIC interoperability,
 public variable-difficulty behavior, payout correctness, Internet-facing

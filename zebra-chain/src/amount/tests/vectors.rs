@@ -9,6 +9,17 @@ use std::{collections::hash_map::RandomState, collections::HashSet, fmt::Debug};
 use color_eyre::eyre::Result;
 
 #[test]
+fn coin_precision_matches_zcash() {
+    assert_eq!(COIN, 100_000_000);
+    assert_eq!(
+        u64::try_from(COIN).expect("the coin unit is positive"),
+        zcash_protocol::value::COIN,
+        "Wcash and the inherited Zcash protocol must use the same base unit"
+    );
+    assert_eq!(Amount::<NonNegative>::new_from_zec(1).zatoshis(), COIN);
+}
+
+#[test]
 fn max_money_matches_selected_consensus() {
     #[cfg(not(feature = "wcash-consensus"))]
     assert_eq!(MAX_MONEY, 21_000_000 * COIN);

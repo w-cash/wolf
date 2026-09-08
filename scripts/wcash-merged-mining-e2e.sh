@@ -199,10 +199,12 @@ validator_tip="$(rpc_result http://127.0.0.1:18242 getbestblockhash)"
 rpc_call http://127.0.0.1:28232 getblockchaininfo | python3 -c '
 import json,sys
 result=json.load(sys.stdin)["result"]
-assert result["chainSupply"]["chainValueZat"] == 1_000_000_000
-pools={pool["id"]: pool["chainValueZat"] for pool in result["valuePools"]}
-assert pools["ironwood"] == 1_000_000_000
-assert all(value == 0 for name,value in pools.items() if name != "ironwood")
+assert result["chainSupply"]["chainValue"] == 6.25
+assert result["chainSupply"]["chainValueZat"] == 625_000_000
+pools={pool["id"]: pool for pool in result["valuePools"]}
+assert pools["ironwood"]["chainValue"] == 6.25
+assert pools["ironwood"]["chainValueZat"] == 625_000_000
+assert all(pool["chainValueZat"] == 0 for name,pool in pools.items() if name != "ironwood")
 '
 
 export WCASH_STRATUM_PASSWORD=local-test-password-change-me
@@ -357,10 +359,12 @@ validator_tip="$(rpc_result http://127.0.0.1:18242 getbestblockhash)"
 rpc_call http://127.0.0.1:28232 getblockchaininfo | python3 -c '
 import json,sys
 result=json.load(sys.stdin)["result"]
-assert result["chainSupply"]["chainValueZat"] == 3_000_000_000
-pools={pool["id"]: pool["chainValueZat"] for pool in result["valuePools"]}
-assert pools["ironwood"] == 3_000_000_000
-assert all(value == 0 for name,value in pools.items() if name != "ironwood")
+assert result["chainSupply"]["chainValue"] == 18.75
+assert result["chainSupply"]["chainValueZat"] == 1_875_000_000
+pools={pool["id"]: pool for pool in result["valuePools"]}
+assert pools["ironwood"]["chainValue"] == 18.75
+assert pools["ironwood"]["chainValueZat"] == 1_875_000_000
+assert all(pool["chainValueZat"] == 0 for name,pool in pools.items() if name != "ironwood")
 '
 
 if ! kill -0 "$pool_pid" 2>/dev/null; then

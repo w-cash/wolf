@@ -20,7 +20,7 @@ Bitcoin block:       965900
 Bitcoin block hash:  0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851
 Anchor audit height: 966011 (112 confirmations counting the anchor)
 Wcash genesis hash:  78b292284bc7b03c6a16b62e29a3ab2015c40d6414cbc27ddcee878225600f10
-P2P magic:           f2dfe29f
+P2P magic:           8ee56b56
 P2P port:            38233
 Suggested RPC port:  38232 (loopback only)
 ```
@@ -128,9 +128,12 @@ payout-critical boundary. The private Wcash coinbase deliberately prevents the
 coordinator from publicly recovering its recipient, so the pool must trust its
 loopback child node to construct the requested reward correctly.
 
-## Reproduce the mining smoke test
+## Reproduce the local mining smoke test
 
-The automated smoke test uses an ephemeral, loopback-only CI profile with no
+This smoke test is a mandatory local release check. It is intentionally not run
+by GitHub Actions because it performs real proof-of-work solving; hosted CI uses
+fixed Equihash and AuxPoW vectors and exercises the non-solving validation paths.
+The smoke test uses an ephemeral, loopback-only profile with no
 peers, no cookie authentication, and no `debug_force_finished_sync` override.
 The inherited test-network policy deliberately permits its isolated template.
 Its bounded template retry covers asynchronous RPC, state, and proposal-service
@@ -156,7 +159,7 @@ Success proves that the frozen public-testnet genesis boots cleanly, the
 test-network bootstrap policy provides a proposal-validated, coinbase-only child
 template without a debug sync override or active mempool,
 the exact authenticated AuxPoW survives the parent coinbase and block-
-commitments paths, and a mined 10-WCASH reward increases only the Ironwood
+commitments paths, and a mined 6.25-WCASH reward increases only the Ironwood
 value pool. The test fixture address is derived from public receiver bytes and
 is not evidence that anyone controls a spending key.
 

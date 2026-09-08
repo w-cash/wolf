@@ -18,7 +18,7 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  merged-mining:
+  auxpow-validation:
     name: AuxPoW, coordinator, and isolated profiles
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -89,33 +89,20 @@ jobs:
       - name: Compile the complete Wcash node graph
         run: cargo check --locked --release -p zebrad --bin zebrad --no-default-features --features wcash-consensus
 
-      - name: Compile the documented Wcash miner graph
+      - name: Compile the documented Wcash coordinator graph
         run: cargo check --locked --release -p zebrad --bin zebrad --features wcash-consensus,internal-miner
 
       - name: Compile the unmodified Zcash profile separately
         run: cargo check --locked --release -p zebrad --bin zebrad --no-default-features
 
-      - name: Build isolated binaries for native integration
+      # GitHub Actions must not execute proof-of-work solving. The native
+      # end-to-end scripts remain mandatory local release checks; hosted CI
+      # validates fixed Equihash proofs and every non-solving integration path.
+      - name: Verify fixed Equihash and AuxPoW vectors without solving work
         run: |
-          cargo build --locked --release -p zebrad --bin zebrad --no-default-features
-          cp target/release/zebrad target/release/zcash-zebrad
-          cargo build --locked --release -p zebrad --bin zebrad --no-default-features --features wcash-consensus
-          cp target/release/zebrad target/release/wcash-zebrad
-          cargo build --locked --release -p wcash-merge-miner --bin wcash-merge-miner
-
-      - name: Mine both chains through two ZIP-301 pool generations
-        run: scripts/wcash-merged-mining-e2e.sh
-
-      - name: Boot and mine the frozen Wcash Testnet genesis
-        run: scripts/wcash-testnet-e2e.sh
-
-      - name: Upload merged-mining diagnostics on failure
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: wcash-merged-mining-failure-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/wcash-*-e2e.*/*.log
-            /tmp/wcash-*-e2e.*/*.log
-          if-no-files-found: warn
-          retention-days: 7
+          cargo test --locked -p wcash-zcash-aux upstream_zcash_genesis_header_and_work_vector
+          cargo test --locked -p wcash-zcash-aux raw_byte_order_interoperability_vector
+          cargo test --locked -p wcash-zcash-aux proof_round_trips_and_all_checks_complete
+          cargo test --locked -p wcash-merge-miner persisted_wcash_winner_requires_consensus_valid_auxpow
+          cargo test --locked -p wcash-merge-miner persisted_zcash_winner_requires_target_and_equihash
+          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash_auxpow_header_and_placeholder_rules

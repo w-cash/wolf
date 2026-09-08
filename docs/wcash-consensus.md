@@ -16,7 +16,7 @@ Public Testnet freezes Bitcoin mainnet block 965,900, hash
 The release vector records Bitcoin height 966,011, or 112 confirmations counting
 the anchor block. Its complete Wcash genesis block ID is
 `78b292284bc7b03c6a16b62e29a3ab2015c40d6414cbc27ddcee878225600f10`.
-Its P2P magic is `f2dfe29f`; its default P2P and recommended loopback RPC
+Its P2P magic is `8ee56b56`; its default P2P and recommended loopback RPC
 ports are 38233 and 38232. It never inherits Zcash's DNS seeds.
 
 The designated mainnet reference is Bitcoin height 965,954, but that anchor is
@@ -54,26 +54,31 @@ vectors, followed by a network reset or explicit consensus upgrade.
 
 ## Monetary policy
 
-Genesis at height 0 has no subsidy. Heights 1 through 1,050,000 inclusive each
-create 10 WCASH. The first halved block is height 1,050,001, and every later era
-contains exactly 1,050,000 blocks. At the 75-second target, each era is about
-2.5 years. Subsidies are integer zatoshi values and each era uses a right shift,
-so fractional zatoshi are discarded.
+Wcash uses Zcash's monetary precision without modification: one WCASH is exactly
+100,000,000 zatoshi, so the smallest consensus amount is 0.00000001 WCASH.
+Amounts are encoded and validated as integer zatoshi; consensus never uses
+floating-point coin values.
+
+Genesis at height 0 has no subsidy. Heights 1 through 1,680,000 inclusive each
+create 6.25 WCASH. The first halved block is height 1,680,001, and every later
+era contains exactly 1,680,000 blocks. At the 75-second target, each era is
+approximately four years. Subsidies are integer zatoshi values and each era
+uses a right shift, so fractional zatoshi are discarded.
 
 The inherited genesis transaction contains one zero-valued transparent output.
 It creates no spendable coins, and the chain supply at height 0 is exactly zero.
 
-The last non-zero subsidy is 1 zatoshi at height 31,500,000. Subsidy is zero
-from height 31,500,001 onward. Summing every era gives exactly:
+The last non-zero subsidy is 1 zatoshi at height 50,400,000. Subsidy is zero
+from height 50,400,001 onward. Summing every era gives exactly:
 
 ```text
-2,099,999,986,350,000 zatoshi
-= 20,999,999.86350000 WCASH
+2,099,999,981,520,000 zatoshi
+= 20,999,999.81520000 WCASH
 ```
 
 Wcash enforces a 21,000,000-WCASH monetary-base hard cap
 (2,100,000,000,000,000 zatoshi). Integer-zatoshi halving truncation makes exact
-scheduled subsidy issuance 0.13650000 WCASH lower than the cap. Transaction fees
+scheduled subsidy issuance 0.18480000 WCASH lower than the cap. Transaction fees
 are transfers of existing value and do not increase supply.
 
 Wcash has no slow start, founders reward, funding stream, deferred pool,

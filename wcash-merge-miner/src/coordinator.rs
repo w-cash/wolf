@@ -2629,13 +2629,8 @@ mod tests {
             .into();
         let target =
             Target::from_le_bytes(expanded.to_little_endian()).expect("valid expanded target");
-        for nonce in 0u32.. {
-            Arc::make_mut(&mut invalid_equihash.header).nonce[..4]
-                .copy_from_slice(&nonce.to_le_bytes());
-            if target.is_met_by_le_hash(invalid_equihash.hash().0) {
-                break;
-            }
-        }
+        *Arc::make_mut(&mut invalid_equihash.header).nonce = [0; 32];
+        assert!(target.is_met_by_le_hash(invalid_equihash.hash().0));
         let invalid_equihash_bytes = invalid_equihash
             .zcash_serialize_to_vec()
             .expect("tampered block serializes");
