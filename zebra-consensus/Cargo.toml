@@ -22,6 +22,9 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
+# Selects the Wcash monetary and transaction-consensus profile in zebra-chain.
+wcash-consensus = ["zebra-chain/wcash-consensus"]
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 progress-bar = [

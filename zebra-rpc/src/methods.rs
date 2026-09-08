@@ -2770,14 +2770,18 @@ where
             //
             // Optional TODO:
             // - add a `MempoolChange` type with an `async changed()` method (like `ChainTip`)
-            let Some((mempool_txs, mempool_tx_deps)) =
-                fetch_mempool_transactions(mempool.clone(), tip_hash)
-                    .await?
-                    // If the mempool and state responses are out of sync:
-                    // - if we are not long polling, omit mempool transactions from the template,
-                    // - if we are long polling, continue to the next iteration of the loop to make fresh state and mempool requests.
-                    .or_else(|| client_long_poll_id.is_none().then(Default::default))
-            else {
+            let template_height = tip_height.next().map_misc_error()?;
+            let Some((mempool_txs, mempool_tx_deps)) = fetch_mempool_transactions(
+                &self.network,
+                template_height,
+                mempool.clone(),
+                tip_hash,
+            )
+            .await?
+            // If the mempool and state responses are out of sync:
+            // - if we are not long polling, omit mempool transactions from the template,
+            // - if we are long polling, continue to the next iteration of the loop to make fresh state and mempool requests.
+            .or_else(|| client_long_poll_id.is_none().then(Default::default)) else {
                 continue;
             };
 
@@ -3921,7 +3925,9 @@ where
             let address = address
                 .parse::<WcashAddress>()
                 .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?;
-            if address.network() != zcash_protocol::consensus::NetworkType::Regtest {
+            if address.network()
+                != zcash_protocol::consensus::NetworkType::from(self.network.kind())
+            {
                 return Err(ErrorObject::owned(
                     0,
                     "Wcash Unified Address is for the wrong network",

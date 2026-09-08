@@ -53,6 +53,20 @@ pub use cache_dir::CacheDir;
 /// or failed DNS attempt.
 const MAX_SINGLE_SEED_PEER_DNS_RETRIES: usize = 0;
 
+const ZCASH_MAINNET_SEED_PEERS: [&str; 5] = [
+    "dnsseed.str4d.xyz:8233",
+    "dnsseed.z.cash:8233",
+    "mainnet.seeder.shieldedinfra.net:8233",
+    "mainnet.seeder.zfnd.org:8233",
+    "seeder.zec.rocks:8233",
+];
+
+const ZCASH_TESTNET_SEED_PEERS: [&str; 3] = [
+    "dnsseed.testnet.z.cash:18233",
+    "seeder.testnet.zec.rocks:18233",
+    "testnet.seeder.zfnd.org:18233",
+];
+
 /// Configuration for networking code.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, default, into = "DConfig")]
@@ -551,33 +565,23 @@ impl Default for Config {
     fn default() -> Config {
         #[cfg(not(feature = "wcash-consensus"))]
         let (listen_addr, network, initial_mainnet_peers, initial_testnet_peers) = {
-            let mainnet_peers = [
-                "dnsseed.str4d.xyz:8233",
-                "dnsseed.z.cash:8233",
-                "mainnet.seeder.shieldedinfra.net:8233",
-                "mainnet.seeder.zfnd.org:8233",
-                "seeder.zec.rocks:8233",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect();
+            let mainnet_peers = ZCASH_MAINNET_SEED_PEERS
+                .into_iter()
+                .map(String::from)
+                .collect();
 
-            let testnet_peers = [
-                "dnsseed.testnet.z.cash:18233",
-                "seeder.testnet.zec.rocks:18233",
-                "testnet.seeder.zfnd.org:18233",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect();
+            let testnet_peers = ZCASH_TESTNET_SEED_PEERS
+                .into_iter()
+                .map(String::from)
+                .collect();
 
             ("[::]:8233", Network::Mainnet, mainnet_peers, testnet_peers)
         };
 
         #[cfg(feature = "wcash-consensus")]
         let (listen_addr, network, initial_mainnet_peers, initial_testnet_peers) = (
-            "[::]:28233",
-            Network::new_wcash_regtest(),
+            "[::]:38233",
+            Network::new_wcash_testnet(),
             IndexSet::new(),
             IndexSet::new(),
         );
@@ -640,10 +644,9 @@ struct DTestnetParameters {
 #[serde(untagged)]
 enum DNetwork {
     DefaultForKind(NetworkKind),
-    /// Built-in Wcash local network. A string keeps the generated TOML simple
-    /// (`network = "WcashRegtest"`) without changing Zebra's persisted
-    /// `NetworkKind` representation.
-    WcashRegtest(String),
+    /// Built-in Wcash network. A string keeps the generated TOML simple
+    /// without changing Zebra's persisted `NetworkKind` representation.
+    Wcash(String),
     ConfiguredRegtest {
         params: Box<DTestnetParameters>,
 
@@ -662,7 +665,7 @@ impl Default for DNetwork {
 
         #[cfg(feature = "wcash-consensus")]
         {
-            DNetwork::WcashRegtest("WcashRegtest".to_string())
+            DNetwork::Wcash("WcashTestnet".to_string())
         }
     }
 }
@@ -678,8 +681,11 @@ struct DConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     testnet_parameters: Option<DTestnetParameters>,
 
-    initial_mainnet_peers: IndexSet<String>,
-    initial_testnet_peers: IndexSet<String>,
+    /// `None` distinguishes an omitted field from an explicitly configured
+    /// peer list. This lets Wcash replace Zebra's serde defaults with an empty
+    /// bootstrap set without silently accepting an explicitly supplied Zcash seed.
+    initial_mainnet_peers: Option<IndexSet<String>>,
+    initial_testnet_peers: Option<IndexSet<String>>,
     cache_dir: CacheDir,
     peerset_initial_target_size: usize,
     #[serde(alias = "new_peer_interval", with = "humantime_serde")]
@@ -695,8 +701,8 @@ impl Default for DConfig {
             external_addr: None,
             network: Default::default(),
             testnet_parameters: None,
-            initial_mainnet_peers: config.initial_mainnet_peers,
-            initial_testnet_peers: config.initial_testnet_peers,
+            initial_mainnet_peers: None,
+            initial_testnet_peers: None,
             cache_dir: config.cache_dir,
             peerset_initial_target_size: config.peerset_initial_target_size,
             crawl_new_peer_interval: config.crawl_new_peer_interval,
@@ -762,7 +768,12 @@ impl From<Config> for DConfig {
         }: Config,
     ) -> Self {
         let dnetwork = if network.uses_wcash_consensus() {
-            DNetwork::WcashRegtest("WcashRegtest".to_string())
+            let name = match (network.is_wcash_testnet(), network.is_wcash_regtest()) {
+                (true, false) => "WcashTestnet",
+                (false, true) => "WcashRegtest",
+                _ => unreachable!("enabled Wcash consensus has a supported built-in network"),
+            };
+            DNetwork::Wcash(name.to_string())
         } else {
             match network.kind() {
                 NetworkKind::Testnet => match network
@@ -791,8 +802,8 @@ impl From<Config> for DConfig {
             external_addr: external_addr.map(|addr| addr.to_string()),
             network: dnetwork,
             testnet_parameters: None,
-            initial_mainnet_peers,
-            initial_testnet_peers,
+            initial_mainnet_peers: Some(initial_mainnet_peers),
+            initial_testnet_peers: Some(initial_testnet_peers),
             cache_dir,
             peerset_initial_target_size,
             crawl_new_peer_interval,
@@ -819,15 +830,56 @@ impl<'de> Deserialize<'de> for Config {
             max_connections_per_ip,
         } = DConfig::deserialize(deserializer)?;
 
+        let is_built_in_wcash = matches!(&dnetwork, DNetwork::Wcash(_));
+        let Config {
+            initial_mainnet_peers: default_mainnet_peers,
+            initial_testnet_peers: default_testnet_peers,
+            ..
+        } = Config::default();
+        let initial_mainnet_peers = initial_mainnet_peers.unwrap_or_else(|| {
+            if is_built_in_wcash {
+                IndexSet::new()
+            } else {
+                default_mainnet_peers
+            }
+        });
+        let initial_testnet_peers = initial_testnet_peers.unwrap_or_else(|| {
+            if is_built_in_wcash {
+                IndexSet::new()
+            } else {
+                default_testnet_peers
+            }
+        });
+
         let network = match (dnetwork, testnet_parameters) {
-            (DNetwork::WcashRegtest(name), _) => {
-                if !name.eq_ignore_ascii_case("WcashRegtest") && !name.eq_ignore_ascii_case("Wcash")
+            (DNetwork::Wcash(_), Some(_)) => {
+                return Err(de::Error::custom(
+                    "built-in Wcash networks reject configured Zcash testnet parameters",
+                ))
+            }
+            (DNetwork::Wcash(name), None) => {
+                let mut configured_peers = initial_mainnet_peers.clone();
+                configured_peers.extend(initial_testnet_peers.iter().cloned());
+                if contains_default_initial_peers(&configured_peers) {
+                    return Err(de::Error::custom(
+                        "Wcash networks cannot use built-in Zcash DNS seeds or initial peers",
+                    ));
+                }
+
+                if name.eq_ignore_ascii_case("WcashTestnet") {
+                    Network::new_wcash_testnet()
+                } else if name.eq_ignore_ascii_case("WcashRegtest")
+                    || name.eq_ignore_ascii_case("Wcash")
                 {
+                    // `Wcash` was the pre-testnet spelling for local regtest.
+                    // Keep it local rather than silently moving an old config
+                    // onto the public network.
+                    Network::new_wcash_regtest()
+                } else {
                     return Err(de::Error::custom(format!(
-                        "unknown network {name:?}; expected WcashRegtest"
+                        "unknown network {name:?}; expected WcashTestnet or WcashRegtest"
                     )));
                 }
-                Network::new_wcash_regtest()
             }
             (DNetwork::ConfiguredTestnet(params), _) => {
                 build_configured_testnet::<D>(*params, &initial_testnet_peers)?
@@ -909,12 +961,11 @@ impl<'de> Deserialize<'de> for Config {
 ///
 /// Returns true if any of them are the default Testnet or Mainnet initial peers.
 fn contains_default_initial_peers(initial_peers: &IndexSet<String>) -> bool {
-    let Config {
-        initial_mainnet_peers: mut default_initial_peers,
-        initial_testnet_peers: default_initial_testnet_peers,
-        ..
-    } = Config::default();
-    default_initial_peers.extend(default_initial_testnet_peers);
+    let default_initial_peers: IndexSet<String> = ZCASH_MAINNET_SEED_PEERS
+        .into_iter()
+        .chain(ZCASH_TESTNET_SEED_PEERS)
+        .map(String::from)
+        .collect();
 
     initial_peers
         .intersection(&default_initial_peers)

@@ -308,8 +308,12 @@ fn adjust_difficulty_and_time_for_testnet(
         .try_into()
         .expect("valid blocks have in-range times");
 
+    let Ok(candidate_block_height) = previous_block_height.next() else {
+        // There is no valid candidate after the maximum supported height.
+        return;
+    };
     let Some(minimum_difficulty_spacing) =
-        NetworkUpgrade::minimum_difficulty_spacing_for_height(network, previous_block_height)
+        NetworkUpgrade::minimum_difficulty_spacing_for_height(network, candidate_block_height)
     else {
         // Returns early if the testnet minimum difficulty consensus rule is not active
         return;
@@ -548,5 +552,67 @@ mod tests {
             result.max_time,
             DateTime32::from(PREV + BLOCK_MAX_TIME_SINCE_MEDIAN)
         );
+    }
+
+    /// The activation height is the candidate block height, not the preceding
+    /// tip height. This protects the boundary block from a template whose time
+    /// range and advertised difficulty disagree.
+    #[test]
+    fn zcash_activation_boundary_uses_candidate_height() {
+        let network = Network::new_default_testnet();
+        // Zcash activates the rule before Blossom, so its target spacing at
+        // this boundary is 150 seconds and the strict minimum gap is 900.
+        let zcash_activation_gap = 6 * 150;
+        let cur = PREV + zcash_activation_gap + 1;
+        let mut result = chain_info(cur);
+
+        adjust_difficulty_and_time_for_testnet(
+            &mut result,
+            &network,
+            Height(299_187),
+            recent_block_data(&network),
+        );
+
+        assert_eq!(
+            result.expected_difficulty,
+            network.target_difficulty_limit().to_compact()
+        );
+        assert_eq!(
+            result.min_time,
+            DateTime32::from(PREV + zcash_activation_gap + 1)
+        );
+    }
+
+    /// Wcash activates its public-testnet minimum-difficulty rule on block 1,
+    /// so the genesis tip must already advertise the two valid timestamp ranges.
+    #[test]
+    fn wcash_height_one_uses_candidate_height() {
+        let network = Network::new_wcash_testnet();
+
+        let mut at_threshold = chain_info(PREV + GAP);
+        adjust_difficulty_and_time_for_testnet(
+            &mut at_threshold,
+            &network,
+            Height::MIN,
+            recent_block_data(&network),
+        );
+        assert_eq!(
+            at_threshold.expected_difficulty,
+            CompactDifficulty::default()
+        );
+        assert_eq!(at_threshold.max_time, DateTime32::from(PREV + GAP));
+
+        let mut past_threshold = chain_info(PREV + GAP + 1);
+        adjust_difficulty_and_time_for_testnet(
+            &mut past_threshold,
+            &network,
+            Height::MIN,
+            recent_block_data(&network),
+        );
+        assert_eq!(
+            past_threshold.expected_difficulty,
+            network.target_difficulty_limit().to_compact()
+        );
+        assert_eq!(past_threshold.min_time, DateTime32::from(PREV + GAP + 1));
     }
 }

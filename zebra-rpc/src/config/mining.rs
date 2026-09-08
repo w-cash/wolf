@@ -232,8 +232,8 @@ pub fn default_miner_address(kind: NetworkKind, addr_type: &MinerAddressType) ->
 
 /// Returns the default miner address for `network`.
 ///
-/// Wcash currently exposes only Regtest, whose default is a Wcash-encoded
-/// Unified Address with an Orchard receiver for Ironwood. Ordinary Zcash
+/// Built-in Wcash networks use their matching Wcash textual namespace and an
+/// address containing the Orchard receiver used for Ironwood. Ordinary Zcash
 /// networks retain their upstream fixtures.
 pub fn default_miner_address_for_network(
     network: &Network,
@@ -243,12 +243,13 @@ pub fn default_miner_address_for_network(
         return default_miner_address(network.kind(), addr_type).to_owned();
     }
 
-    default_miner_address(NetworkKind::Regtest, addr_type)
+    let network_kind = network.kind();
+    default_miner_address(network_kind, addr_type)
         .parse::<ZcashAddress>()
-        .expect("the upstream Regtest miner-address fixture is valid")
+        .expect("the matching upstream miner-address fixture is valid")
         .convert::<WcashAddress>()
         .expect("Wcash supports every non-Sprout upstream miner-address fixture")
-        .with_network(zcash_protocol::consensus::NetworkType::Regtest)
+        .with_network(network_kind.into())
         .encode()
 }
 
@@ -278,6 +279,28 @@ lazy_static::lazy_static! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_wcash_miner_addresses_follow_the_selected_network() {
+        use zcash_protocol::consensus::NetworkType;
+
+        for (network, expected_network, expected_prefix) in [
+            (Network::new_wcash_testnet(), NetworkType::Test, "wutest1"),
+            (
+                Network::new_wcash_regtest(),
+                NetworkType::Regtest,
+                concat!("w", "u", "regtest", "1"),
+            ),
+        ] {
+            let encoded = default_miner_address_for_network(&network, &MinerAddressType::Unified);
+            let address: WcashAddress = encoded
+                .parse()
+                .expect("the generated Wcash miner address is valid");
+
+            assert_eq!(address.network(), expected_network);
+            assert!(encoded.starts_with(expected_prefix));
+        }
+    }
 
     #[test]
     fn mining_config_debug_redacts_payout_material() {

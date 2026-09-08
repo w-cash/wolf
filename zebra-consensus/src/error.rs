@@ -270,6 +270,11 @@ pub enum TransactionError {
     #[error("transaction uses an incorrect consensus branch id")]
     WrongConsensusBranchId,
 
+    #[error(
+        "non-coinbase transactions are disabled on Wcash Testnet until a Wcash-specific signature domain is deployed"
+    )]
+    WcashTestnetTransfersDisabled,
+
     #[error("wrong tx format: tx version is ≥ 5, but `nConsensusBranchId` is missing")]
     MissingConsensusBranchId,
 
@@ -430,6 +435,7 @@ impl TransactionError {
             | NotEnoughOrchardFlags
             | NotEnoughIronwoodFlags
             | WrongConsensusBranchId
+            | WcashTestnetTransfersDisabled
             | MissingConsensusBranchId
             | LockedUntilAfterBlockHeight(_)
             | LockedUntilAfterBlockTime(_) => 100,

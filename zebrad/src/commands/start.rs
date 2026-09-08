@@ -92,7 +92,15 @@ use tokio::{
 use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
 
-use zebra_chain::block::genesis::{regtest_genesis_block, wcash_regtest_genesis_block};
+use zebra_chain::{
+    block::{
+        genesis::{
+            regtest_genesis_block, wcash_regtest_genesis_block, wcash_testnet_genesis_block,
+        },
+        Block,
+    },
+    parameters::Network,
+};
 use zebra_consensus::router::BackgroundTaskHandles;
 use zebra_rpc::{
     methods::RpcImpl, server::RpcServer, MinerParams, MinerParamsError, SubmitBlockChannel,
@@ -130,6 +138,23 @@ pub struct StartCmd {
     /// Continue startup even when zcashd-compat preflight detects minimum hardware shortfalls.
     #[clap(long = "unsafe-low-specs")]
     unsafe_low_specs: bool,
+}
+
+/// Returns a trusted built-in genesis block that can be committed without a peer.
+///
+/// Public Zcash networks retain their normal sync bootstrap. Wcash has no
+/// project-owned seeds at launch, so both built-in Wcash networks must seed the
+/// exact genesis selected by their consensus parameters before peer sync starts.
+fn locally_seeded_genesis_block(network: &Network) -> Option<Arc<Block>> {
+    if network.is_wcash_testnet() {
+        Some(wcash_testnet_genesis_block())
+    } else if network.is_wcash_regtest() {
+        Some(wcash_regtest_genesis_block())
+    } else if network.is_regtest() {
+        Some(regtest_genesis_block())
+    } else {
+        None
+    }
 }
 
 /// Warns if Linux TCP slow-start-after-idle is enabled, which significantly
@@ -662,32 +687,27 @@ impl StartCmd {
         );
 
         info!("spawning syncer task");
-        // In regtest, commit the genesis block directly (bypassing the syncer's genesis
-        // download, which requires a connected peer). Then run the syncer normally so
-        // that multi-hop block propagation works: gossiped blocks that arrive out of
-        // order (e.g. only the latest tip hash was gossiped) will be recovered by the
-        // syncer using block locators within REGTEST_SYNC_RESTART_DELAY (2 seconds).
-        if is_regtest
-            && !syncer
+        // Commit trusted built-in genesis blocks directly when their networks
+        // cannot rely on a seed peer for the initial download. Then run the
+        // syncer normally so later gossiped blocks and locator recovery work.
+        // Public Zcash networks retain their existing peer-sync bootstrap.
+        if let Some(genesis_block) = locally_seeded_genesis_block(&config.network.network) {
+            if !syncer
                 .state_contains(config.network.network.genesis_hash())
                 .await?
-        {
-            let genesis_block = if config.network.network.uses_wcash_consensus() {
-                wcash_regtest_genesis_block()
-            } else {
-                regtest_genesis_block()
-            };
-            let genesis_hash = block_verifier_router
-                .clone()
-                .oneshot(zebra_consensus::Request::Commit(genesis_block))
-                .await
-                .expect("should validate Regtest genesis block");
+            {
+                let genesis_hash = block_verifier_router
+                    .clone()
+                    .oneshot(zebra_consensus::Request::Commit(genesis_block))
+                    .await
+                    .expect("should validate the trusted built-in genesis block");
 
-            assert_eq!(
-                genesis_hash,
-                config.network.network.genesis_hash(),
-                "validated block hash should match network genesis hash"
-            )
+                assert_eq!(
+                    genesis_hash,
+                    config.network.network.genesis_hash(),
+                    "validated block hash should match network genesis hash"
+                )
+            }
         }
         let syncer_task_handle = tokio::spawn(syncer.sync().in_current_span());
 
@@ -977,7 +997,7 @@ impl config::Override<ZebradConfig> for StartCmd {
         #[cfg(feature = "wcash-consensus")]
         if !config.network.network.uses_wcash_consensus() {
             return Err(std::io::Error::other(
-                "this Wcash consensus build only supports network = 'WcashRegtest'; inherited Zcash networks use different monetary bounds",
+                "this Wcash consensus build only supports network = 'WcashTestnet' or 'WcashRegtest'; inherited Zcash networks use different monetary bounds",
             )
             .into());
         }
@@ -1047,7 +1067,7 @@ mod tests {
     use abscissa_core::config::Override;
     use color_eyre::eyre::eyre;
 
-    use super::StartCmd;
+    use super::{locally_seeded_genesis_block, StartCmd};
     use crate::components::zcashd_compat;
     use crate::config::ZebradConfig;
 
@@ -1077,16 +1097,63 @@ mod tests {
             zcashd_compat: false,
             unsafe_low_specs: false,
         };
-        let mut config = ZebradConfig::default();
-        config.network.network = zebra_chain::parameters::Network::new_wcash_regtest();
+        for network in [
+            zebra_chain::parameters::Network::new_wcash_testnet(),
+            zebra_chain::parameters::Network::new_wcash_regtest(),
+        ] {
+            let mut config = ZebradConfig::default();
+            config.network.network = network;
 
-        let error = cmd
-            .override_config(config)
-            .expect_err("the Zcash binary must not use Wcash monetary bounds");
+            let error = cmd
+                .override_config(config)
+                .expect_err("the Zcash binary must not use Wcash monetary bounds");
 
-        assert!(error
-            .to_string()
-            .contains("does not support Wcash networks"));
+            assert!(error
+                .to_string()
+                .contains("does not support Wcash networks"));
+        }
+    }
+
+    #[test]
+    fn local_genesis_bootstrap_selects_exact_built_in_chain() {
+        let wcash_testnet = zebra_chain::parameters::Network::new_wcash_testnet();
+        let wcash_regtest = zebra_chain::parameters::Network::new_wcash_regtest();
+        let zcash_regtest = zebra_chain::parameters::Network::new_regtest(Default::default());
+
+        for network in [&wcash_testnet, &wcash_regtest, &zcash_regtest] {
+            let block = locally_seeded_genesis_block(network)
+                .expect("built-in local-bootstrap networks have a trusted genesis");
+            assert_eq!(block.hash(), network.genesis_hash());
+        }
+
+        assert_ne!(wcash_testnet.genesis_hash(), wcash_regtest.genesis_hash());
+        assert!(locally_seeded_genesis_block(&zebra_chain::parameters::Network::Mainnet).is_none());
+        assert!(locally_seeded_genesis_block(
+            &zebra_chain::parameters::Network::new_default_testnet()
+        )
+        .is_none());
+    }
+
+    #[cfg(feature = "wcash-consensus")]
+    #[test]
+    fn start_accepts_both_built_in_wcash_networks() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+
+        for network in [
+            zebra_chain::parameters::Network::new_wcash_testnet(),
+            zebra_chain::parameters::Network::new_wcash_regtest(),
+        ] {
+            let mut config = ZebradConfig::default();
+            config.network.network = network.clone();
+            let configured = cmd
+                .override_config(config)
+                .expect("the Wcash binary supports both built-in Wcash networks");
+            assert_eq!(configured.network.network, network);
+        }
     }
 
     #[test]

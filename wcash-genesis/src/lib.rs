@@ -1,8 +1,8 @@
 //! Deterministic identity and Bitcoin-anchored genesis data for Wcash.
 //!
-//! Public-network anchors are deliberately unavailable until their Bitcoin
-//! headers and confirmation history are independently checked and frozen in a
-//! reviewed release. Consensus code never fetches data from the network.
+//! Public-network anchors are enabled only after their Bitcoin headers and
+//! confirmation history are independently checked and frozen in a reviewed
+//! release. Consensus code never fetches data from the network.
 
 #![forbid(unsafe_code)]
 
@@ -32,6 +32,25 @@ pub const GENESIS_TIMESTAMP_TEXT: &str = "06/Sep/2026 Wcash";
 /// Bitcoin mainnet height designated for a possible Wcash mainnet anchor.
 pub const DESIGNATED_MAINNET_BITCOIN_HEIGHT: u32 = 965_954;
 
+/// Bitcoin mainnet height frozen into the public Wcash testnet genesis.
+pub const PUBLIC_TESTNET_BITCOIN_HEIGHT: u32 = 965_900;
+
+/// Bitcoin best-chain height used when the public testnet anchor was frozen.
+///
+/// Counting the anchor block itself, this records 112 confirmations. It is an
+/// immutable audit vector, not a value consulted from the network at runtime.
+pub const PUBLIC_TESTNET_VERIFICATION_HEIGHT: u32 = 966_011;
+
+/// Bitcoin header timestamp frozen into the public Wcash testnet genesis.
+pub const PUBLIC_TESTNET_BITCOIN_TIME: u32 = 1_788_768_709;
+
+/// Exact Bitcoin wire header frozen into the public Wcash testnet test vector.
+pub const PUBLIC_TESTNET_BITCOIN_HEADER_HEX: &str = concat!(
+    "00203220700b5cbd51c3511db177feb5891754ee7e3ec5f4849a010000000000",
+    "000000000444905fd34cdb083f512a1957ec2c7ffedf3a7ff5098d1f20a5aed9",
+    "c8484b46c5719e6a5e35021706442381",
+);
+
 /// Bitcoin mainnet height frozen into the local Wcash regtest genesis.
 pub const LOCAL_REGTEST_BITCOIN_HEIGHT: u32 = 965_910;
 
@@ -47,6 +66,12 @@ pub const LOCAL_REGTEST_BITCOIN_HEADER_HEX: &str = concat!(
 
 /// Number of confirmations required by the release procedure before freezing a public anchor.
 pub const MIN_PUBLIC_ANCHOR_CONFIRMATIONS: u32 = 100;
+
+/// Canonical compact `nBits` value for the Wcash public-testnet proof-of-work limit.
+///
+/// This is the compact encoding of `2^251 - 1`, matching the reviewed Zcash
+/// testnet limit while retaining a separate Wcash chain and proof format.
+pub const PUBLIC_TESTNET_POW_LIMIT_BITS: u32 = 0x2007_ffff;
 
 /// Version of the fixed-width Bitcoin anchor encoding.
 pub const ANCHOR_ENCODING_VERSION: u8 = 1;
@@ -584,10 +609,24 @@ pub const REGTEST_ANCHOR: BitcoinAnchor = BitcoinAnchor::frozen(
     ],
 );
 
-// These `None` values are the fail-closed public-network activation gate. A
-// reviewed release must replace the applicable value with a checked anchor.
+/// The frozen Bitcoin mainnet block used for the public Wcash testnet.
+///
+/// The Wcash network discriminator is committed alongside the Bitcoin hash,
+/// so this cannot collide with a regtest or future mainnet anchor even if a
+/// source block were reused.
+pub const TESTNET_ANCHOR: BitcoinAnchor = BitcoinAnchor::frozen(
+    WcashNetwork::Testnet,
+    PUBLIC_TESTNET_BITCOIN_HEIGHT,
+    [
+        0x51, 0x98, 0x6b, 0x3e, 0x1c, 0x27, 0x3a, 0xd8, 0xc5, 0xea, 0xf2, 0x37, 0x78, 0xb4, 0xa8,
+        0x3c, 0xaf, 0xf4, 0xf5, 0x9f, 0xb5, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ],
+);
+
+// This `None` value is the fail-closed mainnet activation gate. A reviewed
+// release must replace it with the announced anchor only after confirmation.
 const MAINNET_ANCHOR: Option<BitcoinAnchor> = None;
-const TESTNET_ANCHOR: Option<BitcoinAnchor> = None;
 
 /// Error returned when no reviewed anchor is frozen for a Wcash network.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -617,8 +656,8 @@ impl Error for PublicNetworkDisabled {}
 
 /// Selects the consensus anchor for a Wcash network.
 ///
-/// An override is honored only on regtest. Mainnet and testnet stay disabled
-/// until a reviewed source release freezes their anchor constants.
+/// An override is honored only on regtest. Mainnet stays disabled until a
+/// reviewed source release freezes its announced anchor.
 ///
 /// # Errors
 ///
@@ -632,10 +671,7 @@ pub const fn select_anchor(
             Some(anchor) => Ok(anchor),
             None => Err(PublicNetworkDisabled { network }),
         },
-        WcashNetwork::Testnet => match TESTNET_ANCHOR {
-            Some(anchor) => Ok(anchor),
-            None => Err(PublicNetworkDisabled { network }),
-        },
+        WcashNetwork::Testnet => Ok(TESTNET_ANCHOR),
         WcashNetwork::Regtest => match regtest_override {
             Some(anchor_override) => Ok(anchor_override.anchor()),
             None => Ok(REGTEST_ANCHOR),
@@ -732,6 +768,13 @@ mod tests {
     const LOCAL_REGTEST_BITCOIN_DISPLAY_HASH: &str =
         "00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146";
     const LOCAL_REGTEST_BITCOIN_BITS: u32 = 0x1702_355e;
+    const PUBLIC_TESTNET_BITCOIN_DISPLAY_HASH: &str =
+        "0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851";
+    const PUBLIC_TESTNET_BITCOIN_BITS: u32 = 0x1702_355e;
+    const TESTNET_ENCODING: &str =
+        "010100000cbd0e0051986b3e1c273ad8c5eaf23778b4a83caff4f59fb55600000000000000000000";
+    const TESTNET_COMMITMENT: &str =
+        "95940842f305c76339570ea54bde7987d3aa90193cb872baab0beb3528bcd6d5";
     const REGTEST_ENCODING: &str =
         "0102000016bd0e0046b146d1927c704ad85f0ade6f2c6498f02f8db2bdbb00000000000000000000";
     const REGTEST_COMMITMENT: &str =
@@ -753,16 +796,22 @@ mod tests {
             [0xaa, 0xe8, 0x3f, 0x5f],
         ];
 
-        for network in [
+        let wcash_networks = [
             WcashNetwork::Mainnet,
             WcashNetwork::Testnet,
             WcashNetwork::Regtest,
-        ] {
+        ];
+        let mut wcash_magics = std::collections::HashSet::new();
+        for network in wcash_networks {
             let identity = network_identity(network);
             let digest = Sha256::digest(identity.domain_label().as_bytes());
             assert_eq!(identity.network(), network);
             assert_eq!(identity.p2p_magic(), digest[..4]);
             assert!(!zcash_magics.contains(&identity.p2p_magic()));
+            assert!(
+                wcash_magics.insert(identity.p2p_magic()),
+                "each Wcash network must have unique P2P magic"
+            );
         }
     }
 
@@ -805,12 +854,58 @@ mod tests {
     }
 
     #[test]
-    fn both_public_networks_fail_closed() {
-        for network in [WcashNetwork::Mainnet, WcashNetwork::Testnet] {
-            let error = select_anchor(network, None)
-                .expect_err("public anchors must stay unavailable before review");
-            assert_eq!(error.network(), network);
-        }
+    fn public_testnet_bitcoin_header_and_hash_are_reproducible() {
+        let header: BitcoinHeader = PUBLIC_TESTNET_BITCOIN_HEADER_HEX
+            .parse()
+            .expect("the frozen Bitcoin anchor header is valid hex");
+        let displayed_hash: BitcoinBlockHash = PUBLIC_TESTNET_BITCOIN_DISPLAY_HASH
+            .parse()
+            .expect("the frozen Bitcoin anchor hash is valid hex");
+
+        assert_eq!(header.block_hash(), displayed_hash);
+        assert_eq!(header.time(), PUBLIC_TESTNET_BITCOIN_TIME);
+        assert_eq!(header.bits(), PUBLIC_TESTNET_BITCOIN_BITS);
+        assert_eq!(header.validate_isolated_mainnet_work(), Ok(()));
+        assert_eq!(
+            TESTNET_ANCHOR.bitcoin_height(),
+            PUBLIC_TESTNET_BITCOIN_HEIGHT
+        );
+        assert_eq!(TESTNET_ANCHOR.bitcoin_block_hash(), displayed_hash);
+        assert_eq!(
+            select_anchor(WcashNetwork::Testnet, None),
+            Ok(TESTNET_ANCHOR)
+        );
+        assert!(
+            PUBLIC_TESTNET_VERIFICATION_HEIGHT - PUBLIC_TESTNET_BITCOIN_HEIGHT + 1
+                >= MIN_PUBLIC_ANCHOR_CONFIRMATIONS,
+            "the frozen audit height must record at least the release minimum confirmations"
+        );
+    }
+
+    #[test]
+    fn public_testnet_anchor_vectors_are_frozen() {
+        assert_eq!(
+            TESTNET_ANCHOR.genesis_statement(),
+            concat!(
+                "06/Sep/2026 Wcash: BTC #965900 ",
+                "0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851"
+            )
+        );
+        assert!(TESTNET_ANCHOR.genesis_statement().len() <= 100);
+        assert_eq!(encode_hex(TESTNET_ANCHOR.encode()), TESTNET_ENCODING);
+        assert_eq!(encode_hex(TESTNET_ANCHOR.commitment()), TESTNET_COMMITMENT);
+        assert_eq!(
+            BitcoinAnchor::decode(&TESTNET_ANCHOR.encode()),
+            Ok(TESTNET_ANCHOR)
+        );
+        assert_ne!(TESTNET_ANCHOR.commitment(), REGTEST_ANCHOR.commitment());
+    }
+
+    #[test]
+    fn mainnet_stays_fail_closed() {
+        let error = select_anchor(WcashNetwork::Mainnet, None)
+            .expect_err("mainnet must stay unavailable before its anchor has enough confirmations");
+        assert_eq!(error.network(), WcashNetwork::Mainnet);
         assert_eq!(DESIGNATED_MAINNET_BITCOIN_HEIGHT, 965_954);
     }
 
@@ -830,9 +925,12 @@ mod tests {
         assert_eq!(first.bitcoin_height(), 42);
         assert_ne!(first.commitment(), REGTEST_ANCHOR.commitment());
 
-        for public_network in [WcashNetwork::Mainnet, WcashNetwork::Testnet] {
-            assert!(select_anchor(public_network, Some(anchor_override)).is_err());
-        }
+        assert!(select_anchor(WcashNetwork::Mainnet, Some(anchor_override)).is_err());
+        assert_eq!(
+            select_anchor(WcashNetwork::Testnet, Some(anchor_override)),
+            Ok(TESTNET_ANCHOR),
+            "a local override must not replace the frozen testnet anchor"
+        );
     }
 
     #[test]

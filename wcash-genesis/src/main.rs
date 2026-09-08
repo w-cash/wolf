@@ -18,6 +18,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| "show-regtest".to_owned());
 
     match command.as_str() {
+        "show-testnet" => {
+            reject_extra_arguments(arguments)?;
+            print_anchor(wcash_genesis::TESTNET_ANCHOR);
+        }
         "show-regtest" => {
             reject_extra_arguments(arguments)?;
             print_anchor(wcash_genesis::REGTEST_ANCHOR);
@@ -43,7 +47,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "mainnet: disabled; designated Bitcoin anchor height {}",
                 wcash_genesis::DESIGNATED_MAINNET_BITCOIN_HEIGHT
             );
-            println!("testnet: disabled; no reviewed anchor frozen");
+            println!(
+                "testnet: enabled for mining interoperability; Bitcoin block {} anchor (verified at Bitcoin height {})",
+                wcash_genesis::PUBLIC_TESTNET_BITCOIN_HEIGHT,
+                wcash_genesis::PUBLIC_TESTNET_VERIFICATION_HEIGHT,
+            );
             println!(
                 "regtest: enabled; frozen Bitcoin block {} anchor",
                 wcash_genesis::LOCAL_REGTEST_BITCOIN_HEIGHT
@@ -81,5 +89,5 @@ fn encode_hex(bytes: impl IntoIterator<Item = u8>) -> String {
 }
 
 fn usage() -> &'static str {
-    "usage: wcash-genesis [show-regtest | status | derive-regtest HEIGHT HEADER_HEX]"
+    "usage: wcash-genesis [show-testnet | show-regtest | status | derive-regtest HEIGHT HEADER_HEX]"
 }

@@ -3368,54 +3368,84 @@ async fn rpc_z_listunifiedreceivers() {
 async fn rpc_z_listunifiedreceivers_uses_wcash_namespace() {
     let _init_guard = zebra_test::init();
 
-    let network = zebra_chain::parameters::Network::new_wcash_regtest();
-    let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
-        network.clone(),
-        Default::default(),
-        Default::default(),
-        "0.0.1",
-        "RPC test",
-        MockService::build().for_unit_tests(),
-        MockService::build().for_unit_tests(),
-        MockService::build().for_unit_tests(),
-        MockService::build().for_unit_tests(),
-        MockSyncStatus::default(),
-        NoChainTip,
-        MockAddressBookPeers::default(),
-        rx,
-        None,
-    );
+    for (network, ua_prefix, sapling_prefix, p2pkh_prefix, p2sh_prefix) in [
+        (
+            zebra_chain::parameters::Network::new_wcash_testnet(),
+            "wutest1",
+            "wtestsapling1",
+            "WT",
+            "WU",
+        ),
+        (
+            zebra_chain::parameters::Network::new_wcash_regtest(),
+            concat!("w", "u", "regtest", "1"),
+            "wregtestsapling1",
+            "WR",
+            "WS",
+        ),
+    ] {
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (rpc, _) = RpcImpl::new(
+            network.clone(),
+            Default::default(),
+            Default::default(),
+            "0.0.1",
+            "RPC test",
+            MockService::build().for_unit_tests(),
+            MockService::build().for_unit_tests(),
+            MockService::build().for_unit_tests(),
+            MockService::build().for_unit_tests(),
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            None,
+        );
 
-    let wcash_address =
-        mining::default_miner_address_for_network(&network, &mining::MinerAddressType::Unified);
-    assert!(wcash_address.starts_with(concat!("w", "u", "regtest", "1")));
+        let wcash_address =
+            mining::default_miner_address_for_network(&network, &mining::MinerAddressType::Unified);
+        assert!(wcash_address.starts_with(ua_prefix));
 
-    let response = rpc
-        .z_list_unified_receivers(wcash_address)
-        .await
-        .expect("the Wcash Unified Address is accepted on Wcash regtest");
+        let response = rpc
+            .z_list_unified_receivers(wcash_address)
+            .await
+            .expect("the Wcash Unified Address is accepted on its matching network");
 
-    assert!(response
-        .orchard()
-        .as_deref()
-        .is_some_and(|address| address.starts_with(concat!("w", "u", "regtest", "1"))));
-    if let Some(address) = response.sapling() {
-        assert!(address.starts_with("wregtestsapling1"));
+        assert!(response
+            .orchard()
+            .as_deref()
+            .is_some_and(|address| address.starts_with(ua_prefix)));
+        if let Some(address) = response.sapling() {
+            assert!(address.starts_with(sapling_prefix));
+        }
+        if let Some(address) = response.p2pkh() {
+            assert!(address.starts_with(p2pkh_prefix));
+        }
+        if let Some(address) = response.p2sh() {
+            assert!(address.starts_with(p2sh_prefix));
+        }
+
+        let inherited_zcash_address =
+            mining::default_miner_address(network.kind(), &mining::MinerAddressType::Unified);
+        assert!(rpc
+            .z_list_unified_receivers(inherited_zcash_address.to_owned())
+            .await
+            .is_err());
+
+        let other_wcash_network = if network.is_wcash_testnet() {
+            zebra_chain::parameters::Network::new_wcash_regtest()
+        } else {
+            zebra_chain::parameters::Network::new_wcash_testnet()
+        };
+        let other_wcash_address = mining::default_miner_address_for_network(
+            &other_wcash_network,
+            &mining::MinerAddressType::Unified,
+        );
+        assert!(rpc
+            .z_list_unified_receivers(other_wcash_address)
+            .await
+            .is_err());
     }
-    if let Some(address) = response.p2pkh() {
-        assert!(address.starts_with("WR"));
-    }
-    if let Some(address) = response.p2sh() {
-        assert!(address.starts_with("WS"));
-    }
-
-    let inherited_zcash_address =
-        mining::default_miner_address(NetworkKind::Regtest, &mining::MinerAddressType::Unified);
-    assert!(rpc
-        .z_list_unified_receivers(inherited_zcash_address.to_owned())
-        .await
-        .is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]

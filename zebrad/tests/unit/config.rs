@@ -691,7 +691,7 @@ fn stored_configs_follow_runtime_network_policy() -> Result<()> {
         if !stored_config.network.network.uses_wcash_consensus() {
             let output = child.wait_with_output()?;
             let output = output.assert_failure()?;
-            output.stderr_contains("only supports network = 'WcashRegtest'")?;
+            output.stderr_contains("only supports network = 'WcashTestnet' or 'WcashRegtest'")?;
             continue;
         }
 
@@ -872,7 +872,10 @@ fn config_load_defaults() {
 
     let config = ZebradConfig::load(None).expect("Should load default config");
 
-    assert_eq!(config.network.network.to_string(), "Wcash");
+    #[cfg(feature = "wcash-consensus")]
+    assert_eq!(config.network.network.to_string(), "WcashTestnet");
+    #[cfg(not(feature = "wcash-consensus"))]
+    assert_eq!(config.network.network.to_string(), "Mainnet");
     assert_eq!(config.rpc.listen_addr, None); // RPC disabled by default
     assert_eq!(config.metrics.endpoint_addr, None); // Metrics disabled by default
 }

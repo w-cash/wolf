@@ -44,8 +44,8 @@ impl Runnable for GenerateCmd {
 # 1. Environment variables with WCASH_ prefix (highest precedence)
 #    - Format: WCASH_SECTION__KEY (double underscore for nested keys)
 #    - Examples:
-#      - WCASH_NETWORK__NETWORK=Wcash
-#      - WCASH_RPC__LISTEN_ADDR=127.0.0.1:28232
+#      - WCASH_NETWORK__NETWORK=WcashTestnet
+#      - WCASH_RPC__LISTEN_ADDR=127.0.0.1:38232
 #      - WCASH_STATE__CACHE_DIR=/path/to/cache
 #      - WCASH_TRACING__FILTER=debug
 #      - WCASH_METRICS__ENDPOINT_ADDR=0.0.0.0:9999

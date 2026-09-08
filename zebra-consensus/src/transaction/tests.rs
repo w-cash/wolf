@@ -41,7 +41,10 @@ use zebra_test::mock_service::MockService;
 
 use crate::{error::TransactionError, transaction::POLL_MEMPOOL_DELAY};
 
-use super::{check, BlockRequest, BlockTxVerifier, MempoolRequest, MempoolTxVerifier};
+use super::{
+    check, check_common_consensus_rules, BlockRequest, BlockTxVerifier, MempoolRequest,
+    MempoolTxVerifier,
+};
 
 #[cfg(test)]
 mod prop;
@@ -76,6 +79,69 @@ fn v5_transactions_basic_check() -> Result<(), Report> {
     }
 
     Ok(())
+}
+
+#[test]
+fn wcash_public_testnet_is_mining_only_until_transaction_domains_are_separated() {
+    let network = Network::new_wcash_testnet();
+    let non_coinbase = Transaction::test_v6(
+        NetworkUpgrade::Nu6_3,
+        Vec::new(),
+        Vec::new(),
+        LockTime::Height(Height::MIN),
+        Height(2),
+    );
+
+    assert_eq!(
+        check_common_consensus_rules(&non_coinbase, Height(1), &network),
+        Err(TransactionError::WcashTestnetTransfersDisabled),
+        "the common block-and-mempool path must reject every public-testnet transfer",
+    );
+
+    let genesis = zebra_chain::block::genesis::wcash_testnet_genesis_block();
+    assert_eq!(
+        check_common_consensus_rules(&genesis.transactions[0], Height::MIN, &network),
+        Ok(()),
+        "the transaction-domain gate must not prevent trusted genesis bootstrap",
+    );
+}
+
+#[cfg(feature = "wcash-consensus")]
+#[tokio::test]
+async fn wcash_testnet_transfer_gate_covers_block_and_mempool_verifiers() {
+    let network = Network::new_wcash_testnet();
+    let transaction = Transaction::test_v6(
+        NetworkUpgrade::Nu6_3,
+        Vec::new(),
+        Vec::new(),
+        LockTime::Height(Height::MIN),
+        Height(2),
+    );
+    let state = service_fn(|_| async { unreachable!("the launch gate runs before state access") });
+    let block_verifier = BlockTxVerifier::new(&network, state.clone());
+    let mempool_verifier = MempoolTxVerifier::new_for_tests(&network, state);
+
+    let block_result = block_verifier.oneshot(BlockRequest {
+        transaction_hash: transaction.hash(),
+        transaction: Arc::new(transaction.clone()),
+        known_utxos: Arc::new(HashMap::new()),
+        height: Height(1),
+        time: DateTime::<Utc>::MAX_UTC,
+    });
+    let mempool_result = mempool_verifier.oneshot(MempoolRequest {
+        transaction: Arc::new(transaction).into(),
+        height: Height(1),
+    });
+
+    let (block_result, mempool_result) = futures::join!(block_result, mempool_result);
+    assert_eq!(
+        block_result,
+        Err(TransactionError::WcashTestnetTransfersDisabled)
+    );
+    assert_eq!(
+        mempool_result,
+        Err(TransactionError::WcashTestnetTransfersDisabled)
+    );
 }
 
 #[test]

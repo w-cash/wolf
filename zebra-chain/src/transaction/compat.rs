@@ -27,15 +27,12 @@ pub fn txin_to_input(
         // special-cased, exactly as `Input::zcash_deserialize` does. Parsing it as a height push
         // would otherwise yield a bogus height instead of `Height::MIN`.
         let script_bytes = txin.script_sig().0 .0.clone();
-        let (height, data) = if script_bytes.as_slice()
-            == crate::transparent::serialize::GENESIS_COINBASE_SCRIPT_SIG
-            || script_bytes.as_slice()
-                == crate::transparent::serialize::WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG
-        {
-            (block::Height::MIN, script_bytes)
-        } else {
-            crate::transparent::serialize::parse_coinbase_height(&script_bytes)?
-        };
+        let (height, data) =
+            if crate::transparent::serialize::is_genesis_coinbase_script(&script_bytes) {
+                (block::Height::MIN, script_bytes)
+            } else {
+                crate::transparent::serialize::parse_coinbase_height(&script_bytes)?
+            };
         Ok(transparent::Input::Coinbase {
             height,
             data,

@@ -188,6 +188,17 @@ impl Network {
         )
     }
 
+    /// Creates the built-in public Wcash Testnet network.
+    ///
+    /// This network has a frozen Bitcoin-anchored genesis, Wcash-only P2P
+    /// identity, and public-network difficulty adjustment from height 1.
+    pub fn new_wcash_testnet() -> Self {
+        Self::new_configured_testnet(
+            testnet::Parameters::new_wcash_testnet()
+                .expect("built-in Wcash Testnet parameters should always be valid"),
+        )
+    }
+
     /// Creates the built-in local Wcash Regtest network.
     ///
     /// Its anchored genesis block and network magic are local-development values. A shared testnet
@@ -207,6 +218,35 @@ impl Network {
             Self::Mainnet => false,
             Self::Testnet(params) => params.uses_wcash_consensus(),
         }
+    }
+
+    /// Returns the selected built-in Wcash network, or `None` for Zcash
+    /// networks and user-configured testnets.
+    pub fn wcash_network(&self) -> Option<wcash_genesis::WcashNetwork> {
+        match self {
+            Self::Mainnet => None,
+            Self::Testnet(params) => params.wcash_network(),
+        }
+    }
+
+    /// Returns true only for the built-in public Wcash Testnet.
+    pub fn is_wcash_testnet(&self) -> bool {
+        self.wcash_network() == Some(wcash_genesis::WcashNetwork::Testnet)
+    }
+
+    /// Returns true when consensus rejects every non-coinbase transaction at `height`.
+    ///
+    /// Keep template construction coupled to this predicate: a mining-only network has no
+    /// consensus-valid mempool transactions, so its block templates must be coinbase-only.
+    /// The height argument makes a future transaction-domain activation an explicit change in
+    /// both consensus verification and template construction.
+    pub fn disables_non_coinbase_transactions(&self, _height: block::Height) -> bool {
+        self.is_wcash_testnet()
+    }
+
+    /// Returns true only for the built-in local Wcash Regtest.
+    pub fn is_wcash_regtest(&self) -> bool {
+        self.wcash_network() == Some(wcash_genesis::WcashNetwork::Regtest)
     }
 
     /// Returns true when this network matches the monetary and consensus profile
@@ -283,6 +323,10 @@ impl Network {
     ///
     /// Part of the consensus rules at <https://zips.z.cash/protocol/protocol.pdf#blockheader>
     pub fn is_max_block_time_enforced(&self, height: block::Height) -> bool {
+        if self.is_wcash_testnet() {
+            return !height.is_min();
+        }
+
         match self {
             Network::Mainnet => true,
             // TODO: Move `TESTNET_MAX_TIME_START_HEIGHT` to a field on testnet::Parameters (#8364)
@@ -294,9 +338,22 @@ impl Network {
     pub fn default_port(&self) -> u16 {
         match self {
             Network::Mainnet => 8233,
-            Network::Testnet(params) if params.uses_wcash_consensus() => 28233,
+            Network::Testnet(_params) if self.is_wcash_testnet() => 38233,
+            Network::Testnet(_params) if self.is_wcash_regtest() => 28233,
             // TODO: Add a `default_port` field to `testnet::Parameters` to return here. (zcashd uses 18344 for Regtest)
             Network::Testnet(_params) => 18233,
+        }
+    }
+
+    /// Returns Wcash's recommended loopback RPC port for built-in networks.
+    ///
+    /// RPC remains disabled unless explicitly configured. Keeping these ports
+    /// separate prevents a testnet pool from silently reaching a regtest node.
+    pub fn wcash_default_rpc_port(&self) -> Option<u16> {
+        match self.wcash_network()? {
+            wcash_genesis::WcashNetwork::Testnet => Some(38232),
+            wcash_genesis::WcashNetwork::Regtest => Some(28232),
+            wcash_genesis::WcashNetwork::Mainnet => None,
         }
     }
 

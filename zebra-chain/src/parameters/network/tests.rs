@@ -8,7 +8,7 @@ use color_eyre::Report;
 use super::Network;
 use crate::{
     amount::{Amount, NonNegative, MAX_MONEY},
-    block::Height,
+    block::{genesis::WCASH_TESTNET_GENESIS_HASH, Height},
     parameters::{
         subsidy::{
             block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, founders_reward,
@@ -18,33 +18,143 @@ use crate::{
         },
         NetworkUpgrade,
     },
+    serialization::DateTime32,
+    work::difficulty::ParameterDifficulty as _,
 };
 
 #[test]
 fn compiled_consensus_profile_is_mutually_exclusive() {
     let zcash = Network::Mainnet;
-    let wcash = Network::new_wcash_regtest();
+    let wcash_networks = [Network::new_wcash_testnet(), Network::new_wcash_regtest()];
 
     assert_eq!(
         zcash.is_compatible_with_compiled_consensus(),
         !cfg!(feature = "wcash-consensus")
     );
-    assert_eq!(
-        wcash.is_compatible_with_compiled_consensus(),
-        cfg!(feature = "wcash-consensus")
-    );
+    for wcash in &wcash_networks {
+        assert_eq!(
+            wcash.is_compatible_with_compiled_consensus(),
+            cfg!(feature = "wcash-consensus")
+        );
+    }
 
     if cfg!(feature = "wcash-consensus") {
-        wcash.assert_compatible_with_compiled_consensus();
+        for wcash in &wcash_networks {
+            wcash.assert_compatible_with_compiled_consensus();
+        }
         assert!(
             std::panic::catch_unwind(|| zcash.assert_compatible_with_compiled_consensus()).is_err()
         );
     } else {
         zcash.assert_compatible_with_compiled_consensus();
-        assert!(
-            std::panic::catch_unwind(|| wcash.assert_compatible_with_compiled_consensus()).is_err()
-        );
+        for wcash in wcash_networks {
+            assert!(
+                std::panic::catch_unwind(|| wcash.assert_compatible_with_compiled_consensus())
+                    .is_err()
+            );
+        }
     }
+}
+
+#[test]
+fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
+    let testnet = Network::new_wcash_testnet();
+    let regtest = Network::new_wcash_regtest();
+    let zcash_networks = [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+    ];
+
+    assert!(testnet.uses_wcash_consensus());
+    assert!(testnet.is_wcash_testnet());
+    assert!(testnet.disables_non_coinbase_transactions(Height(1)));
+    assert!(!testnet.is_wcash_regtest());
+    assert!(!testnet.is_regtest());
+    assert_eq!(testnet.to_string(), "WcashTestnet");
+    assert_eq!(testnet.default_port(), 38233);
+    assert_eq!(testnet.wcash_default_rpc_port(), Some(38232));
+    assert_eq!(
+        testnet.magic().0,
+        wcash_genesis::network_identity(wcash_genesis::WcashNetwork::Testnet).p2p_magic()
+    );
+
+    let genesis = crate::block::genesis::wcash_testnet_genesis_block();
+    assert_eq!(genesis.hash().to_string(), WCASH_TESTNET_GENESIS_HASH);
+    assert_eq!(testnet.genesis_hash(), genesis.hash());
+    assert_eq!(
+        testnet.checkpoint_list().hash(Height::MIN),
+        Some(genesis.hash())
+    );
+    assert_eq!(
+        genesis.header.difficulty_threshold,
+        testnet.target_difficulty_limit().to_compact()
+    );
+    assert_eq!(
+        genesis.header.difficulty_threshold.to_string(),
+        format!("{:08x}", wcash_genesis::PUBLIC_TESTNET_POW_LIMIT_BITS)
+    );
+    assert_eq!(
+        block_subsidy(Height::MIN, &testnet)?,
+        Amount::<NonNegative>::zero(),
+        "Wcash genesis contributes no scheduled issuance"
+    );
+
+    assert_ne!(testnet, regtest);
+    assert_ne!(testnet.to_string(), regtest.to_string());
+    assert_ne!(testnet.magic(), regtest.magic());
+    assert_ne!(testnet.genesis_hash(), regtest.genesis_hash());
+    assert_ne!(testnet.default_port(), regtest.default_port());
+    assert_ne!(
+        testnet.wcash_default_rpc_port(),
+        regtest.wcash_default_rpc_port()
+    );
+    assert!(!regtest.disables_non_coinbase_transactions(Height(1)));
+
+    for zcash in zcash_networks {
+        assert!(!zcash.uses_wcash_consensus());
+        assert!(!zcash.disables_non_coinbase_transactions(Height(1)));
+        assert_ne!(testnet.to_string(), zcash.to_string());
+        assert_ne!(testnet.magic(), zcash.magic());
+        assert_ne!(testnet.genesis_hash(), zcash.genesis_hash());
+        assert_ne!(testnet.default_port(), zcash.default_port());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn wcash_testnet_launch_difficulty_and_time_rules_start_at_height_one() {
+    let network = Network::new_wcash_testnet();
+    let previous_time: chrono::DateTime<chrono::Utc> = DateTime32::from(1_600_000_000).into();
+    let at_threshold: chrono::DateTime<chrono::Utc> = DateTime32::from(1_600_000_450).into();
+    let past_threshold: chrono::DateTime<chrono::Utc> = DateTime32::from(1_600_000_451).into();
+
+    assert_eq!(
+        NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, Height::MIN),
+        None
+    );
+    assert_eq!(
+        NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, Height(1))
+            .expect("Wcash Testnet minimum difficulty activates at height 1")
+            .num_seconds(),
+        450
+    );
+    assert!(!NetworkUpgrade::is_testnet_min_difficulty_block(
+        &network,
+        Height(1),
+        at_threshold,
+        previous_time,
+    ));
+    assert!(NetworkUpgrade::is_testnet_min_difficulty_block(
+        &network,
+        Height(1),
+        past_threshold,
+        previous_time,
+    ));
+    assert!(!network.is_max_block_time_enforced(Height::MIN));
+    assert!(network.is_max_block_time_enforced(Height(1)));
+    assert!(network.is_max_block_time_enforced(Height::MAX));
 }
 
 #[test]
@@ -54,8 +164,11 @@ fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
 
     assert!(network.uses_wcash_consensus());
     assert!(network.is_regtest());
-    assert_eq!(network.to_string(), "Wcash");
+    assert!(network.is_wcash_regtest());
+    assert!(!network.is_wcash_testnet());
+    assert_eq!(network.to_string(), "WcashRegtest");
     assert_eq!(network.default_port(), 28233);
+    assert_eq!(network.wcash_default_rpc_port(), Some(28232));
     assert_eq!(
         network.magic().0,
         wcash_genesis::network_identity(wcash_genesis::WcashNetwork::Regtest).p2p_magic()

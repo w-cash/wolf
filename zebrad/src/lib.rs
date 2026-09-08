@@ -5,10 +5,10 @@
 //! Ironwood shielded pool, and its child blocks are authorized by Zcash-parent
 //! Equihash AuxPoW.
 //!
-//! This source tree currently enables the isolated `WcashRegtest` network only.
-//! Public testnet and mainnet parameters remain disabled until their identities,
-//! genesis anchors, peer discovery, difficulty rules, and pool interoperability
-//! have been independently reviewed and frozen.
+//! This source tree enables a public, mining-only `WcashTestnet` and an isolated
+//! `WcashRegtest`. Testnet has a frozen identity and genesis for AuxPoW and pool
+//! interoperability, but rejects non-coinbase transactions until Wcash-specific
+//! signature domains are implemented. Mainnet remains disabled.
 //!
 //! Wcash retains Zebra's modular crates and much of its Zcash validation code.
 //! The upstream architecture and crate names are preserved where changing them

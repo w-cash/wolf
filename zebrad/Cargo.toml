@@ -85,6 +85,7 @@ internal-miner = [
 # Build a Wcash-only node with Wcash network defaults and monetary bounds.
 wcash-consensus = [
     "zebra-chain/wcash-consensus",
+    "zebra-consensus/wcash-consensus",
     "zebra-network/wcash-consensus",
 ]
 

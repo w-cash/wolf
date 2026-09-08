@@ -5,6 +5,8 @@ use std::{iter, sync::Arc};
 use zebra_chain::{
     amount::{Amount, MAX_WCASH_COINBASE_VALUE},
     block,
+    chain_sync_status::MockSyncStatus,
+    chain_tip::NoChainTip,
 };
 
 use strum::IntoEnumIterator;
@@ -22,7 +24,9 @@ use zebra_chain::{
     serialization::ZcashDeserializeInto,
     transaction::{HashType, Transaction},
 };
+use zebra_node_services::{mempool, BoxError};
 use zebra_script::Sigops;
+use zebra_test::mock_service::MockService;
 
 use crate::client::TransactionTemplate;
 use crate::config::mining::{
@@ -31,9 +35,76 @@ use crate::config::mining::{
 use crate::methods::{hex_data::HexData, types::long_poll::LONG_POLL_ID_LENGTH};
 
 use super::{
-    check_parameters, DefaultRoots, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
-    MinerParams, WcashAuxRequest,
+    check_parameters, check_synced_to_tip, fetch_mempool_transactions, DefaultRoots,
+    GetBlockTemplateParameters, GetBlockTemplateRequestMode, MinerParams, WcashAuxRequest,
 };
+
+/// A clean Wcash Testnet node must be able to serve its first mining template
+/// after locally committing genesis, even before project-owned seed peers
+/// exist. This is the existing test-network bootstrap policy; mainnet's stale
+/// tip protection remains fail-closed.
+#[test]
+fn wcash_testnet_allows_genesis_only_mining_bootstrap() {
+    assert!(check_synced_to_tip(
+        &Network::new_wcash_testnet(),
+        NoChainTip,
+        MockSyncStatus::default(),
+    )
+    .is_ok());
+
+    assert!(
+        check_synced_to_tip(&Network::Mainnet, NoChainTip, MockSyncStatus::default(),).is_err()
+    );
+}
+
+#[tokio::test]
+async fn mining_only_templates_skip_only_the_wcash_testnet_mempool() {
+    const SENTINEL_ERROR: &str = "template mempool sentinel error";
+
+    let template_height = Height(1);
+    let chain_tip_hash = Network::new_wcash_testnet().genesis_hash();
+    let mut skipped_mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (transactions, dependencies) = fetch_mempool_transactions(
+        &Network::new_wcash_testnet(),
+        template_height,
+        skipped_mempool.clone(),
+        chain_tip_hash,
+    )
+    .await
+    .expect("Wcash Testnet mining-only templates do not depend on mempool readiness")
+    .expect("a mining-only template has a current, empty mempool snapshot");
+
+    assert!(transactions.is_empty());
+    assert!(dependencies.dependencies().is_empty());
+    assert!(dependencies.dependents().is_empty());
+    skipped_mempool.expect_no_requests().await;
+
+    for network in [
+        Network::new_wcash_regtest(),
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+    ] {
+        let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let request =
+            fetch_mempool_transactions(&network, template_height, mempool.clone(), chain_tip_hash);
+        let respond = async {
+            let response = mempool
+                .expect_request(mempool::Request::FullTransactions)
+                .await;
+            let error: BoxError = std::io::Error::other(SENTINEL_ERROR).into();
+            response.respond_error(error);
+        };
+
+        let (result, ()) = tokio::join!(request, respond);
+        let error = result.expect_err("non-mining-only networks must preserve mempool failures");
+        assert!(
+            error.message().contains(SENTINEL_ERROR),
+            "unexpected error for {network}: {error}"
+        );
+    }
+}
 
 /// Tests that coinbase transactions can be generated.
 ///
@@ -707,6 +778,31 @@ fn coinbase_at_nu6_3_routes_shielded_output_to_ironwood() {
         None,
         "a different payout receiver must not match the serialized Ironwood note"
     );
+}
+
+/// Wcash Testnet and Regtest payout namespaces cannot be substituted for each other.
+#[test]
+fn wcash_miner_payout_addresses_are_bound_to_the_selected_network() {
+    let testnet = Network::new_wcash_testnet();
+    let regtest = Network::new_wcash_regtest();
+    let testnet_address = default_miner_address_for_network(&testnet, &MinerAddressType::Unified);
+    let regtest_address = default_miner_address_for_network(&regtest, &MinerAddressType::Unified);
+    let config_for = |address: &str| Config {
+        miner_address: Some(address.parse().expect("hard-coded Wcash address is valid")),
+        ..Default::default()
+    };
+
+    for (network, matching_address, other_network_address) in [
+        (&testnet, testnet_address.as_str(), regtest_address.as_str()),
+        (&regtest, regtest_address.as_str(), testnet_address.as_str()),
+    ] {
+        MinerParams::new(network, config_for(matching_address))
+            .expect("the matching Wcash payout namespace is accepted");
+        assert!(matches!(
+            MinerParams::new(network, config_for(other_network_address)),
+            Err(super::MinerParamsError::InvalidAddr(_))
+        ));
+    }
 }
 
 /// Wcash templates pay the entire coinbase reward privately into Ironwood and reject miner

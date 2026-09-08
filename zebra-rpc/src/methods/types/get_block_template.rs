@@ -561,8 +561,9 @@ impl MinerParams {
             &configured_address.to_string(),
         )));
         let addr = match (net.uses_wcash_consensus(), configured_address) {
-            (true, config::mining::MinerAddress::Wcash(address)) => address
-                .convert_if_network::<Address>(zcash_protocol::consensus::NetworkType::Regtest)?,
+            (true, config::mining::MinerAddress::Wcash(address)) => {
+                address.convert_if_network::<Address>(net.kind().into())?
+            }
             (true, config::mining::MinerAddress::Zcash(_)) => {
                 return Err(MinerParamsError::WcashAddressNamespaceRequired)
             }
@@ -1095,8 +1096,11 @@ where
 /// `last_seen_tip_hash` from the mempool response doesn't match the tip hash from the state.
 ///
 /// You should call `check_synced_to_tip()` before calling this function.
-/// If the mempool is inactive because Zebra is not synced to the tip, returns no transactions.
+/// Mining-only networks return an exact empty snapshot without querying the mempool. All mempool
+/// service errors are preserved on networks that support non-coinbase transactions.
 pub async fn fetch_mempool_transactions<Mempool>(
+    network: &Network,
+    template_height: block::Height,
     mempool: Mempool,
     chain_tip_hash: block::Hash,
 ) -> RpcResult<Option<(Vec<VerifiedUnminedTx>, TransactionDependencies)>>
@@ -1108,6 +1112,15 @@ where
         > + 'static,
     Mempool::Future: Send,
 {
+    // Wcash Testnet is consensus-enforced mining-only until its transaction signature domain is
+    // separated from Zcash. No mempool transaction can be included in a valid block, so avoid
+    // making template availability depend on the sync-gated mempool service. This is deliberately
+    // narrower than `uses_wcash_consensus()`: Wcash Regtest supports transactions and must retain
+    // normal mempool behavior.
+    if network.disables_non_coinbase_transactions(template_height) {
+        return Ok(Some(Default::default()));
+    }
+
     let response = mempool
         .oneshot(mempool::Request::FullTransactions)
         .await

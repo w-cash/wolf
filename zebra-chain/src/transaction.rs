@@ -971,11 +971,7 @@ impl crate::serialization::ZcashDeserialize for Transaction {
             for txin in &bundle.vin {
                 if *txin.prevout() == zcash_transparent::bundle::OutPoint::NULL {
                     let script_bytes = txin.script_sig().0 .0.clone();
-                    if script_bytes.as_slice()
-                        != transparent::serialize::GENESIS_COINBASE_SCRIPT_SIG
-                        && script_bytes.as_slice()
-                            != transparent::serialize::WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG
-                    {
+                    if !transparent::serialize::is_genesis_coinbase_script(&script_bytes) {
                         transparent::serialize::parse_coinbase_height(&script_bytes)?;
                     }
                 }

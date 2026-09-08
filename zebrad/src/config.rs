@@ -116,8 +116,8 @@ impl ZebradConfig {
     /// See [`DENY_CONFIG_KEY_SUFFIX_LIST`] and [`is_sensitive_leaf_key()`] above
     ///
     /// # Examples
-    /// - `WCASH_NETWORK__NETWORK=Wcash` selects the Wcash network
-    /// - `WCASH_RPC__LISTEN_ADDR=127.0.0.1:28232` sets the RPC listen address
+    /// - `WCASH_NETWORK__NETWORK=WcashTestnet` selects public Wcash Testnet
+    /// - `WCASH_RPC__LISTEN_ADDR=127.0.0.1:38232` sets its recommended RPC address
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, config::ConfigError> {
         Self::load_with_env(config_path, "WCASH")
     }
