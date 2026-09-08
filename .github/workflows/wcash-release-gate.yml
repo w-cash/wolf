@@ -91,5 +91,5 @@ jobs:
           cp target/release/zebrad target/release/wcash-zebrad
           cargo build --locked --release -p wcash-merge-miner --bin wcash-merge-miner
 
-      - name: Mine and validate both chains end to end
+      - name: Mine both chains through two ZIP-301 pool generations
         run: scripts/wcash-merged-mining-e2e.sh
