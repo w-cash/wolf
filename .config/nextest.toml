@@ -18,7 +18,7 @@ default-filter = 'not test(/^stateful::/) and not test(/^e2e::/) and not test(=u
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "5m", terminate-after = 4 }
-default-filter = 'not test(/^stateful::/) and not test(/^e2e::/) and not test(=unit::end_of_support::check_no_git_dependencies)'
+default-filter = 'not test(/^stateful::/) and not test(/^e2e::/) and not test(=unit::end_of_support::check_no_git_dependencies) and not (package(wcash-merge-miner) and test(/^job::tests::real_solver_/))'
 
 [[profile.ci.overrides]]
 filter = 'test(=integration::network::disconnects_from_misbehaving_peers)'

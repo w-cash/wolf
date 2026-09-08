@@ -28,10 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
-- Kept proof-of-work solving outside GitHub Actions while retaining compilation,
-  linting, deterministic Equihash and AuxPoW vectors, consensus validation, RPC
-  tests, and network-isolation tests in hosted CI. The real-solver end-to-end
-  scripts remain mandatory local release checks.
+- Kept proof-of-work solving outside every GitHub Actions workflow while
+  retaining compilation, linting, deterministic Equihash and AuxPoW vectors,
+  consensus validation, RPC tests, and network-isolation tests in hosted CI.
+  The real-solver tests and end-to-end scripts remain mandatory local release
+  checks.
 - Finalized the prelaunch Wcash emission schedule at 6.25 WCASH per block with
   approximately four-year halvings and a 21-million monetary cap, and rotated
   the Testnet and regtest P2P identities to isolate superseded schedules.
