@@ -310,6 +310,61 @@ async fn wcash_v6_transfer_passes_block_and_mempool_verifiers() {
     );
 }
 
+#[cfg(feature = "wcash-consensus")]
+#[tokio::test]
+async fn wcash_v6_out_of_range_expiry_is_rejected_by_block_and_mempool_verifiers() {
+    let _init_guard = zebra_test::init();
+    let network = Network::new_wcash_testnet();
+    let height = Height(1);
+    let state: MockService<_, _, _, _> = MockService::build().for_unit_tests();
+    let (input, output, known_utxos) = mock_transparent_transfer(
+        Height::MIN,
+        true,
+        0,
+        Amount::try_from(10_001).expect("valid test amount"),
+    );
+
+    // This raw wire value is above both ZIP-203's maximum expiry height and
+    // Zebra's ordinary block-height range. It must remain visible to the
+    // verifier rather than being mapped to `None` as if expiry were disabled.
+    let expiry_height = Height(0x8000_0000);
+    let transaction = Transaction::test_v6_for_network(
+        &network,
+        height,
+        vec![input],
+        vec![output],
+        LockTime::unlocked(),
+        expiry_height,
+    );
+    assert_eq!(transaction.expiry_height(), Some(expiry_height));
+
+    let expected_error = TransactionError::MaximumExpiryHeight {
+        expiry_height,
+        is_coinbase: false,
+        block_height: height,
+        transaction_hash: transaction.hash(),
+    };
+
+    let block_result = BlockTxVerifier::new(&network, state.clone())
+        .oneshot(BlockRequest {
+            transaction_hash: transaction.hash(),
+            transaction: Arc::new(transaction.clone()),
+            known_utxos: Arc::new(known_utxos),
+            height,
+            time: DateTime::<Utc>::MAX_UTC,
+        })
+        .await;
+    assert_eq!(block_result, Err(expected_error.clone()));
+
+    let mempool_result = MempoolTxVerifier::new_for_tests(&network, state)
+        .oneshot(MempoolRequest {
+            transaction: Arc::new(transaction).into(),
+            height,
+        })
+        .await;
+    assert_eq!(mempool_result, Err(expected_error));
+}
+
 #[test]
 fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
     for net in Network::iter() {
@@ -2055,8 +2110,8 @@ async fn v4_coinbase_transaction_with_exceeding_expiry_height() {
 }
 
 /// A non-coinbase V4/V5/V6 transaction with an expiry height in the out-of-range wire band
-/// [2^31, 2^32 - 1] is rejected: `expiry_height()` maps these values to `None`, so the check
-/// must read the raw wire value instead of treating them as "no expiry".
+/// [2^31, 2^32 - 1] is rejected. `expiry_height()` preserves the raw wire value so the
+/// verifier can apply the maximum-height rule instead of treating it as "no expiry".
 #[tokio::test]
 async fn transaction_with_out_of_range_expiry_height() {
     let network = Network::Mainnet;
