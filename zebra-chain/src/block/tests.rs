@@ -26,7 +26,9 @@ fn block_rejects_cross_chain_branch_ids_including_coinbase() {
     fn coinbase_input(height: Height) -> transparent::Input {
         transparent::Input::Coinbase {
             height,
-            data: Vec::new(),
+            // Height 1 is a one-byte script item; one byte of inert miner data
+            // keeps the complete script within the consensus 2..=100 bound.
+            data: vec![0],
             sequence: u32::MAX,
         }
     }

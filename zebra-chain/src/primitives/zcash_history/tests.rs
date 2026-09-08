@@ -23,7 +23,9 @@ fn wcash_v3_history_tree_uses_exact_transaction_domain_and_rebuilds() {
     fn coinbase_input(height: Height) -> transparent::Input {
         transparent::Input::Coinbase {
             height,
-            data: Vec::new(),
+            // Height 1 is a one-byte script item; one byte of inert miner data
+            // keeps the complete script within the consensus 2..=100 bound.
+            data: vec![0],
             sequence: u32::MAX,
         }
     }
