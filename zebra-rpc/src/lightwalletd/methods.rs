@@ -418,7 +418,8 @@ where
         &self,
         request: Request<BlockId>,
     ) -> Result<Response<TreeState>, Status> {
-        let hash_or_height = block_id_to_hash_or_height(request.into_inner())?;
+        let hash_or_height =
+            tree_state_block_id_to_hash_or_height(&self.network, request.into_inner())?;
 
         let treestate = self
             .rpc
@@ -634,6 +635,24 @@ fn block_id_to_hash_or_height(block_id: BlockId) -> Result<HashOrHeight, Status>
             })?;
 
         Ok(HashOrHeight::Height(height))
+    }
+}
+
+/// Converts a tree-state request into a block lookup.
+///
+/// The librustzcash synchronizer requests height zero using protobuf's default
+/// `BlockId` when an account starts scanning at Wcash's height-one launch. A
+/// generic empty block identifier remains invalid, but the two built-in Wcash
+/// profiles can bind that one tree-state request to their already-frozen
+/// genesis hash without making the chain selection ambiguous.
+fn tree_state_block_id_to_hash_or_height(
+    network: &Network,
+    block_id: BlockId,
+) -> Result<HashOrHeight, Status> {
+    if network.uses_wcash_consensus() && block_id.height == 0 && block_id.hash.is_empty() {
+        Ok(HashOrHeight::Hash(network.genesis_hash()))
+    } else {
+        block_id_to_hash_or_height(block_id)
     }
 }
 
@@ -1266,6 +1285,21 @@ mod tests {
             block_id_to_hash_or_height(block_id).expect("a valid height should convert");
 
         assert_eq!(hash_or_height, HashOrHeight::Height(block::Height(500_000)));
+    }
+
+    #[test]
+    fn empty_tree_state_id_selects_only_frozen_wcash_genesis() {
+        for network in [Network::new_wcash_testnet(), Network::new_wcash_regtest()] {
+            let hash_or_height =
+                tree_state_block_id_to_hash_or_height(&network, BlockId::default())
+                    .expect("Wcash height-one wallet scans require the genesis tree state");
+
+            assert_eq!(hash_or_height, HashOrHeight::Hash(network.genesis_hash()));
+        }
+
+        let status = tree_state_block_id_to_hash_or_height(&Network::Mainnet, BlockId::default())
+            .expect_err("an empty Zcash block identifier must remain invalid");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]

@@ -58,17 +58,23 @@ impl AttestedWcashClient {
 
     /// Returns the canonical compact-block identifier at an exact height.
     pub async fn compact_block_ref(&mut self, height: u32) -> Result<BlockRef, WalletRpcError> {
+        if height == 0 {
+            return Ok(BlockRef {
+                height,
+                hash: self.network.genesis_hash(),
+            });
+        }
         compact_block_ref(&mut self.inner, height).await
     }
 
     /// Downloads and validates the commitment-tree state for an exact height.
     pub async fn tree_state(&mut self, height: u32) -> Result<TreeState, WalletRpcError> {
-        let block = compact_block_ref(&mut self.inner, height).await?;
+        let block = self.compact_block_ref(height).await?;
         let state = self
             .inner
             .get_tree_state(BlockId {
-                height: u64::from(height),
-                hash: vec![],
+                height: 0,
+                hash: block.hash.to_vec(),
             })
             .await?
             .into_inner();
@@ -306,10 +312,11 @@ async fn attest_genesis(
     client: &mut LightwalletdClient,
     network: WalletNetwork,
 ) -> Result<BlockRef, WalletRpcError> {
+    let expected = network.genesis_hash();
     let block = client
         .get_block(BlockId {
             height: 0,
-            hash: vec![],
+            hash: expected.to_vec(),
         })
         .await?
         .into_inner();
@@ -329,7 +336,6 @@ async fn attest_genesis(
                 field: "genesis hash",
                 height: block.height,
             })?;
-    let expected = network.genesis_hash();
     if hash != expected {
         return Err(WalletRpcError::WrongGenesis {
             expected: hex::encode(expected),

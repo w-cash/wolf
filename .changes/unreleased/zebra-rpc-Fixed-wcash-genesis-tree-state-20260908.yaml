@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: Fixed
+body: "Bind the height-zero tree-state request used by Wcash height-one wallet scans to the selected frozen Wcash genesis hash, while keeping empty block identifiers invalid on standard Zcash networks."
+time: 2026-09-08T21:45:00.000000000Z
