@@ -12,11 +12,11 @@ own blocks, difficulty target, transactions, and shielded value pool.
 > is not production ready, no Wcash mainnet is active, and it must not be used
 > with funds of real value.
 
-The current public Testnet is deliberately mining-only. Consensus rejects every
-non-coinbase transaction until Wcash has a chain-specific NU6.3 signature and
-branch-ID domain wired through the cryptographic dependencies. Mined rewards
-cannot be transferred. A testnet reset and consensus upgrade are required
-before any value-bearing transaction test.
+The current public Testnet has a Wcash-specific NU6.3 transaction domain.
+Every post-genesis transaction must use version 6 and embed the exact Wcash
+Testnet v1 branch ID; inherited Zcash branch IDs and legacy V1-V5 transactions
+are rejected. This removes the earlier consensus-level mining-only gate, but it
+does not by itself make the engineering network or its wallet production ready.
 
 ## Current consensus snapshot
 
@@ -30,8 +30,8 @@ before any value-bearing transaction test.
 | Monetary cap | 21,000,000 WCASH; exact scheduled issuance is 20,999,999.81520000 WCASH after zatoshi truncation |
 | Development allocation | None: no founders reward, funding stream, lockbox, or developer tax |
 | Coinbase destination | Ironwood only after genesis |
-| Public networks | Mining-only engineering Testnet enabled; mainnet disabled |
-| Testnet transfers | Disabled by consensus; coinbase transactions only |
+| Public networks | V6-only engineering Testnet enabled; mainnet disabled |
+| Testnet transfers | Wcash-domain V6 only; inherited Zcash domains and V1-V5 rejected |
 
 Every post-genesis coinbase must create its reward in Ironwood. Transparent,
 Sapling, and Orchard coinbase outputs are rejected. Unlike the standard Zcash
@@ -47,10 +47,15 @@ gross reward amount; parent-pool metadata can also create off-chain correlation.
 Payment addresses use Wcash-specific namespaces: Unified `wu...`, Sapling
 `ws...`, TEX `wtex...`, and transparent `W...`, with distinct testnet and
 regtest variants. Wcash mining requires a Wcash Unified Address and rejects an
-inherited Zcash address. The node implements payment-address codecs, not a
-wallet or Wcash-specific spending/viewing-key formats; those remain release
-work. See the [consensus snapshot](docs/wcash-consensus.md#payment-address-domains)
-for the complete prefix table.
+inherited Zcash address. The node implements payment-address codecs, and the
+workspace contains an experimental one-shot wallet for controlled Testnet and
+regtest transfers. It derives Wcash addresses, scans a local SQLite wallet from
+an attested loopback node, signs Wcash-domain V6 Ironwood transfers, and
+broadcasts the exact signed bytes. It is not a pool payout or durable settlement
+system. A controlled-key private-coinbase spend must still pass the documented
+end-to-end release gate before this Testnet is described as value-bearing. See
+the [consensus snapshot](docs/wcash-consensus.md#payment-address-domains) for the
+complete prefix table.
 
 ## Run the isolated local network
 
@@ -97,9 +102,10 @@ See:
 The mainnet Bitcoin anchor remains deliberately unset, so mainnet activation
 fails closed. The enabled Testnet is an engineering network, not evidence that
 a community pool or value-bearing mainnet is ready. Promotion requires an
-independently reviewed consensus specification and implementation, adversarial
-multi-node soak and reorg testing, Wcash wallet/key support, project-controlled
-seed infrastructure, physical ASIC interoperability, and an operated TLS,
+independently reviewed consensus specification and implementation, a completed
+private-coinbase wallet spend test, adversarial multi-node soak and reorg
+testing, project-controlled seed infrastructure, physical ASIC
+interoperability, and a separately reviewed TLS,
 variable-difficulty, accounting, payout, and monitoring layer in front of the
 included loopback ZIP-301 service.
 

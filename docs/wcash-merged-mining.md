@@ -231,8 +231,10 @@ The frozen public Testnet identity has a separate automated gate that boots a
 clean height-zero node without the debug sync override, obtains a child
 candidate, mines through the ZIP-301 listener, and requires Wcash plus two
 Zcash processes to accept the resulting work. A community-facing testnet pool
-still needs project-operated seeds, Wcash wallet/key support, an independently
-reviewed consensus specification, multi-node soak and reorg tests, vendor ASIC
-interoperability, and an operated TLS/variable-difficulty edge with payout
-accounting. Do not call this engineering testnet production-ready or use it
-with funds of real value.
+still needs project-operated seeds, a complete controlled-key private-coinbase
+recovery/sign/broadcast test, an independently reviewed consensus
+specification, multi-node soak and reorg tests, vendor ASIC interoperability,
+and an operated TLS/variable-difficulty edge with durable accounting and
+reorg-safe shielded settlement. The experimental one-shot wallet in this
+workspace is not that operated payout system. Do not call this engineering
+testnet production-ready or use it with funds of real value.

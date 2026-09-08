@@ -1,0 +1,4 @@
+project: zebrad
+kind: Changed
+body: "Advance the engineering Wcash Testnet from its initial mining-only boundary to post-genesis V6 transactions under the chain-specific `0xb3cfd27e` domain. Existing prototype state must be reset before testing this incompatible domain ([#1](https://github.com/w-cash/wolf/pull/1))."
+time: 2026-09-08T20:01:26.000000004Z

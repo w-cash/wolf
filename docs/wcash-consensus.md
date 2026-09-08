@@ -38,19 +38,26 @@ decoded timestamp, compact target, and nonce. Local SHA256d and `nBits` checks
 reproduced the hash and verified its work. The audit tip is frozen provenance,
 not a consensus or runtime input.
 
-### Mining-only transaction gate
+### Transaction version and replay domain
 
-Wcash Testnet currently inherits Zcash NU6.3's transaction branch ID and
-signature-hash domain. Distinct addresses, genesis, and P2P magic do not prevent
-cryptographic replay of an otherwise equivalent signed transaction. Consensus
-therefore rejects every non-coinbase transaction on Wcash Testnet through the
-shared block and mempool verifier path.
+Wcash Testnet v1 uses consensus branch ID `0xb3cfd27e` for its NU6.3 / Ironwood
+rules. Standard Zcash NU6.3 keeps `0x37a5165b`. The Wcash ID is carried in every
+post-genesis version-6 transaction and is used by transaction IDs, signature
+hashes, shielded authorization, parsing, block checks, and chain-history
+commitments. Validators compare the exact embedded ID rather than treating the
+shared NU6.3 feature set as sufficient.
 
-This network is for AuxPoW, pool, difficulty, and shielded-coinbase engineering
-only. Its rewards are test-only and cannot be transferred. Enabling value-bearing
-tests requires a Wcash-specific branch ID wired through parsing, sighash, proof,
-wallet, RPC, and light-client dependencies, with two-way cross-chain rejection
-vectors, followed by a network reset or explicit consensus upgrade.
+Wcash rejects every post-genesis V1-V5 transaction. In particular, V4 has no
+embedded branch ID and V5 belongs to an inherited Zcash domain, so neither is a
+valid compatibility path. Wcash-domain V6 transactions are rejected on Zcash
+Mainnet and Testnet, and Zcash-domain V6 transactions are rejected on Wcash.
+Both the block and mempool verifier paths enforce the same checks.
+
+This makes value-bearing transaction testing possible without relying on P2P
+magic or address prefixes for replay protection. Testnet coins remain test-only.
+A controlled-key spend of a matured private coinbase, wallet recovery, mempool
+admission, block-template inclusion, mining, and recipient rescan are still
+release gates rather than assumptions.
 
 ## Monetary policy
 
@@ -151,11 +158,15 @@ an Orchard receiver; the template builder uses that receiver payload to create
 the mandatory Ironwood reward output. Standalone Sapling, TEX, and transparent
 addresses are never valid coinbase destinations.
 
-This node implements payment-address parsing and encoding only. It does not
-provide a wallet, account derivation, or Wcash-specific encodings for spending
-keys, viewing keys, extended keys, or seeds. Those key domains and wallet
-interoperability remain separate release work and must not be inferred from the
-payment-address prefixes above.
+The node implements payment-address parsing and encoding. The workspace also
+contains an experimental one-shot wallet for controlled Testnet and regtest
+transfers. It derives Wcash-domain keys and receivers, scans a local SQLite
+wallet from an attested loopback node, signs Wcash-domain V6 Ironwood transfers,
+and broadcasts the exact signed bytes. It deliberately does not implement batch
+payouts, pool accounting, durable settlement, or idempotent payout requests.
+The controlled-key private-coinbase spend gate must pass before wallet
+interoperability is considered complete. Key control must never be inferred
+from a syntactically valid payment address.
 
 ## Supply auditability
 
@@ -182,7 +193,8 @@ network and consensus rules; those definitions remain isolated in upstream
 library tests.
 
 Wcash Testnet has a frozen identity for public engineering interoperability.
-It is not a production or value-bearing network: wallet/key derivation,
-project-operated seeds, multi-node and pool soak testing, physical ASIC runs,
-and an external security/consensus audit remain required before any mainnet or
-community payout service. See [`wcash-testnet.md`](wcash-testnet.md).
+It is not a production or value-bearing network: the complete wallet spend and
+separately implemented pool-payout gates, project-operated seeds, multi-node and
+pool soak testing, physical ASIC runs, and an external security/consensus audit
+remain required before any mainnet or community payout service. See
+[`wcash-testnet.md`](wcash-testnet.md).

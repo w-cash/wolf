@@ -82,65 +82,231 @@ fn v5_transactions_basic_check() -> Result<(), Report> {
 }
 
 #[test]
-fn wcash_public_testnet_is_mining_only_until_transaction_domains_are_separated() {
-    let network = Network::new_wcash_testnet();
-    let non_coinbase = Transaction::test_v6(
+fn wcash_requires_v6_and_exact_branch_domain() {
+    let wcash = Network::new_wcash_testnet();
+    let wcash_height = Height(1);
+    let zcash_mainnet = Network::Mainnet;
+    let zcash_mainnet_height = NetworkUpgrade::Nu6_3
+        .activation_height(&zcash_mainnet)
+        .expect("NU6.3 is active on Zcash Mainnet");
+    let zcash_testnet = Network::new_default_testnet();
+    let zcash_testnet_height = NetworkUpgrade::Nu6_3
+        .activation_height(&zcash_testnet)
+        .expect("NU6.3 is active on Zcash Testnet");
+    let input = transparent::Input::PrevOut {
+        outpoint: transparent::OutPoint {
+            hash: Hash([0x11; 32]),
+            index: 0,
+        },
+        unlock_script: transparent::Script::new(&[0x51]),
+        sequence: u32::MAX,
+    };
+    let output = transparent::Output {
+        value: Amount::try_from(1).expect("one zatoshi is valid"),
+        lock_script: transparent::Script::new(&[0x51]),
+    };
+
+    let wcash_tx = Transaction::test_v6_for_network(
+        &wcash,
+        wcash_height,
+        vec![input.clone()],
+        vec![output.clone()],
+        LockTime::Height(Height::MIN),
+        Height(2),
+    );
+    let zcash_tx = Transaction::test_v6(
         NetworkUpgrade::Nu6_3,
-        Vec::new(),
-        Vec::new(),
+        vec![input.clone()],
+        vec![output.clone()],
         LockTime::Height(Height::MIN),
         Height(2),
     );
 
     assert_eq!(
-        check_common_consensus_rules(&non_coinbase, Height(1), &network),
-        Err(TransactionError::WcashTestnetTransfersDisabled),
-        "the common block-and-mempool path must reject every public-testnet transfer",
+        check::consensus_branch_id(&wcash_tx, wcash_height, &wcash),
+        Ok(())
+    );
+    assert_eq!(
+        check::consensus_branch_id(&zcash_tx, wcash_height, &wcash),
+        Err(TransactionError::WrongConsensusBranchId),
+        "a Zcash NU6.3 transaction must not replay on Wcash",
+    );
+    assert_eq!(
+        check::consensus_branch_id(&wcash_tx, zcash_mainnet_height, &zcash_mainnet),
+        Err(TransactionError::WrongConsensusBranchId),
+        "a Wcash transaction must not replay on Zcash Mainnet",
+    );
+    assert_eq!(
+        check::consensus_branch_id(&wcash_tx, zcash_testnet_height, &zcash_testnet),
+        Err(TransactionError::WrongConsensusBranchId),
+        "a Wcash transaction must not replay on Zcash Testnet",
+    );
+    assert_eq!(
+        check::consensus_branch_id(&zcash_tx, zcash_mainnet_height, &zcash_mainnet),
+        Ok(()),
+        "standard Zcash NU6.3 behavior must remain unchanged",
+    );
+    assert_ne!(wcash_tx.hash(), zcash_tx.hash());
+    let previous_outputs = Arc::new(vec![output.clone()]);
+    let wcash_sighash = wcash_tx
+        .sighash(
+            NetworkUpgrade::Nu6_3,
+            HashType::ALL,
+            previous_outputs.clone(),
+            Some((0, vec![0x51])),
+        )
+        .expect("the Wcash V6 transparent signature hash is defined");
+    let zcash_sighash = zcash_tx
+        .sighash(
+            NetworkUpgrade::Nu6_3,
+            HashType::ALL,
+            previous_outputs,
+            Some((0, vec![0x51])),
+        )
+        .expect("the Zcash V6 transparent signature hash is defined");
+    assert_ne!(
+        wcash_sighash, zcash_sighash,
+        "the Wcash branch ID must domain-separate transparent signatures as well as transaction IDs",
+    );
+
+    let legacy_transactions = [
+        Transaction::test_v1(
+            vec![input.clone()],
+            vec![output.clone()],
+            LockTime::unlocked(),
+        ),
+        Transaction::test_v2(
+            vec![input.clone()],
+            vec![output.clone()],
+            LockTime::unlocked(),
+        ),
+        Transaction::test_v3(
+            vec![input.clone()],
+            vec![output.clone()],
+            LockTime::unlocked(),
+            Height(2),
+        ),
+        Transaction::test_v4(
+            vec![input.clone()],
+            vec![output.clone()],
+            LockTime::unlocked(),
+            Height::MAX_EXPIRY_HEIGHT,
+        ),
+        Transaction::test_v5(
+            NetworkUpgrade::Nu6_3,
+            vec![input.clone()],
+            vec![output.clone()],
+            LockTime::unlocked(),
+            Height::MAX_EXPIRY_HEIGHT,
+        ),
+    ];
+    for (expected_version, legacy_tx) in (1..=5).zip(&legacy_transactions) {
+        assert_eq!(legacy_tx.version(), expected_version);
+        assert_eq!(
+            check_common_consensus_rules(legacy_tx, wcash_height, &wcash),
+            Err(TransactionError::WcashRequiresV6(expected_version)),
+        );
+    }
+
+    assert_eq!(
+        check_common_consensus_rules(
+            &legacy_transactions[3],
+            zcash_mainnet_height,
+            &zcash_mainnet,
+        ),
+        Ok(()),
+        "Zcash V4 remains valid under upstream NU6.3 rules",
+    );
+    assert_eq!(
+        check_common_consensus_rules(
+            &legacy_transactions[4],
+            zcash_mainnet_height,
+            &zcash_mainnet,
+        ),
+        Ok(()),
+        "Zcash V5 remains valid under upstream NU6.3 rules",
     );
 
     let genesis = zebra_chain::block::genesis::wcash_testnet_genesis_block();
     assert_eq!(
-        check_common_consensus_rules(&genesis.transactions[0], Height::MIN, &network),
+        check_common_consensus_rules(&genesis.transactions[0], Height::MIN, &wcash),
         Ok(()),
-        "the transaction-domain gate must not prevent trusted genesis bootstrap",
+        "the V6 rule must retain the trusted genesis exception",
     );
 }
 
 #[cfg(feature = "wcash-consensus")]
 #[tokio::test]
-async fn wcash_testnet_transfer_gate_covers_block_and_mempool_verifiers() {
+async fn wcash_v6_transfer_passes_block_and_mempool_verifiers() {
+    let _init_guard = zebra_test::init();
     let network = Network::new_wcash_testnet();
-    let transaction = Transaction::test_v6(
-        NetworkUpgrade::Nu6_3,
-        Vec::new(),
-        Vec::new(),
-        LockTime::Height(Height::MIN),
-        Height(2),
+    let height = Height(1);
+    let mut state = MockService::build().for_unit_tests();
+    let (input, output, known_utxos) = mock_transparent_transfer(
+        Height::MIN,
+        true,
+        0,
+        Amount::try_from(10_001).expect("valid test amount"),
     );
-    let state = service_fn(|_| async { unreachable!("the launch gate runs before state access") });
-    let block_verifier = BlockTxVerifier::new(&network, state);
-    let mempool_verifier = MempoolTxVerifier::new_for_tests(&network, state);
+    let transaction = Transaction::test_v6_for_network(
+        &network,
+        height,
+        vec![input],
+        vec![output],
+        LockTime::unlocked(),
+        Height::MAX_EXPIRY_HEIGHT,
+    );
+    let expected_id = transaction.unmined_id();
+    let outpoint = transaction.inputs()[0]
+        .outpoint()
+        .expect("the test transaction spends a previous output");
+    let known_utxos = Arc::new(known_utxos);
 
-    let block_result = block_verifier.oneshot(BlockRequest {
+    let block_request = BlockTxVerifier::new(&network, state.clone()).oneshot(BlockRequest {
         transaction_hash: transaction.hash(),
         transaction: Arc::new(transaction.clone()),
-        known_utxos: Arc::new(HashMap::new()),
-        height: Height(1),
+        known_utxos: known_utxos.clone(),
+        height,
         time: DateTime::<Utc>::MAX_UTC,
     });
-    let mempool_result = mempool_verifier.oneshot(MempoolRequest {
-        transaction: Arc::new(transaction).into(),
-        height: Height(1),
-    });
+    let mempool_request =
+        MempoolTxVerifier::new_for_tests(&network, state.clone()).oneshot(MempoolRequest {
+            transaction: Arc::new(transaction).into(),
+            height,
+        });
+    let state_requests = async {
+        state
+            .expect_request(zebra_state::Request::UnspentBestChainUtxo(outpoint))
+            .await
+            .respond(zebra_state::Response::UnspentBestChainUtxo(
+                known_utxos.get(&outpoint).map(|utxo| utxo.utxo.clone()),
+            ));
+        state
+            .expect_request_that(|request| {
+                matches!(
+                    request,
+                    zebra_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+                )
+            })
+            .await
+            .respond(zebra_state::Response::ValidBestChainTipNullifiersAndAnchors);
+    };
 
-    let (block_result, mempool_result) = futures::join!(block_result, mempool_result);
+    let (block_result, mempool_result, ()) =
+        futures::join!(block_request, mempool_request, state_requests);
     assert_eq!(
-        block_result,
-        Err(TransactionError::WcashTestnetTransfersDisabled)
+        block_result
+            .expect("Wcash V6 block transaction must verify")
+            .tx_id,
+        expected_id
     );
     assert_eq!(
-        mempool_result,
-        Err(TransactionError::WcashTestnetTransfersDisabled)
+        mempool_result
+            .expect("Wcash V6 mempool transaction must verify")
+            .transaction
+            .transaction
+            .id,
+        expected_id
     );
 }
 

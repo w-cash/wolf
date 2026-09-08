@@ -19,7 +19,7 @@ use zcash_script::{
 use zebra_chain::{
     amount::{Amount, NegativeAllowed},
     block::Height,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{ConsensusBranchId, Network, NetworkUpgrade},
     primitives::zcash_note_encryption,
     transaction::{LockTime, Transaction},
     transparent,
@@ -921,11 +921,15 @@ pub fn consensus_branch_id(
         return Ok(());
     }
 
-    let Some(tx_nu) = tx.network_upgrade() else {
+    let Some(tx_branch_id) = tx.embedded_consensus_branch_id() else {
         return Err(TransactionError::MissingConsensusBranchId);
     };
 
-    if tx_nu != current_nu {
+    let Some(expected_branch_id) = ConsensusBranchId::current(network, height) else {
+        return Err(TransactionError::MissingConsensusBranchId);
+    };
+
+    if tx_branch_id != expected_branch_id {
         return Err(TransactionError::WrongConsensusBranchId);
     }
 

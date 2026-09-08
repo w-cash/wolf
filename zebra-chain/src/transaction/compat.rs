@@ -163,7 +163,7 @@ pub fn block_height_to_height(
 pub(crate) fn branch_id_to_network_upgrade(
     branch_id: zcash_protocol::consensus::BranchId,
 ) -> Option<crate::parameters::NetworkUpgrade> {
-    crate::parameters::NetworkUpgrade::try_from(u32::from(branch_id)).ok()
+    branch_id.network_upgrade().map(Into::into)
 }
 
 // ── Sprout JoinSplit fields not exposed by `zcash_primitives` ─────────

@@ -1,0 +1,4 @@
+project: zebra-consensus
+kind: Changed
+body: "Replace the initial Wcash mining-only transaction gate with V6-only, exact-domain validation in both block and mempool verifiers. Wcash rejects V1-V5 and Zcash-domain transactions; Zcash rejects the Wcash domain ([#1](https://github.com/w-cash/wolf/pull/1))."
+time: 2026-09-08T20:01:26.000000002Z

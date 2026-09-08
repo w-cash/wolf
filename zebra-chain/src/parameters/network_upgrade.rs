@@ -76,6 +76,10 @@ impl TryFrom<u32> for NetworkUpgrade {
     type Error = crate::Error;
 
     fn try_from(branch_id: u32) -> Result<Self, Self::Error> {
+        if branch_id == u32::from(WCASH_TESTNET_V1_BRANCH_ID) {
+            return Ok(Self::Nu6_3);
+        }
+
         CONSENSUS_BRANCH_IDS
             .iter()
             .find(|id| id.1 == ConsensusBranchId(branch_id))
@@ -150,6 +154,12 @@ pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
 /// particular network upgrade.
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ConsensusBranchId(pub(crate) u32);
+
+/// The transaction signature domain for Wcash Testnet v1.
+///
+/// This ID is not a Wcash mainnet parameter. A future mainnet must allocate a
+/// distinct reviewed branch ID.
+pub const WCASH_TESTNET_V1_BRANCH_ID: ConsensusBranchId = ConsensusBranchId(0xb3cf_d27e);
 
 impl BytesInDisplayOrder<false, 4> for ConsensusBranchId {
     fn bytes_in_serialized_order(&self) -> [u8; 4] {
@@ -549,10 +559,26 @@ impl ConsensusBranchId {
     /// so this substitute value must not be used in consensus-critical code.
     pub const RPC_MISSING_ID: ConsensusBranchId = ConsensusBranchId(0);
 
+    /// Returns the branch ID for `network_upgrade` on `network`.
+    ///
+    /// Standard Zcash networks retain their upstream branch IDs. The built-in
+    /// Wcash test and regression networks use a distinct transaction domain for
+    /// NU6.3 / Ironwood semantics.
+    pub fn for_network_upgrade(
+        network: &Network,
+        network_upgrade: NetworkUpgrade,
+    ) -> Option<ConsensusBranchId> {
+        if network.uses_wcash_consensus() && network_upgrade == NetworkUpgrade::Nu6_3 {
+            Some(WCASH_TESTNET_V1_BRANCH_ID)
+        } else {
+            network_upgrade.branch_id()
+        }
+    }
+
     /// Returns the current consensus branch id for `network` and `height`.
     ///
     /// Returns None if the network has no branch id at this height.
     pub fn current(network: &Network, height: block::Height) -> Option<ConsensusBranchId> {
-        NetworkUpgrade::current(network, height).branch_id()
+        Self::for_network_upgrade(network, NetworkUpgrade::current(network, height))
     }
 }

@@ -782,16 +782,14 @@ fn check_common_consensus_rules(
     height: block::Height,
     network: &Network,
 ) -> Result<(), TransactionError> {
-    // Wcash currently uses upstream NU6.3 transaction encoding and signature
-    // domains. Network magic, genesis, and address HRPs isolate transport and
-    // presentation, but they do not cryptographically prevent a signed Zcash
-    // transaction from being replayed on a chain with equivalent note keys.
-    // Keep the public engineering testnet mining-only until a Wcash-specific
-    // branch ID is implemented through every parser, sighash, proof, wallet,
-    // and RPC dependency. This consensus check is shared by block and mempool
-    // verification, so neither path can bypass the launch gate.
-    if network.disables_non_coinbase_transactions(height) && !tx.is_coinbase() {
-        return Err(TransactionError::WcashTestnetTransfersDisabled);
+    // Every post-genesis Wcash transaction carries its exact chain-specific
+    // branch ID on the wire. Legacy V4 and V5 formats are deliberately excluded:
+    // V4 has no embedded ID, and Wcash launches directly with V6 / Ironwood.
+    if network.uses_wcash_consensus()
+        && height > block::Height::MIN
+        && tx.tx_version() != TxVersion::V6
+    {
+        return Err(TransactionError::WcashRequiresV6(tx.version()));
     }
 
     check_structure_and_network_rules(tx, height, network)?;

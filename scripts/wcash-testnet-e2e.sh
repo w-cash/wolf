@@ -171,9 +171,9 @@ PY
 
 # The RPC listener can become reachable before every state and proposal service
 # is ready. Retry that bounded startup window without a debug sync override.
-# Wcash Testnet templates are consensus-coupled coinbase-only and do not depend
-# on mempool activation. A successful call proves public Testnet can issue a
-# proposal-checked child candidate at a clean height-zero tip.
+# This fresh isolated node has no submitted transactions, so its first Wcash
+# Testnet template contains only coinbase. The template path still queries the
+# normal mempool and can include valid Wcash-domain V6 transfers.
 aux_template_ready=false
 for _attempt in {1..60}; do
   if rpc_call "$wcash_rpc" createauxblock "[\"$wcash_payout_address\"]" \

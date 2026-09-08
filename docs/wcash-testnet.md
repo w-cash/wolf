@@ -5,11 +5,11 @@ consensus identity is frozen so independently built nodes can agree on the same
 height-zero block, but this is not a production-readiness claim. Wcash mainnet
 remains disabled and testnet coins must have no monetary value.
 
-> **Mining-only launch boundary:** Wcash Testnet consensus rejects every
-> non-coinbase transaction. Mined rewards cannot be transferred. This fail-
-> closed rule remains until a chain-specific NU6.3 signature and branch-ID
-> domain is wired through the cryptographic dependencies. A testnet reset and
-> consensus upgrade will be required before value-bearing transaction tests.
+> **Value-bearing test boundary:** Wcash Testnet accepts only post-genesis V6
+> transactions carrying its chain-specific branch ID `0xb3cfd27e`. Zcash
+> domains and V1-V5 are rejected. This makes controlled spend testing possible,
+> but no coin has monetary value and the network is not production ready until
+> the wallet, payout, reorg, and multi-node gates below pass end to end.
 
 ## Frozen identity
 
@@ -29,7 +29,10 @@ The exact Bitcoin header, proof of work, confirmation audit height, complete
 Wcash genesis bytes, and derived hash are frozen test vectors in the source.
 Consensus never fetches or replaces an anchor at runtime. Testnet, regtest, and
 Zcash use different genesis hashes, P2P magic, ports, and peer-cache paths.
-Wcash configuration also rejects inherited Zcash DNS seeds.
+Wcash configuration also rejects inherited Zcash DNS seeds. Any local state
+created by the earlier mining-only prototype must be deleted and resynchronized;
+post-genesis blocks from that prototype are not compatible with the frozen
+Wcash Testnet v1 transaction domain.
 
 ## Anchor verification record
 
@@ -119,9 +122,8 @@ Zebra's normal test-network policy permits `getblocktemplate` and
 independently require healthy Wcash peers and confirm that its child node is on
 the current best tip before publishing work. The peerless configuration below
 exists only to test deterministic bootstrap; mining on its templates outside
-the smoke test can build a stale private fork. Because Wcash Testnet consensus
-rejects every non-coinbase transaction, its template path is explicitly
-coinbase-only and does not depend on mempool activation.
+the smoke test can build a stale private fork. The Wcash template path uses the
+normal mempool snapshot and can include valid Wcash-domain V6 transactions.
 
 Treat the RPC cookie, node binary, Wcash payout receiver, and host as one
 payout-critical boundary. The private Wcash coinbase deliberately prevents the
@@ -133,11 +135,15 @@ loopback child node to construct the requested reward correctly.
 This smoke test is a mandatory local release check. It is intentionally not run
 by GitHub Actions because it performs real proof-of-work solving; hosted CI uses
 fixed Equihash and AuxPoW vectors and exercises the non-solving validation paths.
-The smoke test uses an ephemeral, loopback-only profile with no
-peers, no cookie authentication, and no `debug_force_finished_sync` override.
-The inherited test-network policy deliberately permits its isolated template.
-Its bounded template retry covers asynchronous RPC, state, and proposal-service
-startup; it does not wait for or require mempool activation.
+The smoke test uses an ephemeral, loopback-only profile with no peers, no cookie
+authentication, and no `debug_force_finished_sync` override. It explicitly
+enables the mempool at genesis and exposes loopback lightwalletd gRPC so the
+controlled spend path is deterministic without public peers; both settings are
+test-only and must not be copied into pool operations. The inherited
+test-network policy deliberately permits its isolated template. Its bounded
+template retry covers asynchronous RPC, state, mempool, and proposal-service
+startup. The first template is normally empty because the fresh isolated node
+has no submitted transactions, not because the mempool is bypassed.
 The test first asserts height zero, the exact genesis hash, the Wcash user agent,
 zero initial supply, and successful `createauxblock`. It then serves a real
 ZIP-301 job, solves Equihash `(200, 9)`, and requires consensus acceptance by
@@ -156,21 +162,60 @@ scripts/wcash-testnet-e2e.sh
 ```
 
 Success proves that the frozen public-testnet genesis boots cleanly, the
-test-network bootstrap policy provides a proposal-validated, coinbase-only child
-template without a debug sync override or active mempool,
+test-network bootstrap policy provides a proposal-validated child template
+without a debug sync override,
 the exact authenticated AuxPoW survives the parent coinbase and block-
 commitments paths, and a mined 6.25-WCASH reward increases only the Ironwood
 value pool. The test fixture address is derived from public receiver bytes and
 is not evidence that anyone controls a spending key.
 
+## Required controlled-key spend gate
+
+The spendability release gate must use fresh ephemeral state and a deterministic
+test seed supplied outside command-line arguments and logs. The experimental
+wallet is intentionally limited to a one-shot Ironwood transfer against an
+attested loopback Wcash node. It provides Wcash address derivation, SQLite
+scanning and balance reporting, Wcash-domain V6 signing, recovery by exported
+transaction ID, exact-byte broadcast, and transaction-status inspection. It is
+not a batch payout, pool accounting, durable settlement, or idempotent-request
+system. The controlled spend gate is complete only when one automated run does
+all of the following:
+
+1. Derives separate miner, recipient, and private-change receivers in the
+   correct Wcash regtest namespace, then mines an exact AuxPoW child block to
+   the controlled miner receiver through the ZIP-301 pool path.
+2. Extends the canonical child chain through the configured confirmation
+   policy, scans compact blocks into the wallet, and identifies the exact
+   private Ironwood coinbase note by block, transaction, action, and value.
+3. Constructs and signs a balanced V6 Ironwood transfer under branch ID
+   `0xb3cfd27e`, with no transparent, Sapling, or Orchard value. The signed
+   transaction must bind the intended network, inputs, recipients, private
+   change, fee, and expiry height.
+4. Submits the exact bytes to the Wcash mempool, observes the exact transaction
+   in `getblocktemplate`, and verifies that template fees, transaction metadata,
+   Merkle roots, authorization-data root, block commitments, and the private
+   Ironwood coinbase all account for it.
+5. Mines and accepts that template through the normal AuxPoW block path, then
+   rescans independently and proves the recipient value, private change, fee,
+   spent nullifier, and wallet balance conservation.
+6. Submits the Wcash transaction to default Zcash Mainnet/Testnet validation and
+   a correctly signed Zcash-domain V6 transaction to Wcash, requiring exact
+   two-way replay rejection. Separate consensus tests must keep rejecting every
+   Wcash post-genesis V1-V5 transaction in both block and mempool contexts.
+
+Passing only transaction serialization or wallet unit tests does not satisfy
+this gate. Passing the gate also does not supply Internet-facing pool security,
+miner settlement, crash-idempotent payout batches, or reorg-safe accounting.
+Those require a separate durable service that freezes settlement across reorgs
+and cannot select or pay the same input twice.
+
 ## What is not ready
 
-The mining-only consensus rule rejects all non-coinbase transactions, so testnet
-rewards cannot move and the current chain must reset when the transaction
-signature domain is activated. The repository also does not yet provide Wcash
-wallet/account/key derivation, a spendability test for the private coinbase
-fixture, project-operated seed infrastructure, or physical ASIC firmware
-certification. The included pool
+Consensus now admits Wcash-domain V6 transfers, but the controlled-key test that
+mines and matures a private coinbase, recovers it in the Wcash wallet, spends it,
+observes mempool and block-template inclusion, mines the transfer, and rescans
+the recipient remains mandatory. Project-operated seed infrastructure and
+physical ASIC firmware certification are also missing. The included pool
 backend intentionally binds only loopback and uses one fixed share target. It
 does not provide Internet-facing TLS, source-IP abuse controls, variable
 difficulty, multi-generation late-share grace, balances, payouts, settlement,

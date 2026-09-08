@@ -7,6 +7,7 @@ use zebra_chain::{
     block,
     chain_sync_status::MockSyncStatus,
     chain_tip::NoChainTip,
+    history_tree::HistoryTree,
 };
 
 use strum::IntoEnumIterator;
@@ -21,8 +22,10 @@ use zebra_chain::{
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
         Network, NetworkUpgrade,
     },
-    serialization::ZcashDeserializeInto,
-    transaction::{HashType, Transaction},
+    serialization::{DateTime32, ZcashDeserializeInto, ZcashSerialize},
+    transaction::{Hash, HashType, Transaction, UnminedTx, VerifiedUnminedTx},
+    transparent,
+    work::difficulty::ParameterDifficulty as _,
 };
 use zebra_node_services::{mempool, BoxError};
 use zebra_script::Sigops;
@@ -32,11 +35,15 @@ use crate::client::TransactionTemplate;
 use crate::config::mining::{
     default_miner_address, default_miner_address_for_network, Config, MinerAddressType,
 };
-use crate::methods::{hex_data::HexData, types::long_poll::LONG_POLL_ID_LENGTH};
+use crate::methods::{
+    hex_data::HexData,
+    types::long_poll::{LongPollId, LONG_POLL_ID_LENGTH},
+};
 
 use super::{
-    check_parameters, check_synced_to_tip, fetch_mempool_transactions, DefaultRoots,
-    GetBlockTemplateParameters, GetBlockTemplateRequestMode, MinerParams, WcashAuxRequest,
+    check_parameters, check_synced_to_tip, fetch_mempool_transactions, BlockTemplateResponse,
+    DefaultRoots, GetBlockTemplateParameters, GetBlockTemplateRequestMode, MinerParams,
+    WcashAuxRequest,
 };
 
 /// A clean Wcash Testnet node must be able to serve its first mining template
@@ -58,29 +65,14 @@ fn wcash_testnet_allows_genesis_only_mining_bootstrap() {
 }
 
 #[tokio::test]
-async fn mining_only_templates_skip_only_the_wcash_testnet_mempool() {
+async fn all_network_templates_query_and_propagate_mempool_errors() {
     const SENTINEL_ERROR: &str = "template mempool sentinel error";
 
     let template_height = Height(1);
     let chain_tip_hash = Network::new_wcash_testnet().genesis_hash();
-    let mut skipped_mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-
-    let (transactions, dependencies) = fetch_mempool_transactions(
-        &Network::new_wcash_testnet(),
-        template_height,
-        skipped_mempool.clone(),
-        chain_tip_hash,
-    )
-    .await
-    .expect("Wcash Testnet mining-only templates do not depend on mempool readiness")
-    .expect("a mining-only template has a current, empty mempool snapshot");
-
-    assert!(transactions.is_empty());
-    assert!(dependencies.dependencies().is_empty());
-    assert!(dependencies.dependents().is_empty());
-    skipped_mempool.expect_no_requests().await;
 
     for network in [
+        Network::new_wcash_testnet(),
         Network::new_wcash_regtest(),
         Network::Mainnet,
         Network::new_default_testnet(),
@@ -98,12 +90,143 @@ async fn mining_only_templates_skip_only_the_wcash_testnet_mempool() {
         };
 
         let (result, ()) = tokio::join!(request, respond);
-        let error = result.expect_err("non-mining-only networks must preserve mempool failures");
+        let error = result.expect_err("every network must preserve mempool failures");
         assert!(
             error.message().contains(SENTINEL_ERROR),
             "unexpected error for {network}: {error}"
         );
     }
+}
+
+#[test]
+fn wcash_template_includes_v6_transfer_fees_and_private_coinbase() {
+    const MINER_FEE: i64 = 10_000;
+    const INPUT_VALUE: i64 = 20_000;
+    const OUTPUT_VALUE: i64 = INPUT_VALUE - MINER_FEE;
+
+    let network = Network::new_wcash_testnet();
+    let height = Height(1);
+    let mut p2sh_op_true = vec![0xa9, 0x14];
+    p2sh_op_true.extend_from_slice(&[
+        0xda, 0x17, 0x45, 0xe9, 0xb5, 0x49, 0xbd, 0x0b, 0xfa, 0x1a, 0x56, 0x99, 0x71, 0xc7, 0x7e,
+        0xba, 0x30, 0xcd, 0x5a, 0x4b,
+    ]);
+    p2sh_op_true.push(0x87);
+    let spent_output = transparent::Output {
+        value: Amount::try_from(INPUT_VALUE).expect("valid input amount"),
+        lock_script: transparent::Script::new(&p2sh_op_true),
+    };
+    let transaction = Arc::new(Transaction::test_v6_for_network(
+        &network,
+        height,
+        vec![transparent::Input::PrevOut {
+            outpoint: transparent::OutPoint {
+                hash: Hash([0x42; 32]),
+                index: 0,
+            },
+            // Push the one-byte OP_TRUE redeem script.
+            unlock_script: transparent::Script::new(&[0x01, 0x51]),
+            sequence: u32::MAX,
+        }],
+        vec![transparent::Output {
+            value: Amount::try_from(OUTPUT_VALUE).expect("valid output amount"),
+            lock_script: transparent::Script::new(&p2sh_op_true),
+        }],
+        zebra_chain::transaction::LockTime::unlocked(),
+        Height(2),
+    ));
+    let unmined = UnminedTx::from(transaction.clone());
+    let miner_fee = Amount::try_from(MINER_FEE).expect("valid conventional fee");
+    let verified = VerifiedUnminedTx::new(unmined, miner_fee, 0, 0, Arc::new(vec![spent_output]))
+        .expect("the transaction pays its ZIP-317 conventional fee");
+    assert!(verified.pays_conventional_fee());
+
+    let miner_address = default_miner_address_for_network(&network, &MinerAddressType::Unified);
+    let miner_params = MinerParams::new(
+        &network,
+        Config {
+            miner_address: Some(
+                miner_address
+                    .parse()
+                    .expect("the hard-coded Wcash address is valid"),
+            ),
+            ..Default::default()
+        },
+    )
+    .expect("Wcash Unified miner parameters are valid");
+    let chain_history_root = HistoryTree::default().hash();
+    let chain_info = zebra_state::GetBlockTemplateChainInfo {
+        tip_hash: network.genesis_hash(),
+        tip_height: Height::MIN,
+        chain_history_root,
+        expected_difficulty: network.target_difficulty_limit().to_compact(),
+        cur_time: DateTime32::now(),
+        min_time: DateTime32::now(),
+        max_time: DateTime32::now(),
+    };
+
+    let response = BlockTemplateResponse::new_internal(
+        &network,
+        None,
+        None,
+        &miner_params,
+        None,
+        &chain_info,
+        LongPollId::new(0, 0, 0, 1, 0),
+        vec![(0, verified.clone())],
+        None,
+    )
+    .expect("a Wcash template with a verified transfer must be buildable");
+
+    assert_eq!(response.transactions.len(), 1);
+    let template_tx = &response.transactions[0];
+    assert_eq!(
+        template_tx.data.as_ref(),
+        transaction
+            .zcash_serialize_to_vec()
+            .expect("transaction serializes")
+    );
+    assert_eq!(template_tx.hash, transaction.hash());
+    assert_eq!(template_tx.auth_digest, transaction.auth_digest().unwrap());
+    assert_eq!(template_tx.fee, miner_fee);
+    assert_eq!(template_tx.sigops, 0);
+
+    let coinbase: Transaction = response
+        .coinbase_txn
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("the template coinbase deserializes");
+    assert_eq!(coinbase.version(), 6);
+    assert_eq!(
+        coinbase.embedded_consensus_branch_id(),
+        zebra_chain::parameters::ConsensusBranchId::current(&network, height)
+    );
+    assert!(coinbase.outputs().is_empty());
+    assert!(!coinbase.has_sapling_shielded_data());
+    assert!(!coinbase.has_orchard_shielded_data());
+    assert!(coinbase.ironwood_actions().next().is_some());
+    assert_eq!(
+        coinbase
+            .ironwood_value_balance()
+            .ironwood_amount()
+            .zatoshis(),
+        -(625_000_000 + MINER_FEE)
+    );
+    zebra_consensus::transaction::check::wcash_coinbase_outputs_are_private(
+        &coinbase, &network, height,
+    )
+    .expect("the fee-paying coinbase remains private");
+    assert_eq!(response.coinbase_txn.fee.zatoshis(), -MINER_FEE);
+
+    let recomputed_roots = DefaultRoots::from_coinbase(
+        &network,
+        height,
+        &response.coinbase_txn,
+        chain_history_root,
+        &[verified],
+    );
+    assert_eq!(response.default_roots, recomputed_roots);
 }
 
 /// Tests that coinbase transactions can be generated.

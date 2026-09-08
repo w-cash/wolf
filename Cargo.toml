@@ -15,6 +15,12 @@ members = [
         "wcash-genesis",
         "wcash-zcash-aux",
         "wcash-merge-miner",
+        "wcash-wallet",
+]
+exclude = [
+        "vendor/zcash_primitives",
+        "vendor/zcash_protocol",
+        "vendor/pczt",
 ]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
@@ -46,10 +52,10 @@ zcash_address = "0.13.0"
 zcash_encoding = "0.4"
 zcash_history = "0.5.0"
 zcash_keys = "0.16"
-zcash_primitives = "0.30"
+zcash_primitives = "=0.30.1"
 zcash_proofs = "0.30"
 zcash_transparent = "0.10.0"
-zcash_protocol = "0.10.0"
+zcash_protocol = "=0.10.5"
 zip32 = "0.2"
 abscissa_core = "0.7"
 base64 = "0.22.1"
@@ -186,6 +192,13 @@ zcash_note_encryption = "0.4.1"
 zcash_script = "0.4.5"
 config = { version = "0.15.14", features = ["toml"] }
 which = "8.0.0"
+
+[patch.crates-io]
+# Wcash Testnet needs a chain-specific ZIP-200 transaction domain while retaining
+# the upstream Zcash NU6.3 domain. See each crate's WCASH-PATCHES.md.
+zcash_primitives = { path = "vendor/zcash_primitives" }
+zcash_protocol = { path = "vendor/zcash_protocol" }
+pczt = { path = "vendor/pczt" }
 
 [workspace.metadata.release]
 

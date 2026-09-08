@@ -9,7 +9,7 @@ use crate::{
     block::merkle::AuthDataRoot,
     fmt::DisplayToDebug,
     ironwood, orchard,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{ConsensusBranchId, Network, NetworkUpgrade},
     sapling,
     serialization::TrustedPreallocate,
     sprout,
@@ -128,15 +128,19 @@ impl Block {
         &self,
         network: &Network,
     ) -> Result<(), error::BlockError> {
-        let block_nu =
-            NetworkUpgrade::current(network, self.coinbase_height().expect("a valid height"));
+        let height = self.coinbase_height().expect("a valid height");
+        let block_nu = NetworkUpgrade::current(network, height);
+        let expected_branch_id = ConsensusBranchId::current(network, height);
 
-        if self
-            .transactions
-            .iter()
-            .filter_map(|trans| trans.as_ref().network_upgrade())
-            .any(|trans_nu| trans_nu != block_nu)
-        {
+        if self.transactions.iter().any(|trans| {
+            let trans = trans.as_ref();
+            trans
+                .network_upgrade()
+                .is_some_and(|trans_nu| trans_nu != block_nu)
+                || trans
+                    .embedded_consensus_branch_id()
+                    .is_some_and(|branch_id| Some(branch_id) != expected_branch_id)
+        }) {
             return Err(error::BlockError::WrongTransactionConsensusBranchId);
         }
 

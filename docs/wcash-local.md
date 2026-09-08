@@ -65,10 +65,12 @@ export ZCASH_PAYOUT_ADDRESS='uregtest1efxggx6lduhm2fx5lnrhxv7h7kpztlpa3ahf3n4w0q
 ```
 
 The address is a public Wcash regtest fixture, not evidence that anyone has its
-spending key. The node currently implements Wcash payment-address codecs and
-private coinbase construction, but not a Wcash wallet or account/key
-derivation. Replace it with a generated, spendable address once wallet support
-exists.
+spending key. The workspace contains an experimental one-shot wallet that can
+derive a Wcash address, scan a local SQLite wallet from an attested loopback
+node, sign an Ironwood-only Wcash V6 transfer, and broadcast its exact bytes.
+This mining procedure does not invoke that wallet or control the fixture key,
+and the wallet is not a batch-payout or pool-settlement service. Use a newly
+derived, controlled-key address only in the documented isolated spend test.
 
 Because that child coinbase is deliberately private, the coordinator cannot
 recover its recipient from a payment address alone. It trusts the loopback

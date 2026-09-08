@@ -219,25 +219,27 @@ pub(crate) struct PrecomputedTxData {
 impl PrecomputedTxData {
     /// Computes the data used for sighash or txid computation.
     ///
-    /// For V4 transactions, uses the network upgrade's consensus branch ID for the sighash,
-    /// which must match the branch ID used when the transaction was signed.
-    /// Returns an error if `nu` doesn't have a valid consensus branch ID.
+    /// For V4 transactions, uses the standard branch ID associated with the network
+    /// upgrade. V5+ transactions carry their exact branch ID on the wire, so this
+    /// method uses the embedded value after checking that it has the requested
+    /// network-upgrade semantics. Network-aware consensus validation is responsible
+    /// for checking the exact embedded ID before signature verification.
     pub(crate) fn new(
         tx: &Transaction,
         nu: NetworkUpgrade,
         all_previous_outputs: Arc<Vec<transparent::Output>>,
     ) -> Result<PrecomputedTxData, Error> {
-        let branch_id = nu
-            .branch_id()
-            .and_then(|cbid| zcash_protocol::consensus::BranchId::try_from(cbid).ok())
-            .ok_or(Error::InvalidConsensusBranchId)?;
+        let branch_id = if tx.version() >= 5 {
+            if tx.network_upgrade() != Some(nu) {
+                return Err(Error::InvalidConsensusBranchId);
+            }
 
-        // For V5+ transactions, the branch_id is embedded and must match.
-        // For V4 transactions, use the network upgrade's branch_id for the sighash.
-        let tx_branch_id = tx.inner().deref().consensus_branch_id();
-        if tx.version() >= 5 && tx_branch_id != branch_id {
-            return Err(Error::InvalidConsensusBranchId);
-        }
+            tx.inner().deref().consensus_branch_id()
+        } else {
+            nu.branch_id()
+                .and_then(|cbid| zcash_protocol::consensus::BranchId::try_from(cbid).ok())
+                .ok_or(Error::InvalidConsensusBranchId)?
+        };
 
         Self::from_transaction_with_branch_id(tx, branch_id, all_previous_outputs)
     }

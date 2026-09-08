@@ -16,7 +16,7 @@ use crate::{
             height_for_halving, miner_subsidy, ParameterSubsidy as _, WCASH_FIRST_HALVING_HEIGHT,
             WCASH_HALVING_INTERVAL, WCASH_INITIAL_BLOCK_SUBSIDY,
         },
-        NetworkUpgrade,
+        ConsensusBranchId, NetworkUpgrade, WCASH_TESTNET_V1_BRANCH_ID,
     },
     serialization::DateTime32,
     work::difficulty::ParameterDifficulty as _,
@@ -68,7 +68,6 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
 
     assert!(testnet.uses_wcash_consensus());
     assert!(testnet.is_wcash_testnet());
-    assert!(testnet.disables_non_coinbase_transactions(Height(1)));
     assert!(!testnet.is_wcash_regtest());
     assert!(!testnet.is_regtest());
     assert_eq!(testnet.to_string(), "WcashTestnet");
@@ -109,11 +108,29 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
         testnet.wcash_default_rpc_port(),
         regtest.wcash_default_rpc_port()
     );
-    assert!(!regtest.disables_non_coinbase_transactions(Height(1)));
+    assert_eq!(
+        ConsensusBranchId::current(&testnet, Height::MIN),
+        None,
+        "Wcash genesis has no post-Overwinter transaction branch"
+    );
+    assert_eq!(
+        ConsensusBranchId::current(&testnet, Height(1)),
+        Some(WCASH_TESTNET_V1_BRANCH_ID)
+    );
+    assert_eq!(
+        ConsensusBranchId::current(&regtest, Height(1)),
+        Some(WCASH_TESTNET_V1_BRANCH_ID)
+    );
+    assert_eq!(
+        zcash_protocol::consensus::BranchId::for_height(
+            &testnet,
+            zcash_protocol::consensus::BlockHeight::from_u32(1),
+        ),
+        zcash_protocol::consensus::BranchId::WcashTestnetV1
+    );
 
     for zcash in zcash_networks {
         assert!(!zcash.uses_wcash_consensus());
-        assert!(!zcash.disables_non_coinbase_transactions(Height(1)));
         assert_ne!(testnet.to_string(), zcash.to_string());
         assert_ne!(testnet.magic(), zcash.magic());
         assert_ne!(testnet.genesis_hash(), zcash.genesis_hash());
@@ -202,17 +219,24 @@ fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
         NetworkUpgrade::Nu6_3
     );
     // Zebra treats omitted earlier upgrades as implicit activations at the
-    // first explicitly configured later upgrade. These assertions protect the
-    // history-tree, mandatory-checkpoint, and transaction-invariant callers
-    // that require Heartwood and Canopy activation heights to exist.
-    assert_eq!(
-        NetworkUpgrade::Heartwood.activation_height(&network),
-        Some(Height(1))
-    );
-    assert_eq!(
-        NetworkUpgrade::Canopy.activation_height(&network),
-        Some(Height(1))
-    );
+    // first explicitly configured later upgrade. Protect every historical
+    // activation queried by wallet scanning, history-tree, checkpoint, and
+    // transaction-invariant code, without pretending that multiple upgrades
+    // are separately activated in the canonical height-to-upgrade map.
+    for upgrade in [
+        NetworkUpgrade::Overwinter,
+        NetworkUpgrade::Sapling,
+        NetworkUpgrade::Blossom,
+        NetworkUpgrade::Heartwood,
+        NetworkUpgrade::Canopy,
+        NetworkUpgrade::Nu5,
+        NetworkUpgrade::Nu6,
+        NetworkUpgrade::Nu6_1,
+        NetworkUpgrade::Nu6_2,
+        NetworkUpgrade::Nu6_3,
+    ] {
+        assert_eq!(upgrade.activation_height(&network), Some(Height(1)));
+    }
     assert_eq!(network.mandatory_checkpoint_height(), Height::MIN);
     assert_eq!(
         NetworkUpgrade::target_spacing_for_height(&network, Height(1)).num_seconds(),

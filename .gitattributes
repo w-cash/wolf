@@ -1,1 +1,6 @@
 **/Cargo.lock linguist-generated=false
+
+# Preserve authenticated upstream crate archives byte-for-byte. Some historical
+# release notes and license files contain upstream whitespace that must not be
+# normalized as part of the Wcash consensus patch.
+vendor/** -whitespace

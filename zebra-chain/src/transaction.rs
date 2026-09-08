@@ -42,7 +42,7 @@ pub use unmined::{
 use crate::{
     amount::{Amount, NegativeAllowed, NonNegative},
     block,
-    parameters::NetworkUpgrade,
+    parameters::{ConsensusBranchId, NetworkUpgrade},
     transparent,
     value_balance::ValueBalance,
     Error,
@@ -97,6 +97,14 @@ impl Transaction {
             // V5+ transactions embed the consensus branch ID
             _ => compat::branch_id_to_network_upgrade(self.0.consensus_branch_id()),
         }
+    }
+
+    /// Returns the exact consensus branch ID embedded in a V5+ transaction.
+    ///
+    /// Earlier transaction formats do not carry this field on the wire.
+    pub fn embedded_consensus_branch_id(&self) -> Option<ConsensusBranchId> {
+        (self.version() >= 5)
+            .then(|| ConsensusBranchId::from(u32::from(self.0.consensus_branch_id())))
     }
 
     /// Compute the sighash for this transaction.
@@ -1302,6 +1310,29 @@ impl Transaction {
             .branch_id()
             .and_then(|cbid| zcash_protocol::consensus::BranchId::try_from(cbid).ok())
             .unwrap_or(zcash_protocol::consensus::BranchId::Nu6_3);
+        Self::build_transparent(
+            zcash_primitives::transaction::TxVersion::V6,
+            branch_id,
+            compat::lock_time_to_u32(&lock_time),
+            compat::height_to_block_height(expiry_height),
+            inputs,
+            outputs,
+        )
+    }
+
+    /// Build a transparent-only V6 transaction with the exact branch ID active
+    /// for `network` at `target_height`, for tests.
+    pub fn test_v6_for_network(
+        network: &crate::parameters::Network,
+        target_height: block::Height,
+        inputs: Vec<transparent::Input>,
+        outputs: Vec<transparent::Output>,
+        lock_time: LockTime,
+        expiry_height: block::Height,
+    ) -> Self {
+        let branch_id = crate::parameters::ConsensusBranchId::current(network, target_height)
+            .and_then(|cbid| zcash_protocol::consensus::BranchId::try_from(cbid).ok())
+            .expect("the test target height must have a known consensus branch ID");
         Self::build_transparent(
             zcash_primitives::transaction::TxVersion::V6,
             branch_id,

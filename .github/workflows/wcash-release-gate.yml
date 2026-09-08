@@ -46,18 +46,35 @@ jobs:
           cargo clippy --locked -p wcash-zcash-aux --all-targets -- -D warnings
           cargo clippy --locked -p wcash-zcash-aux --no-default-features --all-targets -- -D warnings
 
+      - name: Test transaction-domain integration across workspace boundaries
+        run: |
+          cargo test --locked -p zebra-chain --lib --features wcash-consensus wcash_testnet_has_frozen_isolated_network_identity
+          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash_requires_v6_and_exact_branch_domain
+          cargo test --locked -p zebra-rpc --lib --features zebra-chain/wcash-consensus wcash_get_blockchain_info_reports_custom_transaction_domain
+          cargo test --locked -p wcash-wallet --lib wcash_launch_parameters_expose_cumulative_shielded_activations
+          cargo test --locked -p wcash-wallet --test transaction_domain wcash_builder_rejects_standard_nu6_3_branch
+          cargo test --locked -p wcash-wallet --test transaction_domain wcash_pczt_creator_preserves_v6_custom_branch
+
       - name: Test and lint the native coordinator
         run: |
           cargo test --locked -p wcash-merge-miner
           cargo clippy --locked -p wcash-merge-miner --all-targets -- -D warnings
 
+      - name: Test and lint Wcash wallet boundaries
+        run: |
+          cargo test --locked -p wcash-wallet
+          cargo clippy --locked -p wcash-wallet --all-targets -- -D warnings
+
       - name: Test Wcash consensus-specific paths
         run: |
           cargo test --locked -p zebra-chain --lib --features wcash-consensus
           cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash
-          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash_testnet_transfer_gate_covers_block_and_mempool_verifiers
+          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash_requires_v6_and_exact_branch_domain
+          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash_v6_transfer_passes_block_and_mempool_verifiers
           cargo test --locked -p zebra-rpc --lib wcash
           cargo test --locked -p zebra-rpc --lib --features zebra-chain/wcash-consensus wcash
+          cargo test --locked -p zebra-rpc --lib --features zebra-chain/wcash-consensus all_network_templates_query_and_propagate_mempool_errors
+          cargo test --locked -p zebra-rpc --lib --features zebra-chain/wcash-consensus wcash_template_includes_v6_transfer_fees_and_private_coinbase
 
       - name: Test parent RPC payout attestation and serialization
         run: |
@@ -94,6 +111,14 @@ jobs:
 
       - name: Compile the unmodified Zcash profile separately
         run: cargo check --locked --release -p zebrad --bin zebrad --no-default-features
+
+      - name: Preserve standard Zcash branch, history, privacy, and RPC behavior
+        run: |
+          cargo test --locked -p zebra-chain --lib branch_id
+          cargo test --locked -p zebra-chain --lib history
+          cargo test --locked -p zebra-chain --lib zip244
+          cargo test --locked -p zebra-consensus --lib coinbase_outputs_are_decryptable
+          cargo test --locked -p zebra-rpc --lib get_blockchain_info
 
       # GitHub Actions must not execute proof-of-work solving. The native
       # end-to-end scripts remain mandatory local release checks; hosted CI

@@ -60,11 +60,12 @@ and is never consulted as consensus or runtime input. Node consensus uses only
 the immutable anchor fields, Wcash network discriminator, genesis statement,
 commitment, and complete serialized Wcash genesis block.
 
-The public testnet is intentionally mining-only while Wcash still inherits the
-Zcash NU6.3 transaction signature domain. Consensus rejects every non-coinbase
-transaction in both blocks and the mempool. Testnet rewards cannot be transferred
-and have no value; a reset or explicit consensus upgrade is required before
-value-bearing tests.
+The public testnet uses Wcash Testnet v1 branch ID `0xb3cfd27e` for NU6.3 /
+Ironwood transactions and rejects the standard Zcash NU6.3 ID. Every
+post-genesis transaction must be V6, so V1-V5 and inherited Zcash-domain
+transactions are invalid in both blocks and the mempool. Testnet rewards have
+no value; wallet spendability and payout behavior must pass their end-to-end
+release gates before the engineering network is promoted.
 
 ## Fail-closed mainnet launch
 

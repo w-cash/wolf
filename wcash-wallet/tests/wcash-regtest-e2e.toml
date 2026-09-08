@@ -1,0 +1,33 @@
+# Isolated Wcash Regtest profile for the controlled-key wallet spend gate.
+# The miner address belongs to the public test-only seed embedded in the E2E
+# script. Never reuse this profile or seed on a public/value-bearing network.
+
+[network]
+network = "WcashRegtest"
+listen_addr = "127.0.0.1:48233"
+initial_mainnet_peers = []
+initial_testnet_peers = []
+cache_dir = false
+peerset_initial_target_size = 1
+max_connections_per_ip = 1
+
+[state]
+ephemeral = true
+
+[rpc]
+listen_addr = "127.0.0.1:48232"
+lightwalletd_listen_addr = "127.0.0.1:48234"
+enable_cookie_auth = false
+# This bypass is confined to the fresh, peerless process started by the test.
+debug_force_finished_sync = true
+
+[mempool]
+debug_enable_at_height = 0
+
+[mining]
+miner_address = "wuregtest1m6qlf78t724tks6lxvpy7dylmuae5df0xrwaacykakred0jv8tez5v4lqhwhwvrpg9wp4qyf5ty5a9z9ultvqf9h3yd6rgdh6vvdnemk"
+extra_coinbase_data = "WcashWalletE2E"
+internal_miner = false
+
+[tracing]
+filter = "info"

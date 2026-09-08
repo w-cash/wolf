@@ -1,0 +1,4 @@
+project: zebra-chain
+kind: Added
+body: "Add the Wcash Testnet v1 transaction branch ID `0xb3cfd27e`, network-aware branch selection, and exact V6 branch-ID inspection while preserving every standard Zcash mapping ([#1](https://github.com/w-cash/wolf/pull/1))."
+time: 2026-09-08T20:01:26.000000001Z
