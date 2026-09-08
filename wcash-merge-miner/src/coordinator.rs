@@ -29,6 +29,9 @@ use zebra_chain::{
 };
 
 use crate::{
+    accounting::{
+        read_accounting_snapshot_from_reader, AuthenticatedWorker, WorkerAuthenticationProvenance,
+    },
     rpc::{RpcEndpoint, ZebraRpcClient, DEFAULT_RPC_TIMEOUT},
     MinerError, NativePreparedJob, NativeZcashConfig, NativeZcashProvider, ShareProcessor,
     ValidatedNativeShare,
@@ -65,6 +68,18 @@ impl fmt::Debug for CoordinatorConfig {
     }
 }
 
+/// Long-lived owner of native node clients and the authoritative share journal.
+///
+/// Opening a supervisor performs crash recovery and acquires the journal lock
+/// exactly once. Each subsequent generation reuses that validated state.
+pub struct NativeMiningSupervisor {
+    config: CoordinatorConfig,
+    wcash_node: ZebraRpcClient,
+    zcash: NativeZcashProvider,
+    journal: Arc<ShareJournal>,
+    generation_preparation: Mutex<()>,
+}
+
 /// A fully prepared dual-chain job and its submission backend.
 pub struct NativeMiningCoordinator {
     wcash_node: ZebraRpcClient,
@@ -77,7 +92,7 @@ pub struct NativeMiningCoordinator {
     last_outbox_retry: Mutex<Instant>,
     outbox_retry_requested: AtomicBool,
     outbox_retry_in_progress: AtomicBool,
-    journal: ShareJournal,
+    journal: Arc<ShareJournal>,
 }
 
 /// Operator-visible durable winner-outbox counts.
@@ -99,16 +114,21 @@ struct JobFreshness {
     last_checked: Instant,
 }
 
-const MAX_JOB_AGE: Duration = Duration::from_secs(8 * 60);
+/// Maximum time one native header generation is advertised before fresh work is prepared.
+pub const NATIVE_JOB_MAX_AGE_SECONDS: u64 = 45;
+
+// Refresh before the common 55-second S-NOMP/ASIC liveness rebroadcast interval.
+// A fresh child and independently proposal-validated parent are required: merely
+// replaying the same header could restart a miner's duplicate nonce search.
+const MAX_JOB_AGE: Duration = Duration::from_secs(NATIVE_JOB_MAX_AGE_SECONDS);
 const TIP_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
 const OUTBOX_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_CHILD_BLOCK_BYTES: usize = 2_000_000;
 const WINNER_RETENTION_CONFIRMATIONS: u32 = 100;
 
-impl NativeMiningCoordinator {
-    /// Creates a Wcash candidate, builds its parent template, and completes the
-    /// independent Zcash proposal gate before returning solver work.
-    pub fn prepare(
+impl NativeMiningSupervisor {
+    /// Opens and crash-recovers one durable journal for this process lifetime.
+    pub fn open(
         config: CoordinatorConfig,
         journal_path: impl AsRef<Path>,
     ) -> Result<Self, MinerError> {
@@ -134,10 +154,29 @@ impl NativeMiningCoordinator {
             &config.expected_wcash_genesis_hash,
             "expected Wcash genesis hash",
         )?;
-        let mut journal = ShareJournal::open(journal_path)?;
-        let wcash_node = ZebraRpcClient::new(config.wcash_node, DEFAULT_RPC_TIMEOUT)?;
+        let journal = Arc::new(ShareJournal::open(journal_path)?);
+        let wcash_node = ZebraRpcClient::new(config.wcash_node.clone(), DEFAULT_RPC_TIMEOUT)?;
+        let zcash = NativeZcashProvider::connect(config.zcash.clone())?;
+        Ok(Self {
+            config,
+            wcash_node,
+            zcash,
+            journal,
+            generation_preparation: Mutex::new(()),
+        })
+    }
+
+    /// Creates, proposal-validates, and durably activates one fresh generation.
+    pub fn prepare_generation(&self) -> Result<NativeMiningCoordinator, MinerError> {
+        let _preparation = self
+            .generation_preparation
+            .lock()
+            .map_err(|_| coordinator_mutex_error("native generation preparation"))?;
+        let config = &self.config;
+        let wcash_node = self.wcash_node.clone();
+        let zcash = self.zcash.clone();
+        let journal = Arc::clone(&self.journal);
         let expected_zcash_genesis_hash = config.zcash.expected_genesis_hash().to_string();
-        let zcash = NativeZcashProvider::connect(config.zcash)?;
 
         // Replay each chain independently before asking either node to create
         // fresh work. A template/proposal outage must never strand an already
@@ -172,9 +211,10 @@ impl NativeMiningCoordinator {
         wcash_identity?;
         zcash_identity?;
 
-        let child: ChildTemplate =
-            wcash_node.call("createauxblock", json!([config.wcash_payout_address]))?;
-        let candidate_created_at = Instant::now();
+        let child: ChildTemplate = wcash_node.call(
+            "createauxblock",
+            json!([config.wcash_payout_address.clone()]),
+        )?;
         if child.chain_id != WCASH_AUXILIARY_CHAIN_ID {
             return Err(MinerError::InvalidParentTemplate(format!(
                 "Wcash node returned chain id 0x{:08x}, expected 0x{WCASH_AUXILIARY_CHAIN_ID:08x}",
@@ -266,10 +306,11 @@ impl NativeMiningCoordinator {
             child_hash_display: child.hash.clone(),
             child_height: child.height,
             parent_height: job.parent_height(),
-            child_candidate_bytes,
+            child_candidate_bytes: child_candidate_bytes.into(),
         })?;
+        let candidate_created_at = Instant::now();
 
-        let coordinator = Self {
+        let coordinator = NativeMiningCoordinator {
             wcash_node,
             zcash,
             job,
@@ -286,6 +327,16 @@ impl NativeMiningCoordinator {
             journal,
         };
         Ok(coordinator)
+    }
+}
+
+impl NativeMiningCoordinator {
+    /// Opens a one-shot supervisor and prepares one proposal-gated generation.
+    pub fn prepare(
+        config: CoordinatorConfig,
+        journal_path: impl AsRef<Path>,
+    ) -> Result<Self, MinerError> {
+        NativeMiningSupervisor::open(config, journal_path)?.prepare_generation()
     }
 
     /// Returns the exact proposal-gated solver job.
@@ -325,7 +376,7 @@ impl NativeMiningCoordinator {
         if now.saturating_duration_since(self.candidate_created_at) >= MAX_JOB_AGE {
             freshness.active = false;
             return Err(MinerError::StaleNativeJob(format!(
-                "the Wcash candidate reached its {}-second local safety lifetime",
+                "the native job reached its {}-second fresh-work lifetime",
                 MAX_JOB_AGE.as_secs()
             )));
         }
@@ -642,8 +693,13 @@ fn classify_wcash_best_chain_block(
     Ok(WcashBestChainMatch::Exact)
 }
 
-impl ShareProcessor for NativeMiningCoordinator {
-    fn process(&self, worker: &str, share: &ValidatedNativeShare) -> Result<(), MinerError> {
+impl NativeMiningCoordinator {
+    fn process_with_attribution(
+        &self,
+        worker: &str,
+        authentication: JournalWorkerAuthentication,
+        share: &ValidatedNativeShare,
+    ) -> Result<(), MinerError> {
         let is_network_winner = share.wcash_candidate().is_some() || share.parent_block().is_some();
 
         // A tip check on one chain must never suppress a valid winner for the
@@ -651,7 +707,7 @@ impl ShareProcessor for NativeMiningCoordinator {
         // consensus submission RPC make the authoritative decision.
         if is_network_winner {
             self.journal
-                .record(worker, self.job.job().job_id(), share)?;
+                .record(worker, authentication, self.job.job().job_id(), share)?;
             // The client ACK depends only on durable accounting. The dedicated
             // health monitor sees this release-store on its next one-second
             // cycle and performs submission without retaining the ASIC's
@@ -662,8 +718,22 @@ impl ShareProcessor for NativeMiningCoordinator {
 
         self.assert_current()?;
         self.journal
-            .record(worker, self.job.job().job_id(), share)?;
+            .record(worker, authentication, self.job.job().job_id(), share)?;
         Ok(())
+    }
+}
+
+impl ShareProcessor for NativeMiningCoordinator {
+    fn process(&self, worker: &str, share: &ValidatedNativeShare) -> Result<(), MinerError> {
+        self.process_with_attribution(worker, JournalWorkerAuthentication::Operator, share)
+    }
+
+    fn process_authenticated(
+        &self,
+        worker: &AuthenticatedWorker,
+        share: &ValidatedNativeShare,
+    ) -> Result<(), MinerError> {
+        self.process_with_attribution(worker.name(), worker.provenance().into(), share)
     }
 
     fn check_job_health(&self) -> Result<(), MinerError> {
@@ -692,15 +762,15 @@ struct ChildTemplate {
 struct ShareJournal {
     state: Mutex<JournalState>,
     path: PathBuf,
-    active_job: Option<ActiveJournalJob>,
 }
 
+#[derive(Clone)]
 struct ActiveJournalJob {
     job_id: String,
     child_hash_display: String,
     child_height: u32,
     parent_height: u32,
-    child_candidate_bytes: Vec<u8>,
+    child_candidate_bytes: Arc<[u8]>,
 }
 
 struct JournalState {
@@ -710,9 +780,68 @@ struct JournalState {
     /// otherwise terminate a partial JSON line and make crash recovery parse
     /// attacker-controlled concatenated data as a complete record.
     poisoned: bool,
-    active_job_ids: HashSet<[u8; 32]>,
-    active_winner_ids: HashSet<[u8; 32]>,
+    active_job: Option<Arc<ActiveJournalJob>>,
+    seen_job_ids: HashSet<[u8; 32]>,
+    active_job_attributions: HashMap<[u8; 32], ShareReplayIdentity>,
+    active_winner_attributions: HashMap<[u8; 32], ShareReplayIdentity>,
     pending_winners: HashMap<WinnerKey, PendingWinner>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShareAttribution {
+    worker: String,
+    authentication: JournalWorkerAuthentication,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShareReplayIdentity {
+    attribution: ShareAttribution,
+    /// Retained so two persisted records cannot rewrite acceptance history.
+    /// Live idempotent retries compare the remaining deterministic fields.
+    accepted_at: Option<u64>,
+    /// Binds every immutable share/winner field except `accepted_at`, which is
+    /// generated on first acceptance and cannot be reproduced by a retry.
+    immutable_fingerprint: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalWorkerAuthentication {
+    Operator,
+    ExactCredential,
+    SharedSecret,
+    LegacyUnknown,
+}
+
+impl JournalWorkerAuthentication {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::ExactCredential => "exact_credential",
+            Self::SharedSecret => "shared_secret",
+            Self::LegacyUnknown => "legacy_unknown",
+        }
+    }
+
+    fn from_persisted(value: Option<&str>) -> Result<Self, MinerError> {
+        match value {
+            Some("operator") => Ok(Self::Operator),
+            Some("exact_credential") => Ok(Self::ExactCredential),
+            Some("shared_secret") => Ok(Self::SharedSecret),
+            None => Ok(Self::LegacyUnknown),
+            Some(value) => Err(MinerError::InvalidRequest(format!(
+                "share journal contains unknown worker authentication provenance {value:?}"
+            ))),
+        }
+    }
+}
+
+impl From<WorkerAuthenticationProvenance> for JournalWorkerAuthentication {
+    fn from(provenance: WorkerAuthenticationProvenance) -> Self {
+        match provenance {
+            WorkerAuthenticationProvenance::ExactCredential => Self::ExactCredential,
+            WorkerAuthenticationProvenance::SharedSecret => Self::SharedSecret,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -758,6 +887,8 @@ struct PendingWinner {
 
 const MAX_SHARES_PER_JOB: usize = 100_000;
 const MAX_PENDING_WINNERS: usize = 4_096;
+const MAX_REPLAYED_WINNER_SHARES: usize = 1_000_000;
+pub(crate) const MAX_JOURNAL_GENERATIONS: usize = 1_000_000;
 const MAX_JOURNAL_RECORD_BYTES: usize = 10 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 1024 * 1024 * 1024;
 const JOURNAL_VERSION: u8 = 2;
@@ -770,6 +901,7 @@ impl ShareJournal {
                 "share journal path is empty".to_string(),
             ));
         }
+        reject_existing_journal_symlink(path)?;
         let mut options = OpenOptions::new();
         options.create(true).append(true).read(true);
         #[cfg(unix)]
@@ -784,6 +916,14 @@ impl ShareJournal {
                 path.display()
             ))
         })?;
+        if !file.metadata()?.is_file() {
+            return Err(MinerError::InvalidRequest(format!(
+                "share journal {} is not a regular file",
+                path.display()
+            )));
+        }
+        reject_existing_journal_symlink(path)?;
+        verify_locked_journal_path(&file, path)?;
         let journal_bytes = file.metadata()?.len();
         if journal_bytes > MAX_JOURNAL_BYTES {
             return Err(MinerError::InvalidRequest(format!(
@@ -811,10 +951,21 @@ impl ShareJournal {
             }
         }
         sync_journal_parent_directory(path)?;
-        let active_job_ids = HashSet::new();
-        let active_winner_ids = HashSet::new();
+        let active_job_attributions = HashMap::new();
+        let active_winner_attributions = HashMap::new();
         let mut pending_winners = HashMap::new();
+        let mut replayed_winner_identities = HashMap::new();
+        let mut seen_job_ids = HashSet::new();
+        // The accounting report is the authoritative interpretation of journal
+        // history. Run that exact parser before accepting any new share so the
+        // online outbox can never continue from a ledger that accounting would
+        // later reject. Rewind the cloned descriptor because `File::try_clone`
+        // can share its seek position with the locked handle.
         let mut reader = BufReader::new(file.try_clone()?);
+        read_accounting_snapshot_from_reader(&mut reader)?;
+        let mut replay_file = reader.into_inner();
+        replay_file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(replay_file);
         let mut complete_bytes = 0u64;
         while let Some((line, terminated, consumed)) = read_bounded_journal_line(&mut reader)? {
             if !terminated {
@@ -836,14 +987,46 @@ impl ShareJournal {
                     record.version, record.record
                 )));
             }
-            let share_id = parse_share_id(&record.share_id)?;
+            let job_id = parse_job_id(&record.job_id)?;
             match record.record.as_str() {
+                "job_activated" => {
+                    validate_persisted_job_activation(&record)?;
+                    if seen_job_ids.contains(&job_id) {
+                        return Err(MinerError::InvalidRequest(
+                            "share journal activates a previously used job ID".to_string(),
+                        ));
+                    }
+                    insert_seen_job_id(&mut seen_job_ids, job_id)?;
+                }
                 "accepted_share" => {
-                    // Accepted-share IDs are loaded for the newly prepared job
-                    // by activate_job; retaining every historical share here
-                    // would allow an old journal to consume unbounded memory.
+                    required_share_id(&record)?;
+                    // A legacy v2 journal might predate explicit activation
+                    // records. Its job IDs remain permanently reserved.
+                    insert_seen_job_id(&mut seen_job_ids, job_id)?;
                 }
                 "winner_outbox" => {
+                    let share_id = required_share_id(&record)?;
+                    insert_seen_job_id(&mut seen_job_ids, job_id)?;
+                    let identity = persisted_journal_record_fingerprint(&record);
+                    if let Some(previous) = replayed_winner_identities.get(&share_id) {
+                        if previous != &identity {
+                            return Err(MinerError::InvalidRequest(
+                                "share journal redefines a winner share ID with different immutable data"
+                                    .to_string(),
+                            ));
+                        }
+                        // An exact duplicate append is idempotent. In
+                        // particular, it must not resurrect an already-matured
+                        // outbox entry later in the same journal.
+                        continue;
+                    } else {
+                        replayed_winner_identities.insert(share_id, identity);
+                        if replayed_winner_identities.len() > MAX_REPLAYED_WINNER_SHARES {
+                            return Err(MinerError::InvalidRequest(format!(
+                                "share journal contains more than {MAX_REPLAYED_WINNER_SHARES} distinct winner shares"
+                            )));
+                        }
+                    }
                     let winners = persisted_winners(&record, share_id)?;
                     if winners.is_empty() {
                         return Err(MinerError::InvalidRequest(
@@ -869,6 +1052,7 @@ impl ShareJournal {
                     }
                 }
                 "winner_observed" | "winner_orphaned" | "winner_matured" | "winner_confirmed" => {
+                    let share_id = required_share_id(&record)?;
                     let chain = WinnerChain::parse(record.chain.as_deref().ok_or_else(|| {
                         MinerError::InvalidRequest("winner status record has no chain".to_string())
                     })?)?;
@@ -942,98 +1126,99 @@ impl ShareJournal {
                 file,
                 bytes_written: complete_bytes,
                 poisoned: false,
-                active_job_ids,
-                active_winner_ids,
+                active_job: None,
+                seen_job_ids,
+                active_job_attributions,
+                active_winner_attributions,
                 pending_winners,
             }),
             path: path.to_path_buf(),
-            active_job: None,
         })
     }
 
-    fn activate_job(&mut self, active_job: ActiveJournalJob) -> Result<(), MinerError> {
-        let state = self.state.get_mut().map_err(|_| journal_mutex_error())?;
-        verify_locked_journal_path(&state.file, &self.path)?;
-        let mut file = state.file.try_clone()?;
-        file.seek(SeekFrom::Start(0))?;
-        let mut reader = BufReader::new(file);
-        let mut active_job_ids = HashSet::new();
-        let mut active_winner_ids = HashSet::new();
-        while let Some((line, terminated, _consumed)) = read_bounded_journal_line(&mut reader)? {
-            if !terminated {
-                return Err(MinerError::InvalidRequest(
-                    "share journal changed while the active job was being loaded".to_string(),
-                ));
-            }
-            let record: PersistedShareKey = serde_json::from_slice(&line).map_err(|error| {
-                MinerError::InvalidRequest(format!("share journal is corrupted: {error}"))
-            })?;
-            if record.version != JOURNAL_VERSION || record.job_id != active_job.job_id {
-                continue;
-            }
-            let share_id = parse_share_id(&record.share_id)?;
-            match record.record.as_str() {
-                "accepted_share" => {
-                    active_job_ids.insert(share_id);
-                }
-                "winner_outbox" => {
-                    active_winner_ids.insert(share_id);
-                }
-                "winner_observed" | "winner_orphaned" | "winner_matured" | "winner_confirmed" => {}
-                _ => {
-                    return Err(MinerError::InvalidRequest(format!(
-                        "share journal contains unsupported version {} record {:?}",
-                        record.version, record.record
-                    )));
-                }
-            }
-            if active_job_ids.len() > MAX_SHARES_PER_JOB {
-                return Err(MinerError::InvalidRequest(format!(
-                    "share journal already contains more than {MAX_SHARES_PER_JOB} shares for job {}",
-                    active_job.job_id
-                )));
-            }
+    fn activate_job(&self, active_job: ActiveJournalJob) -> Result<(), MinerError> {
+        let job_id = parse_job_id(&active_job.job_id)?;
+        parse_canonical_journal_hex(&active_job.child_hash_display, "activated Wcash block hash")?;
+        if active_job.child_height == 0 || active_job.parent_height == 0 {
+            return Err(MinerError::InvalidRequest(
+                "activated native job heights must be positive".to_string(),
+            ));
         }
-
-        verify_locked_journal_path(&state.file, &self.path)?;
-        state.active_job_ids = active_job_ids;
-        state.active_winner_ids = active_winner_ids;
-        self.active_job = Some(active_job);
+        let mut state = self.lock_state()?;
+        if state.seen_job_ids.contains(&job_id) {
+            return Err(MinerError::InvalidRequest(format!(
+                "native job ID {} was already activated or recorded; refusing unsafe reuse",
+                active_job.job_id
+            )));
+        }
+        ensure_job_generation_capacity(state.seen_job_ids.len(), false)?;
+        let record = json!({
+            "version": JOURNAL_VERSION,
+            "record": "job_activated",
+            "recorded_at": unix_timestamp()?,
+            "job_id": &active_job.job_id,
+            "wcash_block_hash": &active_job.child_hash_display,
+            "wcash_height": active_job.child_height,
+            "zcash_height": active_job.parent_height,
+        });
+        let mut encoded = serde_json::to_vec(&record)?;
+        encoded.push(b'\n');
+        append_synced_journal_record(&mut state, &self.path, &encoded)?;
+        state.seen_job_ids.insert(job_id);
+        state.active_job_attributions.clear();
+        state.active_winner_attributions.clear();
+        state.active_job = Some(Arc::new(active_job));
         Ok(())
     }
 
     fn record(
         &self,
         worker: &str,
+        authentication: JournalWorkerAuthentication,
         job_id: &str,
         share: &ValidatedNativeShare,
     ) -> Result<[u8; 32], MinerError> {
-        let active_job = self.active_job.as_ref().ok_or_else(|| {
-            MinerError::InvalidRequest("share journal has no active mining job".to_string())
-        })?;
-        if active_job.job_id != job_id {
-            return Err(MinerError::InvalidRequest(
-                "share belongs to a different job than the active journal".to_string(),
-            ));
-        }
+        validate_attribution_worker(worker)?;
+        let mut state = self.lock_state()?;
+        let active_job = active_job_for_share(&state, job_id)?;
         let share_id = share_id(job_id, share);
         let is_network_winner = share.wcash_candidate().is_some() || share.parent_block().is_some();
         let wcash_block = share
             .wcash_candidate()
             .map(|winner| {
                 complete_wcash_candidate(
-                    &active_job.child_candidate_bytes,
+                    active_job.child_candidate_bytes.as_ref(),
                     &active_job.child_hash_display,
                     winner.encoded_proof(),
                 )
             })
             .transpose()?;
         let zcash_block = share.parent_block().map(<[u8]>::to_vec);
-        let mut state = self.lock_state()?;
-        if state.active_job_ids.contains(&share_id) || state.active_winner_ids.contains(&share_id) {
+        let timestamp = unix_timestamp()?;
+        let record = json!({
+            "version": JOURNAL_VERSION,
+            "record": if is_network_winner { "winner_outbox" } else { "accepted_share" },
+            "accepted_at": timestamp,
+            "share_id": hex::encode(share_id),
+            "worker": worker,
+            "worker_authentication": authentication.as_str(),
+            "job_id": job_id,
+            "parent_hash_le": hex::encode(share.parent_block_hash().into_le_bytes()),
+            "share_target": display_target(share.accepted_target()),
+            "wcash_candidate": share.wcash_candidate().is_some(),
+            "zcash_candidate": share.parent_block().is_some(),
+            "wcash_block_hash": &active_job.child_hash_display,
+            "wcash_height": active_job.child_height,
+            "zcash_height": active_job.parent_height,
+            "wcash_block": wcash_block.as_deref().map(hex::encode),
+            "zcash_block": zcash_block.as_deref().map(hex::encode),
+        });
+        let persisted_record: PersistedShareKey = serde_json::from_value(record.clone())?;
+        let identity = persisted_share_identity(&persisted_record)?;
+        if is_matching_replay(&state, share_id, &identity)? {
             return Ok(share_id);
         }
-        if !is_network_winner && state.active_job_ids.len() >= MAX_SHARES_PER_JOB {
+        if !is_network_winner && state.active_job_attributions.len() >= MAX_SHARES_PER_JOB {
             return Err(MinerError::InvalidRequest(format!(
                 "share journal reached the {MAX_SHARES_PER_JOB}-share per-job safety limit; rotate work before accepting more shares"
             )));
@@ -1054,30 +1239,11 @@ impl ShareJournal {
             .count();
             ensure_pending_winner_capacity(state.pending_winners.len(), additional_winners)?;
         }
-
-        let timestamp = unix_timestamp()?;
-        let record = json!({
-            "version": JOURNAL_VERSION,
-            "record": if is_network_winner { "winner_outbox" } else { "accepted_share" },
-            "accepted_at": timestamp,
-            "share_id": hex::encode(share_id),
-            "worker": worker,
-            "job_id": job_id,
-            "parent_hash_le": hex::encode(share.parent_block_hash().into_le_bytes()),
-            "share_target": display_target(share.accepted_target()),
-            "wcash_candidate": share.wcash_candidate().is_some(),
-            "zcash_candidate": share.parent_block().is_some(),
-            "wcash_block_hash": &active_job.child_hash_display,
-            "wcash_height": active_job.child_height,
-            "zcash_height": active_job.parent_height,
-            "wcash_block": wcash_block.as_deref().map(hex::encode),
-            "zcash_block": zcash_block.as_deref().map(hex::encode),
-        });
         let mut encoded = serde_json::to_vec(&record)?;
         encoded.push(b'\n');
         append_synced_journal_record(&mut state, &self.path, &encoded)?;
         if is_network_winner {
-            state.active_winner_ids.insert(share_id);
+            state.active_winner_attributions.insert(share_id, identity);
             if let Some(block_bytes) = wcash_block {
                 let key = WinnerKey {
                     share_id,
@@ -1113,7 +1279,7 @@ impl ShareJournal {
                 );
             }
         } else {
-            state.active_job_ids.insert(share_id);
+            state.active_job_attributions.insert(share_id, identity);
         }
         Ok(share_id)
     }
@@ -1226,17 +1392,29 @@ impl WinnerStatus {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedShareKey {
     version: u8,
     record: String,
     job_id: String,
-    share_id: String,
+    #[serde(default)]
+    share_id: Option<String>,
+    #[serde(default)]
+    accepted_at: Option<u64>,
+    #[serde(default)]
+    recorded_at: Option<u64>,
+    #[serde(default)]
+    worker: Option<String>,
+    #[serde(default)]
+    worker_authentication: Option<String>,
     #[serde(default)]
     wcash_candidate: bool,
     #[serde(default)]
     zcash_candidate: bool,
     #[serde(default)]
     parent_hash_le: Option<String>,
+    #[serde(default)]
+    share_target: Option<String>,
     #[serde(default)]
     wcash_block_hash: Option<String>,
     #[serde(default)]
@@ -1255,10 +1433,193 @@ struct PersistedShareKey {
     height: Option<u32>,
 }
 
+fn required_share_id(record: &PersistedShareKey) -> Result<[u8; 32], MinerError> {
+    parse_share_id(required_journal_field(
+        record.share_id.as_deref(),
+        "share_id",
+    )?)
+}
+
+fn validate_persisted_job_activation(record: &PersistedShareKey) -> Result<(), MinerError> {
+    parse_job_id(&record.job_id)?;
+    if record.recorded_at == Some(0)
+        || record.recorded_at.is_none()
+        || record.accepted_at.is_some()
+        || record.share_id.is_some()
+        || record.worker.is_some()
+        || record.worker_authentication.is_some()
+        || record.parent_hash_le.is_some()
+        || record.share_target.is_some()
+        || record.wcash_candidate
+        || record.zcash_candidate
+        || record.wcash_block.is_some()
+        || record.zcash_block.is_some()
+        || record.chain.is_some()
+        || record.block_hash.is_some()
+        || record.height.is_some()
+    {
+        return Err(MinerError::InvalidRequest(
+            "share journal contains malformed job activation metadata".to_string(),
+        ));
+    }
+    let child_hash = required_journal_field(
+        record.wcash_block_hash.as_deref(),
+        "job_activated.wcash_block_hash",
+    )?;
+    parse_canonical_journal_hex(child_hash, "job_activated.wcash_block_hash")?;
+    if record.wcash_height.is_none_or(|height| height == 0)
+        || record.zcash_height.is_none_or(|height| height == 0)
+    {
+        return Err(MinerError::InvalidRequest(
+            "share journal job activation has no positive chain heights".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn active_job_for_share(
+    state: &JournalState,
+    job_id: &str,
+) -> Result<Arc<ActiveJournalJob>, MinerError> {
+    let active_job = state.active_job.as_ref().ok_or_else(|| {
+        MinerError::InvalidRequest("share journal has no active mining job".to_string())
+    })?;
+    if active_job.job_id != job_id {
+        return Err(MinerError::InvalidRequest(
+            "share belongs to a different or retired journal generation".to_string(),
+        ));
+    }
+    Ok(Arc::clone(active_job))
+}
+
+fn persisted_share_attribution(record: &PersistedShareKey) -> Result<ShareAttribution, MinerError> {
+    let worker = required_journal_field(record.worker.as_deref(), "share.worker")?;
+    validate_attribution_worker(worker)?;
+    Ok(ShareAttribution {
+        worker: worker.to_string(),
+        authentication: JournalWorkerAuthentication::from_persisted(
+            record.worker_authentication.as_deref(),
+        )?,
+    })
+}
+
+fn persisted_share_identity(record: &PersistedShareKey) -> Result<ShareReplayIdentity, MinerError> {
+    if record.accepted_at == Some(0) {
+        return Err(MinerError::InvalidRequest(
+            "share journal has an invalid zero acceptance timestamp".to_string(),
+        ));
+    }
+    Ok(ShareReplayIdentity {
+        attribution: persisted_share_attribution(record)?,
+        accepted_at: record.accepted_at,
+        immutable_fingerprint: persisted_share_fingerprint(record),
+    })
+}
+
+fn persisted_journal_record_fingerprint(record: &PersistedShareKey) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"Wcash/share-journal/exact-record/v1\0");
+    update_fingerprint_optional_u64(&mut digest, record.accepted_at);
+    digest.update(persisted_share_fingerprint(record));
+    digest.finalize().into()
+}
+
+fn persisted_share_fingerprint(record: &PersistedShareKey) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"Wcash/share-journal/immutable-replay/v1\0");
+    update_fingerprint_bytes(&mut digest, record.record.as_bytes());
+    update_fingerprint_bytes(&mut digest, record.job_id.as_bytes());
+    update_fingerprint_optional(&mut digest, record.worker.as_deref());
+    update_fingerprint_optional(&mut digest, record.worker_authentication.as_deref());
+    update_fingerprint_optional(&mut digest, record.parent_hash_le.as_deref());
+    update_fingerprint_optional(&mut digest, record.share_target.as_deref());
+    digest.update([
+        u8::from(record.wcash_candidate),
+        u8::from(record.zcash_candidate),
+    ]);
+    update_fingerprint_optional(&mut digest, record.wcash_block_hash.as_deref());
+    update_fingerprint_optional_u32(&mut digest, record.wcash_height);
+    update_fingerprint_optional_u32(&mut digest, record.zcash_height);
+    update_fingerprint_optional(&mut digest, record.wcash_block.as_deref());
+    update_fingerprint_optional(&mut digest, record.zcash_block.as_deref());
+    digest.finalize().into()
+}
+
+fn update_fingerprint_bytes(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value);
+}
+
+fn update_fingerprint_optional(digest: &mut Sha256, value: Option<&str>) {
+    digest.update([u8::from(value.is_some())]);
+    if let Some(value) = value {
+        update_fingerprint_bytes(digest, value.as_bytes());
+    }
+}
+
+fn update_fingerprint_optional_u32(digest: &mut Sha256, value: Option<u32>) {
+    digest.update([u8::from(value.is_some())]);
+    if let Some(value) = value {
+        digest.update(value.to_le_bytes());
+    }
+}
+
+fn update_fingerprint_optional_u64(digest: &mut Sha256, value: Option<u64>) {
+    digest.update([u8::from(value.is_some())]);
+    if let Some(value) = value {
+        digest.update(value.to_le_bytes());
+    }
+}
+
+fn validate_attribution_worker(worker: &str) -> Result<(), MinerError> {
+    if worker.is_empty()
+        || worker.len() > 128
+        || !worker
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':'))
+    {
+        return Err(MinerError::InvalidRequest(
+            "share worker must contain 1..=128 ASCII letters, digits, '.', '-', '_', or ':'"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_matching_replay(
+    state: &JournalState,
+    share_id: [u8; 32],
+    identity: &ShareReplayIdentity,
+) -> Result<bool, MinerError> {
+    let existing = state
+        .active_job_attributions
+        .get(&share_id)
+        .or_else(|| state.active_winner_attributions.get(&share_id));
+    match existing {
+        None => Ok(false),
+        Some(existing)
+            if existing.attribution == identity.attribution
+                && existing.immutable_fingerprint == identity.immutable_fingerprint =>
+        {
+            Ok(true)
+        }
+        Some(_) => Err(MinerError::InvalidRequest(
+            "share replay conflicts with immutable data in the durable journal entry".to_string(),
+        )),
+    }
+}
+
 fn persisted_winners(
     record: &PersistedShareKey,
     share_id: [u8; 32],
 ) -> Result<Vec<PendingWinner>, MinerError> {
+    let expected_parent_hash = parse_raw_hash(
+        required_journal_field(
+            record.parent_hash_le.as_deref(),
+            "winner_outbox.parent_hash_le",
+        )?,
+        "winner_outbox.parent_hash_le",
+    )?;
     let mut winners = Vec::with_capacity(2);
     if record.wcash_candidate {
         let block_hash_display = required_journal_field(
@@ -1275,12 +1636,17 @@ fn persisted_winners(
             "winner_outbox.wcash_block",
             MAX_CHILD_BLOCK_BYTES,
         )?;
-        validate_persisted_block(
+        let recovered_parent_hash = validate_persisted_winner_block(
             &block_bytes,
             &block_hash_display,
             height,
-            Some(WCASH_BLOCK_WIRE_VERSION),
+            PersistedWinnerBlockKind::Wcash,
         )?;
+        if recovered_parent_hash != expected_parent_hash {
+            return Err(MinerError::InvalidRequest(
+                "share journal Wcash winner is bound to a different parent header".to_string(),
+            ));
+        }
         let key = WinnerKey {
             share_id,
             chain: WinnerChain::Wcash,
@@ -1295,14 +1661,7 @@ fn persisted_winners(
         });
     }
     if record.zcash_candidate {
-        let raw_parent_hash = parse_raw_hash(
-            required_journal_field(
-                record.parent_hash_le.as_deref(),
-                "winner_outbox.parent_hash_le",
-            )?,
-            "winner_outbox.parent_hash_le",
-        )?;
-        let block_hash_display = display_hash(raw_parent_hash);
+        let block_hash_display = display_hash(expected_parent_hash);
         let height = record.zcash_height.ok_or_else(|| {
             MinerError::InvalidRequest("winner_outbox has no Zcash height".to_string())
         })?;
@@ -1311,7 +1670,17 @@ fn persisted_winners(
             "winner_outbox.zcash_block",
             MAX_CHILD_BLOCK_BYTES,
         )?;
-        validate_persisted_block(&block_bytes, &block_hash_display, height, None)?;
+        let recovered_parent_hash = validate_persisted_winner_block(
+            &block_bytes,
+            &block_hash_display,
+            height,
+            PersistedWinnerBlockKind::Zcash,
+        )?;
+        if recovered_parent_hash != expected_parent_hash {
+            return Err(MinerError::InvalidRequest(
+                "share journal Zcash winner is bound to a different parent header".to_string(),
+            ));
+        }
         let key = WinnerKey {
             share_id,
             chain: WinnerChain::Zcash,
@@ -1332,12 +1701,19 @@ fn required_journal_field<'a>(value: Option<&'a str>, field: &str) -> Result<&'a
     value.ok_or_else(|| MinerError::InvalidRequest(format!("share journal has no {field}")))
 }
 
-fn validate_persisted_block(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PersistedWinnerBlockKind {
+    Wcash,
+    Zcash,
+}
+
+/// Consensus-validates exact winner bytes and their immutable journal metadata.
+pub(crate) fn validate_persisted_winner_block(
     block_bytes: &[u8],
     expected_hash_display: &str,
     expected_height: u32,
-    expected_version: Option<u32>,
-) -> Result<(), MinerError> {
+    kind: PersistedWinnerBlockKind,
+) -> Result<[u8; 32], MinerError> {
     let block: Block = block_bytes.zcash_deserialize_into().map_err(|error| {
         MinerError::InvalidRequest(format!("share journal contains an invalid block: {error}"))
     })?;
@@ -1347,6 +1723,10 @@ fn validate_persisted_block(
         ));
     }
     let expected_hash = parse_display_hash(expected_hash_display, "winner_outbox block hash")?;
+    let expected_version = match kind {
+        PersistedWinnerBlockKind::Wcash => Some(WCASH_BLOCK_WIRE_VERSION),
+        PersistedWinnerBlockKind::Zcash => None,
+    };
     if block.hash().0 != expected_hash
         || block.coinbase_height().map(u32::from) != Some(expected_height)
         || expected_version.is_some_and(|version| block.header.version != version)
@@ -1366,7 +1746,36 @@ fn validate_persisted_block(
             "share journal Wcash winner has no AuxPoW witness".to_string(),
         ));
     }
-    if expected_version.is_some() {
+    let expanded = block
+        .header
+        .difficulty_threshold
+        .to_expanded()
+        .ok_or_else(|| {
+            MinerError::InvalidRequest(format!(
+                "share journal {} winner has an invalid compact target",
+                match kind {
+                    PersistedWinnerBlockKind::Wcash => "Wcash",
+                    PersistedWinnerBlockKind::Zcash => "Zcash",
+                }
+            ))
+        })?;
+    if expanded.to_compact() != block.header.difficulty_threshold {
+        return Err(MinerError::InvalidRequest(format!(
+            "share journal {} winner has a non-canonical compact target",
+            match kind {
+                PersistedWinnerBlockKind::Wcash => "Wcash",
+                PersistedWinnerBlockKind::Zcash => "Zcash",
+            }
+        )));
+    }
+    let expanded_value: U256 = expanded.into();
+    let target = Target::from_le_bytes(expanded_value.to_little_endian()).map_err(|error| {
+        MinerError::InvalidRequest(format!(
+            "share journal winner has an invalid target: {error}"
+        ))
+    })?;
+
+    let parent_hash = if expected_version.is_some() {
         let witness = block
             .header
             .solution
@@ -1377,28 +1786,30 @@ fn validate_persisted_block(
                 "share journal Wcash winner contains malformed AuxPoW: {error}"
             ))
         })?;
-        let expanded = block
-            .header
-            .difficulty_threshold
-            .to_expanded()
-            .ok_or_else(|| {
-                MinerError::InvalidRequest(
-                    "share journal Wcash winner has an invalid compact target".to_string(),
-                )
-            })?;
-        let expanded: U256 = expanded.into();
-        let target = Target::from_le_bytes(expanded.to_little_endian()).map_err(|error| {
-            MinerError::InvalidRequest(format!(
-                "share journal Wcash winner has an invalid target: {error}"
-            ))
-        })?;
         proof.validate(block.hash().0, target).map_err(|error| {
             MinerError::InvalidRequest(format!(
                 "share journal Wcash winner contains invalid AuxPoW: {error}"
             ))
         })?;
-    }
-    Ok(())
+        proof.parent_header().block_hash().into_le_bytes()
+    } else {
+        if !target.is_met_by_le_hash(block.hash().0) {
+            return Err(MinerError::InvalidRequest(
+                "share journal Zcash winner does not meet its compact target".to_string(),
+            ));
+        }
+        block
+            .header
+            .solution
+            .check(&block.header)
+            .map_err(|error| {
+                MinerError::InvalidRequest(format!(
+                    "share journal Zcash winner contains invalid Equihash: {error}"
+                ))
+            })?;
+        block.hash().0
+    };
+    Ok(parent_hash)
 }
 
 fn read_bounded_journal_line<R: BufRead>(
@@ -1517,6 +1928,18 @@ fn verify_locked_journal_path(file: &File, path: &Path) -> Result<(), MinerError
     use std::os::unix::fs::MetadataExt;
 
     let locked = file.metadata()?;
+    let path_metadata = fs::symlink_metadata(path).map_err(|_| {
+        MinerError::InvalidRequest(format!(
+            "share journal path {} no longer refers to the locked file; stop the coordinator before rotating it",
+            path.display()
+        ))
+    })?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(MinerError::InvalidRequest(format!(
+            "share journal path {} must remain a regular non-symbolic-link file",
+            path.display()
+        )));
+    }
     let current = fs::metadata(path).map_err(|_| {
         MinerError::InvalidRequest(format!(
             "share journal path {} no longer refers to the locked file; stop the coordinator before rotating it",
@@ -1534,13 +1957,33 @@ fn verify_locked_journal_path(file: &File, path: &Path) -> Result<(), MinerError
 
 #[cfg(not(unix))]
 fn verify_locked_journal_path(_file: &File, path: &Path) -> Result<(), MinerError> {
-    if !path.is_file() {
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        MinerError::InvalidRequest(format!(
+            "share journal path {} no longer refers to the locked file",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(MinerError::InvalidRequest(format!(
-            "share journal path {} is no longer a regular file",
+            "share journal path {} is no longer a regular non-symbolic-link file",
             path.display()
         )));
     }
     Ok(())
+}
+
+fn reject_existing_journal_symlink(path: &Path) -> Result<(), MinerError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(MinerError::InvalidRequest(format!(
+                "share journal {} must not be a symbolic link",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(MinerError::Io(error)),
+    }
 }
 
 fn journal_mutex_error() -> MinerError {
@@ -1610,23 +2053,66 @@ fn complete_wcash_candidate(
     Ok(completed)
 }
 
-fn parse_share_id(encoded: &str) -> Result<[u8; 32], MinerError> {
-    if encoded.len() != 64 {
-        return Err(MinerError::InvalidRequest(
-            "share journal contains a non-32-byte share ID".to_string(),
-        ));
+fn parse_job_id(encoded: &str) -> Result<[u8; 32], MinerError> {
+    parse_journal_id(encoded, "job")
+}
+
+fn insert_seen_job_id(
+    seen_job_ids: &mut HashSet<[u8; 32]>,
+    job_id: [u8; 32],
+) -> Result<(), MinerError> {
+    let already_seen = seen_job_ids.contains(&job_id);
+    ensure_job_generation_capacity(seen_job_ids.len(), already_seen)?;
+    seen_job_ids.insert(job_id);
+    Ok(())
+}
+
+fn ensure_job_generation_capacity(count: usize, already_seen: bool) -> Result<(), MinerError> {
+    if !already_seen && count >= MAX_JOURNAL_GENERATIONS {
+        return Err(MinerError::InvalidRequest(format!(
+            "share journal contains more than {MAX_JOURNAL_GENERATIONS} mining generations"
+        )));
     }
-    hex::decode(encoded)
+    Ok(())
+}
+
+fn parse_share_id(encoded: &str) -> Result<[u8; 32], MinerError> {
+    parse_journal_id(encoded, "share")
+}
+
+fn parse_canonical_journal_hex(encoded: &str, field: &'static str) -> Result<[u8; 32], MinerError> {
+    let decoded = parse_raw_hash(encoded, field)?;
+    if encoded != hex::encode(decoded) {
+        return Err(MinerError::InvalidRequest(format!(
+            "share journal {field} is not canonical lowercase hexadecimal"
+        )));
+    }
+    Ok(decoded)
+}
+
+fn parse_journal_id(encoded: &str, kind: &str) -> Result<[u8; 32], MinerError> {
+    if encoded.len() != 64 {
+        return Err(MinerError::InvalidRequest(format!(
+            "share journal contains a non-32-byte {kind} ID"
+        )));
+    }
+    let decoded: [u8; 32] = hex::decode(encoded)
         .map_err(|error| {
-            MinerError::InvalidRequest(format!("share journal contains invalid share ID: {error}"))
+            MinerError::InvalidRequest(format!("share journal contains invalid {kind} ID: {error}"))
         })?
         .try_into()
         .map_err(|bytes: Vec<u8>| {
             MinerError::InvalidRequest(format!(
-                "share journal ID decoded to {} bytes, expected 32",
+                "share journal {kind} ID decoded to {} bytes, expected 32",
                 bytes.len()
             ))
-        })
+        })?;
+    if encoded != hex::encode(decoded) {
+        return Err(MinerError::InvalidRequest(format!(
+            "share journal {kind} ID is not canonical lowercase hexadecimal"
+        )));
+    }
+    Ok(decoded)
 }
 
 fn parse_raw_hash(encoded: &str, field: &'static str) -> Result<[u8; 32], MinerError> {
@@ -1714,10 +2200,75 @@ fn decode_bounded_hex(
 mod tests {
     use std::fs;
 
+    use hex::FromHex;
     use tempfile::tempdir;
-    use zebra_chain::block::genesis::{regtest_genesis_block, wcash_regtest_genesis_block};
+    use zebra_chain::block::genesis::wcash_regtest_genesis_block;
 
     use super::*;
+
+    fn mainnet_genesis_block() -> Block {
+        Vec::from_hex(include_str!("../../zebra-test/src/vectors/block-main-0-000-000.txt").trim())
+            .expect("mainnet genesis fixture is hex")
+            .zcash_deserialize_into()
+            .expect("mainnet genesis fixture is a block")
+    }
+
+    fn mainnet_block_one() -> Block {
+        Vec::from_hex(include_str!("../../zebra-test/src/vectors/block-main-0-000-001.txt").trim())
+            .expect("mainnet block fixture is hex")
+            .zcash_deserialize_into()
+            .expect("mainnet block fixture is a block")
+    }
+
+    fn journal_share_id(job_id: &str, parent_hash_le: [u8; 32]) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"Wcash/share-journal/v2\0");
+        hash.update(
+            u64::try_from(job_id.len())
+                .expect("fixture job length fits u64")
+                .to_le_bytes(),
+        );
+        hash.update(job_id.as_bytes());
+        hash.update(parent_hash_le);
+        hex::encode(<[u8; 32]>::from(hash.finalize()))
+    }
+
+    fn accepted_share_fixture(
+        job_id: &str,
+        parent_hash_le: [u8; 32],
+        worker: &str,
+        authentication: Option<&str>,
+    ) -> serde_json::Value {
+        let mut record = json!({
+            "version": JOURNAL_VERSION,
+            "record": "accepted_share",
+            "accepted_at": 1,
+            "job_id": job_id,
+            "share_id": journal_share_id(job_id, parent_hash_le),
+            "worker": worker,
+            "parent_hash_le": hex::encode(parent_hash_le),
+            "share_target": "ff".repeat(32),
+            "wcash_candidate": false,
+            "zcash_candidate": false,
+            "wcash_block_hash": "42".repeat(32),
+            "wcash_height": 1,
+            "zcash_height": 1,
+        });
+        if let Some(authentication) = authentication {
+            record["worker_authentication"] = json!(authentication);
+        }
+        record
+    }
+
+    fn active_job_fixture(byte: u8) -> ActiveJournalJob {
+        ActiveJournalJob {
+            job_id: format!("{byte:02x}").repeat(32),
+            child_hash_display: format!("{:02x}", byte.wrapping_add(1)).repeat(32),
+            child_height: 1,
+            parent_height: 1,
+            child_candidate_bytes: Arc::from([]),
+        }
+    }
 
     #[test]
     fn display_hash_and_target_are_reversed_exactly_once() {
@@ -1780,6 +2331,232 @@ mod tests {
         assert_eq!(parse_share_id(&"07".repeat(32)).expect("valid ID"), [7; 32]);
         assert!(parse_share_id("07").is_err());
         assert!(parse_share_id(&"zz".repeat(32)).is_err());
+        assert!(parse_job_id(&"AB".repeat(32)).is_err());
+        assert!(ensure_job_generation_capacity(MAX_JOURNAL_GENERATIONS - 1, false).is_ok());
+        assert!(ensure_job_generation_capacity(MAX_JOURNAL_GENERATIONS, true).is_ok());
+        assert!(ensure_job_generation_capacity(MAX_JOURNAL_GENERATIONS, false).is_err());
+    }
+
+    #[test]
+    fn job_activation_is_durable_and_reuse_fails_after_restart() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("shares.jsonl");
+        let first = active_job_fixture(0x11);
+        let journal = ShareJournal::open(&path).expect("new private journal");
+        journal
+            .activate_job(first.clone())
+            .expect("first activation is durable");
+        let records = fs::read_to_string(&path).expect("read activation journal");
+        let activation: serde_json::Value =
+            serde_json::from_str(records.trim()).expect("activation is JSON");
+        assert_eq!(activation["record"], "job_activated");
+        assert_eq!(activation["job_id"], first.job_id);
+        assert!(activation.get("share_id").is_none());
+        drop(journal);
+
+        let recovered = ShareJournal::open(&path).expect("recover activation");
+        assert!(recovered.activate_job(first).is_err());
+    }
+
+    #[test]
+    fn rotation_rejects_late_shares_and_a_b_a_job_reuse() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("shares.jsonl");
+        let journal = ShareJournal::open(&path).expect("new private journal");
+        let first = active_job_fixture(0x21);
+        let second = active_job_fixture(0x22);
+        journal
+            .activate_job(first.clone())
+            .expect("activate generation A");
+        journal
+            .activate_job(second.clone())
+            .expect("activate generation B");
+        let state = journal.state.lock().expect("journal state");
+        assert!(active_job_for_share(&state, &first.job_id).is_err());
+        assert!(active_job_for_share(&state, &second.job_id).is_ok());
+        drop(state);
+        assert!(journal.activate_job(first).is_err());
+        assert_eq!(
+            fs::read_to_string(&path)
+                .expect("read journal")
+                .lines()
+                .count(),
+            2,
+            "failed A-B-A reuse must not append a third activation"
+        );
+    }
+
+    #[test]
+    fn legacy_share_job_id_is_permanently_reserved() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("shares.jsonl");
+        let job = active_job_fixture(0x31);
+        let parent_hash_le = [0x41; 32];
+        write_journal_records(
+            &path,
+            &[accepted_share_fixture(
+                &job.job_id,
+                parent_hash_le,
+                "legacy worker",
+                None,
+            )],
+        );
+        let journal = ShareJournal::open(&path).expect("legacy journal recovers");
+        assert!(journal.activate_job(job).is_err());
+        drop(journal);
+        let snapshot = crate::accounting::read_accounting_snapshot(&path)
+            .expect("the same complete legacy record remains accountable");
+        assert_eq!(snapshot.shares_by_authentication["legacy_unknown"], 1);
+        assert_eq!(snapshot.workers["legacy worker"].accepted_shares, 1);
+    }
+
+    #[test]
+    fn online_replay_rejects_every_accounting_invalid_share_shape() {
+        let directory = tempdir().expect("temporary directory");
+        let base = accepted_share_fixture(
+            &"43".repeat(32),
+            [0x44; 32],
+            "account.rig-01",
+            Some("exact_credential"),
+        );
+        let malformed = vec![
+            {
+                let mut record = base.clone();
+                record.as_object_mut().unwrap().remove("accepted_at");
+                record
+            },
+            {
+                let mut record = base.clone();
+                record["accepted_at"] = json!(0);
+                record
+            },
+            {
+                let mut record = base.clone();
+                record.as_object_mut().unwrap().remove("worker");
+                record
+            },
+            {
+                let mut record = base.clone();
+                record["worker_authentication"] = json!("legacy_unknown");
+                record
+            },
+            {
+                let mut record = base.clone();
+                record.as_object_mut().unwrap().remove("parent_hash_le");
+                record
+            },
+            {
+                let mut record = base.clone();
+                record["share_target"] = json!("00".repeat(32));
+                record
+            },
+            {
+                let mut record = base.clone();
+                record["share_target"] = json!("FF".repeat(32));
+                record
+            },
+            {
+                let mut record = base.clone();
+                record["share_id"] = json!("45".repeat(32));
+                record
+            },
+            {
+                let mut record = base.clone();
+                record.as_object_mut().unwrap().remove("wcash_candidate");
+                record
+            },
+            {
+                let mut record = base.clone();
+                record["wcash_candidate"] = json!(true);
+                record
+            },
+            {
+                let mut record = base.clone();
+                record.as_object_mut().unwrap().remove("wcash_block_hash");
+                record
+            },
+            {
+                let mut record = base.clone();
+                record["zcash_height"] = json!(0);
+                record
+            },
+            {
+                let mut record = base.clone();
+                record["chain"] = json!("zcash");
+                record
+            },
+        ];
+        for (index, record) in malformed.into_iter().enumerate() {
+            let path = directory
+                .path()
+                .join(format!("malformed-share-{index}.jsonl"));
+            write_journal_records(&path, &[record]);
+            assert!(
+                ShareJournal::open(&path).is_err(),
+                "malformed share fixture {index} must fail online replay"
+            );
+        }
+
+        let valid_path = directory.path().join("valid-share.jsonl");
+        write_journal_records(&valid_path, &[base]);
+        assert!(ShareJournal::open(&valid_path).is_ok());
+    }
+
+    #[test]
+    fn malformed_or_duplicate_activation_fails_closed() {
+        let directory = tempdir().expect("temporary directory");
+        let malformed_path = directory.path().join("malformed.jsonl");
+        let duplicate_path = directory.path().join("duplicate.jsonl");
+        let activation = json!({
+            "version": JOURNAL_VERSION,
+            "record": "job_activated",
+            "recorded_at": 1,
+            "job_id": "51".repeat(32),
+            "wcash_block_hash": "61".repeat(32),
+            "wcash_height": 1,
+            "zcash_height": 1,
+        });
+        let mut malformed = activation.clone();
+        malformed["share_id"] = json!("71".repeat(32));
+        write_journal_records(&malformed_path, &[malformed]);
+        assert!(ShareJournal::open(&malformed_path).is_err());
+        write_journal_records(&duplicate_path, &[activation.clone(), activation]);
+        assert!(ShareJournal::open(&duplicate_path).is_err());
+    }
+
+    #[test]
+    fn duplicate_winner_share_id_requires_an_exact_record() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("winner.jsonl");
+        let block = mainnet_block_one();
+        let raw_hash = block.hash().0;
+        let job_id = "81".repeat(32);
+        let outbox = json!({
+            "version": JOURNAL_VERSION,
+            "record": "winner_outbox",
+            "accepted_at": 1,
+            "job_id": job_id,
+            "share_id": journal_share_id(&"81".repeat(32), raw_hash),
+            "worker": "account.rig-01",
+            "worker_authentication": "exact_credential",
+            "parent_hash_le": hex::encode(raw_hash),
+            "share_target": "ff".repeat(32),
+            "wcash_candidate": false,
+            "zcash_candidate": true,
+            "wcash_block_hash": "82".repeat(32),
+            "wcash_height": 1,
+            "zcash_height": 1,
+            "zcash_block": hex::encode(
+                block.zcash_serialize_to_vec().expect("fixture serializes")
+            ),
+        });
+        write_journal_records(&path, &[outbox.clone(), outbox.clone()]);
+        assert!(ShareJournal::open(&path).is_ok());
+
+        let mut conflict = outbox.clone();
+        conflict["accepted_at"] = json!(2);
+        write_journal_records(&path, &[outbox, conflict]);
+        assert!(ShareJournal::open(&path).is_err());
     }
 
     #[test]
@@ -1799,15 +2576,77 @@ mod tests {
             .zcash_serialize_to_vec()
             .expect("malformed Wcash block serializes canonically");
         assert!(
-            validate_persisted_block(
+            validate_persisted_winner_block(
                 &malformed_bytes,
                 &display_hash(malformed.hash().0),
                 0,
-                Some(WCASH_BLOCK_WIRE_VERSION),
+                PersistedWinnerBlockKind::Wcash,
             )
             .is_err(),
             "a nonempty but invalid AuxPoW witness must not survive journal recovery"
         );
+    }
+
+    #[test]
+    fn persisted_zcash_winner_requires_target_and_equihash() {
+        let valid = mainnet_genesis_block();
+        let valid_bytes = valid
+            .zcash_serialize_to_vec()
+            .expect("mainnet genesis serializes");
+        assert_eq!(
+            validate_persisted_winner_block(
+                &valid_bytes,
+                &display_hash(valid.hash().0),
+                0,
+                PersistedWinnerBlockKind::Zcash,
+            )
+            .expect("mainnet genesis has valid target and Equihash"),
+            valid.hash().0,
+        );
+
+        let mut invalid_target_bytes = valid_bytes.clone();
+        invalid_target_bytes[104..108].copy_from_slice(&0u32.to_le_bytes());
+        let invalid_target: Block = invalid_target_bytes
+            .zcash_deserialize_into()
+            .expect("zero compact target remains structurally decodable");
+        assert!(validate_persisted_winner_block(
+            &invalid_target_bytes,
+            &display_hash(invalid_target.hash().0),
+            0,
+            PersistedWinnerBlockKind::Zcash,
+        )
+        .is_err());
+
+        let mut invalid_equihash = valid;
+        Arc::make_mut(&mut invalid_equihash.header).difficulty_threshold =
+            CompactDifficulty::from_bytes_in_display_order(&[0x20, 0x7f, 0xff, 0xff])
+                .expect("maximum positive compact target");
+        let expanded: U256 = invalid_equihash
+            .header
+            .difficulty_threshold
+            .to_expanded()
+            .expect("valid compact target")
+            .into();
+        let target =
+            Target::from_le_bytes(expanded.to_little_endian()).expect("valid expanded target");
+        for nonce in 0u32.. {
+            Arc::make_mut(&mut invalid_equihash.header).nonce[..4]
+                .copy_from_slice(&nonce.to_le_bytes());
+            if target.is_met_by_le_hash(invalid_equihash.hash().0) {
+                break;
+            }
+        }
+        let invalid_equihash_bytes = invalid_equihash
+            .zcash_serialize_to_vec()
+            .expect("tampered block serializes");
+        let error = validate_persisted_winner_block(
+            &invalid_equihash_bytes,
+            &display_hash(invalid_equihash.hash().0),
+            0,
+            PersistedWinnerBlockKind::Zcash,
+        )
+        .expect_err("the valid target must not mask invalid Equihash");
+        assert!(error.to_string().contains("invalid Equihash"));
     }
 
     #[test]
@@ -1930,6 +2769,28 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_symbolic_links_and_non_regular_files() {
+        use std::os::unix::{fs::symlink, fs::PermissionsExt};
+
+        let directory = tempdir().expect("temporary directory");
+        let target = directory.path().join("target.jsonl");
+        let link = directory.path().join("shares.jsonl");
+        fs::write(&target, []).expect("create journal target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+            .expect("make target private");
+        symlink(&target, &link).expect("create journal symlink");
+        assert!(
+            ShareJournal::open(&link).is_err(),
+            "online replay must reject a symbolic-link journal just like accounting"
+        );
+
+        let non_regular = directory.path().join("journal-directory");
+        fs::create_dir(&non_regular).expect("create non-regular journal path");
+        assert!(ShareJournal::open(&non_regular).is_err());
+    }
+
     #[test]
     fn mutex_poison_prevents_every_future_journal_write() {
         let directory = tempdir().expect("temporary directory");
@@ -1969,43 +2830,52 @@ mod tests {
         let directory = tempdir().expect("temporary directory");
         let valid_path = directory.path().join("valid.jsonl");
         let invalid_path = directory.path().join("invalid.jsonl");
-        let block = regtest_genesis_block();
+        let block = mainnet_block_one();
         let block_bytes = block
             .zcash_serialize_to_vec()
             .expect("genesis block serializes");
         let raw_hash = block.hash().0;
         let display = display_hash(raw_hash);
-        let share_id = "2a".repeat(32);
+        let job_id = "91".repeat(32);
+        let share_id = journal_share_id(&job_id, raw_hash);
         let outbox = json!({
             "version": JOURNAL_VERSION,
             "record": "winner_outbox",
-            "job_id": "job-a",
+            "accepted_at": 1,
+            "job_id": job_id,
             "share_id": share_id,
+            "worker": "account.rig-01",
+            "worker_authentication": "exact_credential",
             "parent_hash_le": hex::encode(raw_hash),
+            "share_target": "ff".repeat(32),
             "wcash_candidate": false,
             "zcash_candidate": true,
-            "zcash_height": 0,
+            "wcash_block_hash": "92".repeat(32),
+            "wcash_height": 1,
+            "zcash_height": 1,
             "zcash_block": hex::encode(block_bytes),
         });
         let observed = json!({
             "version": JOURNAL_VERSION,
             "record": "winner_observed",
-            "job_id": "job-a",
-            "share_id": "2a".repeat(32),
+            "recorded_at": 2,
+            "job_id": "91".repeat(32),
+            "share_id": share_id,
             "chain": "zcash",
             "block_hash": display,
-            "height": 0,
+            "height": 1,
         });
         let matured = json!({
             "version": JOURNAL_VERSION,
             "record": "winner_matured",
-            "job_id": "job-a",
-            "share_id": "2a".repeat(32),
+            "recorded_at": 3,
+            "job_id": "91".repeat(32),
+            "share_id": share_id,
             "chain": "zcash",
             "block_hash": display_hash(raw_hash),
-            "height": 0,
+            "height": 1,
         });
-        write_journal_records(&valid_path, &[outbox.clone(), observed, matured]);
+        write_journal_records(&valid_path, &[outbox.clone(), observed.clone(), matured]);
         let valid = ShareJournal::open(&valid_path).expect("exact transitions load");
         assert_eq!(valid.status().expect("journal status").pending_zcash, 0);
         drop(valid);
@@ -2013,17 +2883,66 @@ mod tests {
         let forged = json!({
             "version": JOURNAL_VERSION,
             "record": "winner_observed",
-            "job_id": "job-a",
-            "share_id": "2a".repeat(32),
+            "recorded_at": 2,
+            "job_id": "91".repeat(32),
+            "share_id": share_id,
             "chain": "zcash",
             "block_hash": "ff".repeat(32),
-            "height": 0,
+            "height": 1,
         });
-        write_journal_records(&invalid_path, &[outbox, forged]);
+        write_journal_records(&invalid_path, &[outbox.clone(), forged]);
         assert!(
             ShareJournal::open(&invalid_path).is_err(),
             "a status line cannot discard or mutate a different winner"
         );
+
+        let malformed_statuses = vec![
+            {
+                let mut status = observed.clone();
+                status.as_object_mut().unwrap().remove("recorded_at");
+                status
+            },
+            {
+                let mut status = observed.clone();
+                status["recorded_at"] = json!(0);
+                status
+            },
+            {
+                let mut status = observed.clone();
+                status["accepted_at"] = json!(1);
+                status
+            },
+            {
+                let mut status = observed.clone();
+                status["worker"] = json!("account.rig-01");
+                status
+            },
+            {
+                let mut status = observed.clone();
+                status["block_hash"] = json!(display.to_ascii_uppercase());
+                status
+            },
+            {
+                let mut status = observed.clone();
+                status["height"] = json!(0);
+                status
+            },
+            {
+                let mut status = observed.clone();
+                status["wcash_candidate"] = json!(false);
+                status
+            },
+        ];
+        for (index, status) in malformed_statuses.into_iter().enumerate() {
+            let path = directory
+                .path()
+                .join(format!("malformed-status-{index}.jsonl"));
+            write_journal_records(&path, &[outbox.clone(), status]);
+            assert!(
+                ShareJournal::open(&path).is_err(),
+                "malformed status fixture {index} must fail online replay"
+            );
+        }
     }
 
     fn write_journal_records(path: &Path, records: &[serde_json::Value]) {

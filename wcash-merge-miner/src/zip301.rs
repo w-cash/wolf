@@ -1,7 +1,7 @@
 //! Stock-ASIC compatible ZIP-301 frontend for a proposal-validated native job.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -16,7 +16,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use wcash_zcash_aux::{AuxPowError, Target};
 
-use crate::{MinerError, NativePreparedJob, ValidatedNativeShare, EQUIHASH_SOLUTION_BYTES};
+use crate::{
+    accounting::{AuthenticatedWorker, WorkerAuthenticator},
+    MinerError, NativePreparedJob, ValidatedNativeShare, EQUIHASH_SOLUTION_BYTES,
+};
 
 /// Maximum ZIP-301 request frame accepted from one ASIC.
 pub const MAX_ZIP301_REQUEST_BYTES: usize = 64 * 1024;
@@ -27,19 +30,26 @@ pub const DEFAULT_ZIP301_CLIENT_LIMIT: usize = 256;
 /// Default maximum number of shares that may be validated and committed concurrently.
 pub const DEFAULT_ZIP301_VALIDATION_LIMIT: usize = 4;
 
+/// Default maximum number of simultaneous memory-hard worker authentications.
+pub const DEFAULT_ZIP301_AUTHENTICATION_LIMIT: usize = 4;
+
 const NONCE_1_BYTES: usize = 4;
 const NONCE_2_BYTES: usize = 32 - NONCE_1_BYTES;
 const SOLUTION_PREFIX: [u8; 3] = [0xfd, 0x40, 0x05];
 const MAX_SHARES_PER_JOB: usize = 100_000;
 const MAX_AUTHORIZED_WORKERS_PER_CONNECTION: usize = 16;
 const MAX_SUBMISSIONS_PER_SECOND_PER_CONNECTION: usize = 64;
+const MAX_AUTHORIZATIONS_PER_MINUTE_PER_CONNECTION: usize = 32;
+const MAX_AUTHORIZATIONS_PER_CONNECTION: usize = 64;
 const MAX_ZIP301_VALIDATION_LIMIT: usize = 1_024;
+const MAX_ZIP301_AUTHENTICATION_LIMIT: usize = 256;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_FRAME_ASSEMBLY_TIME: Duration = Duration::from_secs(10);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(5);
 const VALIDATION_RETRY_DELAY: Duration = Duration::from_millis(1);
 const JOB_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 const SUBMISSION_RATE_WINDOW: Duration = Duration::from_secs(1);
+const AUTHORIZATION_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Callback that durably accounts for a valid share and queues any winners.
 ///
@@ -50,6 +60,15 @@ const SUBMISSION_RATE_WINDOW: Duration = Duration::from_secs(1);
 pub trait ShareProcessor: Send + Sync + 'static {
     /// Processes one Equihash-valid, target-valid share.
     fn process(&self, worker: &str, share: &ValidatedNativeShare) -> Result<(), MinerError>;
+
+    /// Processes a share with its canonical authenticated identity and provenance.
+    fn process_authenticated(
+        &self,
+        worker: &AuthenticatedWorker,
+        share: &ValidatedNativeShare,
+    ) -> Result<(), MinerError> {
+        self.process(worker.name(), share)
+    }
 
     /// Fails when this listener's frozen job should be retired immediately.
     fn check_job_health(&self) -> Result<(), MinerError> {
@@ -70,9 +89,16 @@ where
 #[derive(Clone)]
 pub struct Zip301Config {
     share_target: Target,
-    password_hash: [u8; 32],
+    authentication: Zip301Authentication,
     maximum_clients: usize,
+    maximum_parallel_authentications: usize,
     maximum_parallel_validations: usize,
+}
+
+#[derive(Clone)]
+enum Zip301Authentication {
+    SharedPassword([u8; 32]),
+    ExactWorkers(Arc<dyn WorkerAuthenticator>),
 }
 
 impl Zip301Config {
@@ -85,10 +111,27 @@ impl Zip301Config {
         }
         Ok(Self {
             share_target,
-            password_hash: Sha256::digest(password.as_bytes()).into(),
+            authentication: Zip301Authentication::SharedPassword(
+                Sha256::digest(password.as_bytes()).into(),
+            ),
             maximum_clients: DEFAULT_ZIP301_CLIENT_LIMIT,
+            maximum_parallel_authentications: DEFAULT_ZIP301_AUTHENTICATION_LIMIT,
             maximum_parallel_validations: DEFAULT_ZIP301_VALIDATION_LIMIT,
         })
+    }
+
+    /// Creates a fixed-difficulty listener with independently authenticated workers.
+    pub fn new_with_worker_authenticator(
+        share_target: Target,
+        authenticator: Arc<dyn WorkerAuthenticator>,
+    ) -> Self {
+        Self {
+            share_target,
+            authentication: Zip301Authentication::ExactWorkers(authenticator),
+            maximum_clients: DEFAULT_ZIP301_CLIENT_LIMIT,
+            maximum_parallel_authentications: DEFAULT_ZIP301_AUTHENTICATION_LIMIT,
+            maximum_parallel_validations: DEFAULT_ZIP301_VALIDATION_LIMIT,
+        }
     }
 
     /// Sets a strict positive simultaneous-session limit.
@@ -118,9 +161,30 @@ impl Zip301Config {
         Ok(self)
     }
 
+    /// Sets a strict bound on concurrent memory-hard worker authentications.
+    pub fn with_maximum_parallel_authentications(
+        mut self,
+        maximum_parallel_authentications: usize,
+    ) -> Result<Self, MinerError> {
+        if maximum_parallel_authentications == 0
+            || maximum_parallel_authentications > MAX_ZIP301_AUTHENTICATION_LIMIT
+        {
+            return Err(MinerError::InvalidRequest(format!(
+                "ZIP-301 authentication limit must be in 1..={MAX_ZIP301_AUTHENTICATION_LIMIT}"
+            )));
+        }
+        self.maximum_parallel_authentications = maximum_parallel_authentications;
+        Ok(self)
+    }
+
     /// Returns the configured share target.
     pub const fn share_target(&self) -> Target {
         self.share_target
+    }
+
+    /// Returns true when each exact worker has an independent credential.
+    pub const fn uses_worker_authenticator(&self) -> bool {
+        matches!(&self.authentication, Zip301Authentication::ExactWorkers(_))
     }
 }
 
@@ -129,8 +193,18 @@ impl std::fmt::Debug for Zip301Config {
         formatter
             .debug_struct("Zip301Config")
             .field("share_target", &self.share_target)
-            .field("password", &"[REDACTED]")
+            .field(
+                "authentication",
+                &match &self.authentication {
+                    Zip301Authentication::SharedPassword(_) => "shared-password [REDACTED]",
+                    Zip301Authentication::ExactWorkers(_) => "exact-worker credentials [REDACTED]",
+                },
+            )
             .field("maximum_clients", &self.maximum_clients)
+            .field(
+                "maximum_parallel_authentications",
+                &self.maximum_parallel_authentications,
+            )
             .field(
                 "maximum_parallel_validations",
                 &self.maximum_parallel_validations,
@@ -139,31 +213,119 @@ impl std::fmt::Debug for Zip301Config {
     }
 }
 
+/// A loopback ZIP-301 socket that remains bound across sequential job generations.
+///
+/// Keeping the owning listener open prevents a normal job rotation from having
+/// to rebind a port that can still have accepted connections in `TIME_WAIT`.
+/// Exactly one generation may accept connections from this listener at a time.
+pub struct Zip301LoopbackListener {
+    listener: TcpListener,
+    generation_active: AtomicBool,
+}
+
+impl Zip301LoopbackListener {
+    /// Binds a persistent, nonblocking listener to a literal loopback address.
+    pub fn bind(bind: SocketAddr) -> Result<Self, MinerError> {
+        if !bind.ip().is_loopback() {
+            return Err(MinerError::InvalidRequest(
+                "the built-in ZIP-301 listener only binds loopback addresses".to_string(),
+            ));
+        }
+
+        let listener = TcpListener::bind(bind)?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            generation_active: AtomicBool::new(false),
+        })
+    }
+
+    /// Returns the effective bound address, including an OS-assigned port.
+    pub fn local_addr(&self) -> Result<SocketAddr, MinerError> {
+        self.listener.local_addr().map_err(MinerError::from)
+    }
+
+    /// Serves one frozen job while retaining the bound socket for the next generation.
+    pub fn serve(
+        &self,
+        job: NativePreparedJob,
+        config: Zip301Config,
+        processor: Arc<dyn ShareProcessor>,
+    ) -> Result<(), MinerError> {
+        let (listener, _generation) = self.begin_generation()?;
+        serve_zip301_generation(listener, job, config, processor)
+    }
+
+    fn begin_generation(&self) -> Result<(TcpListener, Zip301GenerationGuard<'_>), MinerError> {
+        self.generation_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                MinerError::InvalidRequest(
+                    "the ZIP-301 listener already has an active job generation".to_string(),
+                )
+            })?;
+        let generation = Zip301GenerationGuard {
+            active: &self.generation_active,
+        };
+        let listener = self.listener.try_clone()?;
+        Ok((listener, generation))
+    }
+}
+
+impl std::fmt::Debug for Zip301LoopbackListener {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Zip301LoopbackListener")
+            .field("local_addr", &self.listener.local_addr())
+            .field(
+                "generation_active",
+                &self.generation_active.load(Ordering::Acquire),
+            )
+            .finish()
+    }
+}
+
+struct Zip301GenerationGuard<'a> {
+    active: &'a AtomicBool,
+}
+
+impl Drop for Zip301GenerationGuard<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
 /// Serves one frozen native job over ZIP-301 for ASIC interoperability testing.
 ///
 /// The built-in listener deliberately accepts only a loopback bind. Community
 /// deployments should put an authenticated, rate-limited TCP/TLS edge in front
 /// of it and rotate jobs through a supervisor whenever either chain tip changes.
+/// Supervisors must bind [`Zip301LoopbackListener`] once and call its
+/// [`Zip301LoopbackListener::serve`] method for each sequential generation;
+/// this convenience function owns the socket for one generation only.
 pub fn serve_zip301_loopback(
     bind: SocketAddr,
     job: NativePreparedJob,
     config: Zip301Config,
     processor: Arc<dyn ShareProcessor>,
 ) -> Result<(), MinerError> {
-    if !bind.ip().is_loopback() {
-        return Err(MinerError::InvalidRequest(
-            "the built-in ZIP-301 listener only binds loopback addresses".to_string(),
-        ));
-    }
+    Zip301LoopbackListener::bind(bind)?.serve(job, config, processor)
+}
+
+fn serve_zip301_generation(
+    listener: TcpListener,
+    job: NativePreparedJob,
+    config: Zip301Config,
+    processor: Arc<dyn ShareProcessor>,
+) -> Result<(), MinerError> {
     validate_share_target(
         config.share_target,
         job.job().required_target(),
         job.parent_target(),
     )?;
     let maximum_clients = config.maximum_clients;
+    let maximum_parallel_authentications = config.maximum_parallel_authentications;
     let maximum_parallel_validations = config.maximum_parallel_validations;
-    let listener = TcpListener::bind(bind)?;
-    listener.set_nonblocking(true)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_reason = Arc::new(Mutex::new(None));
     let state = Arc::new(ServerState {
@@ -172,6 +334,7 @@ pub fn serve_zip301_loopback(
         processor,
         next_nonce: AtomicU32::new(1),
         duplicates: Mutex::new(DuplicateCache::default()),
+        authentications: ConnectionLimiter::new(maximum_parallel_authentications),
         validations: ConnectionLimiter::new(maximum_parallel_validations),
         shutdown: Arc::clone(&shutdown),
     });
@@ -235,6 +398,7 @@ struct ServerState {
     processor: Arc<dyn ShareProcessor>,
     next_nonce: AtomicU32,
     duplicates: Mutex<DuplicateCache>,
+    authentications: ConnectionLimiter,
     validations: ConnectionLimiter,
     shutdown: Arc<AtomicBool>,
 }
@@ -318,7 +482,8 @@ fn serve_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Result<()
     let mut reader = BufReader::new(read_stream);
     let nonce_1 = allocate_session_nonce(&state.next_nonce)?;
     let mut subscribed = false;
-    let mut authorized = HashSet::new();
+    let mut authorized = HashMap::new();
+    let mut authorization_policy = AuthorizationPolicy::new(Instant::now());
     let mut submission_rate = SubmissionRateLimiter::new(Instant::now());
 
     while !state.shutdown.load(Ordering::Acquire) {
@@ -372,7 +537,24 @@ fn serve_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Result<()
                     write_message(&mut stream, &rpc_error(id, 25, "not subscribed"))?;
                     continue;
                 }
-                match authorize(params, &state.config) {
+                match authorization_policy.admit(Instant::now()) {
+                    AuthorizationAdmission::Allowed => {}
+                    AuthorizationAdmission::RateLimited => {
+                        write_message(
+                            &mut stream,
+                            &rpc_error(id, 24, "authorization rate limit exceeded"),
+                        )?;
+                        continue;
+                    }
+                    AuthorizationAdmission::LifetimeExhausted => {
+                        write_message(
+                            &mut stream,
+                            &rpc_error(id, 24, "authorization attempt limit exceeded"),
+                        )?;
+                        break;
+                    }
+                }
+                match authorize(params, &state.config, &state.authentications) {
                     Ok(worker) => match insert_authorized_worker(&mut authorized, worker) {
                         Ok(new_worker) => {
                             write_message(&mut stream, &rpc_success(id, Value::Bool(true)))?;
@@ -427,7 +609,11 @@ fn serve_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Result<()
     Ok(())
 }
 
-fn authorize<'a>(params: &'a Value, config: &Zip301Config) -> Result<&'a str, &'static str> {
+fn authorize(
+    params: &Value,
+    config: &Zip301Config,
+    authentications: &ConnectionLimiter,
+) -> Result<WorkerAuthorization, &'static str> {
     let params = params
         .as_array()
         .ok_or("authorize params must be an array")?;
@@ -442,30 +628,64 @@ fn authorize<'a>(params: &'a Value, config: &Zip301Config) -> Result<&'a str, &'
     {
         return Err("worker name is invalid");
     }
-    let supplied: [u8; 32] = Sha256::digest(password.as_bytes()).into();
-    if !constant_time_eq(&supplied, &config.password_hash) {
-        return Err("authorization failed");
-    }
-    Ok(worker)
+    let _authentication_permit = authentications
+        .try_acquire()
+        .ok_or("authentication capacity is exhausted; retry later")?;
+    let identity = match &config.authentication {
+        Zip301Authentication::SharedPassword(password_hash) => {
+            let supplied: [u8; 32] = Sha256::digest(password.as_bytes()).into();
+            if !constant_time_eq(&supplied, password_hash) {
+                return Err("authorization failed");
+            }
+            AuthenticatedWorker::from_shared_secret(worker).map_err(|_| "worker name is invalid")?
+        }
+        Zip301Authentication::ExactWorkers(authenticator) => authenticator
+            .authenticate(worker, password)
+            .ok_or("authorization failed")?,
+    };
+    Ok(WorkerAuthorization {
+        requested_name: worker.to_string(),
+        identity,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkerAuthorization {
+    requested_name: String,
+    identity: AuthenticatedWorker,
 }
 
 fn insert_authorized_worker(
-    authorized: &mut HashSet<String>,
-    worker: &str,
+    authorized: &mut HashMap<String, AuthenticatedWorker>,
+    authorization: WorkerAuthorization,
 ) -> Result<bool, &'static str> {
-    if authorized.contains(worker) {
-        return Ok(false);
+    if let Some(existing) = authorized.get(&authorization.requested_name) {
+        return if existing == &authorization.identity {
+            Ok(false)
+        } else {
+            Err("worker authorization changed during the connection")
+        };
     }
     if authorized.len() >= MAX_AUTHORIZED_WORKERS_PER_CONNECTION {
         return Err("too many workers on one connection");
     }
-    authorized.insert(worker.to_string());
+    authorized.insert(authorization.requested_name, authorization.identity);
     Ok(true)
+}
+
+fn processor_worker_identity<'a>(
+    authorized: &'a HashMap<String, AuthenticatedWorker>,
+    requested_name: &str,
+) -> Result<&'a AuthenticatedWorker, SubmitError> {
+    authorized.get(requested_name).ok_or_else(|| SubmitError {
+        code: 24,
+        message: "worker is not authorized".to_string(),
+    })
 }
 
 fn submit(
     state: &ServerState,
-    authorized: &HashSet<String>,
+    authorized: &HashMap<String, AuthenticatedWorker>,
     nonce_1: [u8; NONCE_1_BYTES],
     params: &Value,
 ) -> Result<(), SubmitError> {
@@ -476,12 +696,7 @@ fn submit(
     let worker = params[0]
         .as_str()
         .ok_or_else(|| SubmitError::other("worker name must be a string"))?;
-    if !authorized.contains(worker) {
-        return Err(SubmitError {
-            code: 24,
-            message: "worker is not authorized".to_string(),
-        });
-    }
+    let processor_worker = processor_worker_identity(authorized, worker)?;
     let job_id = params[1]
         .as_str()
         .ok_or_else(|| SubmitError::other("job id must be a string"))?;
@@ -570,7 +785,10 @@ fn submit(
     }
     drop(duplicates);
 
-    if let Err(error) = state.processor.process(worker, &share) {
+    if let Err(error) = state
+        .processor
+        .process_authenticated(processor_worker, &share)
+    {
         if let Ok(mut duplicates) = state.duplicates.lock() {
             duplicates.remove(duplicate_key);
         }
@@ -590,6 +808,64 @@ fn submit(
         });
     }
     Ok(())
+}
+
+struct AuthorizationPolicy {
+    attempts: usize,
+    rate: AuthorizationRateLimiter,
+}
+
+impl AuthorizationPolicy {
+    fn new(now: Instant) -> Self {
+        Self {
+            attempts: 0,
+            rate: AuthorizationRateLimiter::new(now),
+        }
+    }
+
+    fn admit(&mut self, now: Instant) -> AuthorizationAdmission {
+        if self.attempts >= MAX_AUTHORIZATIONS_PER_CONNECTION {
+            return AuthorizationAdmission::LifetimeExhausted;
+        }
+        self.attempts += 1;
+        if self.rate.try_acquire(now) {
+            AuthorizationAdmission::Allowed
+        } else {
+            AuthorizationAdmission::RateLimited
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthorizationAdmission {
+    Allowed,
+    RateLimited,
+    LifetimeExhausted,
+}
+
+struct AuthorizationRateLimiter {
+    attempts: VecDeque<Instant>,
+}
+
+impl AuthorizationRateLimiter {
+    fn new(_now: Instant) -> Self {
+        Self {
+            attempts: VecDeque::with_capacity(MAX_AUTHORIZATIONS_PER_MINUTE_PER_CONNECTION),
+        }
+    }
+
+    fn try_acquire(&mut self, now: Instant) -> bool {
+        while self.attempts.front().is_some_and(|attempted| {
+            now.saturating_duration_since(*attempted) >= AUTHORIZATION_RATE_WINDOW
+        }) {
+            self.attempts.pop_front();
+        }
+        if self.attempts.len() >= MAX_AUTHORIZATIONS_PER_MINUTE_PER_CONNECTION {
+            return false;
+        }
+        self.attempts.push_back(now);
+        true
+    }
 }
 
 struct SubmissionRateLimiter {
@@ -842,6 +1118,67 @@ impl Drop for ConnectionPermit {
 mod tests {
     use super::*;
 
+    fn accept_with_deadline(listener: &TcpListener) -> TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((stream, _peer)) => return stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "persistent listener did not accept the local connection"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("persistent listener accept failed: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn persistent_listener_owns_one_generation_and_keeps_its_port_bound() {
+        let listener = Zip301LoopbackListener::bind(
+            "127.0.0.1:0"
+                .parse()
+                .expect("valid ephemeral loopback address"),
+        )
+        .expect("bind persistent listener");
+        let address = listener.local_addr().expect("bound listener address");
+
+        let (first_generation, first_guard) =
+            listener.begin_generation().expect("start first generation");
+        assert!(listener.begin_generation().is_err());
+        let first_client = TcpStream::connect(address).expect("connect first generation");
+        let first_server = accept_with_deadline(&first_generation);
+        first_server
+            .shutdown(std::net::Shutdown::Both)
+            .expect("close first server connection");
+        drop(first_server);
+        drop(first_client);
+        drop(first_generation);
+        drop(first_guard);
+
+        // The owning listener never released the port while accepted sockets
+        // from the retired generation entered their OS close lifecycle.
+        let (second_generation, second_guard) = listener
+            .begin_generation()
+            .expect("start second generation without rebinding");
+        let second_client = TcpStream::connect(address).expect("connect second generation");
+        let second_server = accept_with_deadline(&second_generation);
+        drop(second_server);
+        drop(second_client);
+        drop(second_generation);
+        drop(second_guard);
+    }
+
+    #[test]
+    fn persistent_listener_rejects_non_loopback_binds() {
+        let bind = "192.0.2.1:8237"
+            .parse()
+            .expect("valid documentation-only address");
+        assert!(Zip301LoopbackListener::bind(bind).is_err());
+    }
+
     #[test]
     fn target_and_nonce_encoding_follow_zip301() {
         let target = Target::from_le_bytes(std::array::from_fn(|index| index as u8 + 1))
@@ -896,28 +1233,210 @@ mod tests {
     fn credentials_are_hashed_and_compared_in_constant_time_shape() {
         let config = Zip301Config::new(Target::MAX, "correct horse battery")
             .expect("strong fixture password");
+        let authentications = ConnectionLimiter::new(1);
+        let worker = authorize(
+            &json!(["worker.1", "correct horse battery"]),
+            &config,
+            &authentications,
+        )
+        .expect("correct shared credential");
+        assert_eq!(worker.requested_name, "worker.1");
+        assert_eq!(worker.identity.name(), "worker.1");
         assert_eq!(
-            authorize(&json!(["worker.1", "correct horse battery"]), &config),
-            Ok("worker.1")
+            worker.identity.provenance(),
+            crate::accounting::WorkerAuthenticationProvenance::SharedSecret
         );
-        assert!(authorize(&json!(["worker.1", "wrong password"]), &config).is_err());
+        assert!(authorize(
+            &json!(["worker.1", "wrong password"]),
+            &config,
+            &authentications,
+        )
+        .is_err());
         assert!(!format!("{config:?}").contains("correct horse"));
+    }
+
+    struct AliasAuthenticator;
+
+    impl WorkerAuthenticator for AliasAuthenticator {
+        fn authenticate(&self, worker: &str, password: &str) -> Option<AuthenticatedWorker> {
+            (worker == "login-alias" && password == "independent password")
+                .then(|| AuthenticatedWorker::new("account.rig-01").expect("canonical worker"))
+        }
+    }
+
+    #[test]
+    fn authenticated_login_resolves_to_canonical_processor_identity() {
+        let config =
+            Zip301Config::new_with_worker_authenticator(Target::MAX, Arc::new(AliasAuthenticator));
+        assert!(config.uses_worker_authenticator());
+        let authentications = ConnectionLimiter::new(1);
+        let authorization = authorize(
+            &json!(["login-alias", "independent password"]),
+            &config,
+            &authentications,
+        )
+        .expect("valid independent worker credential");
+        assert_eq!(authorization.requested_name, "login-alias");
+        assert_eq!(authorization.identity.name(), "account.rig-01");
+        assert_eq!(
+            authorization.identity.provenance(),
+            crate::accounting::WorkerAuthenticationProvenance::ExactCredential
+        );
+
+        let mut authorized = HashMap::new();
+        assert_eq!(
+            insert_authorized_worker(&mut authorized, authorization),
+            Ok(true)
+        );
+        assert_eq!(
+            processor_worker_identity(&authorized, "login-alias")
+                .expect("processor identity")
+                .name(),
+            "account.rig-01"
+        );
+        assert!(processor_worker_identity(&authorized, "account.rig-01").is_err());
+        assert!(authorize(
+            &json!(["login-alias", "incorrect password"]),
+            &config,
+            &authentications,
+        )
+        .is_err());
+        assert!(!format!("{config:?}").contains("login-alias"));
+    }
+
+    #[test]
+    fn authorization_rate_and_connection_lifetime_are_bounded() {
+        let started = Instant::now();
+        let mut policy = AuthorizationPolicy::new(started);
+        for _ in 0..MAX_AUTHORIZATIONS_PER_MINUTE_PER_CONNECTION {
+            assert_eq!(policy.admit(started), AuthorizationAdmission::Allowed);
+        }
+        for _ in MAX_AUTHORIZATIONS_PER_MINUTE_PER_CONNECTION..MAX_AUTHORIZATIONS_PER_CONNECTION {
+            assert_eq!(policy.admit(started), AuthorizationAdmission::RateLimited);
+        }
+        assert_eq!(
+            policy.admit(started + AUTHORIZATION_RATE_WINDOW),
+            AuthorizationAdmission::LifetimeExhausted,
+        );
+
+        let mut elapsed_window = AuthorizationPolicy::new(started);
+        for _ in 0..MAX_AUTHORIZATIONS_PER_MINUTE_PER_CONNECTION {
+            assert_eq!(
+                elapsed_window.admit(started),
+                AuthorizationAdmission::Allowed
+            );
+        }
+        assert_eq!(
+            elapsed_window.admit(started + AUTHORIZATION_RATE_WINDOW),
+            AuthorizationAdmission::Allowed,
+        );
+    }
+
+    struct BlockingAuthenticator {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl WorkerAuthenticator for BlockingAuthenticator {
+        fn authenticate(&self, worker: &str, password: &str) -> Option<AuthenticatedWorker> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.entered.send(()).ok()?;
+            let (released, condition) = &*self.release;
+            let guard = released.lock().ok()?;
+            let _guard = condition.wait_while(guard, |released| !*released).ok()?;
+            (password == "independent password")
+                .then(|| AuthenticatedWorker::new(worker).expect("valid test worker"))
+        }
+    }
+
+    #[test]
+    fn concurrent_authentication_capacity_is_global_and_released() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = Zip301Config::new_with_worker_authenticator(
+            Target::MAX,
+            Arc::new(BlockingAuthenticator {
+                entered: entered_tx,
+                release: Arc::clone(&release),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let authentications = ConnectionLimiter::new(1);
+        let first_config = config.clone();
+        let first_authentications = authentications.clone();
+        let first = thread::spawn(move || {
+            authorize(
+                &json!(["worker.first", "independent password"]),
+                &first_config,
+                &first_authentications,
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first authentication entered its memory-hard provider");
+
+        assert_eq!(
+            authorize(
+                &json!(["worker.second", "independent password"]),
+                &config,
+                &authentications,
+            ),
+            Err("authentication capacity is exhausted; retry later"),
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        let (released, condition) = &*release;
+        *released.lock().expect("release mutex") = true;
+        condition.notify_all();
+        assert!(first
+            .join()
+            .expect("authentication worker did not panic")
+            .is_ok());
+        assert!(authorize(
+            &json!(["worker.second", "independent password"]),
+            &config,
+            &authentications,
+        )
+        .is_ok());
+        assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 
     #[test]
     fn worker_authorization_and_frame_assembly_are_bounded() {
-        let mut authorized = HashSet::new();
+        let mut authorized = HashMap::new();
         for index in 0..MAX_AUTHORIZED_WORKERS_PER_CONNECTION {
+            let worker = format!("worker.{index}");
             assert_eq!(
-                insert_authorized_worker(&mut authorized, &format!("worker.{index}")),
+                insert_authorized_worker(
+                    &mut authorized,
+                    WorkerAuthorization {
+                        requested_name: worker.clone(),
+                        identity: AuthenticatedWorker::new(worker).expect("valid worker"),
+                    },
+                ),
                 Ok(true)
             );
         }
         assert_eq!(
-            insert_authorized_worker(&mut authorized, "worker.0"),
+            insert_authorized_worker(
+                &mut authorized,
+                WorkerAuthorization {
+                    requested_name: "worker.0".to_string(),
+                    identity: AuthenticatedWorker::new("worker.0").expect("valid worker"),
+                },
+            ),
             Ok(false)
         );
-        assert!(insert_authorized_worker(&mut authorized, "one-too-many").is_err());
+        assert!(insert_authorized_worker(
+            &mut authorized,
+            WorkerAuthorization {
+                requested_name: "one-too-many".to_string(),
+                identity: AuthenticatedWorker::new("one-too-many").expect("valid worker"),
+            },
+        )
+        .is_err());
 
         let mut complete = std::io::BufReader::new(std::io::Cursor::new(b"{}\n"));
         assert!(read_frame_until(&mut complete, Instant::now()).is_err());

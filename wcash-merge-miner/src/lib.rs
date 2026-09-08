@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod accounting;
 mod coinbase;
 mod coordinator;
 mod error;
@@ -22,13 +23,18 @@ pub mod native;
 pub mod protocol;
 pub mod rpc;
 pub mod zip301;
+pub mod zip301_client;
 
 pub use coinbase::{build_parent_coinbase, ParentOutput};
-pub use coordinator::{CoordinatorConfig, NativeMiningCoordinator, WinnerOutboxStatus};
+pub use coordinator::{
+    CoordinatorConfig, NativeMiningCoordinator, NativeMiningSupervisor, WinnerOutboxStatus,
+    NATIVE_JOB_MAX_AGE_SECONDS,
+};
 pub use error::MinerError;
 pub use job::{JobConfig, PreparedJob, SolvedAuxPow, EQUIHASH_SOLUTION_BYTES};
 pub use native::{
     NativePreparedJob, NativeZcashConfig, NativeZcashProvider, ParentNodeOutcome,
     ParentSubmissionReport, ValidatedNativeShare,
 };
-pub use zip301::{serve_zip301_loopback, ShareProcessor, Zip301Config};
+pub use zip301::{serve_zip301_loopback, ShareProcessor, Zip301Config, Zip301LoopbackListener};
+pub use zip301_client::{mine_zip301_once, Zip301AcceptedShare, Zip301ClientConfig};

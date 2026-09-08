@@ -9,18 +9,22 @@ use std::{
     process,
     sync::Arc,
     thread,
-    time::Duration,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use serde_json::{json, Value};
 use wcash_merge_miner::{
+    accounting::{hash_worker_password, read_accounting_snapshot, WorkerCredentialStore},
+    mine_zip301_once,
     protocol::serve_loopback,
     rpc::RpcEndpoint,
-    serve_zip301_loopback,
-    zip301::{DEFAULT_ZIP301_CLIENT_LIMIT, DEFAULT_ZIP301_VALIDATION_LIMIT},
-    CoordinatorConfig, JobConfig, MinerError, NativeMiningCoordinator, NativeZcashConfig,
-    PreparedJob, ShareProcessor, Zip301Config,
+    zip301::{
+        DEFAULT_ZIP301_AUTHENTICATION_LIMIT, DEFAULT_ZIP301_CLIENT_LIMIT,
+        DEFAULT_ZIP301_VALIDATION_LIMIT,
+    },
+    CoordinatorConfig, JobConfig, MinerError, NativeMiningCoordinator, NativeMiningSupervisor,
+    NativeZcashConfig, PreparedJob, ShareProcessor, Zip301ClientConfig, Zip301Config,
+    Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
 };
 use wcash_zcash_aux::Target;
 use zcash_address::ZcashAddress;
@@ -35,11 +39,13 @@ const ZCASH_TEMPLATE_RPC_PASSWORD: &str = "ZCASH_TEMPLATE_RPC_PASSWORD";
 const ZCASH_VALIDATOR_RPC_USERNAME: &str = "ZCASH_VALIDATOR_RPC_USERNAME";
 const ZCASH_VALIDATOR_RPC_PASSWORD: &str = "ZCASH_VALIDATOR_RPC_PASSWORD";
 const WCASH_STRATUM_PASSWORD: &str = "WCASH_STRATUM_PASSWORD";
+const WCASH_WORKER_CREDENTIALS: &str = "WCASH_WORKER_CREDENTIALS";
 const WCASH_SHARE_TARGET: &str = "WCASH_SHARE_TARGET";
 const WCASH_SHARE_JOURNAL: &str = "WCASH_SHARE_JOURNAL";
 const WCASH_PAYOUT_ADDRESS: &str = "WCASH_PAYOUT_ADDRESS";
 const ZCASH_PAYOUT_ADDRESS: &str = "ZCASH_PAYOUT_ADDRESS";
 const WCASH_VALIDATION_LIMIT: &str = "WCASH_VALIDATION_LIMIT";
+const WCASH_AUTHENTICATION_LIMIT: &str = "WCASH_AUTHENTICATION_LIMIT";
 const WCASH_EXPECTED_GENESIS_HASH: &str = "WCASH_EXPECTED_GENESIS_HASH";
 const ZCASH_EXPECTED_GENESIS_HASH: &str = "ZCASH_EXPECTED_GENESIS_HASH";
 
@@ -49,6 +55,14 @@ Synthetic development harness:
   wcash-merge-miner job  <child-hash-le> [target-le]
   wcash-merge-miner mine <child-hash-le> [target-le] [max-runs] [start-nonce]
   wcash-merge-miner serve <child-hash-le> [target-le] [127.0.0.1:port]
+
+ZIP-301 reference miner:
+  wcash-merge-miner zip301-mine <127.0.0.1:port> <worker>
+    [max-runs] [start-nonce]
+
+Pool administration:
+  wcash-merge-miner worker-password-hash
+  wcash-merge-miner accounting-report <share-journal-path>
 
 Native node pipeline:
   wcash-merge-miner native-job <wcash-rpc-url> <zcash-template-rpc-url>
@@ -74,8 +88,9 @@ Every native command requires WCASH_EXPECTED_GENESIS_HASH and
 ZCASH_EXPECTED_GENESIS_HASH (64 hex characters in conventional RPC display
 order). Every node is pinned to those height-zero hashes before work is issued.
 
-Both native-serve commands additionally require WCASH_STRATUM_PASSWORD (12..=1024 bytes)
-and WCASH_SHARE_TARGET (exactly 32 bytes of conventional big-endian target hex).
+Both native-serve commands additionally require WCASH_WORKER_CREDENTIALS (the
+path to a private version-1 exact-worker registry) and WCASH_SHARE_TARGET
+(exactly 32 bytes of conventional big-endian target hex).
 The wcash-unified-address argument must be `-`; its value is read from
 WCASH_PAYOUT_ADDRESS to keep it out of process listings and preflight logs.
 ZCASH_PAYOUT_ADDRESS must exactly match the canonical mining.miner_address on
@@ -85,14 +100,24 @@ recipient in both parent coinbases, and compares their transparent outputs.
 Plaintext payout configuration is omitted from diagnostics, but native preflight
 prints the exact Zcash coinbase and its recipient is publicly recoverable by
 Zcash protocol design.
-WCASH_VALIDATION_LIMIT optionally
-sets the global concurrent share-validation limit (default 4, maximum 1024).
+WCASH_VALIDATION_LIMIT optionally sets the global concurrent share-validation
+limit (default 4, maximum 1024). WCASH_AUTHENTICATION_LIMIT optionally sets the
+global concurrent Argon2id verification limit (default 4, maximum 256).
 WCASH_SHARE_JOURNAL optionally selects the durable JSON-lines share journal; the
 default is .wcash-share-journal-v2.jsonl in the current directory (created 0600
 on Unix). The default listener is 127.0.0.1:28237 and the default client limit is
 256. native-serve automatically rotates proposal-validated jobs and retries
 temporary preparation failures with bounded backoff. native-serve-once serves
 one frozen job and exits when it becomes stale, for controlled integration tests.
+
+zip301-mine reads its selected worker's password from WCASH_STRATUM_PASSWORD and
+acts as a bounded, loopback-only reference ASIC. It reconstructs work exclusively
+from ZIP-301 wire messages, solves real Equihash `(200, 9)`, and submits the
+result over the pool connection.
+
+worker-password-hash reads WCASH_STRATUM_PASSWORD and emits an Argon2id PHC
+string for a private worker-credential file. accounting-report obtains a shared
+lock and validates the complete durable ledger before emitting aggregate JSON.
 
 Synthetic hashes and targets are exactly 32 bytes in little-endian numeric/raw
 consensus order. Their default target is ff..ff.
@@ -122,8 +147,62 @@ fn run() -> Result<(), Box<dyn Error>> {
         "native-mine" => run_native_mine(arguments),
         "native-serve-once" => run_native_serve_once(arguments),
         "native-serve" => run_native_serve(arguments),
+        "zip301-mine" => run_zip301_mine(arguments),
+        "worker-password-hash" => run_worker_password_hash(arguments),
+        "accounting-report" => run_accounting_report(arguments),
         _ => Err(MinerError::InvalidRequest(format!("unknown command {command:?}")).into()),
     }
+}
+
+fn run_worker_password_hash(arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    ensure_no_more(arguments)?;
+    let password = required_env(WCASH_STRATUM_PASSWORD)?;
+    let password_hash = hash_worker_password(&password)?;
+    drop(password);
+    print_json(&json!({"password_hash": password_hash}))
+}
+
+fn run_accounting_report(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let ledger_path = PathBuf::from(next_required(&mut arguments, "share-journal-path")?);
+    ensure_no_more(arguments)?;
+    let snapshot = read_accounting_snapshot(ledger_path)?;
+    print_json(&serde_json::to_value(snapshot)?)
+}
+
+fn run_zip301_mine(mut arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let endpoint = next_required(&mut arguments, "ZIP-301 loopback endpoint")?
+        .parse::<SocketAddr>()
+        .map_err(|error| {
+            MinerError::InvalidRequest(format!("invalid ZIP-301 loopback endpoint: {error}"))
+        })?;
+    let worker = next_required(&mut arguments, "worker")?;
+    let maximum_runs = parse_optional_u64(arguments.next(), 64, "max-runs")?;
+    let start_nonce = parse_optional_u64(arguments.next(), 0, "start-nonce")?;
+    ensure_no_more(arguments)?;
+    let password = required_env(WCASH_STRATUM_PASSWORD)?;
+    let config = Zip301ClientConfig::new(
+        endpoint,
+        worker.clone(),
+        password,
+        maximum_runs,
+        start_nonce,
+    )?;
+    let accepted = mine_zip301_once(config)?;
+
+    print_json(&json!({
+        "command": "zip301-mine",
+        "result": "accepted",
+        "endpoint": endpoint.to_string(),
+        "worker": worker,
+        "job_id": accepted.job_id(),
+        "parent_block_hash": accepted.parent_block_hash(),
+        "nonce": hex::encode(accepted.nonce()),
+        "share_target": display_target(accepted.share_target()),
+        "attempted_nonce_runs": accepted.attempted_nonce_runs(),
+    }))?;
+    Ok(())
 }
 
 fn run_synthetic(
@@ -258,9 +337,11 @@ fn run_native_server(
 ) -> Result<(), Box<dyn Error>> {
     let arguments = parse_native_serve_arguments(arguments)?;
 
-    // Validate and hash the Stratum secret before making any network request.
-    // Zip301Config retains only its SHA-256 digest.
-    let stratum_password = required_env(WCASH_STRATUM_PASSWORD)?;
+    // Validate the complete worker registry before making any network request.
+    // The registry retains only Argon2id password hashes.
+    let credential_path = PathBuf::from(required_env(WCASH_WORKER_CREDENTIALS)?);
+    let credentials = WorkerCredentialStore::from_path(&credential_path)?;
+    let worker_count = credentials.len();
     let share_target =
         parse_display_target(&required_env(WCASH_SHARE_TARGET)?, "WCASH_SHARE_TARGET")?;
     let maximum_parallel_validations = parse_optional_usize(
@@ -268,13 +349,20 @@ fn run_native_server(
         DEFAULT_ZIP301_VALIDATION_LIMIT,
         WCASH_VALIDATION_LIMIT,
     )?;
-    let zip301 = Zip301Config::new(share_target, &stratum_password)?
+    let maximum_parallel_authentications = parse_optional_usize(
+        optional_env(WCASH_AUTHENTICATION_LIMIT)?,
+        DEFAULT_ZIP301_AUTHENTICATION_LIMIT,
+        WCASH_AUTHENTICATION_LIMIT,
+    )?;
+    let zip301 = Zip301Config::new_with_worker_authenticator(share_target, Arc::new(credentials))
         .with_maximum_clients(arguments.maximum_clients)?
+        .with_maximum_parallel_authentications(maximum_parallel_authentications)?
         .with_maximum_parallel_validations(maximum_parallel_validations)?;
-    drop(stratum_password);
+    let listener = Zip301LoopbackListener::bind(arguments.bind)?;
 
     let journal = share_journal_path()?;
     let configured = configure_native(&arguments.connection)?;
+    let supervisor = NativeMiningSupervisor::open(configured.config.clone(), &journal)?;
     let command = if automatic_rotation {
         "native-serve"
     } else {
@@ -283,27 +371,26 @@ fn run_native_server(
     let mut preparation_backoff = Duration::from_secs(1);
 
     loop {
-        let coordinator =
-            match NativeMiningCoordinator::prepare(configured.config.clone(), &journal) {
-                Ok(coordinator) => {
-                    preparation_backoff = Duration::from_secs(1);
-                    coordinator
-                }
-                Err(error) if automatic_rotation => {
-                    eprintln!(
-                        "native job preparation failed: {error}; retrying in {} second(s)",
-                        preparation_backoff.as_secs()
-                    );
-                    thread::sleep(preparation_backoff);
-                    // At a 60-second ceiling, one supervisor cannot consume all
-                    // 16 child-candidate cache slots within their 10-minute TTL
-                    // when parent preparation repeatedly fails after
-                    // `createauxblock` succeeds.
-                    preparation_backoff = (preparation_backoff * 2).min(Duration::from_secs(60));
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
+        let coordinator = match supervisor.prepare_generation() {
+            Ok(coordinator) => {
+                preparation_backoff = Duration::from_secs(1);
+                coordinator
+            }
+            Err(error) if automatic_rotation && is_retryable_native_preparation_error(&error) => {
+                eprintln!(
+                    "transient native job preparation failure: {error}; retrying in {} second(s)",
+                    preparation_backoff.as_secs()
+                );
+                thread::sleep(preparation_backoff);
+                // At a 60-second ceiling, one supervisor cannot consume all
+                // 16 child-candidate cache slots within their 10-minute TTL
+                // when parent preparation repeatedly fails after
+                // `createauxblock` succeeds.
+                preparation_backoff = (preparation_backoff * 2).min(Duration::from_secs(60));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let job = coordinator.job().clone();
 
         print_json(&native_preflight(
@@ -315,14 +402,16 @@ fn run_native_server(
             Some(ServeSummary {
                 bind: arguments.bind,
                 maximum_clients: arguments.maximum_clients,
+                maximum_parallel_authentications,
                 maximum_parallel_validations,
                 share_target,
+                worker_count,
                 automatic_rotation,
             }),
         )?)?;
 
         let processor: Arc<dyn ShareProcessor> = Arc::new(coordinator);
-        match serve_zip301_loopback(arguments.bind, job, zip301.clone(), processor) {
+        match listener.serve(job, zip301.clone(), processor) {
             Err(MinerError::StaleNativeJob(reason)) if automatic_rotation => {
                 eprintln!("rotating stale native job: {reason}");
             }
@@ -330,6 +419,72 @@ fn run_native_server(
             Ok(()) => return Ok(()),
         }
     }
+}
+
+/// Returns `true` only when preparing the next frozen generation failed for a
+/// reason that can safely change without an operator or software correction.
+///
+/// This list is intentionally exhaustive. In particular, malformed templates,
+/// proposal rejections, identity/payout mismatches, journal failures, invalid
+/// configuration, and malformed RPC responses must stop the supervisor instead
+/// of being hidden behind an unbounded retry loop.
+fn is_retryable_native_preparation_error(error: &MinerError) -> bool {
+    match error {
+        MinerError::RpcTransport(error) => is_retryable_rpc_transport(error),
+        MinerError::RpcHttpStatus(status) => is_retryable_http_status(*status),
+        MinerError::RpcError {
+            code: Some(-9 | -10 | -28),
+            ..
+        } => true,
+        MinerError::Io(error) => is_retryable_io_kind(error.kind()),
+        MinerError::ParentTipMismatch { .. }
+        | MinerError::ChildTipMismatch { .. }
+        | MinerError::StaleNativeJob(_) => true,
+        _ => false,
+    }
+}
+
+fn is_retryable_rpc_transport(error: &reqwest::Error) -> bool {
+    if error.is_timeout() {
+        return true;
+    }
+
+    // A generic request/build/TLS error can be permanent or security-sensitive.
+    // Retry a non-timeout transport failure only when its source chain exposes
+    // an I/O kind which is explicitly classified as transient below.
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| is_retryable_io_kind(error.kind()))
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+
+    false
+}
+
+const fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+const fn is_retryable_io_kind(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -590,8 +745,10 @@ fn share_journal_path() -> Result<PathBuf, MinerError> {
 struct ServeSummary {
     bind: SocketAddr,
     maximum_clients: usize,
+    maximum_parallel_authentications: usize,
     maximum_parallel_validations: usize,
     share_target: Target,
+    worker_count: usize,
     automatic_rotation: bool,
 }
 
@@ -621,6 +778,7 @@ fn native_preflight(
         "lifecycle": {
             "one_frozen_job": true,
             "automatic_rotation": serve.is_some_and(|serve| serve.automatic_rotation),
+            "maximum_generation_age_seconds": NATIVE_JOB_MAX_AGE_SECONDS,
             "message": lifecycle_message,
         },
         "rpc": {
@@ -685,10 +843,12 @@ fn native_preflight(
             "bind": serve.bind.to_string(),
             "loopback_only": true,
             "maximum_clients": serve.maximum_clients,
+            "maximum_parallel_authentications": serve.maximum_parallel_authentications,
             "maximum_parallel_validations": serve.maximum_parallel_validations,
             "share_target": display_target(serve.share_target),
-            "stratum_password_configured": true,
-            "stratum_password_source": WCASH_STRATUM_PASSWORD,
+            "authentication": "exact-worker-argon2id",
+            "worker_count": serve.worker_count,
+            "worker_credentials_source": WCASH_WORKER_CREDENTIALS,
         });
     }
     Ok(output)
@@ -907,5 +1067,159 @@ mod tests {
         );
         assert_eq!(display_target(target), display);
         assert!(parse_display_target(&"00".repeat(32), "target").is_err());
+    }
+
+    #[test]
+    fn preparation_retry_accepts_only_explicit_transient_http_and_rpc_failures() {
+        for status in [408, 425, 429, 500, 502, 503, 504] {
+            let status = reqwest::StatusCode::from_u16(status).expect("valid HTTP status");
+            assert!(
+                is_retryable_native_preparation_error(&MinerError::RpcHttpStatus(status)),
+                "HTTP {status} must be retryable"
+            );
+        }
+        for status in [400, 401, 403, 404, 405, 409, 422, 501, 505] {
+            let status = reqwest::StatusCode::from_u16(status).expect("valid HTTP status");
+            assert!(
+                !is_retryable_native_preparation_error(&MinerError::RpcHttpStatus(status)),
+                "HTTP {status} must stop the supervisor"
+            );
+        }
+
+        for code in [-9, -10, -28] {
+            assert!(is_retryable_native_preparation_error(&rpc_error(Some(
+                code
+            ))));
+        }
+        for code in [None, Some(-1), Some(-5), Some(-8), Some(-32601)] {
+            assert!(
+                !is_retryable_native_preparation_error(&rpc_error(code)),
+                "RPC code {code:?} must stop the supervisor"
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_retry_distinguishes_transient_and_permanent_io() {
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::NetworkDown,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Interrupted,
+        ] {
+            assert!(
+                is_retryable_native_preparation_error(&MinerError::Io(io::Error::from(kind))),
+                "I/O kind {kind:?} must be retryable"
+            );
+        }
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AlreadyExists,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::WriteZero,
+            io::ErrorKind::Unsupported,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::Other,
+        ] {
+            assert!(
+                !is_retryable_native_preparation_error(&MinerError::Io(io::Error::from(kind))),
+                "I/O kind {kind:?} must stop the supervisor"
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_retry_accepts_timeout_but_rejects_request_builder_errors() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("loopback listener must be available");
+        let address = listener.local_addr().expect("listener has a local address");
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("client connects");
+            thread::sleep(Duration::from_millis(100));
+        });
+        let timeout = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(20))
+            .build()
+            .expect("client configuration is valid")
+            .get(format!("http://{address}"))
+            .send()
+            .expect_err("silent server must exceed the request deadline");
+        assert!(timeout.is_timeout());
+        assert!(is_retryable_native_preparation_error(
+            &MinerError::RpcTransport(timeout)
+        ));
+        server.join().expect("server exits normally");
+
+        let builder_error = reqwest::blocking::Client::new()
+            .get("://invalid-url")
+            .build()
+            .expect_err("invalid URL must fail request construction");
+        assert!(builder_error.is_builder());
+        assert!(!is_retryable_native_preparation_error(
+            &MinerError::RpcTransport(builder_error)
+        ));
+    }
+
+    #[test]
+    fn preparation_retry_allows_tip_races_but_stops_security_failures() {
+        assert!(is_retryable_native_preparation_error(
+            &MinerError::ParentTipMismatch {
+                expected: "parent-a".to_string(),
+                endpoint: "validator".to_string(),
+                actual: "parent-b".to_string(),
+            }
+        ));
+        assert!(is_retryable_native_preparation_error(
+            &MinerError::ChildTipMismatch {
+                expected: "child-a".to_string(),
+                endpoint: "child".to_string(),
+                actual: "child-b".to_string(),
+            }
+        ));
+        assert!(is_retryable_native_preparation_error(
+            &MinerError::StaleNativeJob("candidate expired during preparation".to_string())
+        ));
+
+        let permanent = [
+            MinerError::RpcConfiguration("unsafe endpoint".to_string()),
+            MinerError::RpcProtocol("malformed response".to_string()),
+            MinerError::RpcResponseTooLarge(8 * 1024 * 1024),
+            MinerError::ParentProposalRejected {
+                endpoint: "validator".to_string(),
+                reason: "rejected".to_string(),
+            },
+            MinerError::NetworkIdentityMismatch {
+                expected: "expected-genesis".to_string(),
+                endpoint: "node".to_string(),
+                actual: "foreign-genesis".to_string(),
+            },
+            MinerError::InvalidParentTemplate("payout commitment mismatch".to_string()),
+            MinerError::InvalidRequest("share journal is corrupted".to_string()),
+            MinerError::CoinbaseSerialization(io::Error::from(io::ErrorKind::ConnectionReset)),
+        ];
+        for error in permanent {
+            assert!(
+                !is_retryable_native_preparation_error(&error),
+                "{error} must stop the supervisor"
+            );
+        }
+    }
+
+    fn rpc_error(code: Option<i64>) -> MinerError {
+        MinerError::RpcError {
+            endpoint: "node".to_string(),
+            code,
+            message: "test error".to_string(),
+        }
     }
 }
