@@ -118,7 +118,7 @@ async fn wcash_testnet_transfer_gate_covers_block_and_mempool_verifiers() {
         Height(2),
     );
     let state = service_fn(|_| async { unreachable!("the launch gate runs before state access") });
-    let block_verifier = BlockTxVerifier::new(&network, state.clone());
+    let block_verifier = BlockTxVerifier::new(&network, state);
     let mempool_verifier = MempoolTxVerifier::new_for_tests(&network, state);
 
     let block_result = block_verifier.oneshot(BlockRequest {
