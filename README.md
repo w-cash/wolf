@@ -24,6 +24,7 @@ before any value-bearing transaction test.
 | --- | --- |
 | Parent proof of work | Zcash Equihash `(200, 9)` AuxPoW only |
 | Target block spacing | 75 seconds |
+| Monetary precision | 8 decimal places, identical to Zcash; 1 WCASH = 100,000,000 zatoshi |
 | Initial subsidy | 6.25 WCASH at heights 1 through 1,680,000 |
 | Halving | Every 1,680,000 blocks (about four years); first halved block is 1,680,001 |
 | Monetary cap | 21,000,000 WCASH; exact scheduled issuance is 20,999,999.81520000 WCASH after zatoshi truncation |

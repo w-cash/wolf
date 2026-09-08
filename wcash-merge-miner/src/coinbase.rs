@@ -4,7 +4,7 @@ use std::io::Cursor;
 
 use wcash_zcash_aux::{commitment_payload, validate_miner_data_commitment, AuxPowError};
 use zebra_chain::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NonNegative, MAX_SINGLE_TRANSACTION_VALUE},
     block::Height,
     serialization::{ZcashDeserialize, ZcashSerialize},
     transaction::{LockTime, Transaction},
@@ -14,7 +14,7 @@ use zebra_chain::{
 use crate::MinerError;
 
 /// Zatoshis in the fixed 21-million-ZEC parent-chain monetary range.
-const MAX_PARENT_MONEY: u64 = 21_000_000 * 100_000_000;
+const MAX_PARENT_MONEY: u64 = MAX_SINGLE_TRANSACTION_VALUE as u64;
 
 /// One optional non-commitment transparent output in a synthetic local coinbase.
 #[derive(Clone, Debug, Eq, PartialEq)]

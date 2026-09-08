@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Finalized the prelaunch Wcash emission schedule at 6.25 WCASH per block with
   approximately four-year halvings and a 21-million monetary cap, and rotated
   the Testnet and regtest P2P identities to isolate superseded schedules.
+- Pinned Wcash monetary precision to Zcash's eight decimal places: one WCASH is
+  100,000,000 zatoshi, with integer-zatoshi consensus and RPC regression tests.
 - Reset local regtest genesis to Bitcoin mainnet block 965,910 and rotated the
   regtest P2P identity to `Wcash/regtest/v2` so nodes on the superseded local
   chain cannot connect to this chain.

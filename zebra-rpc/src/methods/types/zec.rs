@@ -209,3 +209,30 @@ impl<C1: Constraint, C2: Constraint> PartialEq<Zec<C2>> for Amount<C1> {
 }
 
 impl<C: Constraint> Eq for Zec<C> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zebra_chain::amount::NonNegative;
+
+    #[test]
+    fn wcash_and_zcash_coin_amounts_use_eight_decimal_precision() {
+        assert_eq!(COIN, 100_000_000);
+        assert_eq!(MAX_ZEC_FORMAT_PRECISION, 8);
+
+        let one_zatoshi = Zec::<NonNegative>::try_from(1).expect("one zatoshi is valid");
+        let one_coin = Zec::<NonNegative>::try_from(COIN).expect("one coin is valid");
+        let wcash_initial_subsidy =
+            Zec::<NonNegative>::try_from(625_000_000).expect("the Wcash subsidy is valid");
+
+        assert_eq!(one_zatoshi.to_string(), "0.00000001");
+        assert_eq!(one_coin.to_string(), "1.00000000");
+        assert_eq!(wcash_initial_subsidy.to_string(), "6.25000000");
+
+        let parsed_smallest_unit = "0.00000001"
+            .parse::<Zec<NonNegative>>()
+            .expect("eight decimal places are valid");
+        assert_eq!(parsed_smallest_unit.zatoshis(), 1);
+        assert!("0.000000001".parse::<Zec<NonNegative>>().is_err());
+    }
+}

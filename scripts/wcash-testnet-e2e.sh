@@ -206,6 +206,7 @@ assert response.get("error") in (None, False), response
 result = response["result"]
 assert result["height"] == 1, result
 assert result["previousblockhash"] == sys.argv[2], result
+assert result["coinbasevalue"] == 625_000_000, result
 assert len(result["hash"]) == 64, result
 assert len(result["target"]) == 64, result
 assert result["data"], result
@@ -328,10 +329,12 @@ rpc_call "$wcash_rpc" getblockchaininfo | python3 -c '
 import json,sys
 result=json.load(sys.stdin)["result"]
 assert result["blocks"] == 1, result
+assert result["chainSupply"]["chainValue"] == 6.25, result
 assert result["chainSupply"]["chainValueZat"] == 625_000_000, result
-pools={pool["id"]: pool["chainValueZat"] for pool in result["valuePools"]}
-assert pools["ironwood"] == 625_000_000, pools
-assert all(value == 0 for name,value in pools.items() if name != "ironwood"), pools
+pools={pool["id"]: pool for pool in result["valuePools"]}
+assert pools["ironwood"]["chainValue"] == 6.25, pools
+assert pools["ironwood"]["chainValueZat"] == 625_000_000, pools
+assert all(pool["chainValueZat"] == 0 for name,pool in pools.items() if name != "ironwood"), pools
 '
 
 kill -TERM "$pool_pid" 2>/dev/null || true

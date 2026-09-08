@@ -54,6 +54,11 @@ vectors, followed by a network reset or explicit consensus upgrade.
 
 ## Monetary policy
 
+Wcash uses Zcash's monetary precision without modification: one WCASH is exactly
+100,000,000 zatoshi, so the smallest consensus amount is 0.00000001 WCASH.
+Amounts are encoded and validated as integer zatoshi; consensus never uses
+floating-point coin values.
+
 Genesis at height 0 has no subsidy. Heights 1 through 1,680,000 inclusive each
 create 6.25 WCASH. The first halved block is height 1,680,001, and every later
 era contains exactly 1,680,000 blocks. At the 75-second target, each era is

@@ -7,7 +7,7 @@ use color_eyre::Report;
 
 use super::Network;
 use crate::{
-    amount::{Amount, NonNegative, MAX_MONEY},
+    amount::{Amount, NonNegative, COIN, MAX_MONEY},
     block::{genesis::WCASH_TESTNET_GENESIS_HASH, Height},
     parameters::{
         subsidy::{
@@ -223,6 +223,12 @@ fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
         75
     );
     assert_eq!(WCASH_INITIAL_BLOCK_SUBSIDY, 625_000_000);
+    assert_eq!(COIN, 100_000_000, "Wcash must retain Zcash precision");
+    assert_eq!(
+        WCASH_INITIAL_BLOCK_SUBSIDY,
+        u64::try_from(6 * COIN + COIN / 4).unwrap(),
+        "the initial subsidy must be exactly 6.25000000 WCASH"
+    );
     assert_eq!(WCASH_HALVING_INTERVAL, 1_680_000);
     assert_eq!(
         u64::try_from(WCASH_HALVING_INTERVAL).unwrap() * 75,
