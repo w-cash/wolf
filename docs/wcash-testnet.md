@@ -128,9 +128,12 @@ payout-critical boundary. The private Wcash coinbase deliberately prevents the
 coordinator from publicly recovering its recipient, so the pool must trust its
 loopback child node to construct the requested reward correctly.
 
-## Reproduce the mining smoke test
+## Reproduce the local mining smoke test
 
-The automated smoke test uses an ephemeral, loopback-only CI profile with no
+This smoke test is a mandatory local release check. It is intentionally not run
+by GitHub Actions because it performs real proof-of-work solving; hosted CI uses
+fixed Equihash and AuxPoW vectors and exercises the non-solving validation paths.
+The smoke test uses an ephemeral, loopback-only profile with no
 peers, no cookie authentication, and no `debug_force_finished_sync` override.
 The inherited test-network policy deliberately permits its isolated template.
 Its bounded template retry covers asynchronous RPC, state, and proposal-service

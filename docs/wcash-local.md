@@ -268,8 +268,13 @@ A successful run proves that this checkout can construct a private Wcash
 coinbase, authenticate AuxPoW v2 through both Zcash transaction commitments,
 solve real Equihash, pass an unmodified Zcash proposal validator, submit exact
 blocks to both chains, and accept a canonical ZIP-301 share bound to an exact
-authenticated worker. The automated native E2E test mines through two ZIP-301
+authenticated worker. The local native E2E test mines through two ZIP-301
 generations and checks the resulting journal aggregate.
+
+Because these scripts perform real proof-of-work solving, they are mandatory
+local release checks and are intentionally excluded from GitHub Actions. Hosted
+CI compiles the same components and validates fixed Equihash/AuxPoW vectors,
+consensus rules, RPC behavior, and profile isolation without solving work.
 
 It does not prove wallet recovery, vendor-by-vendor ASIC interoperability,
 public variable-difficulty behavior, payout correctness, Internet-facing
