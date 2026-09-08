@@ -1,0 +1,44 @@
+[package]
+name = "wcash-wallet"
+version = "0.1.0"
+publish = false
+authors.workspace = true
+description = "An experimental local testnet wallet for Wcash"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+blake2b_simd.workspace = true
+clap = { workspace = true, features = ["derive"] }
+hex.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
+rusqlite = "0.37"
+secrecy = "0.8"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tonic = { workspace = true, features = ["transport"] }
+zcash_address.workspace = true
+zcash_client_backend = { version = "0.24.0", features = ["lightwalletd-tonic-tls-webpki-roots", "lightwalletd-tonic-transport", "orchard", "sync"] }
+zcash_client_sqlite = { version = "0.22.0", features = ["orchard"] }
+zcash_keys = { workspace = true, features = ["orchard", "sapling"] }
+zcash_primitives = { workspace = true, features = ["circuits"] }
+zcash_proofs = { workspace = true, features = ["bundled-prover", "multicore"] }
+zcash_protocol.workspace = true
+zebra-chain = { path = "../zebra-chain", version = "12.0.0" }
+zip32.workspace = true
+orchard.workspace = true
+zeroize = "1.8"
+
+[dev-dependencies]
+pczt = "0.9.3"
+tempfile.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

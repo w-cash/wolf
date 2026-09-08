@@ -1096,11 +1096,10 @@ where
 /// `last_seen_tip_hash` from the mempool response doesn't match the tip hash from the state.
 ///
 /// You should call `check_synced_to_tip()` before calling this function.
-/// Mining-only networks return an exact empty snapshot without querying the mempool. All mempool
-/// service errors are preserved on networks that support non-coinbase transactions.
+/// All mempool service errors are preserved for every network profile.
 pub async fn fetch_mempool_transactions<Mempool>(
-    network: &Network,
-    template_height: block::Height,
+    _network: &Network,
+    _template_height: block::Height,
     mempool: Mempool,
     chain_tip_hash: block::Hash,
 ) -> RpcResult<Option<(Vec<VerifiedUnminedTx>, TransactionDependencies)>>
@@ -1112,15 +1111,6 @@ where
         > + 'static,
     Mempool::Future: Send,
 {
-    // Wcash Testnet is consensus-enforced mining-only until its transaction signature domain is
-    // separated from Zcash. No mempool transaction can be included in a valid block, so avoid
-    // making template availability depend on the sync-gated mempool service. This is deliberately
-    // narrower than `uses_wcash_consensus()`: Wcash Regtest supports transactions and must retain
-    // normal mempool behavior.
-    if network.disables_non_coinbase_transactions(template_height) {
-        return Ok(Some(Default::default()));
-    }
-
     let response = mempool
         .oneshot(mempool::Request::FullTransactions)
         .await

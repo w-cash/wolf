@@ -14,7 +14,7 @@ pub use zcash_history::{V1, V2, V3};
 use crate::{
     block::{Block, ChainHistoryMmrRootHash},
     orchard,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{ConsensusBranchId, Network, NetworkUpgrade},
     sapling,
 };
 
@@ -139,8 +139,7 @@ impl<V: Version> Tree<V> {
         peaks: &BTreeMap<u32, Entry>,
         extra: &BTreeMap<u32, Entry>,
     ) -> Result<Self, io::Error> {
-        let branch_id = network_upgrade
-            .branch_id()
+        let branch_id = ConsensusBranchId::for_network_upgrade(network, network_upgrade)
             .expect("unexpected pre-Overwinter MMR history tree");
         let mut peaks_vec = Vec::new();
         for (idx, entry) in peaks {
@@ -261,8 +260,7 @@ impl Version for zcash_history::V1 {
             .coinbase_height()
             .expect("block must have coinbase height during contextual verification");
         let network_upgrade = NetworkUpgrade::current(network, height);
-        let branch_id = network_upgrade
-            .branch_id()
+        let branch_id = ConsensusBranchId::for_network_upgrade(network, network_upgrade)
             .expect("must have branch ID for chain history network upgrades");
         let block_hash = block.hash().0;
         let time: u32 = block

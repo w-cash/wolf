@@ -1,0 +1,4 @@
+project: zebrad
+kind: Added
+body: "Add an experimental one-shot Wcash Testnet wallet for domain-separated keys and Unified Addresses, SQLite scanning and balance reporting against an attested loopback node, Wcash-domain V6 Ironwood signing, transaction recovery, exact-byte broadcast, and status inspection. Batch payouts, pool accounting, durable settlement, and idempotent payout requests remain out of scope ([#1](https://github.com/w-cash/wolf/pull/1))."
+time: 2026-09-08T20:01:26.000000005Z

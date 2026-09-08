@@ -20,7 +20,7 @@ use zebra_chain::{
     chain_sync_status::MockSyncStatus,
     chain_tip::{mock::MockChainTip, ChainTip, NoChainTip},
     history_tree::HistoryTree,
-    parameters::{ConsensusBranchId, Network, NetworkUpgrade},
+    parameters::{ConsensusBranchId, Network, WCASH_TESTNET_V1_BRANCH_ID},
     serialization::{DateTime32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction::{self, Transaction, UnminedTx, VerifiedUnminedTx},
     transparent,
@@ -503,15 +503,11 @@ proptest! {
 
                     prop_assert_eq!(
                         info.consensus.chain_tip.0,
-                        NetworkUpgrade::current(&network, block_height)
-                            .branch_id()
-                            .unwrap()
+                        ConsensusBranchId::current(&network, block_height).unwrap()
                     );
                     prop_assert_eq!(
                         info.consensus.next_block.0,
-                        NetworkUpgrade::current(&network, (block_height + 1).unwrap())
-                            .branch_id()
-                            .unwrap()
+                        ConsensusBranchId::current(&network, (block_height + 1).unwrap()).unwrap()
                     );
 
                     for u in info.upgrades {
@@ -597,9 +593,9 @@ proptest! {
             prop_assert_eq!(response.blocks, Height::MIN);
             prop_assert_eq!(response.value_pools, GetBlockchainInfoBalance::value_pools(ValueBalance::zero(), None));
 
-            let genesis_branch_id = NetworkUpgrade::current(&network, Height::MIN).branch_id().unwrap_or(ConsensusBranchId::RPC_MISSING_ID);
+            let genesis_branch_id = ConsensusBranchId::current(&network, Height::MIN).unwrap_or(ConsensusBranchId::RPC_MISSING_ID);
             let next_height = (Height::MIN + 1).expect("genesis height plus one is next height and valid");
-            let next_branch_id = NetworkUpgrade::current(&network, next_height).branch_id().unwrap_or(ConsensusBranchId::RPC_MISSING_ID);
+            let next_branch_id = ConsensusBranchId::current(&network, next_height).unwrap_or(ConsensusBranchId::RPC_MISSING_ID);
 
             prop_assert_eq!(response.consensus.chain_tip.0, genesis_branch_id);
             prop_assert_eq!(response.consensus.next_block.0, next_branch_id);
@@ -924,6 +920,76 @@ fn check_err_code<T>(
     }
 
     Ok(())
+}
+
+#[test]
+fn wcash_get_blockchain_info_reports_custom_transaction_domain() {
+    let (runtime, _init_guard) = zebra_test::init_async();
+    let _guard = runtime.enter();
+    let network = Network::new_wcash_testnet();
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+    let tip_height = Height(1);
+    let tip_hash = network.genesis_hash();
+    let tip_time: chrono::DateTime<chrono::Utc> = DateTime32::now().into();
+    chain_tip_sender.send_best_tip_height(tip_height);
+    chain_tip_sender.send_best_tip_hash(tip_hash);
+    chain_tip_sender.send_best_tip_block_time(tip_time);
+
+    let (mut mempool, mut state, rpc, mempool_tx_queue) = mock_services(network.clone(), chain_tip);
+
+    runtime.block_on(async move {
+        let response_fut = rpc.get_blockchain_info();
+        let mock_state_handler = async move {
+            state
+                .expect_request(zebra_state::ReadRequest::UsageInfo)
+                .await
+                .expect("getblockchaininfo must query state usage")
+                .respond(zebra_state::ReadResponse::UsageInfo(0));
+            state
+                .expect_request(zebra_state::ReadRequest::TipPoolValues)
+                .await
+                .expect("getblockchaininfo must query tip pool values")
+                .respond(zebra_state::ReadResponse::TipPoolValues {
+                    tip_height,
+                    tip_hash,
+                    value_balance: ValueBalance::default(),
+                });
+            state
+                .expect_request(zebra_state::ReadRequest::ChainInfo)
+                .await
+                .expect("getblockchaininfo must query chain info")
+                .respond(zebra_state::ReadResponse::ChainInfo(
+                    GetBlockTemplateChainInfo {
+                        tip_hash,
+                        tip_height,
+                        chain_history_root: HistoryTree::default().hash(),
+                        expected_difficulty: Default::default(),
+                        cur_time: DateTime32::now(),
+                        min_time: DateTime32::now(),
+                        max_time: DateTime32::now(),
+                    },
+                ));
+        };
+
+        let (response, ()) = tokio::join!(response_fut, mock_state_handler);
+        let response = response.expect("Wcash getblockchaininfo must succeed");
+
+        assert_eq!(response.consensus.chain_tip.0, WCASH_TESTNET_V1_BRANCH_ID);
+        assert_eq!(response.consensus.next_block.0, WCASH_TESTNET_V1_BRANCH_ID);
+        assert!(
+            response
+                .upgrades
+                .keys()
+                .any(|id| id.0 == WCASH_TESTNET_V1_BRANCH_ID),
+            "the upgrades map must expose the Wcash Testnet v1 branch ID"
+        );
+
+        mempool
+            .expect_no_requests()
+            .await
+            .expect("getblockchaininfo does not query the mempool");
+        assert!(mempool_tx_queue.now_or_never().is_none());
+    });
 }
 
 /// Creates mocked:

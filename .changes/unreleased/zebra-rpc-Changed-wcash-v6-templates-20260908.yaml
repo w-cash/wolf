@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: Changed
+body: "Include verified Wcash-domain V6 mempool transactions and their fees in Wcash block templates, retain private Ironwood coinbase accounting, and report the exact Wcash branch ID through `getblockchaininfo` ([#1](https://github.com/w-cash/wolf/pull/1))."
+time: 2026-09-08T20:01:26.000000003Z

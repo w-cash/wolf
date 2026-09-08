@@ -11,7 +11,7 @@ consensus. Each has a distinct genesis block, P2P magic, default P2P/RPC ports,
 and peer-cache domain. Both activate NU6.3 at height 1 and use the Ironwood
 transaction format for every mined block.
 
-Public Testnet freezes Bitcoin mainnet block 965,900, hash
+The built-in Testnet profile freezes Bitcoin mainnet block 965,900, hash
 `0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851`.
 The release vector records Bitcoin height 966,011, or 112 confirmations counting
 the anchor block. Its complete Wcash genesis block ID is
@@ -38,19 +38,30 @@ decoded timestamp, compact target, and nonce. Local SHA256d and `nBits` checks
 reproduced the hash and verified its work. The audit tip is frozen provenance,
 not a consensus or runtime input.
 
-### Mining-only transaction gate
+### Transaction version and replay domain
 
-Wcash Testnet currently inherits Zcash NU6.3's transaction branch ID and
-signature-hash domain. Distinct addresses, genesis, and P2P magic do not prevent
-cryptographic replay of an otherwise equivalent signed transaction. Consensus
-therefore rejects every non-coinbase transaction on Wcash Testnet through the
-shared block and mempool verifier path.
+Wcash Testnet v1 uses consensus branch ID `0xb3cfd27e` for its NU6.3 / Ironwood
+rules. Standard Zcash NU6.3 keeps `0x37a5165b`. The Wcash ID is carried in every
+post-genesis version-6 transaction and is used by transaction IDs, signature
+hashes, shielded authorization, parsing, block checks, and chain-history
+commitments. Validators compare the exact embedded ID rather than treating the
+shared NU6.3 feature set as sufficient.
 
-This network is for AuxPoW, pool, difficulty, and shielded-coinbase engineering
-only. Its rewards are test-only and cannot be transferred. Enabling value-bearing
-tests requires a Wcash-specific branch ID wired through parsing, sighash, proof,
-wallet, RPC, and light-client dependencies, with two-way cross-chain rejection
-vectors, followed by a network reset or explicit consensus upgrade.
+Wcash rejects every post-genesis V1-V5 transaction. In particular, V4 has no
+embedded branch ID and V5 belongs to an inherited Zcash domain, so neither is a
+valid compatibility path. Wcash-domain V6 transactions are rejected on Zcash
+Mainnet and Testnet, and Zcash-domain V6 transactions are rejected on Wcash.
+Both the block and mempool verifier paths enforce the same checks.
+
+This makes value-transfer testing possible without relying on P2P
+magic or address prefixes for replay protection. A controlled local Regtest E2E
+has mined three private coinbases, scanned them into the experimental wallet,
+signed and broadcast a one-WCASH Wcash-domain transfer, observed its exact bytes
+and fee in the mempool and block template, mined it through AuxPoW, and rescanned
+the recipient and private change. The test uses the explicit Regtest-only
+one-confirmation override; the public Testnet wallet policy remains 100
+confirmations. Testnet coins remain test-only, and this local result is not a
+public-network or production-wallet claim.
 
 ## Monetary policy
 
@@ -88,7 +99,8 @@ belongs to the miner coinbase and is subject to the shielded-output rules below.
 ## Block timing and difficulty
 
 The target spacing is 75 seconds. Regtest deliberately uses its fixed
-proof-of-work limit. Public Testnet starts at compact target `0x2007ffff`
+proof-of-work limit. The built-in Testnet profile starts at compact target
+`0x2007ffff`
 (`2^251 - 1`) and uses the inherited damped 17-block retarget from launch. A
 candidate strictly more than 450 seconds after its predecessor may use the
 testnet proof-of-work limit; exactly 450 seconds does not trigger the rule.
@@ -151,11 +163,16 @@ an Orchard receiver; the template builder uses that receiver payload to create
 the mandatory Ironwood reward output. Standalone Sapling, TEX, and transparent
 addresses are never valid coinbase destinations.
 
-This node implements payment-address parsing and encoding only. It does not
-provide a wallet, account derivation, or Wcash-specific encodings for spending
-keys, viewing keys, extended keys, or seeds. Those key domains and wallet
-interoperability remain separate release work and must not be inferred from the
-payment-address prefixes above.
+The node implements payment-address parsing and encoding. The workspace also
+contains an experimental one-shot wallet for controlled Testnet and regtest
+transfers. It derives Wcash-domain keys and receivers, scans a local SQLite
+wallet from an attested loopback node, signs Wcash-domain V6 Ironwood transfers,
+and broadcasts the exact signed bytes. It deliberately does not implement batch
+payouts, pool accounting, durable settlement, or idempotent payout requests.
+The controlled-key private-coinbase spend gate has passed for one deterministic,
+isolated Regtest path. That result does not establish general wallet
+interoperability, public Testnet operation, or production payout safety. Key
+control must never be inferred from a syntactically valid payment address.
 
 ## Supply auditability
 
@@ -181,8 +198,11 @@ every inherited Zcash network configuration because Wcash uses different
 network and consensus rules; those definitions remain isolated in upstream
 library tests.
 
-Wcash Testnet has a frozen identity for public engineering interoperability.
-It is not a production or value-bearing network: wallet/key derivation,
-project-operated seeds, multi-node and pool soak testing, physical ASIC runs,
-and an external security/consensus audit remain required before any mainnet or
-community payout service. See [`wcash-testnet.md`](wcash-testnet.md).
+Wcash Testnet has a frozen identity for future public engineering
+interoperability, but no public Wcash Testnet is deployed. The controlled local
+Regtest wallet-spend lifecycle has passed; the wallet remains experimental and
+is not a production or pool-settlement service. Project-operated seeds, a
+separately implemented pool-payout system, multi-node and pool soak testing,
+physical ASIC runs, and an external security/consensus audit remain required
+before any mainnet or community payout service. Mainnet remains disabled. See
+[`wcash-testnet.md`](wcash-testnet.md).

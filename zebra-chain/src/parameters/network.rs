@@ -234,16 +234,6 @@ impl Network {
         self.wcash_network() == Some(wcash_genesis::WcashNetwork::Testnet)
     }
 
-    /// Returns true when consensus rejects every non-coinbase transaction at `height`.
-    ///
-    /// Keep template construction coupled to this predicate: a mining-only network has no
-    /// consensus-valid mempool transactions, so its block templates must be coinbase-only.
-    /// The height argument makes a future transaction-domain activation an explicit change in
-    /// both consensus verification and template construction.
-    pub fn disables_non_coinbase_transactions(&self, _height: block::Height) -> bool {
-        self.is_wcash_testnet()
-    }
-
     /// Returns true only for the built-in local Wcash Regtest.
     pub fn is_wcash_regtest(&self) -> bool {
         self.wcash_network() == Some(wcash_genesis::WcashNetwork::Regtest)
@@ -532,5 +522,16 @@ impl zcash_protocol::consensus::Parameters for Network {
         NetworkUpgrade::from(nu)
             .activation_height(self)
             .map(|Height(h)| zcash_protocol::consensus::BlockHeight::from_u32(h))
+    }
+
+    fn branch_id_for_upgrade(
+        &self,
+        nu: zcash_protocol::consensus::NetworkUpgrade,
+    ) -> zcash_protocol::consensus::BranchId {
+        if self.uses_wcash_consensus() && nu == zcash_protocol::consensus::NetworkUpgrade::Nu6_3 {
+            zcash_protocol::consensus::BranchId::WcashTestnetV1
+        } else {
+            nu.branch_id()
+        }
     }
 }
