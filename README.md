@@ -2,10 +2,10 @@
 
 Wcash is an experimental privacy-focused auxiliary proof-of-work chain written
 in Rust. It is based on the Zcash Foundation's Zebra `main` history through
-[`abf397469`](https://github.com/ZcashFoundation/zebra/commit/abf397469356dd03f7e6321a33b41f0d98a20060)
-(207 commits after v6.3.0), including the NU6.3 changes and the upstream fixes
-that restore coinbase-script-length and expiry-height validation across the
-parser/verifier boundary. Wcash
+[`99a1bed5c`](https://github.com/ZcashFoundation/zebra/commit/99a1bed5c0b3f0fab76879229ebbb65dfa4b67db)
+(211 commits after v6.3.0), including the NU6.3 changes and the upstream fixes
+that restore coinbase-script-length, expiry-height, and fallible Sprout
+aggregate value-balance validation across the parser/verifier boundary. Wcash
 borrows Equihash `(200, 9)` work from a Zcash parent block while maintaining its
 own blocks, difficulty target, transactions, and shielded value pool.
 

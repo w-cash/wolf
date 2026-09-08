@@ -125,6 +125,7 @@ jobs:
         run: |
           cargo test --locked -p zebra-chain --lib coinbase_script_len_bounds_enforced_at_parse
           cargo test --locked -p zebra-chain --lib expiry_height_preserves_out_of_range_values
+          cargo test --locked -p zebra-chain --lib sprout_aggregate_value_balance_out_of_range_is_rejected
           cargo test --locked -p zebra-consensus --lib out_of_range_expiry_height
           cargo test --locked -p zebra-consensus --lib small_order
           cargo test --locked -p zebra-consensus --lib tx_with_pre_activation_branch_id_is_rejected
