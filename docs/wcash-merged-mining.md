@@ -226,15 +226,23 @@ silently weaken the parent reward check.
 
 ## Release boundary
 
-The consensus and exact native dual-submit path pass local three-node regtest.
-The frozen public Testnet identity has a separate automated gate that boots a
-clean height-zero node without the debug sync override, obtains a child
-candidate, mines through the ZIP-301 listener, and requires Wcash plus two
-Zcash processes to accept the resulting work. A community-facing testnet pool
-still needs project-operated seeds, a complete controlled-key private-coinbase
-recovery/sign/broadcast test, an independently reviewed consensus
+The consensus and exact native dual-submit path pass local three-node Regtest.
+The frozen Testnet profile has a separate automated phase that boots a clean
+height-zero node without the debug sync override, obtains a child candidate,
+mines through the ZIP-301 listener, and requires Wcash plus two Zcash processes
+to accept the resulting work. The same release script also passes a separate
+controlled Regtest wallet lifecycle: three private coinbases are scanned, a
+one-WCASH V6 transfer is matched in the mempool and block template, rejected by
+both standard Zcash Regtest nodes, mined in a fourth AuxPoW block, and rescanned
+with the full 25-WCASH supply remaining in Ironwood. That transfer uses the
+explicit Regtest-only unsafe one-confirmation override; the public Testnet wallet
+policy remains 100 confirmations.
+
+No public Wcash Testnet or community pool is deployed. A community-facing pool
+still needs project-operated seeds, an independently reviewed consensus
 specification, multi-node soak and reorg tests, vendor ASIC interoperability,
-and an operated TLS/variable-difficulty edge with durable accounting and
-reorg-safe shielded settlement. The experimental one-shot wallet in this
-workspace is not that operated payout system. Do not call this engineering
-testnet production-ready or use it with funds of real value.
+and an operated TLS/variable-difficulty edge with durable accounting, payouts,
+and reorg-safe shielded settlement. The experimental one-shot wallet in this
+workspace is not that operated payout system. Wcash mainnet remains disabled.
+Do not call this engineering profile production-ready or use it with funds of
+real value.

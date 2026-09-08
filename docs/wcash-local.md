@@ -2,8 +2,9 @@
 
 This procedure runs the same native template, proposal, solving, and dual-
 submission path used by the merged-mining coordinator. It uses three isolated
-loopback regtest nodes and real Equihash `(200, 9)`. It is not a public testnet
-or a wallet-spend test.
+loopback regtest nodes and real Equihash `(200, 9)`. The numbered manual flow is
+mining-only; the mandatory automated E2E described below adds a separate
+controlled wallet-spend phase. Neither is a public Testnet deployment.
 
 ## 1. Build separate consensus binaries
 
@@ -20,6 +21,7 @@ cargo build --locked --release -p zebrad --bin zebrad \
 cp target/release/zebrad target/release/wcash-zebrad
 
 cargo build --locked --release -p wcash-merge-miner --bin wcash-merge-miner
+cargo build --locked --release -p wcash-wallet --bin wcash-wallet
 ```
 
 The feature boundary is deliberate. A Wcash-consensus binary rejects inherited
@@ -266,22 +268,34 @@ The report is evidence for later accounting review, not a payout instruction.
 
 ## 7. What this proves
 
-A successful run proves that this checkout can construct a private Wcash
-coinbase, authenticate AuxPoW v2 through both Zcash transaction commitments,
-solve real Equihash, pass an unmodified Zcash proposal validator, submit exact
-blocks to both chains, and accept a canonical ZIP-301 share bound to an exact
-authenticated worker. The local native E2E test mines through two ZIP-301
-generations and checks the resulting journal aggregate.
+A successful manual mining run proves that this checkout can construct a
+private Wcash coinbase, authenticate AuxPoW v2 through both Zcash transaction
+commitments, solve real Equihash, pass an unmodified Zcash proposal validator,
+submit exact blocks to both chains, and accept a canonical ZIP-301 share bound
+to an exact authenticated worker.
+
+The mandatory `scripts/wcash-testnet-e2e.sh` run adds a separate controlled
+Regtest wallet phase. It mines and scans three private 6.25-WCASH coinbases,
+signs and broadcasts a one-WCASH Wcash V6 transfer, matches its exact bytes and
+fee in the mempool and block template, verifies duplicate-broadcast handling and
+rejection by two standard Zcash Regtest nodes, mines the transaction in a fourth
+real AuxPoW block, and rescans the recipient and private change. Its final supply
+check is exactly 25 WCASH, entirely in Ironwood. The transfer uses the explicit
+Regtest-only unsafe one-confirmation override; the public Testnet wallet policy
+remains 100 confirmations.
 
 Because these scripts perform real proof-of-work solving, they are mandatory
 local release checks and are intentionally excluded from GitHub Actions. Hosted
 CI compiles the same components and validates fixed Equihash/AuxPoW vectors,
 consensus rules, RPC behavior, and profile isolation without solving work.
 
-It does not prove wallet recovery, vendor-by-vendor ASIC interoperability,
-public variable-difficulty behavior, payout correctness, Internet-facing
-security, long-running reorg behavior, or independent consensus-review results.
-No physical ASIC model or firmware is certified. Those remain community-pool
+The E2E proves only that deterministic local wallet lifecycle. It does not prove
+general or production wallet interoperability, vendor-by-vendor ASIC
+interoperability, public variable-difficulty behavior, payout correctness,
+Internet-facing security, long-running reorg behavior, or independent
+consensus-review results. No public Wcash Testnet, public pool, payout, or
+settlement service is deployed. No physical ASIC model or firmware is certified,
+and Wcash mainnet remains disabled. Those remain community-pool and network
 release gates.
 
 Wcash payment namespaces are disjoint from Zcash: Unified `wu...`, Sapling

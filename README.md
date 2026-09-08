@@ -2,21 +2,24 @@
 
 Wcash is an experimental privacy-focused auxiliary proof-of-work chain written
 in Rust. It is based on the Zcash Foundation's Zebra `main` history through
-[`d1fd7adfd`](https://github.com/ZcashFoundation/zebra/commit/d1fd7adfd366bddfb8f38ce70b417a5e3408799b)
-(188 commits after v6.3.0), including its latest Ironwood/NU6.3 fixes. Wcash
+[`abf397469`](https://github.com/ZcashFoundation/zebra/commit/abf397469356dd03f7e6321a33b41f0d98a20060)
+(207 commits after v6.3.0), including the NU6.3 changes and the upstream fixes
+that restore coinbase-script-length and expiry-height validation across the
+parser/verifier boundary. Wcash
 borrows Equihash `(200, 9)` work from a Zcash parent block while maintaining its
 own blocks, difficulty target, transactions, and shielded value pool.
 
-> **Development status:** this repository enables a public Wcash Testnet for
-> engineering and mining interoperability, plus an isolated local regtest. It
-> is not production ready, no Wcash mainnet is active, and it must not be used
-> with funds of real value.
+> **Development status:** this repository contains a frozen Wcash engineering
+> Testnet profile plus an isolated local regtest. No public Wcash Testnet node,
+> seed, or community pool is deployed. The software is not production ready,
+> Wcash mainnet remains disabled, and it must not be used with funds of real
+> value.
 
-The current public Testnet has a Wcash-specific NU6.3 transaction domain.
+The built-in Testnet profile has a Wcash-specific NU6.3 transaction domain.
 Every post-genesis transaction must use version 6 and embed the exact Wcash
 Testnet v1 branch ID; inherited Zcash branch IDs and legacy V1-V5 transactions
 are rejected. This removes the earlier consensus-level mining-only gate, but it
-does not by itself make the engineering network or its wallet production ready.
+does not by itself make the engineering profile or its wallet production ready.
 
 ## Current consensus snapshot
 
@@ -30,7 +33,7 @@ does not by itself make the engineering network or its wallet production ready.
 | Monetary cap | 21,000,000 WCASH; exact scheduled issuance is 20,999,999.81520000 WCASH after zatoshi truncation |
 | Development allocation | None: no founders reward, funding stream, lockbox, or developer tax |
 | Coinbase destination | Ironwood only after genesis |
-| Public networks | V6-only engineering Testnet enabled; mainnet disabled |
+| Public networks | Engineering Testnet profile implemented but not deployed; mainnet disabled |
 | Testnet transfers | Wcash-domain V6 only; inherited Zcash domains and V1-V5 rejected |
 
 Every post-genesis coinbase must create its reward in Ironwood. Transparent,
@@ -52,10 +55,13 @@ workspace contains an experimental one-shot wallet for controlled Testnet and
 regtest transfers. It derives Wcash addresses, scans a local SQLite wallet from
 an attested loopback node, signs Wcash-domain V6 Ironwood transfers, and
 broadcasts the exact signed bytes. It is not a pool payout or durable settlement
-system. A controlled-key private-coinbase spend must still pass the documented
-end-to-end release gate before this Testnet is described as value-bearing. See
-the [consensus snapshot](docs/wcash-consensus.md#payment-address-domains) for the
-complete prefix table.
+system. Its controlled local Regtest gate has mined three private coinbases,
+scanned and spent one WCASH under the Wcash V6 domain, included the exact
+transaction in the mempool and block template, mined it through AuxPoW, and
+rescanned the recipient and private change. That gate deliberately used the
+explicit Regtest-only one-confirmation override; the public Testnet wallet policy
+remains 100 confirmations. The complete prefix table is in the
+[consensus snapshot](docs/wcash-consensus.md#payment-address-domains).
 
 ## Run the isolated local network
 
@@ -95,19 +101,20 @@ See:
 - [Consensus and monetary policy](docs/wcash-consensus.md)
 - [Zcash merged-mining design](docs/wcash-merged-mining.md)
 - [Local regtest guide](docs/wcash-local.md)
-- [Public Testnet identity and operator boundary](docs/wcash-testnet.md)
+- [Testnet profile and operator boundary](docs/wcash-testnet.md)
 
 ## Release blockers
 
 The mainnet Bitcoin anchor remains deliberately unset, so mainnet activation
-fails closed. The enabled Testnet is an engineering network, not evidence that
-a community pool or value-bearing mainnet is ready. Promotion requires an
-independently reviewed consensus specification and implementation, a completed
-private-coinbase wallet spend test, adversarial multi-node soak and reorg
-testing, project-controlled seed infrastructure, physical ASIC
-interoperability, and a separately reviewed TLS,
-variable-difficulty, accounting, payout, and monitoring layer in front of the
-included loopback ZIP-301 service.
+fails closed. The controlled private-coinbase spend lifecycle has passed in
+isolated Regtest, but no public Testnet is deployed and that local result is not
+evidence that a community pool or value-bearing mainnet is ready. Promotion
+still requires an independently reviewed consensus specification and
+implementation, public-network operation under the 100-confirmation wallet
+policy, adversarial multi-node soak and reorg testing, project-controlled seed
+infrastructure, physical ASIC interoperability, and a separately reviewed TLS,
+variable-difficulty, accounting, payout, settlement, and monitoring layer in
+front of the included loopback ZIP-301 service.
 
 ## Upstream attribution and license
 

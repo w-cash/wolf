@@ -11,7 +11,7 @@ consensus. Each has a distinct genesis block, P2P magic, default P2P/RPC ports,
 and peer-cache domain. Both activate NU6.3 at height 1 and use the Ironwood
 transaction format for every mined block.
 
-Public Testnet freezes Bitcoin mainnet block 965,900, hash
+The built-in Testnet profile freezes Bitcoin mainnet block 965,900, hash
 `0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851`.
 The release vector records Bitcoin height 966,011, or 112 confirmations counting
 the anchor block. Its complete Wcash genesis block ID is
@@ -53,11 +53,15 @@ valid compatibility path. Wcash-domain V6 transactions are rejected on Zcash
 Mainnet and Testnet, and Zcash-domain V6 transactions are rejected on Wcash.
 Both the block and mempool verifier paths enforce the same checks.
 
-This makes value-bearing transaction testing possible without relying on P2P
-magic or address prefixes for replay protection. Testnet coins remain test-only.
-A controlled-key spend of a matured private coinbase, wallet recovery, mempool
-admission, block-template inclusion, mining, and recipient rescan are still
-release gates rather than assumptions.
+This makes value-transfer testing possible without relying on P2P
+magic or address prefixes for replay protection. A controlled local Regtest E2E
+has mined three private coinbases, scanned them into the experimental wallet,
+signed and broadcast a one-WCASH Wcash-domain transfer, observed its exact bytes
+and fee in the mempool and block template, mined it through AuxPoW, and rescanned
+the recipient and private change. The test uses the explicit Regtest-only
+one-confirmation override; the public Testnet wallet policy remains 100
+confirmations. Testnet coins remain test-only, and this local result is not a
+public-network or production-wallet claim.
 
 ## Monetary policy
 
@@ -95,7 +99,8 @@ belongs to the miner coinbase and is subject to the shielded-output rules below.
 ## Block timing and difficulty
 
 The target spacing is 75 seconds. Regtest deliberately uses its fixed
-proof-of-work limit. Public Testnet starts at compact target `0x2007ffff`
+proof-of-work limit. The built-in Testnet profile starts at compact target
+`0x2007ffff`
 (`2^251 - 1`) and uses the inherited damped 17-block retarget from launch. A
 candidate strictly more than 450 seconds after its predecessor may use the
 testnet proof-of-work limit; exactly 450 seconds does not trigger the rule.
@@ -164,9 +169,10 @@ transfers. It derives Wcash-domain keys and receivers, scans a local SQLite
 wallet from an attested loopback node, signs Wcash-domain V6 Ironwood transfers,
 and broadcasts the exact signed bytes. It deliberately does not implement batch
 payouts, pool accounting, durable settlement, or idempotent payout requests.
-The controlled-key private-coinbase spend gate must pass before wallet
-interoperability is considered complete. Key control must never be inferred
-from a syntactically valid payment address.
+The controlled-key private-coinbase spend gate has passed for one deterministic,
+isolated Regtest path. That result does not establish general wallet
+interoperability, public Testnet operation, or production payout safety. Key
+control must never be inferred from a syntactically valid payment address.
 
 ## Supply auditability
 
@@ -192,9 +198,11 @@ every inherited Zcash network configuration because Wcash uses different
 network and consensus rules; those definitions remain isolated in upstream
 library tests.
 
-Wcash Testnet has a frozen identity for public engineering interoperability.
-It is not a production or value-bearing network: the complete wallet spend and
-separately implemented pool-payout gates, project-operated seeds, multi-node and
-pool soak testing, physical ASIC runs, and an external security/consensus audit
-remain required before any mainnet or community payout service. See
+Wcash Testnet has a frozen identity for future public engineering
+interoperability, but no public Wcash Testnet is deployed. The controlled local
+Regtest wallet-spend lifecycle has passed; the wallet remains experimental and
+is not a production or pool-settlement service. Project-operated seeds, a
+separately implemented pool-payout system, multi-node and pool soak testing,
+physical ASIC runs, and an external security/consensus audit remain required
+before any mainnet or community payout service. Mainnet remains disabled. See
 [`wcash-testnet.md`](wcash-testnet.md).
