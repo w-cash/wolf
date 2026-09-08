@@ -861,7 +861,7 @@ fn wcash_coinbase_is_private_and_ironwood_only() {
             .ironwood_value_balance()
             .ironwood_amount()
             .zatoshis(),
-        -1_000_012_345
+        -625_012_345
     );
 
     assert!(matches!(
@@ -907,7 +907,7 @@ fn wcash_coinbase_is_private_and_ironwood_only() {
 #[test]
 fn wcash_zero_subsidy_tail_stays_private() {
     let net = Network::new_wcash_regtest();
-    let height = Height(31_500_001);
+    let height = Height(50_400_001);
     let unified_address = default_miner_address_for_network(&net, &MinerAddressType::Unified);
     let miner_params = MinerParams::new(
         &net,

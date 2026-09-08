@@ -20,7 +20,7 @@ Bitcoin block:       965900
 Bitcoin block hash:  0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851
 Anchor audit height: 966011 (112 confirmations counting the anchor)
 Wcash genesis hash:  78b292284bc7b03c6a16b62e29a3ab2015c40d6414cbc27ddcee878225600f10
-P2P magic:           f2dfe29f
+P2P magic:           8ee56b56
 P2P port:            38233
 Suggested RPC port:  38232 (loopback only)
 ```
@@ -156,7 +156,7 @@ Success proves that the frozen public-testnet genesis boots cleanly, the
 test-network bootstrap policy provides a proposal-validated, coinbase-only child
 template without a debug sync override or active mempool,
 the exact authenticated AuxPoW survives the parent coinbase and block-
-commitments paths, and a mined 10-WCASH reward increases only the Ironwood
+commitments paths, and a mined 6.25-WCASH reward increases only the Ironwood
 value pool. The test fixture address is derived from public receiver bytes and
 is not evidence that anyone controls a spending key.
 

@@ -29,19 +29,19 @@ use constants::{
     POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
 };
 
-/// Wcash starts at 10 WCASH per mined block.
-pub(crate) const WCASH_INITIAL_BLOCK_SUBSIDY: u64 = 10 * amount::COIN as u64;
+/// Wcash starts at 6.25 WCASH per mined block.
+pub(crate) const WCASH_INITIAL_BLOCK_SUBSIDY: u64 = 625_000_000;
 
-/// Wcash halves every 1,050,000 blocks, approximately 2.5 years at 75 seconds per block.
+/// Wcash halves every 1,680,000 blocks, approximately four years at 75 seconds per block.
 ///
-/// Together with the 10 WCASH initial subsidy, this interval keeps total
+/// Together with the 6.25 WCASH initial subsidy, this interval keeps total
 /// scheduled issuance below the 21 million WCASH monetary-base hard cap.
-pub(crate) const WCASH_HALVING_INTERVAL: HeightDiff = 1_050_000;
+pub(crate) const WCASH_HALVING_INTERVAL: HeightDiff = 1_680_000;
 
 /// The first Wcash block paid at half the initial subsidy.
 ///
-/// Heights 1 through 1,050,000 inclusive form the initial-subsidy era; genesis has no subsidy.
-pub(crate) const WCASH_FIRST_HALVING_HEIGHT: Height = Height(1_050_001);
+/// Heights 1 through 1,680,000 inclusive form the initial-subsidy era; genesis has no subsidy.
+pub(crate) const WCASH_FIRST_HALVING_HEIGHT: Height = Height(1_680_001);
 
 /// The funding stream receiver categories.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]

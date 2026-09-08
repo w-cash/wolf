@@ -328,9 +328,9 @@ rpc_call "$wcash_rpc" getblockchaininfo | python3 -c '
 import json,sys
 result=json.load(sys.stdin)["result"]
 assert result["blocks"] == 1, result
-assert result["chainSupply"]["chainValueZat"] == 1_000_000_000, result
+assert result["chainSupply"]["chainValueZat"] == 625_000_000, result
 pools={pool["id"]: pool["chainValueZat"] for pool in result["valuePools"]}
-assert pools["ironwood"] == 1_000_000_000, pools
+assert pools["ironwood"] == 625_000_000, pools
 assert all(value == 0 for name,value in pools.items() if name != "ironwood"), pools
 '
 

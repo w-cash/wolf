@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Added the isolated Wcash regtest consensus flavor, deterministic
   frozen Bitcoin-block anchor, Wcash-only P2P identity, 75-second target spacing,
-  10 WCASH initial subsidy, 1,050,000-block halvings, and 21-million monetary cap.
+  6.25 WCASH initial subsidy, 1,680,000-block halvings, and 21-million monetary cap.
 - Added a strict bounded Zcash Equihash `(200, 9)` AuxPoW proof format,
   consensus validation, interoperability vector, real-solver local harness,
   and loopback JSON-lines mining interface.
@@ -28,9 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
-- Corrected the prelaunch Wcash emission schedule to enforce the 21-million
-  monetary cap, and rotated the Testnet and regtest P2P identities so nodes
-  built for the superseded 33.6-million schedule cannot join the same peer mesh.
+- Finalized the prelaunch Wcash emission schedule at 6.25 WCASH per block with
+  approximately four-year halvings and a 21-million monetary cap, and rotated
+  the Testnet and regtest P2P identities to isolate superseded schedules.
 - Reset local regtest genesis to Bitcoin mainnet block 965,910 and rotated the
   regtest P2P identity to `Wcash/regtest/v2` so nodes on the superseded local
   chain cannot connect to this chain.

@@ -24,9 +24,9 @@ before any value-bearing transaction test.
 | --- | --- |
 | Parent proof of work | Zcash Equihash `(200, 9)` AuxPoW only |
 | Target block spacing | 75 seconds |
-| Initial subsidy | 10 WCASH at heights 1 through 1,050,000 |
-| Halving | Every 1,050,000 blocks (about 2.5 years); first halved block is 1,050,001 |
-| Monetary cap | 21,000,000 WCASH; exact scheduled issuance is 20,999,999.86350000 WCASH after zatoshi truncation |
+| Initial subsidy | 6.25 WCASH at heights 1 through 1,680,000 |
+| Halving | Every 1,680,000 blocks (about four years); first halved block is 1,680,001 |
+| Monetary cap | 21,000,000 WCASH; exact scheduled issuance is 20,999,999.81520000 WCASH after zatoshi truncation |
 | Development allocation | None: no founders reward, funding stream, lockbox, or developer tax |
 | Coinbase destination | Ironwood only after genesis |
 | Public networks | Mining-only engineering Testnet enabled; mainnet disabled |
@@ -72,7 +72,7 @@ control the keys before testing spendability.
 This local chain freezes Bitcoin mainnet block 965,910, hash
 `00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146`,
 which was the Blockstream tip snapshot selected for regtest genesis. It replaces
-the earlier local genesis and uses the `Wcash/regtest/v3` P2P identity.
+the earlier local genesis and uses the `Wcash/regtest/v4` P2P identity.
 
 The native merge-mining coordinator can create a private Wcash candidate,
 request a commitment-aware Zcash template, obtain independent proposal

@@ -199,9 +199,9 @@ validator_tip="$(rpc_result http://127.0.0.1:18242 getbestblockhash)"
 rpc_call http://127.0.0.1:28232 getblockchaininfo | python3 -c '
 import json,sys
 result=json.load(sys.stdin)["result"]
-assert result["chainSupply"]["chainValueZat"] == 1_000_000_000
+assert result["chainSupply"]["chainValueZat"] == 625_000_000
 pools={pool["id"]: pool["chainValueZat"] for pool in result["valuePools"]}
-assert pools["ironwood"] == 1_000_000_000
+assert pools["ironwood"] == 625_000_000
 assert all(value == 0 for name,value in pools.items() if name != "ironwood")
 '
 
@@ -357,9 +357,9 @@ validator_tip="$(rpc_result http://127.0.0.1:18242 getbestblockhash)"
 rpc_call http://127.0.0.1:28232 getblockchaininfo | python3 -c '
 import json,sys
 result=json.load(sys.stdin)["result"]
-assert result["chainSupply"]["chainValueZat"] == 3_000_000_000
+assert result["chainSupply"]["chainValueZat"] == 1_875_000_000
 pools={pool["id"]: pool["chainValueZat"] for pool in result["valuePools"]}
-assert pools["ironwood"] == 3_000_000_000
+assert pools["ironwood"] == 1_875_000_000
 assert all(value == 0 for name,value in pools.items() if name != "ironwood")
 '
 
