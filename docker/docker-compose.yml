@@ -1,7 +1,11 @@
 services:
-  zebra:
-    container_name: zebra
-    image: zfnd/zebra
+  wcash:
+    container_name: wcash
+    image: wcash-node:local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
     platform: linux/amd64
     restart: unless-stopped
     deploy:
@@ -12,33 +16,31 @@ services:
     env_file:
       - .env
     volumes:
-      - zebrad-cache:/home/zebra/.cache/zebra
-    # Having `tty` set to true makes Zebra use colored logs.
+      - wcash-cache:/home/zebra/.cache/wcash
+    # Having `tty` set to true makes Wcash use colored logs.
     tty: true
-    # ! Comment out the `configs` mapping below to use the environment variables in the
-    # ! `.env` file, instead of the default configuration file.
+    # This file supplies the base configuration. WCASH_* values from `.env`
+    # override it. Remove this mapping to run entirely from defaults and `.env`.
     configs:
-      - source: zebra-config
-        target: /home/zebra/.config/zebrad.toml
+      - source: wcash-config
+        target: /home/zebra/.config/wcash.toml
 
     # P2P port for inbound peer connections (recommended).
     ports:
-      - "8233:8233"   # P2P on Mainnet (use 18233:18233 for Testnet)
+      - "127.0.0.1:28233:28233" # local P2P on Wcash Regtest
 
     # Uncomment any of these to expose additional services:
-    #   - "18233:18233" # P2P on Testnet
-    #   - "8232:8232"   # RPC endpoint on Mainnet
-    #   - "18232:18232" # RPC endpoint on Testnet
+    #   - "28232:28232" # RPC endpoint on Wcash Regtest
     #   - "9999:9999"   # Metrics
     #   - "3000:3000"   # Tracing
     #   - "8080:8080"   # Health endpoints (/healthy, /ready)
 
 configs:
-  zebra-config:
+  wcash-config:
     #! To customize the default configuration, edit this file before starting
     #! the container.
-    file: ./default-zebra-config.toml
+    file: ./default-wcash-config.toml
 
 volumes:
-  zebrad-cache:
+  wcash-cache:
     driver: local

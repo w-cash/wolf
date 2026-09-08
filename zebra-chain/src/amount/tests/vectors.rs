@@ -9,6 +9,17 @@ use std::{collections::hash_map::RandomState, collections::HashSet, fmt::Debug};
 use color_eyre::eyre::Result;
 
 #[test]
+fn max_money_matches_selected_consensus() {
+    #[cfg(not(feature = "wcash-consensus"))]
+    assert_eq!(MAX_MONEY, 21_000_000 * COIN);
+
+    #[cfg(feature = "wcash-consensus")]
+    assert_eq!(MAX_MONEY, 3_359_999_978_160_000);
+
+    assert_eq!(MAX_SINGLE_TRANSACTION_VALUE, 21_000_000 * COIN);
+}
+
+#[test]
 fn test_add_bare() -> Result<()> {
     let _init_guard = zebra_test::init();
 
@@ -331,10 +342,11 @@ fn test_sum() -> Result<()> {
         })
     );
 
-    // above max of i64 error
+    // A long iterator reports the first sum outside the amount constraint and
+    // the number of items that were not consumed.
     let times: usize = (i64::MAX / MAX_MONEY)
         .try_into()
-        .expect("4392 can always be converted to usize");
+        .expect("the positive quotient can always be converted to usize");
     let amounts: Vec<Amount> = std::iter::repeat_n(MAX_MONEY.try_into()?, times + 1).collect();
 
     let sum_ref = amounts.iter().sum::<Result<Amount, Error>>();
@@ -344,15 +356,15 @@ fn test_sum() -> Result<()> {
     assert_eq!(
         sum_ref,
         Err(Error::SumOverflow {
-            partial_sum: 4200000000000000,
-            remaining_items: 4391
+            partial_sum: MAX_MONEY * 2,
+            remaining_items: times - 1,
         })
     );
 
-    // below min of i64 overflow
+    // The same behavior applies below the negative amount constraint.
     let times: usize = (i64::MAX / MAX_MONEY)
         .try_into()
-        .expect("4392 can always be converted to usize");
+        .expect("the positive quotient can always be converted to usize");
     let neg_max_money: Amount<NegativeAllowed> = (-MAX_MONEY).try_into()?;
     let amounts: Vec<Amount<NegativeAllowed>> =
         std::iter::repeat_n(neg_max_money, times + 1).collect();
@@ -364,8 +376,8 @@ fn test_sum() -> Result<()> {
     assert_eq!(
         sum_ref,
         Err(Error::SumOverflow {
-            partial_sum: -4200000000000000,
-            remaining_items: 4391
+            partial_sum: -(MAX_MONEY * 2),
+            remaining_items: times - 1,
         })
     );
 

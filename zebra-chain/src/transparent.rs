@@ -18,11 +18,13 @@ use crate::{
     parameters::Network,
     serialization::ZcashSerialize,
     transaction,
-    transparent::serialize::GENESIS_COINBASE_SCRIPT_SIG,
 };
 
-pub use address::Address;
+pub use address::{Address, WcashTransparentAddressError};
 pub use script::Script;
+pub use serialize::{
+    WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG, WCASH_TESTNET_GENESIS_COINBASE_SCRIPT_SIG,
+};
 pub use utxo::{
     new_ordered_outputs, new_outputs, outputs_from_utxos, utxos_from_ordered_utxos,
     CoinbaseSpendRestriction, OrderedUtxo, Utxo,
@@ -171,8 +173,7 @@ impl Input {
             Input::PrevOut { .. } => None,
             Input::Coinbase { height, data, .. } => {
                 if height.is_min() {
-                    (data.as_slice() == GENESIS_COINBASE_SCRIPT_SIG)
-                        .then_some(GENESIS_COINBASE_SCRIPT_SIG.to_vec())
+                    serialize::is_genesis_coinbase_script(data).then(|| data.clone())
                 } else {
                     let mut script = push_num(height.into()).to_bytes();
                     script.extend_from_slice(data);
@@ -355,13 +356,17 @@ impl Output {
     ///
     /// Returns None if the address type is not valid or unrecognized.
     pub fn address(&self, net: &Network) -> Option<Address> {
+        let network_kind = if net.uses_wcash_consensus() {
+            net.kind()
+        } else {
+            net.t_addr_kind()
+        };
+
         match TxOut::try_from(self).ok()?.recipient_address()? {
             TransparentAddress::PublicKeyHash(pkh) => {
-                Some(Address::from_pub_key_hash(net.t_addr_kind(), pkh))
+                Some(Address::from_pub_key_hash(network_kind, pkh))
             }
-            TransparentAddress::ScriptHash(sh) => {
-                Some(Address::from_script_hash(net.t_addr_kind(), sh))
-            }
+            TransparentAddress::ScriptHash(sh) => Some(Address::from_script_hash(network_kind, sh)),
         }
     }
 

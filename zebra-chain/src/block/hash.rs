@@ -1,5 +1,6 @@
 use std::{fmt, io, sync::Arc};
 
+use byteorder::{LittleEndian, WriteBytesExt};
 use hex::{FromHex, ToHex};
 use serde::{Deserialize, Serialize};
 
@@ -9,15 +10,20 @@ use crate::serialization::{
 };
 
 use super::Header;
+use crate::work::equihash::WCASH_BLOCK_WIRE_VERSION;
+
+/// BLAKE2b personalization for proof-independent Wcash block identifiers.
+const WCASH_BLOCK_ID_PERSONALIZATION: &[u8; 16] = b"WcashBlockIdV1\0\0";
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
 /// A hash of a block, used to identify blocks and link blocks into a chain. ⛓️
 ///
-/// Technically, this is the (SHA256d) hash of a block *header*, but since the
-/// block header includes the Merkle root of the transaction Merkle tree, it
-/// binds the entire contents of the block and is used to identify entire blocks.
+/// For Zcash, this is the SHA256d hash of the full block header. For Wcash, it
+/// is a domain-separated BLAKE2b-256 hash of every header field except the
+/// attached AuxPoW witness. Excluding the witness prevents proof malleability
+/// from changing the identity of an otherwise identical Wcash block.
 ///
 /// Note: Zebra displays transaction and block hashes in big-endian byte-order,
 /// following the u256 convention set by Bitcoin and zcashd.
@@ -87,12 +93,52 @@ impl From<[u8; 32]> for Hash {
 
 impl<'a> From<&'a Header> for Hash {
     fn from(block_header: &'a Header) -> Self {
+        if block_header.version == WCASH_BLOCK_WIRE_VERSION {
+            return Self(wcash_block_id(block_header));
+        }
+
         let mut hash_writer = sha256d::Writer::default();
         block_header
             .zcash_serialize(&mut hash_writer)
             .expect("Sha256dWriter is infallible");
         Self(hash_writer.finish())
     }
+}
+
+/// Hashes the fixed, proof-independent portion of a Wcash header.
+fn wcash_block_id(header: &Header) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(crate::work::equihash::Solution::INPUT_LENGTH + 32);
+    bytes
+        .write_u32::<LittleEndian>(header.version)
+        .expect("writing to a Vec is infallible");
+    header
+        .previous_block_hash
+        .zcash_serialize(&mut bytes)
+        .expect("writing to a Vec is infallible");
+    bytes.extend_from_slice(&header.merkle_root.0);
+    bytes.extend_from_slice(&header.commitment_bytes[..]);
+    bytes
+        .write_u32::<LittleEndian>(
+            header
+                .time
+                .timestamp()
+                .try_into()
+                .expect("deserialized and generated timestamps are u32 values"),
+        )
+        .expect("writing to a Vec is infallible");
+    bytes
+        .write_u32::<LittleEndian>(header.difficulty_threshold.0)
+        .expect("writing to a Vec is infallible");
+    bytes.extend_from_slice(&header.nonce[..]);
+
+    let digest = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(WCASH_BLOCK_ID_PERSONALIZATION)
+        .hash(&bytes);
+    digest
+        .as_bytes()
+        .try_into()
+        .expect("the requested BLAKE2b digest length is 32 bytes")
 }
 
 impl From<Header> for Hash {

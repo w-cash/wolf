@@ -35,6 +35,11 @@ pub const MAX_BLOCK_BYTES: u64 = 2_000_000;
 /// so the deserialisation would pick up any errors.
 fn check_version(version: u32) -> Result<(), &'static str> {
     match version {
+        // Wcash deliberately reserves one value that is invalid under native
+        // Zcash's signed-version rule. Checking the exact marker before the
+        // high-bit rejection keeps the two wire formats disjoint.
+        equihash::WCASH_BLOCK_WIRE_VERSION => Ok(()),
+
         // The Zcash specification says that:
         // "The current and only defined block version number for Zcash is 4."
         // but this is not actually part of the consensus rules, and in fact
@@ -102,7 +107,7 @@ impl ZcashDeserialize for Header {
                 ))?,
             difficulty_threshold: CompactDifficulty(reader.read_u32::<LittleEndian>()?),
             nonce: reader.read_32_bytes()?.into(),
-            solution: equihash::Solution::zcash_deserialize(reader)?,
+            solution: equihash::Solution::zcash_deserialize_for_version(reader, version)?,
         })
     }
 }

@@ -121,6 +121,7 @@ impl Clone for NonFinalizedState {
 impl NonFinalizedState {
     /// Returns a new non-finalized state for `network`.
     pub fn new(network: &Network) -> NonFinalizedState {
+        network.assert_compatible_with_compiled_consensus();
         NonFinalizedState {
             chain_set: Default::default(),
             network: network.clone(),

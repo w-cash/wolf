@@ -324,7 +324,6 @@ impl<Req, Resp> Clone for AlwaysErr<Req, Resp> {
         }
     }
 }
-
 impl<Req, Resp> AlwaysErr<Req, Resp> {
     fn new() -> Self {
         Self {
@@ -909,4 +908,3 @@ async fn dispatch(rpc: &FuzzRpcImpl, call: RpcCall) {
         }
     }
 }
-

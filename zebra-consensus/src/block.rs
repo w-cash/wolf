@@ -243,7 +243,15 @@ where
             // > The block data MUST be validated and checked against the server's usual
             // > acceptance rules (excluding the check for a valid proof-of-work).
             // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
-            if request.is_proposal() || network.disable_pow() {
+            if network.uses_wcash_consensus() {
+                if request.is_proposal() {
+                    check::wcash_auxpow_proposal_is_valid(&block.header, &network, &height, &hash)?;
+                } else {
+                    // Wcash AuxPoW is consensus authorization data. Never let
+                    // the inherited Regtest `disable_pow` switch bypass it.
+                    check::wcash_auxpow_is_valid(&block.header, &network, &height, &hash)?;
+                }
+            } else if request.is_proposal() || network.disable_pow() {
                 check::difficulty_threshold_is_valid(&block.header, &network, &height, &hash)?;
             } else {
                 // Do the difficulty checks first, to raise the threshold for
@@ -279,8 +287,12 @@ where
 
             // Now do the slower checks
 
-            // Check compatibility with ZIP-212 shielded Sapling and Orchard coinbase output decryption
-            tx::check::coinbase_outputs_are_decryptable(&coinbase_tx, &network, height)?;
+            // Zcash requires public recovery of shielded coinbase outputs using the all-zero
+            // outgoing viewing key. Wcash deliberately uses ordinary private Ironwood note
+            // encryption, while retaining all proof and value-balance checks.
+            if !network.uses_wcash_consensus() {
+                tx::check::coinbase_outputs_are_decryptable(&coinbase_tx, &network, height)?;
+            }
 
             // Send transactions to the transaction verifier to be checked
             let mut async_checks = FuturesUnordered::new();

@@ -65,6 +65,9 @@ pub enum TransactionError {
     #[error("coinbase transaction Sapling or Orchard outputs MUST be decryptable with an all-zero outgoing viewing key")]
     CoinbaseOutputsNotDecryptable,
 
+    #[error("Wcash coinbase Ironwood outputs MUST NOT be recoverable with the all-zero outgoing viewing key")]
+    WcashCoinbaseOutputPubliclyRecoverable,
+
     #[error("coinbase inputs MUST NOT exist in mempool")]
     CoinbaseInMempool,
 
@@ -267,6 +270,11 @@ pub enum TransactionError {
     #[error("transaction uses an incorrect consensus branch id")]
     WrongConsensusBranchId,
 
+    #[error(
+        "non-coinbase transactions are disabled on Wcash Testnet until a Wcash-specific signature domain is deployed"
+    )]
+    WcashTestnetTransfersDisabled,
+
     #[error("wrong tx format: tx version is ≥ 5, but `nConsensusBranchId` is missing")]
     MissingConsensusBranchId,
 
@@ -400,6 +408,7 @@ impl TransactionError {
             | CoinbaseHasOrchardActions
             | OrchardHasEnableCrossAddress
             | CoinbaseOutputsNotDecryptable
+            | WcashCoinbaseOutputPubliclyRecoverable
             | CoinbaseInMempool
             | NonCoinbaseHasCoinbaseInput
             | CoinbaseExpiryBlockHeight { .. }
@@ -426,6 +435,7 @@ impl TransactionError {
             | NotEnoughOrchardFlags
             | NotEnoughIronwoodFlags
             | WrongConsensusBranchId
+            | WcashTestnetTransfersDisabled
             | MissingConsensusBranchId
             | LockedUntilAfterBlockHeight(_)
             | LockedUntilAfterBlockTime(_) => 100,
@@ -491,6 +501,39 @@ pub enum BlockError {
         zebra_chain::parameters::Network,
     ),
 
+    #[error(
+        "Wcash block {height:?} {hash:?} has header version 0x{actual:08x}, expected 0x{expected:08x}"
+    )]
+    InvalidWcashHeaderVersion {
+        height: zebra_chain::block::Height,
+        hash: zebra_chain::block::Hash,
+        actual: u32,
+        expected: u32,
+    },
+
+    #[error("Wcash block {height:?} {hash:?} does not carry a Wcash AuxPoW witness")]
+    MissingWcashAuxPowVariant {
+        height: zebra_chain::block::Height,
+        hash: zebra_chain::block::Hash,
+    },
+
+    #[error("Wcash genesis block {hash:?} must carry an empty AuxPoW witness")]
+    UnexpectedWcashGenesisAuxPow { hash: zebra_chain::block::Hash },
+
+    #[error("Wcash block {height:?} {hash:?} is missing its Zcash AuxPoW proof")]
+    MissingWcashAuxPow {
+        height: zebra_chain::block::Height,
+        hash: zebra_chain::block::Hash,
+    },
+
+    #[error("invalid Zcash AuxPoW proof in Wcash block {height:?} {hash:?}: {source}")]
+    InvalidWcashAuxPow {
+        height: zebra_chain::block::Height,
+        hash: zebra_chain::block::Hash,
+        #[source]
+        source: wcash_zcash_aux::AuxPowError,
+    },
+
     #[error("transaction has wrong consensus branch id for block network upgrade")]
     WrongTransactionConsensusBranchId,
 
@@ -544,6 +587,11 @@ impl BlockError {
             | InvalidDifficulty(_, _)
             | TargetDifficultyLimit(_, _, _, _, _)
             | DifficultyFilter(_, _, _, _)
+            | InvalidWcashHeaderVersion { .. }
+            | MissingWcashAuxPowVariant { .. }
+            | UnexpectedWcashGenesisAuxPow { .. }
+            | MissingWcashAuxPow { .. }
+            | InvalidWcashAuxPow { .. }
             | NoTransactions
             | BadMerkleRoot { .. }
             | WrongTransactionConsensusBranchId

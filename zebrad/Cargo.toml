@@ -3,7 +3,7 @@
 name = "zebrad"
 version = "6.3.0"
 authors.workspace = true
-description = "The Zcash Foundation's independent, consensus-compatible implementation of a Zcash node"
+description = "A Zebra-based node for isolated Wcash and Zcash consensus profiles"
 license.workspace = true
 repository.workspace = true
 
@@ -76,9 +76,17 @@ indexer = ["zebra-state/indexer"]
 # Experimental internal miner support
 internal-miner = [
     "thread-priority",
+    "dep:wcash-merge-miner",
     "zebra-chain/internal-miner",
     # TODO: move common code into zebra-chain or zebra-node-services and remove the RPC dependency
     "zebra-rpc/internal-miner",
+]
+
+# Build a Wcash-only node with Wcash network defaults and monetary bounds.
+wcash-consensus = [
+    "zebra-chain/wcash-consensus",
+    "zebra-consensus/wcash-consensus",
+    "zebra-network/wcash-consensus",
 ]
 
 # Experimental elasticsearch indexing
@@ -226,6 +234,7 @@ rand = { workspace = true }
 
 # prod feature internal-miner
 thread-priority = { workspace = true, optional = true }
+wcash-merge-miner = { path = "../wcash-merge-miner", optional = true }
 
 # prod feature sentry
 sentry = { workspace = true, features = ["backtrace", "contexts", "logs", "rustls", "tracing", "ureq"], optional = true }
@@ -275,6 +284,8 @@ vergen-git2 = { workspace = true, features = ["cargo", "rustc"] }
 tonic-prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
+wcash-zcash-aux = { workspace = true }
+
 abscissa_core = { workspace = true, features = ["testing"] }
 anyhow = { workspace = true }
 hex-literal = { workspace = true }

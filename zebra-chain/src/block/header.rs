@@ -23,7 +23,7 @@ use proptest_derive::Arbitrary;
 /// backwards reference (previous header hash) present in the block
 /// header. Each block points backwards to its parent, all the way
 /// back to the genesis block (the first block in the blockchain).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Header {
     /// The block's version field. This is supposed to be `4`:
     ///
@@ -149,17 +149,26 @@ impl Header {
     pub const REGTEST_SERIALIZED_SIZE: usize =
         Solution::INPUT_LENGTH + 32 + Solution::REGTEST_SERIALIZED_SIZE;
 
+    /// The minimum serialized size of a Wcash header, with an empty AuxPoW
+    /// witness. Empty witnesses are only valid for genesis and templates.
+    pub const WCASH_MIN_SERIALIZED_SIZE: usize =
+        Solution::INPUT_LENGTH + 32 + Solution::WCASH_MIN_SERIALIZED_SIZE;
+
+    /// The maximum serialized size of a Wcash header.
+    pub const WCASH_MAX_SERIALIZED_SIZE: usize =
+        Solution::INPUT_LENGTH + 32 + Solution::WCASH_MAX_SERIALIZED_SIZE;
+
+    /// Returns the exact serialized size of this header.
+    pub fn serialized_len(&self) -> usize {
+        Solution::INPUT_LENGTH + 32 + self.solution.serialized_len()
+    }
+
     /// Returns the size of a serialized block header on `network`, in bytes.
     ///
-    /// Every header field has a fixed size, except the Equihash solution,
-    /// whose size is constant per network, so this is also constant per network:
-    /// [`Self::REGTEST_SERIALIZED_SIZE`] on Regtest, [`Self::SERIALIZED_SIZE`] everywhere else.
+    /// For Wcash this returns the maximum header size, reserving room for the
+    /// AuxPoW witness when constructing a block template.
     pub fn serialized_size(network: &Network) -> usize {
-        if network.is_regtest() {
-            Self::REGTEST_SERIALIZED_SIZE
-        } else {
-            Self::SERIALIZED_SIZE
-        }
+        Solution::INPUT_LENGTH + 32 + Solution::serialized_size(network)
     }
 }
 

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{net::TcpListener, time::Duration};
 
 use color_eyre::eyre::Result;
 
@@ -7,7 +7,10 @@ use zebra_test::{args, prelude::*};
 
 use crate::common::{
     check::is_zebrad_version,
-    config::{default_test_config, external_address_test_config, persistent_test_config, testdir},
+    config::{
+        default_test_config, external_address_test_config, persistent_test_config,
+        start_message_for_consensus, test_network_for_consensus, testdir,
+    },
     launch::{ZebradTestDirExt, LAUNCH_DELAY},
 };
 
@@ -23,7 +26,7 @@ fn generate_no_args() -> Result<()> {
     let output = output.assert_success()?;
 
     // First line
-    output.stdout_line_contains("# Default configuration for zebrad")?;
+    output.stdout_line_contains("# Default configuration for Wcash")?;
 
     Ok(())
 }
@@ -51,7 +54,7 @@ fn generate_args() -> Result<()> {
     output.assert_failure()?;
 
     // Add a config file name to tempdir path
-    let generated_config_path = testdir.path().join("zebrad.toml");
+    let generated_config_path = testdir.path().join("wcash.toml");
 
     // Valid
     let child =
@@ -123,7 +126,8 @@ fn start_no_args() -> Result<()> {
     let _init_guard = zebra_test::init();
 
     // start caches state, so run one of the start tests with persistent state
-    let testdir = testdir()?.with_config(&mut persistent_test_config(&Mainnet)?)?;
+    let testdir =
+        testdir()?.with_config(&mut persistent_test_config(&test_network_for_consensus())?)?;
 
     let mut child = testdir.spawn_child(args!["-v", "start"])?;
 
@@ -134,7 +138,7 @@ fn start_no_args() -> Result<()> {
     let output = child.wait_with_output()?;
     let output = output.assert_failure()?;
 
-    output.stdout_line_contains("Starting zebrad")?;
+    output.stdout_line_contains(start_message_for_consensus())?;
 
     // Make sure the command passed the legacy chain check
     output.stdout_line_contains("starting legacy chain check")?;
@@ -150,7 +154,8 @@ fn start_no_args() -> Result<()> {
 fn start_args() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet))?;
+    let testdir =
+        testdir()?.with_config(&mut default_test_config(&test_network_for_consensus()))?;
     let testdir = &testdir;
 
     let mut child = testdir.spawn_child(args!["start"])?;
@@ -224,7 +229,17 @@ fn version_args() -> Result<()> {
 #[test]
 fn external_address() -> Result<()> {
     let _init_guard = zebra_test::init();
-    let testdir = testdir()?.with_config(&mut external_address_test_config(&Mainnet)?)?;
+    let network = test_network_for_consensus();
+    let peer_listener = TcpListener::bind("127.0.0.1:0")?;
+    let peer_addr = peer_listener.local_addr()?.to_string();
+    let mut config = external_address_test_config(&network)?;
+
+    match network {
+        Mainnet => config.network.initial_mainnet_peers = [peer_addr].into(),
+        Testnet(_) => config.network.initial_testnet_peers = [peer_addr].into(),
+    }
+
+    let testdir = testdir()?.with_config(&mut config)?;
     let mut child = testdir.spawn_child(args!["start"])?;
 
     // Give enough time to start connecting to some peers.
@@ -236,7 +251,7 @@ fn external_address() -> Result<()> {
     let output = output.assert_failure()?;
 
     // Zebra started
-    output.stdout_line_contains("Starting zebrad")?;
+    output.stdout_line_contains(start_message_for_consensus())?;
 
     // Make sure we are using external address for Version messages.
     output.stdout_line_contains("using external address for Version messages")?;

@@ -1,10 +1,10 @@
-//! `generate` subcommand - generates a default `zebrad.toml` config.
+//! `generate` subcommand - generates a default `wcash.toml` config.
 
 use crate::config::ZebradConfig;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
 
-/// Generate a default `zebrad.toml` configuration
+/// Generate a default `wcash.toml` configuration
 #[derive(Command, Debug, Default, Parser)]
 pub struct GenerateCmd {
     /// The file to write the generated config to.
@@ -23,32 +23,32 @@ impl Runnable for GenerateCmd {
     #[allow(clippy::print_stdout)]
     fn run(&self) {
         let default_config = ZebradConfig::default();
-        let mut output = r"# Default configuration for zebrad.
+        let mut output = r"# Default configuration for Wcash.
 #
 # This file can be used as a skeleton for custom configs.
 #
 # Unspecified fields use default values. Optional fields are Some(field) if the
 # field is present and None if it is absent.
 #
-# This file is generated as an example using zebrad's current defaults.
+# This file is generated as an example using Wcash's current defaults.
 # You should set only the config options you want to keep, and delete the rest.
 # Only a subset of fields are present in the skeleton, since optional values
 # whose default is None are omitted.
 #
 # The config format (including a complete list of sections and fields) is
 # documented here:
-# https://docs.rs/zebrad/latest/zebrad/config/struct.ZebradConfig.html
+# https://github.com/w-cash/wolf
 #
 # CONFIGURATION SOURCES (in order of precedence, highest to lowest):
 #
-# 1. Environment variables with ZEBRA_ prefix (highest precedence)
-#    - Format: ZEBRA_SECTION__KEY (double underscore for nested keys)
+# 1. Environment variables with WCASH_ prefix (highest precedence)
+#    - Format: WCASH_SECTION__KEY (double underscore for nested keys)
 #    - Examples:
-#      - ZEBRA_NETWORK__NETWORK=Testnet
-#      - ZEBRA_RPC__LISTEN_ADDR=127.0.0.1:8232
-#      - ZEBRA_STATE__CACHE_DIR=/path/to/cache
-#      - ZEBRA_TRACING__FILTER=debug
-#      - ZEBRA_METRICS__ENDPOINT_ADDR=0.0.0.0:9999
+#      - WCASH_NETWORK__NETWORK=WcashTestnet
+#      - WCASH_RPC__LISTEN_ADDR=127.0.0.1:38232
+#      - WCASH_STATE__CACHE_DIR=/path/to/cache
+#      - WCASH_TRACING__FILTER=debug
+#      - WCASH_METRICS__ENDPOINT_ADDR=0.0.0.0:9999
 #
 # 2. Configuration file (TOML format)
 #    - At the path specified via -c flag, e.g. `zebrad -c myconfig.toml start`, or
@@ -56,14 +56,14 @@ impl Runnable for GenerateCmd {
 #
 # 3. Hard-coded defaults (lowest precedence)
 #
-# The user's preference directory and the default path to the `zebrad` config are platform dependent,
+# The user's preference directory and the default path to the Wcash config are platform dependent,
 # based on `dirs::preference_dir`, see https://docs.rs/dirs/latest/dirs/fn.preference_dir.html :
 #
 # | Platform | Value                                 | Example                                        |
 # | -------- | ------------------------------------- | ---------------------------------------------- |
-# | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/zebrad.toml`              |
-# | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/zebrad.toml` |
-# | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\zebrad.toml`     |
+# | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/wcash.toml`              |
+# | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/wcash.toml` |
+# | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\wcash.toml`     |
 
 "
         .to_owned();

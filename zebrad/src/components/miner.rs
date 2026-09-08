@@ -1,4 +1,4 @@
-//! Internal mining in Zebra.
+//! Internal native-Zcash and Wcash AuxPoW mining in Zebra.
 //!
 //! # TODO
 //! - pause mining if we have no peers, like `zcashd` does,
@@ -40,6 +40,10 @@ use zebra_rpc::{
 use zebra_state::WatchReceiver;
 
 use crate::components::metrics::Config;
+
+/// Number of synthetic Zcash parent nonces searched before the Wcash internal
+/// miner starts another bounded batch.
+const WCASH_AUXPOW_NONCES_PER_BATCH: u64 = 8;
 
 /// The amount of time we wait between block template retries.
 pub const BLOCK_TEMPLATE_WAIT_TIME: Duration = Duration::from_secs(20);
@@ -325,7 +329,7 @@ where
 
         // If the template has actually changed, send an updated template.
         template_sender.send_if_modified(|old_block| {
-            if old_block.as_ref().map(|b| *b.header) == Some(*block.header) {
+            if old_block.as_ref().map(|b| b.header.clone()) == Some(block.header.clone()) {
                 return false;
             }
             *old_block = Some(Arc::new(block));
@@ -342,8 +346,9 @@ where
     Ok(())
 }
 
-/// Runs a single mining thread that gets blocks from the `template_receiver`, calculates equihash
-/// solutions with nonces based on `solver_id`, and submits valid blocks to Zebra's block validator.
+/// Runs a single mining thread that gets blocks from the `template_receiver`, calculates native
+/// Equihash or Zcash-parent AuxPoW solutions with nonces based on `solver_id`, and submits valid
+/// blocks to Zebra's block validator.
 ///
 /// This method is CPU and memory-intensive. It uses 144 MB of RAM and one CPU core while running.
 /// It can run for minutes or hours if the network difficulty is high. Mining uses a thread with
@@ -434,7 +439,7 @@ where
 
         // Set up the cancellation conditions for the miner.
         let mut cancel_receiver = template_receiver.clone();
-        let old_header = *template.header;
+        let old_header = template.header.as_ref().clone();
         let cancel_fn = move || match cancel_receiver.has_changed() {
             // Guard against get_block_template() providing an identical header. This could happen
             // if something irrelevant to the block data changes, the time was within 1 second, or
@@ -445,7 +450,10 @@ where
                 // We only need to check header equality, because the block data is bound to the
                 // header.
                 if has_changed
-                    && Some(old_header) != cancel_receiver.cloned_watch_data().map(|b| *b.header)
+                    && Some(old_header.clone())
+                        != cancel_receiver
+                            .cloned_watch_data()
+                            .map(|b| b.header.as_ref().clone())
                 {
                     Err(SolverCancelled)
                 } else {
@@ -457,33 +465,37 @@ where
         };
 
         // Mine at least one block using the equihash solver.
-        let Ok(blocks) = mine_a_block(solver_id, template, cancel_fn).await else {
-            // If the solver was cancelled, we're either shutting down, or we have a new template.
-            if solver_id == 0 {
-                info!(
-                    ?height,
-                    ?solver_id,
-                    new_template = ?template_receiver.has_changed(),
-                    shutting_down = ?is_shutting_down(),
-                    "solver cancelled: getting a new block template or shutting down"
-                );
-            } else {
-                debug!(
-                    ?height,
-                    ?solver_id,
-                    new_template = ?template_receiver.has_changed(),
-                    shutting_down = ?is_shutting_down(),
-                    "solver cancelled: getting a new block template or shutting down"
-                );
-            }
+        let blocks = match mine_a_block(solver_id, template, cancel_fn).await {
+            Ok(blocks) => blocks,
+            Err(InternalMiningError::Cancelled(_)) => {
+                // If the solver was cancelled, we're either shutting down, or we have a new template.
+                if solver_id == 0 {
+                    info!(
+                        ?height,
+                        ?solver_id,
+                        new_template = ?template_receiver.has_changed(),
+                        shutting_down = ?is_shutting_down(),
+                        "solver cancelled: getting a new block template or shutting down"
+                    );
+                } else {
+                    debug!(
+                        ?height,
+                        ?solver_id,
+                        new_template = ?template_receiver.has_changed(),
+                        shutting_down = ?is_shutting_down(),
+                        "solver cancelled: getting a new block template or shutting down"
+                    );
+                }
 
-            // If the blockchain is changing rapidly, limit how often we'll update the template.
-            // But if we're shutting down, do that immediately.
-            if template_receiver.has_changed().is_ok() && !is_shutting_down() {
-                sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
-            }
+                // If the blockchain is changing rapidly, limit how often we'll update the template.
+                // But if we're shutting down, do that immediately.
+                if template_receiver.has_changed().is_ok() && !is_shutting_down() {
+                    sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
+                }
 
-            continue;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
         };
 
         // Submit the newly mined blocks to the verifiers.
@@ -541,24 +553,28 @@ where
     Ok(())
 }
 
-/// Mines one or more blocks based on `template`. Calculates equihash solutions, checks difficulty,
-/// and returns as soon as it has at least one block. Uses a different nonce range for each
+/// Mines one or more blocks based on `template`. Native templates use Zebra's Equihash solver;
+/// Wcash templates use a real Equihash synthetic Zcash parent and attach its canonical AuxPoW
+/// proof. Returns as soon as it has at least one block and uses a different nonce range for each
 /// `solver_id`.
 ///
-/// If `cancel_fn()` returns an error, returns early with `Err(SolverCancelled)`.
+/// If `cancel_fn()` returns an error, returns early with
+/// [`InternalMiningError::Cancelled`].
 ///
 /// See [`run_mining_solver()`] for more details.
 pub async fn mine_a_block<F>(
     solver_id: u8,
     template: Arc<Block>,
     cancel_fn: F,
-) -> Result<AtLeastOne<Block>, SolverCancelled>
+) -> Result<AtLeastOne<Block>, InternalMiningError>
 where
     F: FnMut() -> Result<(), SolverCancelled> + Send + Sync + 'static,
 {
+    let height = template.coinbase_height().expect("template is valid");
+
     // TODO: Replace with Arc::unwrap_or_clone() when it stabilises:
     // https://github.com/rust-lang/rust/issues/93610
-    let mut header = *template.header;
+    let mut header = template.header.as_ref().clone();
 
     // Use a different nonce for each solver thread.
     // Change both the first and last bytes, so we don't have to care if the nonces are incremented in
@@ -568,20 +584,25 @@ where
 
     // Mine one or more blocks using the solver, in a low-priority blocking thread.
     let span = Span::current();
-    let solved_headers =
-        tokio::task::spawn_blocking(move || span.in_scope(move || {
+    let solved_headers = tokio::task::spawn_blocking(move || {
+        span.in_scope(move || {
             let miner_thread_handle = ThreadBuilder::default().name("zebra-miner").priority(ThreadPriority::Min).spawn(move |priority_result| {
                 if let Err(error) = priority_result {
                     info!(?error, "could not set miner to run at a low priority: running at default priority");
                 }
 
-                Solution::solve(header, cancel_fn)
+                if header.solution.as_wcash().is_some() {
+                    solve_wcash_header(header, height, solver_id, cancel_fn)
+                } else {
+                    Solution::solve(header, cancel_fn).map_err(InternalMiningError::from)
+                }
             }).expect("unable to spawn miner thread");
 
             miner_thread_handle.wait_for_panics()
-        }))
-        .wait_for_panics()
-        .await?;
+        })
+    })
+    .wait_for_panics()
+    .await?;
 
     // Modify the template into solved blocks.
 
@@ -600,4 +621,83 @@ where
     Ok(solved_blocks
         .try_into()
         .expect("a 1:1 mapping of AtLeastOne produces at least one block"))
+}
+
+/// Errors produced by the built-in native or Wcash AuxPoW solver.
+#[derive(Debug, thiserror::Error)]
+pub enum InternalMiningError {
+    /// A new template or node shutdown cancelled the current work.
+    #[error(transparent)]
+    Cancelled(#[from] SolverCancelled),
+
+    /// The local Zcash-parent harness rejected the Wcash template or work.
+    #[error(transparent)]
+    Wcash(#[from] wcash_merge_miner::MinerError),
+
+    /// A generated template timestamp cannot be serialized into a block header.
+    #[error("Wcash block template timestamp {0} does not fit in u32")]
+    InvalidTemplateTimestamp(i64),
+
+    /// A solved Wcash header could not be represented as a non-empty result.
+    #[error("Wcash solver unexpectedly produced an empty result set")]
+    EmptySolutionSet,
+}
+
+/// Mines a real Equihash `(200, 9)` synthetic Zcash parent and attaches its
+/// canonical proof to `header`.
+///
+/// This is a local integration harness. Its parent coinbase commits to Wcash
+/// but does not contain the payouts or other transactions required by a live
+/// Zcash node. Production pools need a parent template producer or complete
+/// coinbase builder that includes the commitment before shielded proving and
+/// authorization, recomputes all affected parent commitments, and submits
+/// parent-chain winners independently.
+fn solve_wcash_header<F>(
+    header: block::Header,
+    height: block::Height,
+    solver_id: u8,
+    mut cancel_fn: F,
+) -> Result<AtLeastOne<block::Header>, InternalMiningError>
+where
+    F: FnMut() -> Result<(), SolverCancelled>,
+{
+    let timestamp = header
+        .time
+        .timestamp()
+        .try_into()
+        .map_err(|_| InternalMiningError::InvalidTemplateTimestamp(header.time.timestamp()))?;
+    let config = wcash_merge_miner::JobConfig {
+        parent_height: height.0,
+        timestamp,
+        auxiliary_nonce: u32::from(solver_id),
+        ..Default::default()
+    };
+    let job = wcash_merge_miner::PreparedJob::from_wcash_header(&header, config)?;
+
+    // Give each configured solver a disjoint initial range. A single worker is
+    // currently launched, but this remains correct when parallel mining is
+    // re-enabled.
+    let mut start_nonce = u64::from(solver_id) << 56;
+    loop {
+        cancel_fn()?;
+        match job.solve_with_cancel(start_nonce, WCASH_AUXPOW_NONCES_PER_BATCH, || {
+            cancel_fn().is_err()
+        }) {
+            Ok(solved) => {
+                let solved_header = job.attach_to_header(header, &solved)?;
+                return vec![solved_header]
+                    .try_into()
+                    .map_err(|_| InternalMiningError::EmptySolutionSet);
+            }
+            Err(wcash_merge_miner::MinerError::SolverExhausted { attempted }) => {
+                start_nonce = start_nonce
+                    .checked_add(attempted)
+                    .ok_or(wcash_merge_miner::MinerError::NonceRangeOverflow)?;
+            }
+            Err(wcash_merge_miner::MinerError::SolverCancelled { .. }) => {
+                return Err(SolverCancelled.into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }

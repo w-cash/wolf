@@ -7,7 +7,7 @@ use once_cell::sync::Lazy;
 use tower::{buffer::Buffer, util::BoxService};
 
 use zebra_chain::{
-    amount::{DeferredPoolBalanceChange, MAX_MONEY},
+    amount::{DeferredPoolBalanceChange, MAX_MONEY, MAX_WCASH_COINBASE_VALUE},
     block::{
         tests::generate::{
             large_multi_transaction_block, large_single_transaction_block_many_inputs,
@@ -17,7 +17,10 @@ use zebra_chain::{
     parameters::{subsidy::block_subsidy, NetworkUpgrade},
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
     transaction::{arbitrary::transaction_to_fake_v5, LockTime, Transaction},
-    work::difficulty::{ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY},
+    work::{
+        difficulty::{ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY},
+        equihash::{Solution, WCASH_BLOCK_WIRE_VERSION},
+    },
 };
 use zebra_script::Sigops;
 use zebra_test::transcript::{ExpectedTranscriptError, Transcript};
@@ -80,7 +83,7 @@ static INVALID_COINBASE_TRANSCRIPT: Lazy<
 
     // Test 1: Empty transaction
     let block1 = Block {
-        header: header.into(),
+        header: header.clone().into(),
         transactions: Vec::new(),
     };
 
@@ -276,6 +279,67 @@ fn equihash_is_valid_for_historical_blocks() -> Result<(), Report> {
         check::equihash_solution_is_valid(&block.header)
             .expect("the equihash solution from a historical block should be valid");
     }
+
+    Ok(())
+}
+
+#[test]
+fn wcash_auxpow_header_and_placeholder_rules() -> Result<(), Report> {
+    let _init_guard = zebra_test::init();
+    let network = Network::new_wcash_regtest();
+    let genesis = zebra_chain::block::genesis::wcash_regtest_genesis_block();
+    let genesis_hash = genesis.hash();
+
+    check::wcash_auxpow_is_valid(&genesis.header, &network, &Height::MIN, &genesis_hash)?;
+
+    let mut header = genesis.header.as_ref().clone();
+    header.version = 4;
+    let hash = block::Hash::from(&header);
+    assert!(matches!(
+        check::wcash_auxpow_is_valid(&header, &network, &Height(1), &hash),
+        Err(BlockError::InvalidWcashHeaderVersion { .. })
+    ));
+
+    header.version = WCASH_BLOCK_WIRE_VERSION;
+    header.solution = Solution::Regtest([0; 36]);
+    let hash = block::Hash::from(&header);
+    assert!(matches!(
+        check::wcash_auxpow_is_valid(&header, &network, &Height(1), &hash),
+        Err(BlockError::MissingWcashAuxPowVariant { .. })
+    ));
+
+    header.solution = Solution::for_wcash(Vec::new())?;
+    let hash = block::Hash::from(&header);
+    assert_eq!(
+        check::wcash_auxpow_is_valid(&header, &network, &Height(1), &hash),
+        Err(BlockError::MissingWcashAuxPow {
+            height: Height(1),
+            hash,
+        })
+    );
+    check::wcash_auxpow_proposal_is_valid(&header, &network, &Height(1), &hash)?;
+
+    header.solution = Solution::for_wcash(vec![0])?;
+    let hash = block::Hash::from(&header);
+    assert!(matches!(
+        check::wcash_auxpow_is_valid(&header, &network, &Height(1), &hash),
+        Err(BlockError::InvalidWcashAuxPow {
+            source: wcash_zcash_aux::AuxPowError::UnexpectedEnd {
+                field: "proof magic",
+                ..
+            },
+            ..
+        })
+    ));
+
+    assert_eq!(
+        check::wcash_auxpow_proposal_is_valid(&header, &network, &Height::MIN, &hash),
+        Err(BlockError::UnexpectedWcashGenesisAuxPow { hash })
+    );
+    assert_eq!(
+        check::wcash_auxpow_is_valid(&header, &network, &Height::MIN, &hash),
+        Err(BlockError::UnexpectedWcashGenesisAuxPow { hash })
+    );
 
     Ok(())
 }
@@ -568,6 +632,74 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
         ),
         Err(BlockError::Transaction(TransactionError::Subsidy(
             SubsidyError::InvalidMinerFees,
+        )))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn wcash_coinbase_rejects_transparent_and_missing_ironwood_outputs() -> Result<(), Report> {
+    let _init_guard = zebra_test::init();
+    let network = Network::new_wcash_regtest();
+    let height = Height(1);
+    let expected_block_subsidy = block_subsidy(height, &network)?;
+    let deferred = DeferredPoolBalanceChange::zero();
+
+    let block = Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_1046400_BYTES[..])
+        .expect("block should deserialize");
+    let transparent_coinbase = block
+        .transactions
+        .first()
+        .expect("block contains a coinbase");
+
+    assert_eq!(
+        check::miner_fees_are_valid(
+            transparent_coinbase,
+            height,
+            Amount::try_from(MAX_WCASH_COINBASE_VALUE)?,
+            expected_block_subsidy,
+            deferred,
+            &network,
+        ),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::WcashCoinbaseValueTooLarge,
+        )))
+    );
+
+    assert_eq!(
+        check::miner_fees_are_valid(
+            transparent_coinbase,
+            height,
+            Amount::zero(),
+            expected_block_subsidy,
+            deferred,
+            &network,
+        ),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::WcashTransparentCoinbaseOutput,
+        )))
+    );
+
+    let no_output_coinbase = Transaction::test_v4(
+        transparent_coinbase.inputs(),
+        Vec::new(),
+        transparent_coinbase
+            .lock_time()
+            .unwrap_or_else(LockTime::unlocked),
+        Height::MIN,
+    );
+    assert_eq!(
+        check::miner_fees_are_valid(
+            &no_output_coinbase,
+            height,
+            Amount::zero(),
+            expected_block_subsidy,
+            deferred,
+            &network,
+        ),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::WcashIronwoodCoinbaseOutputMissing,
         )))
     );
 

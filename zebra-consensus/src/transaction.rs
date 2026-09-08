@@ -97,6 +97,7 @@ where
 {
     /// Creates a new block transaction verifier.
     pub fn new(network: &Network, state: ZS) -> Self {
+        network.assert_compatible_with_compiled_consensus();
         Self {
             network: network.clone(),
             state: Timeout::new(state, UTXO_LOOKUP_TIMEOUT),
@@ -132,6 +133,7 @@ where
 {
     /// Creates a new mempool transaction verifier.
     pub fn new(network: &Network, state: ZS, mempool_setup_rx: oneshot::Receiver<Mempool>) -> Self {
+        network.assert_compatible_with_compiled_consensus();
         Self {
             network: network.clone(),
             state: Timeout::new(state, UTXO_LOOKUP_TIMEOUT),
@@ -780,6 +782,18 @@ fn check_common_consensus_rules(
     height: block::Height,
     network: &Network,
 ) -> Result<(), TransactionError> {
+    // Wcash currently uses upstream NU6.3 transaction encoding and signature
+    // domains. Network magic, genesis, and address HRPs isolate transport and
+    // presentation, but they do not cryptographically prevent a signed Zcash
+    // transaction from being replayed on a chain with equivalent note keys.
+    // Keep the public engineering testnet mining-only until a Wcash-specific
+    // branch ID is implemented through every parser, sighash, proof, wallet,
+    // and RPC dependency. This consensus check is shared by block and mempool
+    // verification, so neither path can bypass the launch gate.
+    if network.disables_non_coinbase_transactions(height) && !tx.is_coinbase() {
+        return Err(TransactionError::WcashTestnetTransfersDisabled);
+    }
+
     check_structure_and_network_rules(tx, height, network)?;
 
     if tx.is_coinbase() {

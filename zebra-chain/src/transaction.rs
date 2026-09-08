@@ -226,6 +226,92 @@ impl Transaction {
         self.transparent_bundle().is_some_and(|b| b.is_coinbase())
     }
 
+    /// Rebuilds a coinbase transaction with a replacement scriptSig.
+    ///
+    /// This narrowly scoped constructor is used to derive the deterministic
+    /// Wcash genesis transaction from Zebra's inherited Regtest genesis. It
+    /// preserves every non-input transaction component and recomputes the txid.
+    pub(crate) fn with_coinbase_script(self, script_sig: Vec<u8>) -> Option<Self> {
+        if !self.is_coinbase() {
+            return None;
+        }
+
+        let data = &*self.0;
+        let mut transparent_bundle = data.transparent_bundle()?.clone();
+        if transparent_bundle.vin.len() != 1 {
+            return None;
+        }
+
+        let sequence = transparent_bundle.vin[0].sequence();
+        transparent_bundle.vin[0] = zcash_transparent::bundle::TxIn::from_parts(
+            zcash_transparent::bundle::OutPoint::NULL,
+            zcash_transparent::address::Script(zcash_script::script::Code(script_sig)),
+            sequence,
+        );
+
+        let tx_data = compat::transaction_data_from_parts(
+            data.version(),
+            data.consensus_branch_id(),
+            data.lock_time(),
+            data.expiry_height(),
+            Some(transparent_bundle),
+            data.sprout_bundle().cloned(),
+            data.sapling_bundle().cloned(),
+            data.orchard_bundle().cloned(),
+            data.ironwood_bundle().cloned(),
+        );
+
+        tx_data.freeze().ok().map(Transaction)
+    }
+
+    /// Constructs a transparent-only NU6.3/V6 transaction from Zebra-native parts.
+    ///
+    /// Returns `None` if an input cannot be canonically represented, an output
+    /// exceeds the inherited transaction-library value bound, or the resulting
+    /// transaction cannot be frozen.
+    pub fn from_nu63_transparent_parts(
+        inputs: Vec<transparent::Input>,
+        outputs: Vec<transparent::Output>,
+        lock_time: LockTime,
+        expiry_height: block::Height,
+    ) -> Option<Self> {
+        if inputs.iter().any(|input| {
+            matches!(input, transparent::Input::Coinbase { .. })
+                && input.coinbase_script().is_none()
+        }) {
+            return None;
+        }
+        if outputs.iter().any(|output| {
+            let value: i64 = output.value.into();
+            !(0..=crate::amount::MAX_SINGLE_TRANSACTION_VALUE).contains(&value)
+        }) {
+            return None;
+        }
+
+        let branch_id = NetworkUpgrade::Nu6_3
+            .branch_id()
+            .and_then(|id| zcash_protocol::consensus::BranchId::try_from(id).ok())?;
+
+        let vin = inputs.iter().map(compat::input_to_txin).collect();
+        let vout = outputs.iter().map(compat::output_to_txout).collect();
+        let transparent_bundle = Some(zcash_transparent::bundle::Bundle {
+            vin,
+            vout,
+            authorization: zcash_transparent::bundle::Authorized,
+        });
+        let tx_data = zp_tx::TransactionData::from_parts_v6(
+            branch_id,
+            compat::lock_time_to_u32(&lock_time),
+            compat::height_to_block_height(expiry_height),
+            transparent_bundle,
+            None,
+            None,
+            None,
+        );
+
+        tx_data.freeze().ok().map(Transaction)
+    }
+
     /// Returns `true` if this is a valid non-coinbase transaction.
     pub fn is_valid_non_coinbase(&self) -> bool {
         !self.is_coinbase()
@@ -885,7 +971,9 @@ impl crate::serialization::ZcashDeserialize for Transaction {
             for txin in &bundle.vin {
                 if *txin.prevout() == zcash_transparent::bundle::OutPoint::NULL {
                     let script_bytes = txin.script_sig().0 .0.clone();
-                    transparent::serialize::parse_coinbase_height(&script_bytes)?;
+                    if !transparent::serialize::is_genesis_coinbase_script(&script_bytes) {
+                        transparent::serialize::parse_coinbase_height(&script_bytes)?;
+                    }
                 }
             }
         }

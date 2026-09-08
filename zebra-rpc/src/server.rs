@@ -141,8 +141,11 @@ impl RpcServer {
 
         let http_middleware = tower::ServiceBuilder::new().layer(http_middleware_layer);
 
+        // Do not install jsonrpsee's raw request/response logger. Mining RPCs
+        // can contain private shielded payout receivers and RPC parameters are
+        // not safe diagnostic fields, even at TRACE. RpcTracingMiddleware
+        // records method names, status, and error codes without request bodies.
         let rpc_middleware = RpcServiceBuilder::new()
-            .rpc_logger(1024)
             .layer_fn(FixRpcResponseMiddleware::new)
             .layer_fn(RpcMetricsMiddleware::new)
             .layer_fn(RpcTracingMiddleware::new);

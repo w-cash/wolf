@@ -28,7 +28,7 @@ pub const MAX_ZEC_FORMAT_PRECISION: usize = 8;
 /// A wrapper type that formats [`Amount`]s as ZEC, using double-precision floating point.
 ///
 /// This formatting is accurate to the nearest zatoshi, as long as the number of floating-point
-/// calculations is very small. This is because [`MAX_MONEY`] uses 51 bits, but [`f64`] has
+/// calculations is very small. This is because [`MAX_MONEY`] uses 52 bits, but [`f64`] has
 /// [53 bits of precision](f64::MANTISSA_DIGITS).
 ///
 /// Rust uses [`roundTiesToEven`](f32), which can lose one bit of precision per calculation
@@ -51,12 +51,11 @@ impl<C: Constraint> Zec<C> {
     pub fn lossy_zec(&self) -> f64 {
         let zats = self.zatoshis();
         // These conversions are exact, because f64 has 53 bits of precision,
-        // MAX_MONEY has <51, and COIN has <27, so we have 2 extra bits of precision.
+        // MAX_MONEY has 52 bits, and COIN has <27, so the integer conversion has one spare bit.
         let zats = zats as f64;
         let coin = COIN as f64;
 
-        // After this calculation, we might have lost one bit of precision,
-        // leaving us with only 1 extra bit.
+        // This division can consume that spare bit, but remains accurate to the nearest zatoshi.
         zats / coin
     }
 

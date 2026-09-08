@@ -606,6 +606,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wcash_state_paths_are_isolated_by_network_identity() {
+        let config = Config {
+            cache_dir: PathBuf::from("/tmp/wcash-state-path-vector"),
+            ephemeral: false,
+            ..Config::default()
+        };
+        let testnet = Network::new_wcash_testnet();
+        let regtest = Network::new_wcash_regtest();
+        let zcash_testnet = Network::new_default_testnet();
+
+        let testnet_path = config.db_path("state", 1, &testnet);
+        let regtest_path = config.db_path("state", 1, &regtest);
+        let zcash_path = config.db_path("state", 1, &zcash_testnet);
+
+        assert!(testnet_path.ends_with("state/v1/wcashtestnet"));
+        assert!(regtest_path.ends_with("state/v1/wcashregtest"));
+        assert_ne!(testnet_path, regtest_path);
+        assert_ne!(testnet_path, zcash_path);
+        assert_ne!(
+            config.non_finalized_state_backup_dir(&testnet),
+            config.non_finalized_state_backup_dir(&regtest)
+        );
+    }
+
+    #[test]
     fn redacted_string_hides_contents_from_debug() {
         let secret = RedactedString::from("hunter2");
 

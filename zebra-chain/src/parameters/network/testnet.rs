@@ -29,10 +29,13 @@ use crate::{
 use super::magic::Magic;
 
 /// Reserved network names that should not be allowed for configured Testnets.
-pub const RESERVED_NETWORK_NAMES: [&str; 6] = [
+pub const RESERVED_NETWORK_NAMES: [&str; 9] = [
     "Mainnet",
     "Testnet",
     "Regtest",
+    "Wcash",
+    "WcashTestnet",
+    "WcashRegtest",
     "MainnetKind",
     "TestnetKind",
     "RegtestKind",
@@ -47,6 +50,14 @@ pub const MAX_HRP_LENGTH: usize = 30;
 /// The block hash of the Regtest genesis block, `zcash-cli -regtest getblockhash 0`
 const REGTEST_GENESIS_HASH: &str =
     "029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327";
+
+/// The deterministic Wcash Regtest P2P network magic.
+const WCASH_REGTEST_NETWORK_MAGIC: Magic =
+    Magic(wcash_genesis::network_identity(wcash_genesis::WcashNetwork::Regtest).p2p_magic());
+
+/// The deterministic public Wcash Testnet P2P network magic.
+const WCASH_TESTNET_NETWORK_MAGIC: Magic =
+    Magic(wcash_genesis::network_identity(wcash_genesis::WcashNetwork::Testnet).p2p_magic());
 
 /// The block hash of the Testnet genesis block, `zcash-cli -testnet getblockhash 0`
 const TESTNET_GENESIS_HASH: &str =
@@ -478,6 +489,11 @@ pub struct ParametersBuilder {
     target_difficulty_limit: ExpandedDifficulty,
     /// A flag for disabling proof-of-work checks when Zebra is validating blocks
     disable_pow: bool,
+    /// First height at which a long block gap may use the testnet proof-of-work limit.
+    ///
+    /// This is private consensus state: configured testnets retain Zcash's
+    /// historical height, while built-in Wcash Testnet starts the rule at block 1.
+    minimum_difficulty_start_height: Option<Height>,
     /// Whether to allow transactions with transparent outputs to spend coinbase outputs,
     /// similar to `fCoinbaseMustBeShielded` in zcashd.
     should_allow_unshielded_coinbase_spends: bool,
@@ -517,6 +533,7 @@ impl Default for ParametersBuilder {
                 .to_expanded()
                 .expect("difficulty limits are valid expanded values"),
             disable_pow: false,
+            minimum_difficulty_start_height: Some(Height(299_188)),
             funding_streams: testnet::FUNDING_STREAMS.clone(),
             should_lock_funding_stream_address_period: false,
             pre_blossom_halving_interval: PRE_BLOSSOM_HALVING_INTERVAL,
@@ -572,9 +589,14 @@ impl ParametersBuilder {
         mut self,
         network_magic: Magic,
     ) -> Result<Self, ParametersBuilderError> {
-        if [magics::MAINNET, magics::REGTEST]
-            .into_iter()
-            .any(|reserved_magic| network_magic == reserved_magic)
+        if [
+            magics::MAINNET,
+            magics::REGTEST,
+            WCASH_REGTEST_NETWORK_MAGIC,
+            WCASH_TESTNET_NETWORK_MAGIC,
+        ]
+        .into_iter()
+        .any(|reserved_magic| network_magic == reserved_magic)
         {
             return Err(ParametersBuilderError::ReservedNetworkMagic);
         }
@@ -754,6 +776,15 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the first height at which the testnet minimum-difficulty rule is active.
+    ///
+    /// This is intentionally private so configured Zcash testnets cannot copy a
+    /// built-in Wcash consensus identity through configuration.
+    fn with_minimum_difficulty_start_height(mut self, height: Option<Height>) -> Self {
+        self.minimum_difficulty_start_height = height;
+        self
+    }
+
     /// Sets whether coinbase outputs may be spent into transparent outputs in the
     /// [`Parameters`] being built (the inverse of zcashd's `-regtestshieldcoinbase`).
     pub fn with_unshielded_coinbase_spends(
@@ -857,6 +888,7 @@ impl ParametersBuilder {
             should_lock_funding_stream_address_period: _,
             target_difficulty_limit,
             disable_pow,
+            minimum_difficulty_start_height,
             should_allow_unshielded_coinbase_spends,
             pre_blossom_halving_interval,
             post_blossom_halving_interval,
@@ -865,6 +897,7 @@ impl ParametersBuilder {
             temporary_orchard_disabling_soft_fork_height,
         } = self;
         Parameters {
+            consensus_flavor: ConsensusFlavor::Zcash,
             network_name,
             network_magic,
             genesis_hash,
@@ -874,6 +907,7 @@ impl ParametersBuilder {
             funding_streams,
             target_difficulty_limit,
             disable_pow,
+            minimum_difficulty_start_height,
             should_allow_unshielded_coinbase_spends,
             pre_blossom_halving_interval,
             post_blossom_halving_interval,
@@ -921,6 +955,7 @@ impl ParametersBuilder {
             should_lock_funding_stream_address_period: _,
             target_difficulty_limit,
             disable_pow,
+            minimum_difficulty_start_height,
             should_allow_unshielded_coinbase_spends,
             pre_blossom_halving_interval,
             post_blossom_halving_interval,
@@ -936,6 +971,7 @@ impl ParametersBuilder {
             && self.funding_streams == funding_streams
             && self.target_difficulty_limit == target_difficulty_limit
             && self.disable_pow == disable_pow
+            && self.minimum_difficulty_start_height == minimum_difficulty_start_height
             && self.should_allow_unshielded_coinbase_spends
                 == should_allow_unshielded_coinbase_spends
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
@@ -974,6 +1010,9 @@ impl From<ConfiguredActivationHeights> for RegtestParameters {
 /// Network consensus parameters for test networks such as Regtest and the default Testnet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Parameters {
+    /// Selects consensus rules that cannot be enabled through the public configured-Testnet
+    /// builder.
+    consensus_flavor: ConsensusFlavor,
     /// The name of this network to be used by the `Display` trait impl.
     network_name: String,
     /// The network magic, acts as an identifier for the network.
@@ -992,6 +1031,8 @@ pub struct Parameters {
     target_difficulty_limit: ExpandedDifficulty,
     /// A flag for disabling proof-of-work checks when Zebra is validating blocks
     disable_pow: bool,
+    /// First height at which the public-testnet minimum-difficulty rule is active.
+    minimum_difficulty_start_height: Option<Height>,
     /// Whether to allow transactions with transparent outputs to spend coinbase outputs,
     /// similar to `fCoinbaseMustBeShielded` in zcashd.
     should_allow_unshielded_coinbase_spends: bool,
@@ -1005,6 +1046,17 @@ pub struct Parameters {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+}
+
+/// Private consensus rule selection for built-in networks.
+///
+/// This type and the corresponding [`Parameters`] field are intentionally private. Callers can
+/// configure Zcash Testnet parameters, but cannot accidentally turn a configured Testnet into
+/// Wcash by reproducing its public field values.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ConsensusFlavor {
+    Zcash,
+    Wcash(wcash_genesis::WcashNetwork),
 }
 
 impl Default for Parameters {
@@ -1041,6 +1093,7 @@ impl Parameters {
             // This value is chosen to match zcashd, see: <https://github.com/zcash/zcash/blob/master/src/chainparams.cpp#L654>
             .with_target_difficulty_limit(U256::from_big_endian(&[0x0f; 32]))?
             .with_disable_pow(true)
+            .with_minimum_difficulty_start_height(None)
             .with_unshielded_coinbase_spends(
                 should_allow_unshielded_coinbase_spends.unwrap_or(true),
             )
@@ -1061,9 +1114,89 @@ impl Parameters {
         }
 
         Ok(Self {
+            consensus_flavor: ConsensusFlavor::Zcash,
             network_name: "Regtest".to_string(),
             network_magic: magics::REGTEST,
             ..parameters.finish()
+        })
+    }
+
+    /// Creates the built-in public Wcash Testnet parameters.
+    ///
+    /// NU6.3 activates at height 1. The inherited Zcash damped retarget is
+    /// active from launch, and a gap strictly greater than six 75-second target
+    /// spacings permits one proof-of-work-limit block for testnet liveness.
+    pub(super) fn new_wcash_testnet() -> Result<Self, ParametersBuilderError> {
+        let genesis = block::genesis::wcash_testnet_genesis_block();
+        assert_eq!(
+            genesis.hash().to_string(),
+            block::genesis::WCASH_TESTNET_GENESIS_HASH,
+            "the constructed Wcash Testnet genesis must match its frozen ID"
+        );
+        let parameters = Self::build()
+            .with_genesis_hash(block::genesis::WCASH_TESTNET_GENESIS_HASH)?
+            .with_target_difficulty_limit(U256::from_big_endian(&[
+                0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff,
+            ]))?
+            .with_disable_pow(false)
+            .with_minimum_difficulty_start_height(Some(Height(1)))
+            .with_unshielded_coinbase_spends(false)
+            .with_slow_start_interval(Height::MIN)
+            .disable_temporary_orchard_disabling_soft_fork()
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu6_3: Some(1),
+                ..Default::default()
+            })?
+            .clear_funding_streams()
+            .with_lockbox_disbursements(Vec::new())
+            .with_checkpoints(false)?
+            .finish();
+
+        assert_eq!(
+            genesis.header.difficulty_threshold,
+            parameters.target_difficulty_limit.to_compact(),
+            "Wcash Testnet genesis nBits must equal its configured proof-of-work limit"
+        );
+
+        Ok(Self {
+            consensus_flavor: ConsensusFlavor::Wcash(wcash_genesis::WcashNetwork::Testnet),
+            network_name: "WcashTestnet".to_string(),
+            network_magic: WCASH_TESTNET_NETWORK_MAGIC,
+            ..parameters
+        })
+    }
+
+    /// Creates the built-in local Wcash Regtest parameters.
+    ///
+    /// NU6.3 activates at height 1, so every mined block uses the 75-second post-Blossom target
+    /// spacing and can pay its coinbase reward into Ironwood. Wcash proof-of-work remains enabled
+    /// because its AuxPoW verifier replaces native Equihash validation, including on Regtest.
+    pub(super) fn new_wcash_regtest() -> Result<Self, ParametersBuilderError> {
+        let genesis_hash = block::genesis::wcash_regtest_genesis_block().hash();
+        let parameters = Self::build()
+            .with_genesis_hash(genesis_hash)?
+            .with_target_difficulty_limit(U256::from_big_endian(&[0x0f; 32]))?
+            .with_disable_pow(false)
+            .with_minimum_difficulty_start_height(None)
+            .with_unshielded_coinbase_spends(false)
+            .with_slow_start_interval(Height::MIN)
+            .disable_temporary_orchard_disabling_soft_fork()
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu6_3: Some(1),
+                ..Default::default()
+            })?
+            .clear_funding_streams()
+            .with_lockbox_disbursements(Vec::new())
+            .with_checkpoints(false)?
+            .finish();
+
+        Ok(Self {
+            consensus_flavor: ConsensusFlavor::Wcash(wcash_genesis::WcashNetwork::Regtest),
+            network_name: "WcashRegtest".to_string(),
+            network_magic: WCASH_REGTEST_NETWORK_MAGIC,
+            ..parameters
         })
     }
 
@@ -1074,11 +1207,16 @@ impl Parameters {
 
     /// Returns true if the instance of [`Parameters`] represents Regtest.
     pub fn is_regtest(&self) -> bool {
+        if let ConsensusFlavor::Wcash(network) = self.consensus_flavor {
+            return network == wcash_genesis::WcashNetwork::Regtest;
+        }
+
         if self.network_magic != magics::REGTEST {
             return false;
         }
 
         let Self {
+            consensus_flavor: _,
             network_name,
             // Already checked network magic above
             network_magic: _,
@@ -1090,6 +1228,7 @@ impl Parameters {
             funding_streams: _,
             target_difficulty_limit,
             disable_pow,
+            minimum_difficulty_start_height: _,
             // Configurable on Regtest
             should_allow_unshielded_coinbase_spends: _,
             pre_blossom_halving_interval,
@@ -1107,6 +1246,19 @@ impl Parameters {
             && self.disable_pow == disable_pow
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
+    }
+
+    /// Returns true when these parameters select the built-in Wcash consensus rules.
+    pub(super) fn uses_wcash_consensus(&self) -> bool {
+        matches!(self.consensus_flavor, ConsensusFlavor::Wcash(_))
+    }
+
+    /// Returns the built-in Wcash network selected by these parameters.
+    pub(super) fn wcash_network(&self) -> Option<wcash_genesis::WcashNetwork> {
+        match self.consensus_flavor {
+            ConsensusFlavor::Zcash => None,
+            ConsensusFlavor::Wcash(network) => Some(network),
+        }
     }
 
     /// Returns the network name
@@ -1152,6 +1304,12 @@ impl Parameters {
     /// Returns true if proof-of-work validation should be disabled for this network
     pub fn disable_pow(&self) -> bool {
         self.disable_pow
+    }
+
+    /// Returns the first height at which a long testnet block gap may use the
+    /// configured proof-of-work limit.
+    pub fn minimum_difficulty_start_height(&self) -> Option<Height> {
+        self.minimum_difficulty_start_height
     }
 
     /// Returns true if this network should allow transactions with transparent outputs

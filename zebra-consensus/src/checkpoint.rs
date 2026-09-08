@@ -597,7 +597,16 @@ where
             .ok_or(VerifyCheckpointError::CoinbaseHeight { hash })?;
         self.check_height(height)?;
 
-        if self.network.disable_pow() {
+        if self.network.uses_wcash_consensus() {
+            // Checkpoints authenticate the child hash chain, but they do not
+            // replace Wcash's per-block Zcash AuxPoW authorization.
+            crate::block::check::wcash_auxpow_is_valid(
+                &block.header,
+                &self.network,
+                &height,
+                &hash,
+            )?;
+        } else if self.network.disable_pow() {
             crate::block::check::difficulty_threshold_is_valid(
                 &block.header,
                 &self.network,

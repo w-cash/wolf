@@ -402,6 +402,10 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::Block`] with the specified block.
     Block(Option<Arc<Block>>),
 
+    /// Response to [`ReadRequest::BlockAndDepth`] with the specified best-chain
+    /// block and its depth from the same chain snapshot.
+    BlockAndDepth(Option<(Arc<Block>, u32)>),
+
     /// Response to [`ReadRequest::BlockAndSize`] with the specified block and
     /// serialized size.
     BlockAndSize(Option<(Arc<Block>, usize)>),
@@ -622,6 +626,7 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::UsageInfo(_)
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::BlockInfo(_)
+            | ReadResponse::BlockAndDepth(_)
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
             | ReadResponse::SaplingTree(_)

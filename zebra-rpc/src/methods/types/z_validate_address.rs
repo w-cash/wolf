@@ -6,7 +6,7 @@ use jsonrpsee::core::RpcResult;
 
 use zebra_chain::{
     parameters::{Network, NetworkKind},
-    primitives::Address,
+    primitives::{Address, WcashAddress},
 };
 
 /// `z_validateaddress` response
@@ -82,24 +82,35 @@ pub fn z_validate_address(
     network: Network,
     raw_address: String,
 ) -> RpcResult<ZValidateAddressResponse> {
-    let Ok(address) = raw_address.parse::<zcash_address::ZcashAddress>() else {
-        return Ok(ZValidateAddressResponse::invalid());
+    let uses_wcash_consensus = network.uses_wcash_consensus();
+    let address = if uses_wcash_consensus {
+        let Ok(address) = raw_address.parse::<WcashAddress>() else {
+            return Ok(ZValidateAddressResponse::invalid());
+        };
+        address.convert::<Address>()
+    } else {
+        let Ok(address) = raw_address.parse::<zcash_address::ZcashAddress>() else {
+            return Ok(ZValidateAddressResponse::invalid());
+        };
+        address.convert::<Address>()
     };
 
-    let address = match address.convert::<Address>() {
+    let address = match address {
         Ok(address) => address,
         Err(err) => {
-            tracing::debug!(?err, "conversion error");
+            tracing::debug!(?err, "address conversion error");
             return Ok(ZValidateAddressResponse::invalid());
         }
     };
 
     let is_transparent = matches!(address, Address::Transparent(_));
 
-    // Collapse regtest to testnet. Only applied if address is transparent (P2PKH or P2SH).
-    let expected_kind = match (is_transparent, network.kind()) {
-        (true, NetworkKind::Regtest) => NetworkKind::Testnet,
-        _ => network.kind(),
+    // Wcash gives Testnet and Regtest distinct namespaces. Preserve Zcash's
+    // historical transparent Testnet/Regtest namespace sharing on Zcash consensus.
+    let expected_kind = match (uses_wcash_consensus, is_transparent, network.kind()) {
+        (true, _, network_kind) => network_kind,
+        (false, true, NetworkKind::Regtest) => NetworkKind::Testnet,
+        (false, _, network_kind) => network_kind,
     };
 
     if address.network() == expected_kind {
@@ -119,5 +130,54 @@ pub fn z_validate_address(
         );
 
         Ok(ZValidateAddressResponse::invalid())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zcash_protocol::consensus::NetworkType;
+
+    #[test]
+    fn wcash_consensus_accepts_only_addresses_for_the_selected_network() {
+        for (network, expected, other) in [
+            (
+                Network::new_wcash_testnet(),
+                NetworkType::Test,
+                NetworkType::Regtest,
+            ),
+            (
+                Network::new_wcash_regtest(),
+                NetworkType::Regtest,
+                NetworkType::Test,
+            ),
+        ] {
+            let matching = WcashAddress::from_transparent_p2sh(expected, [0; 20]).encode();
+            assert_eq!(
+                z_validate_address(network.clone(), matching.clone()).unwrap(),
+                ZValidateAddressResponse {
+                    is_valid: true,
+                    address: Some(matching),
+                    address_type: Some(ZValidateAddressType::P2sh),
+                    is_mine: Some(false),
+                }
+            );
+
+            let wrong_network = WcashAddress::from_transparent_p2sh(other, [0; 20]).encode();
+            assert_eq!(
+                z_validate_address(network.clone(), wrong_network).unwrap(),
+                ZValidateAddressResponse::invalid(),
+            );
+
+            assert_eq!(
+                z_validate_address(
+                    network,
+                    "zregtestsapling1jalqhycwumq3unfxlzyzcktq3n478n82k2wacvl8gwfxk6ahshkxmtp2034qj28n7gl92ka5wca"
+                        .to_string(),
+                )
+                .unwrap(),
+                ZValidateAddressResponse::invalid(),
+            );
+        }
     }
 }

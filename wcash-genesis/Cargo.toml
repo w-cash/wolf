@@ -1,0 +1,23 @@
+[package]
+name = "wcash-genesis"
+version = "0.1.0"
+authors.workspace = true
+description = "Deterministic Wcash network identity and Bitcoin-anchored genesis data"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+blake2b_simd = "1.0"
+sha2 = "0.10.9"
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }

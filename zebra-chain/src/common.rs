@@ -9,11 +9,11 @@ use std::{
 
 use tempfile::PersistError;
 
-/// Returns Zebra's default cache directory path.
+/// Returns Wcash's default cache directory path.
 pub fn default_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap().join("cache"))
-        .join("zebra")
+        .join("wcash")
 }
 
 /// Accepts a target file path and a byte-slice.
@@ -68,4 +68,14 @@ pub fn atomic_write(
         // Drops the temp file and returns the file path.
         .map(|_| file_path);
     Ok(persist_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_cache_dir;
+
+    #[test]
+    fn default_cache_is_isolated_from_zcash() {
+        assert_eq!(default_cache_dir().file_name().unwrap(), "wcash");
+    }
 }

@@ -7,7 +7,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
-use zebra_rpc::config::mining::{default_miner_address, MinerAddressType};
+use zebra_rpc::config::mining::{default_miner_address_for_network, MinerAddressType};
 
 use crate::components::With;
 
@@ -33,22 +33,22 @@ fn is_sensitive_leaf_key(leaf_key: &str) -> bool {
         .any(|deny_suffix| key.ends_with(deny_suffix))
 }
 
-/// Configuration for `zebrad`.
+/// Configuration for the Wcash node.
 ///
-/// The `zebrad` config is a TOML-encoded version of this structure. The meaning
+/// The Wcash config is a TOML-encoded version of this structure. The meaning
 /// of each field is described in the documentation, although it may be necessary
 /// to click through to the sub-structures for each section.
 ///
-/// The path to the configuration file can also be specified with the `--config` flag when running Zebra.
+/// The path to the configuration file can also be specified with the `--config` flag.
 ///
-/// The default path to the `zebrad` config is platform dependent, based on
+/// The default path to the Wcash config is platform dependent, based on
 /// [`dirs::preference_dir`](https://docs.rs/dirs/latest/dirs/fn.preference_dir.html):
 ///
 /// | Platform | Value                                 | Example                                        |
 /// | -------- | ------------------------------------- | ---------------------------------------------- |
-/// | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/zebrad.toml`              |
-/// | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/zebrad.toml` |
-/// | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\zebrad.toml`     |
+/// | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/wcash.toml`              |
+/// | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/wcash.toml` |
+/// | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\wcash.toml`     |
 #[derive(Clone, Default, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ZebradConfig {
@@ -98,11 +98,11 @@ impl ZebradConfig {
     /// Loads the configuration from the conventional sources.
     ///
     /// Configuration is loaded from three sources, in order of precedence:
-    /// 1. Environment variables with `ZEBRA_` prefix (highest precedence)
+    /// 1. Environment variables with `WCASH_` prefix (highest precedence)
     /// 2. TOML configuration file (if provided)
     /// 3. Hard-coded defaults (lowest precedence)
     ///
-    /// Environment variables use the format `ZEBRA_SECTION__KEY` where:
+    /// Environment variables use the format `WCASH_SECTION__KEY` where:
     /// - `SECTION` is the configuration section (e.g., `network`, `rpc`)
     /// - `KEY` is the configuration key within that section
     /// - Double underscores (`__`) separate nested keys
@@ -116,20 +116,20 @@ impl ZebradConfig {
     /// See [`DENY_CONFIG_KEY_SUFFIX_LIST`] and [`is_sensitive_leaf_key()`] above
     ///
     /// # Examples
-    /// - `ZEBRA_NETWORK__NETWORK=Testnet` sets `network.network = "Testnet"`
-    /// - `ZEBRA_RPC__LISTEN_ADDR=127.0.0.1:8232` sets `rpc.listen_addr = "127.0.0.1:8232"`
+    /// - `WCASH_NETWORK__NETWORK=WcashTestnet` selects public Wcash Testnet
+    /// - `WCASH_RPC__LISTEN_ADDR=127.0.0.1:38232` sets its recommended RPC address
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, config::ConfigError> {
-        Self::load_with_env(config_path, "ZEBRA")
+        Self::load_with_env(config_path, "WCASH")
     }
 
     /// Loads configuration using a caller-provided environment variable prefix.
     ///
     /// This allows callers that need multiple configs in the same process (e.g.,
     /// the `copy-state` command) to keep overrides separate. For example:
-    /// - Source/base config uses `ZEBRA_...` env vars (default prefix)
-    /// - Target config uses `ZEBRA_TARGET_...` env vars
+    /// - Source/base config uses `WCASH_...` env vars (default prefix)
+    /// - Target config uses `WCASH_TARGET_...` env vars
     ///
-    /// The nested key separator remains `__`, e.g., `ZEBRA_TARGET_STATE__CACHE_DIR`.
+    /// The nested key separator remains `__`, e.g., `WCASH_TARGET_STATE__CACHE_DIR`.
     pub fn load_with_env(
         config_path: Option<PathBuf>,
         env_prefix: &str,
@@ -191,7 +191,7 @@ impl ZebradConfig {
 impl With<MinerAddressType> for ZebradConfig {
     fn with(mut self, miner_address_type: MinerAddressType) -> Self {
         self.mining.miner_address = Some(
-            default_miner_address(self.network.network.kind(), &miner_address_type)
+            default_miner_address_for_network(&self.network.network, &miner_address_type)
                 .parse()
                 .expect("valid hard-coded address"),
         );

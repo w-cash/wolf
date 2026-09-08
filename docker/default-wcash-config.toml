@@ -1,34 +1,34 @@
-# Default configuration file for running Zebra in Docker.
+# Default configuration file for running Wcash in Docker.
 #
-# This file is tailored for Zebra running in Docker. Do not use it with Zebra
+# This file is tailored for Wcash running in Docker. Do not use it with Wcash
 # running directly on your localhost as some fields are adjusted specifically
 # for Docker.
 #
 # You can use this file as a starting point for custom configuration. If you
-# don't specify a field, Zebra will use its default value.
+# don't specify a field, the Wcash node will use its default value.
+# `WcashRegtest` is an isolated development network, not a public testnet.
 #
 # The config format, including a complete list of sections and fields, is
 # documented here:
 # https://docs.rs/zebrad/latest/zebrad/config/struct.ZebradConfig.html
 
 [network]
-network = "Mainnet"
-listen_addr = "[::]:8233"
+network = "WcashRegtest"
+listen_addr = "[::]:28233"
 
 # Set to your public IP:port if behind a NAT or load balancer.
 
-# external_addr = "203.0.113.42:8233"
+# external_addr = "203.0.113.42:28233"
 
-cache_dir = "/home/zebra/.cache/zebra"
+cache_dir = "/home/zebra/.cache/wcash"
 
 [rpc]
 # The RPC server is disabled by default. To enable it, uncomment one of the
 # lines below and alternatively set your own port.
 
-# listen_addr = "0.0.0.0:8232" # Mainnet
-# listen_addr = "0.0.0.0:18232" # Testnet
+# listen_addr = "0.0.0.0:28232" # Wcash Regtest
 
-cookie_dir = "/home/zebra/.cache/zebra"
+cookie_dir = "/home/zebra/.cache/wcash"
 
 # To disable cookie authentication, uncomment the line below and set the value
 # to false.
@@ -36,10 +36,10 @@ cookie_dir = "/home/zebra/.cache/zebra"
 # enable_cookie_auth = true
 
 [state]
-cache_dir = "/home/zebra/.cache/zebra"
+cache_dir = "/home/zebra/.cache/wcash"
 
 [tracing]
-# Zebra recognizes whether its logs are being written to a terminal or a file,
+# Wcash recognizes whether its logs are being written to a terminal or a file,
 # and uses colored logs for terminals and uncolored logs for files. To force
 # colors even for files, uncomment the line below. To disable colors, set
 # `use_color` to false.
@@ -50,7 +50,7 @@ use_color = true
 # Logging to a file is disabled by default. To enable it, uncomment the line
 # below and alternatively set your own path.
 
-# log_file = "/home/zebra/.local/state/zebrad.log"
+# log_file = "/home/zebra/.local/state/wcash.log"
 
 # Sending tracing events to systemd-journald is disabled by default. To enable
 # it, uncomment the line below.
@@ -74,7 +74,8 @@ use_color = true
 # enforce_on_test_networks = false
 
 [mining]
-# If you are going to use Zebra as a backend for a mining pool, set your mining
-# address.
+# If you are going to use Wcash as a backend for a mining pool, set your mining
+# address. Wcash coinbase rewards require a Wcash Regtest Unified Address with
+# an Orchard receiver; transparent and Sapling recipients are rejected.
 
 # miner_address = "your_mining_address"

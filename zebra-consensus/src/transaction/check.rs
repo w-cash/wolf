@@ -498,6 +498,34 @@ pub fn coinbase_outputs_are_decryptable(
     Ok(())
 }
 
+/// Checks that every Wcash Ironwood coinbase action is private from Zcash's
+/// conventional all-zero outgoing viewing key.
+///
+/// Each action is checked independently, so a private padding action cannot
+/// conceal a deliberately public reward action. This rule cannot prevent a
+/// recipient from voluntarily publishing their own viewing data.
+pub fn wcash_coinbase_outputs_are_private(
+    transaction: &Transaction,
+    network: &Network,
+    height: Height,
+) -> Result<(), TransactionError> {
+    if !network.uses_wcash_consensus() {
+        return Ok(());
+    }
+    if !transaction.is_coinbase() {
+        return Err(TransactionError::NotCoinbase);
+    }
+    if !zcash_note_encryption::ironwood_outputs_are_private_from_zero_ovk(
+        transaction,
+        network,
+        height,
+    ) {
+        return Err(TransactionError::WcashCoinbaseOutputPubliclyRecoverable);
+    }
+
+    Ok(())
+}
+
 /// Returns `Ok(())` if the expiry height for the coinbase transaction is valid
 /// according to specifications [7.1] and [ZIP-203].
 ///

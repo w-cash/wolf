@@ -1022,10 +1022,13 @@ pub async fn test_mining_rpcs<State, ReadState>(
 
     #[allow(clippy::unnecessary_struct_initialization)]
     let mining_conf = crate::config::mining::Config {
-        miner_address: Some(ZcashAddress::from_transparent_p2sh(
-            NetworkType::from(NetworkKind::from(network)),
-            [0x7e; 20],
-        )),
+        miner_address: Some(
+            ZcashAddress::from_transparent_p2sh(
+                NetworkType::from(NetworkKind::from(network)),
+                [0x7e; 20],
+            )
+            .into(),
+        ),
         extra_coinbase_data: None,
         miner_memo: None,
         // TODO: Use default field values when optional features are enabled in tests #8183

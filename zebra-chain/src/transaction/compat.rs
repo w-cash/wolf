@@ -1,6 +1,5 @@
 //! Conversions between Zebra and `zcash_primitives` transaction types.
 
-#[cfg(any(test, feature = "proptest-impl"))]
 use zcash_protocol::value::Zatoshis;
 
 use zcash_primitives::transaction::{self as zp_tx};
@@ -28,16 +27,12 @@ pub fn txin_to_input(
         // special-cased, exactly as `Input::zcash_deserialize` does. Parsing it as a height push
         // would otherwise yield a bogus height instead of `Height::MIN`.
         let script_bytes = txin.script_sig().0 .0.clone();
-        let (height, data) = if script_bytes.as_slice()
-            == crate::transparent::serialize::GENESIS_COINBASE_SCRIPT_SIG
-        {
-            (
-                block::Height::MIN,
-                crate::transparent::serialize::GENESIS_COINBASE_SCRIPT_SIG.to_vec(),
-            )
-        } else {
-            crate::transparent::serialize::parse_coinbase_height(&script_bytes)?
-        };
+        let (height, data) =
+            if crate::transparent::serialize::is_genesis_coinbase_script(&script_bytes) {
+                (block::Height::MIN, script_bytes)
+            } else {
+                crate::transparent::serialize::parse_coinbase_height(&script_bytes)?
+            };
         Ok(transparent::Input::Coinbase {
             height,
             data,
@@ -58,7 +53,6 @@ pub fn txin_to_input(
 }
 
 /// Convert a Zebra `transparent::Input` into a librustzcash `TxIn<Authorized>`.
-#[cfg(any(test, feature = "proptest-impl"))]
 pub fn input_to_txin(
     input: &transparent::Input,
 ) -> zcash_transparent::bundle::TxIn<zcash_transparent::bundle::Authorized> {
@@ -109,7 +103,6 @@ pub fn txout_to_output(txout: &zcash_transparent::bundle::TxOut) -> transparent:
 }
 
 /// Convert a Zebra `transparent::Output` into a librustzcash `TxOut`.
-#[cfg(any(test, feature = "proptest-impl"))]
 pub fn output_to_txout(output: &transparent::Output) -> zcash_transparent::bundle::TxOut {
     let zatoshis = Zatoshis::from_nonnegative_i64(output.value.into())
         .expect("Zebra Amount<NonNegative> is always a valid Zatoshis");
@@ -135,7 +128,6 @@ pub fn u32_to_lock_time(lock_time: u32) -> LockTime {
 }
 
 /// Convert a Zebra `LockTime` into a `u32` for librustzcash.
-#[cfg(any(test, feature = "proptest-impl"))]
 pub fn lock_time_to_u32(lock_time: &LockTime) -> u32 {
     use crate::serialization::ZcashSerialize;
     let mut buf = Vec::with_capacity(4);
@@ -151,7 +143,6 @@ pub fn lock_time_to_u32(lock_time: &LockTime) -> u32 {
 // ── Height ───────────────────────────────────────────────────────────
 
 /// Convert a Zebra `block::Height` into a librustzcash `BlockHeight`.
-#[cfg(any(test, feature = "proptest-impl"))]
 pub fn height_to_block_height(h: block::Height) -> zcash_protocol::consensus::BlockHeight {
     h.into()
 }

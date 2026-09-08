@@ -1,29 +1,38 @@
 #!/usr/bin/env bash
 
-# Entrypoint for running Zebra in Docker.
+# Entrypoint for running the Wcash node in Docker.
 #
 # This script handles privilege dropping and launches zebrad or tests.
 # Configuration is managed by config-rs using defaults, optional TOML, and
-# environment variables prefixed with ZEBRA_.
+# environment variables prefixed with WCASH_.
 
 set -eo pipefail
 
-# Default cache directories for Zebra components.
-# These use the config-rs ZEBRA_SECTION__KEY format and will be picked up
-# by zebrad's configuration system automatically.
-: "${ZEBRA_STATE__CACHE_DIR:=${HOME}/.cache/zebra}"
-: "${ZEBRA_RPC__COOKIE_DIR:=${HOME}/.cache/zebra}"
+# Cache directories that the entrypoint must prepare before dropping privileges.
+# In environment-only mode, export the defaults for config-rs. When a TOML file
+# is present, avoid overriding its paths; caller-provided WCASH_* values remain
+# exported and still take precedence over the file.
+: "${WCASH_STATE__CACHE_DIR:=${HOME}/.cache/wcash}"
+: "${WCASH_NETWORK__CACHE_DIR:=${HOME}/.cache/wcash}"
+: "${WCASH_RPC__COOKIE_DIR:=${HOME}/.cache/wcash}"
+
+WCASH_CONFIG_PATH="${CONFIG_FILE_PATH:-${HOME}/.config/wcash.toml}"
+if [[ ! -f ${WCASH_CONFIG_PATH} ]]; then
+  export WCASH_STATE__CACHE_DIR
+  export WCASH_NETWORK__CACHE_DIR
+  export WCASH_RPC__COOKIE_DIR
+fi
 
 # Leave zcashd-compat disabled unless the container runtime explicitly opts in.
 # Compat images can set ZCASHD_COMPAT_ENABLED=true to use a vendored
-# /usr/local/bin/zcashd, while still allowing ZEBRA_ZCASHD_COMPAT__* overrides.
+# /usr/local/bin/zcashd, while still allowing WCASH_ZCASHD_COMPAT__* overrides.
 case "${ZCASHD_COMPAT_ENABLED:-}" in
 true | TRUE | 1 | yes | YES | on | ON)
-  export ZEBRA_ZCASHD_COMPAT__ENABLED="${ZEBRA_ZCASHD_COMPAT__ENABLED:-true}"
+  export WCASH_ZCASHD_COMPAT__ENABLED="${WCASH_ZCASHD_COMPAT__ENABLED:-true}"
   if [[ -x /usr/local/bin/zcashd ]]; then
-    export ZEBRA_ZCASHD_COMPAT__MANAGE_ZCASHD="${ZEBRA_ZCASHD_COMPAT__MANAGE_ZCASHD:-true}"
-    export ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE="${ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE:-path}"
-    export ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH="${ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH:-/usr/local/bin/zcashd}"
+    export WCASH_ZCASHD_COMPAT__MANAGE_ZCASHD="${WCASH_ZCASHD_COMPAT__MANAGE_ZCASHD:-true}"
+    export WCASH_ZCASHD_COMPAT__ZCASHD_SOURCE="${WCASH_ZCASHD_COMPAT__ZCASHD_SOURCE:-path}"
+    export WCASH_ZCASHD_COMPAT__ZCASHD_PATH="${WCASH_ZCASHD_COMPAT__ZCASHD_PATH:-/usr/local/bin/zcashd}"
   fi
   ;;
 false | FALSE | 0 | no | NO | off | OFF | "") ;;
@@ -86,11 +95,12 @@ create_owned_zcashd_datadir() {
     echo "WARNING: could not chown zcashd datadir ${dir}; relying on existing permissions" >&2
 }
 
-# Create and own cache and config directories based on ZEBRA_* environment variables
-[[ -n ${ZEBRA_STATE__CACHE_DIR} ]] && create_owned_directory "${ZEBRA_STATE__CACHE_DIR}"
-[[ -n ${ZEBRA_RPC__COOKIE_DIR} ]] && create_owned_directory "${ZEBRA_RPC__COOKIE_DIR}"
-[[ -n ${ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR:-} ]] && create_owned_zcashd_datadir "${ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR}"
-[[ -n ${ZEBRA_TRACING__LOG_FILE} ]] && create_owned_directory "$(dirname "${ZEBRA_TRACING__LOG_FILE}")"
+# Create and own cache and config directories based on WCASH_* environment variables.
+[[ -n ${WCASH_STATE__CACHE_DIR} ]] && create_owned_directory "${WCASH_STATE__CACHE_DIR}"
+[[ -n ${WCASH_NETWORK__CACHE_DIR} ]] && create_owned_directory "${WCASH_NETWORK__CACHE_DIR}"
+[[ -n ${WCASH_RPC__COOKIE_DIR} ]] && create_owned_directory "${WCASH_RPC__COOKIE_DIR}"
+[[ -n ${WCASH_ZCASHD_COMPAT__ZCASHD_DATADIR:-} ]] && create_owned_zcashd_datadir "${WCASH_ZCASHD_COMPAT__ZCASHD_DATADIR}"
+[[ -n ${WCASH_TRACING__LOG_FILE:-} ]] && create_owned_directory "$(dirname "${WCASH_TRACING__LOG_FILE}")"
 
 # --- Optional config file support ---
 # If provided, pass a config file path through to zebrad via CONFIG_FILE_PATH.

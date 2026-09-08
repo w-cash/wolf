@@ -69,8 +69,8 @@ const FANOUT: usize = 3;
 const BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 3;
 
 /// Controls how many times the syncer will re-request a block whose download
-/// failed because no peer delivered it (a `NotFound`), before giving up and
-/// letting the normal tip re-walk handle it.
+/// or proof-dependent validation failed, before giving up and letting the
+/// normal sync restart handle it.
 ///
 /// Without this re-request, a single missing block at the checkpoint frontier
 /// is dropped and never re-fetched, wedging the whole verify pipeline until the
@@ -78,6 +78,33 @@ const BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 3;
 /// through the tower-level `BLOCK_DOWNLOAD_RETRY_LIMIT` (and hedging), so this
 /// is a coarse, hash-scoped retry on top of an exhausted per-request retry.
 const MAX_BLOCK_REOBTAIN_RETRIES: u8 = 3;
+
+/// Returns true when `error` rejected only Wcash AuxPoW witness data.
+///
+/// Wcash block IDs deliberately exclude the AuxPoW witness, so another peer can
+/// serve a different witness for the same requested ID. Unlike other consensus
+/// failures, retrying these errors can retrieve a valid block from another peer.
+fn is_wcash_auxpow_witness_error(error: &zebra_consensus::RouterError) -> bool {
+    fn is_witness_error(error: &zebra_consensus::VerifyBlockError) -> bool {
+        matches!(
+            error,
+            zebra_consensus::VerifyBlockError::Block {
+                source: zebra_consensus::BlockError::MissingWcashAuxPow { .. }
+            } | zebra_consensus::VerifyBlockError::Block {
+                source: zebra_consensus::BlockError::InvalidWcashAuxPow { .. }
+            }
+        )
+    }
+
+    match error {
+        zebra_consensus::RouterError::Block { source } => is_witness_error(source),
+        zebra_consensus::RouterError::Checkpoint { source } => matches!(
+            source.as_ref(),
+            zebra_consensus::VerifyCheckpointError::VerifyBlock(error)
+                if is_witness_error(error)
+        ),
+    }
+}
 
 /// The fewest `TransparentInputNotFound` drops without a verified block before the sync
 /// restarts, so a low `full_verify_concurrency_limit` can't disable the #11168 exemption.
@@ -421,12 +448,13 @@ where
     /// Sender for reporting peer addresses that advertised unexpectedly invalid transactions.
     misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
 
-    /// Blocks whose download failed with `NotFound` and should be re-requested on
-    /// the next sync round, instead of being silently dropped (#5709).
+    /// Blocks whose download or proof-dependent validation failed and should be
+    /// re-requested in the current sync run, instead of being silently dropped.
     reobtain_hashes: IndexSet<block::Hash>,
 
-    /// Per-hash count of how many times a `NotFound` block has been re-requested,
-    /// bounded by [`MAX_BLOCK_REOBTAIN_RETRIES`].
+    /// Per-hash count of how many times a retryable block has been re-requested,
+    /// bounded by [`MAX_BLOCK_REOBTAIN_RETRIES`]. Saturated entries are retained
+    /// until the block arrives or the sync run restarts, so the bound cannot reset.
     block_reobtain_retries: HashMap<block::Hash, u8>,
 
     /// `TransparentInputNotFound` drops since the last verified block, bounded by the
@@ -747,7 +775,7 @@ where
         Ok(extra_hashes)
     }
 
-    /// Re-issues downloads for blocks that failed with `NotFound` (#5709).
+    /// Re-issues downloads for retryable missing blocks and Wcash witnesses.
     ///
     /// These are re-requested even while the download pipeline is past its
     /// lookahead limit, because a missing low block is exactly what stops the
@@ -1257,18 +1285,27 @@ where
         };
 
         // A hash the syncer still needs, whose download did not produce a usable block, is
-        // otherwise dropped here and only rediscovered by a later sync round. Re-queue it for the
-        // next sync round, bounded by `MAX_BLOCK_REOBTAIN_RETRIES`:
+        // otherwise dropped here and only rediscovered by a later sync run. Re-queue it in the
+        // current sync run, bounded by `MAX_BLOCK_REOBTAIN_RETRIES`:
         // - `DownloadFailed`/`NotFound`: no peer delivered the block, which wedges the checkpoint
         //   frontier until the verify timeout (#5709).
         // - `BehindTipHeightLimit`: the body was not a usable block for this hash, so the hash is
         //   still missing (GHSA-g95h-hw6g-pvgv). This re-request runs whether or not the peer could
         //   be attributed, and covers the window before a score reaches the address book, which
         //   only applies misbehavior reports in batches.
+        // - Wcash AuxPoW witness failures: the witness is deliberately excluded from the block ID,
+        //   so a different peer can provide valid witness bytes for the same requested hash.
         // - UTXO races (#11168): the block was never rejected, and the state parks its
         //   children until it arrives, so re-request it instead of waiting for a tip walk.
-        // Other consensus failures (`Invalid`/`ValidationRequestError`) are deliberately
-        // excluded — re-downloading a block the network already rejected is pointless.
+        // - Short post-checkpoint verification timeouts (#5125): validation did not complete,
+        //   so retrying the same hash is safe.
+        // Other consensus failures remain excluded because re-downloading a block rejected for
+        // proof-independent data cannot make it valid.
+        let is_wcash_auxpow_failure = matches!(
+            &response,
+            Err(BlockDownloadVerifyError::Invalid { error, .. })
+                if is_wcash_auxpow_witness_error(error)
+        );
         let reobtain_hash = match &response {
             Err(BlockDownloadVerifyError::DownloadFailed { error, hash })
                 if format!("{error:?}").contains("NotFound") =>
@@ -1276,6 +1313,11 @@ where
                 Some(*hash)
             }
             Err(BlockDownloadVerifyError::BehindTipHeightLimit { hash, .. }) => Some(*hash),
+            Err(BlockDownloadVerifyError::Invalid { error, hash, .. })
+                if is_wcash_auxpow_witness_error(error) =>
+            {
+                Some(*hash)
+            }
             Err(e @ BlockDownloadVerifyError::Invalid { hash, .. })
                 if Self::is_utxo_lookup_timeout(e) =>
             {
@@ -1289,11 +1331,13 @@ where
             _ => None,
         };
 
+        let mut reobtain_scheduled = false;
         if let Some(hash) = reobtain_hash {
             let attempts = self.block_reobtain_retries.entry(hash).or_insert(0);
             if *attempts < MAX_BLOCK_REOBTAIN_RETRIES {
                 *attempts += 1;
                 self.reobtain_hashes.insert(hash);
+                reobtain_scheduled = true;
                 debug!(
                     ?hash,
                     attempts = *attempts,
@@ -1302,9 +1346,8 @@ where
             } else {
                 debug!(
                     ?hash,
-                    "missing block exceeded re-download retries, dropping"
+                    "missing block exceeded re-download retries, not re-queueing"
                 );
-                self.block_reobtain_retries.remove(&hash);
             }
         }
 
@@ -1327,7 +1370,15 @@ where
             }
         }
 
-        Self::handle_response(response)
+        // A Wcash witness failure is nonfatal only while this sync run has a
+        // concrete re-download queued. Once its bounded retry budget is
+        // exhausted, restart normally instead of silently stalling on a hash
+        // that cannot be committed.
+        if is_wcash_auxpow_failure && reobtain_scheduled {
+            Ok(())
+        } else {
+            Self::handle_response(response)
+        }
     }
 
     /// Returns `true` for the `AwaitUtxo` timeout that `should_restart_sync` exempts (#11168).

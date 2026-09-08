@@ -1,0 +1,28 @@
+[package]
+name = "wcash-zcash-aux"
+version = "0.1.0"
+publish = false
+authors.workspace = true
+description = "Strict Zcash Equihash AuxPoW primitives for Wcash"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["zebra"]
+zebra = ["dep:zebra-chain"]
+
+[dependencies]
+blake2b_simd = { workspace = true }
+equihash = "0.3"
+sha2 = "0.10"
+zebra-chain = { path = "../zebra-chain", version = "12.0.0", optional = true }
+
+[dev-dependencies]
+hex = "0.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

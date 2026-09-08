@@ -28,6 +28,32 @@ pub const GENESIS_COINBASE_SCRIPT_SIG: [u8; 77] = [
     54, 52, 56, 51, 53, 100, 51, 52,
 ];
 
+/// The exact local Wcash-regtest genesis statement.
+///
+/// This local vector commits to the independently checked Bitcoin block
+/// 965,910. Public Wcash Testnet has a separate frozen statement below; Wcash
+/// mainnet remains disabled.
+pub const WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 95] =
+    b"06/Sep/2026 Wcash: BTC #965910 00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146";
+
+/// The exact public Wcash-testnet genesis statement.
+///
+/// This statement commits to the independently checked Bitcoin mainnet block
+/// 965,900. Its Wcash-network discriminator is separately committed in the
+/// header's anchor commitment.
+pub const WCASH_TESTNET_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 95] =
+    b"06/Sep/2026 Wcash: BTC #965900 0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851";
+
+/// Returns true for one of the exact, frozen genesis coinbase scripts.
+///
+/// No prefix, partial, or runtime-supplied match is accepted. Treating an
+/// ordinary height-zero-looking script as genesis would bypass BIP-34 parsing.
+pub(crate) fn is_genesis_coinbase_script(script_sig: &[u8]) -> bool {
+    script_sig == GENESIS_COINBASE_SCRIPT_SIG
+        || script_sig == WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG
+        || script_sig == WCASH_TESTNET_GENESIS_COINBASE_SCRIPT_SIG
+}
+
 /// Parses the BIP-34 block-height prefix of a non-genesis coinbase script and returns the height
 /// along with the trailing miner data.
 ///
@@ -200,8 +226,8 @@ impl ZcashDeserialize for Input {
             }
             let script_sig = zcash_deserialize_bytes_external_count(len, &mut reader)?;
 
-            let (height, data) = if script_sig.as_slice() == GENESIS_COINBASE_SCRIPT_SIG {
-                (Height::MIN, GENESIS_COINBASE_SCRIPT_SIG.to_vec())
+            let (height, data) = if is_genesis_coinbase_script(&script_sig) {
+                (Height::MIN, script_sig)
             } else {
                 parse_coinbase_height(&script_sig)?
             };

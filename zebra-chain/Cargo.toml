@@ -33,6 +33,9 @@ async-error = [
 # Experimental internal miner support
 internal-miner = ["equihash/solver"]
 
+# Select Wcash aggregate monetary bounds.
+wcash-consensus = []
+
 # Experimental elasticsearch support
 elasticsearch = []
 
@@ -64,6 +67,7 @@ bs58 = { workspace = true, features = ["check"] }
 byteorder = { workspace = true }
 
 equihash = { workspace = true }
+f4jumble = { workspace = true }
 
 group = { workspace = true }
 incrementalmerkletree.workspace = true
@@ -95,6 +99,7 @@ zcash_protocol.workspace = true
 zcash_address.workspace = true
 zcash_transparent = { workspace = true }
 sinsemilla = { workspace = true }
+wcash-genesis.workspace = true
 
 # Time
 chrono = { workspace = true, features = ["clock", "std", "serde"] }

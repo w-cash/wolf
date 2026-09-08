@@ -7,7 +7,7 @@ use std::{
 use chrono::{DateTime, Duration, LocalResult, TimeZone, Utc};
 
 use crate::{
-    amount::{Amount, DeferredPoolBalanceChange, NonNegative, MAX_MONEY},
+    amount::{Amount, DeferredPoolBalanceChange, NonNegative, MAX_SINGLE_TRANSACTION_VALUE},
     block::{
         serialize::MAX_BLOCK_BYTES, Block, BlockTimeError, Commitment::*, Hash, Header, Height,
     },
@@ -18,6 +18,7 @@ use crate::{
     },
     transaction::{LockTime, Transaction},
     transparent,
+    work::equihash::{Solution, MAX_WCASH_AUXPOW_BYTES, WCASH_BLOCK_WIRE_VERSION},
 };
 
 use super::generate; // TODO: this should be rewritten as strategies
@@ -65,6 +66,74 @@ fn blockheaderhash_from_blockheader() {
     assert_eq!(blockheader, other_header);
 }
 
+#[test]
+fn wcash_block_id_excludes_auxpow_witness() {
+    let (mut header, _) = generate::block_header();
+    header.version = WCASH_BLOCK_WIRE_VERSION;
+    header.solution =
+        Solution::for_wcash([1, 2, 3].as_slice()).expect("small Wcash proof should fit");
+
+    let block_id = header.hash();
+    let mut alternate_proof = header.clone();
+    alternate_proof.solution =
+        Solution::for_wcash([9, 8, 7, 6].as_slice()).expect("small Wcash proof should fit");
+    assert_eq!(
+        block_id,
+        alternate_proof.hash(),
+        "malleating an attached proof must not change Wcash block identity"
+    );
+
+    let mut alternate_core = header;
+    alternate_core.nonce[0] ^= 1;
+    assert_ne!(
+        block_id,
+        alternate_core.hash(),
+        "every proof-independent header field remains committed"
+    );
+}
+
+#[test]
+fn wcash_header_round_trip_and_oversized_proof_rejection() {
+    assert_ne!(
+        WCASH_BLOCK_WIRE_VERSION >> 31,
+        0,
+        "the Wcash marker must remain outside native Zcash's valid version space"
+    );
+    let (mut header, _) = generate::block_header();
+    header.version = WCASH_BLOCK_WIRE_VERSION;
+    header.solution =
+        Solution::for_wcash(vec![0x5a; 2_048]).expect("bounded Wcash proof should construct");
+
+    let bytes = header
+        .zcash_serialize_to_vec()
+        .expect("Wcash header should serialize");
+    assert_eq!(bytes.len(), header.serialized_len());
+    assert_eq!(
+        bytes
+            .zcash_deserialize_into::<Header>()
+            .expect("Wcash header should deserialize"),
+        header
+    );
+
+    // Preserve the fixed header core and declare one byte over the outer
+    // proof limit. Deserialization must reject the length before allocating or
+    // attempting to read the declared payload.
+    let fixed_header_bytes = Solution::INPUT_LENGTH + 32;
+    let mut oversized = bytes[..fixed_header_bytes].to_vec();
+    oversized.push(0xfe);
+    oversized.extend_from_slice(
+        &u32::try_from(MAX_WCASH_AUXPOW_BYTES + 1)
+            .unwrap()
+            .to_le_bytes(),
+    );
+    assert!(matches!(
+        oversized.zcash_deserialize_into::<Header>(),
+        Err(SerializationError::Parse(
+            "proof solution exceeds its version-specific size limit"
+        ))
+    ));
+}
+
 /// Regression test for https://github.com/ZcashFoundation/zebra/issues/10585.
 ///
 /// `Block::chain_value_pool_change()` previously aggregated transaction value
@@ -77,9 +146,12 @@ fn blockheaderhash_from_blockheader() {
 fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
     let _init_guard = zebra_test::init();
 
-    let max_money: Amount<NonNegative> = MAX_MONEY.try_into().expect("MAX_MONEY is a valid amount");
-    // Two `MAX_MONEY` transparent outputs make the transaction-level output
-    // sum exceed `MAX_MONEY`, so `value_balance` returns `Err`.
+    let max_output: Amount<NonNegative> = MAX_SINGLE_TRANSACTION_VALUE
+        .try_into()
+        .expect("the single-transaction limit is a valid amount");
+    // Two maximum library-compatible transparent outputs exceed the aggregate
+    // monetary cap under both the Zcash and Wcash consensus profiles, so
+    // `value_balance` returns `Err`.
     let coinbase = Transaction::test_v1(
         vec![transparent::Input::Coinbase {
             height: Height(1),
@@ -87,8 +159,8 @@ fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
             sequence: 0xFFFF_FFFF,
         }],
         vec![
-            transparent::Output::new(max_money, transparent::Script::new(&[])),
-            transparent::Output::new(max_money, transparent::Script::new(&[])),
+            transparent::Output::new(max_output, transparent::Script::new(&[])),
+            transparent::Output::new(max_output, transparent::Script::new(&[])),
         ],
         LockTime::unlocked(),
     );

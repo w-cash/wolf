@@ -1,9 +1,64 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
+All notable changes to Wcash and its Zebra base are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org).
+
+## [Unreleased]
+
+### Added
+
+- Added the isolated Wcash regtest consensus flavor, deterministic
+  frozen Bitcoin-block anchor, Wcash-only P2P identity, 75-second target spacing,
+  10 WCASH initial subsidy, 1,680,000-block halvings, and exact issuance cap.
+- Added a strict bounded Zcash Equihash `(200, 9)` AuxPoW proof format,
+  consensus validation, interoperability vector, real-solver local harness,
+  and loopback JSON-lines mining interface.
+- Added a feature-gated internal miner that constructs real Equihash work over
+  a synthetic Zcash parent and submits the resulting Wcash block through the
+  normal validator.
+- Added distinct Wcash payment-address namespaces for Unified, Sapling, TEX,
+  and transparent receivers, with strict network checks in Wcash mining and RPC
+  paths. Wallet and spending/viewing-key encodings are not included.
+- Added a native three-node merged-mining coordinator that reconstructs exact
+  Zcash work, requires independent proposal validation, verifies the shielded
+  parent payout policy, exposes a loopback ZIP-301 backend, and durably replays
+  Wcash and Zcash winners independently.
+
+### Changed
+
+- Reset local regtest genesis to Bitcoin mainnet block 965,910 and rotated the
+  regtest P2P identity to `Wcash/regtest/v2` so nodes on the superseded local
+  chain cannot connect to this chain.
+- Made Wcash regtest the only network accepted by the node executable and
+  isolated its configuration, cache, network magic, ports, user agent, and
+  Docker defaults from inherited Zcash networks.
+- Routed every post-genesis coinbase subsidy and fee into private Ironwood
+  actions. Transparent, Sapling, Orchard, and publicly zero-OVK-recoverable
+  Wcash coinbase outputs are rejected by consensus.
+- Removed founders rewards, funding streams, deferred-pool payments, lockbox
+  disbursements, slow start, premine, and protocol development tax from Wcash.
+- Redacted the full configuration and miner payment address from Wcash startup
+  logs.
+
+### Security
+
+- Bounded variable Wcash header witnesses and outbound header-message size,
+  and added bounded alternate-peer retries for malleated AuxPoW witnesses.
+- Limited the local mining interface to eight concurrent loopback clients and
+  isolated malformed, oversized, reset, and idle connections from its listener.
+- Bound every durable share append to the originally locked journal inode and,
+  on Unix, reject journal directories writable by group or other users.
+
+### Known limitations
+
+- This release is local pre-testnet software. Public genesis/network/difficulty
+  parameters, wallet maturity-and-spend interoperability, vendor ASIC testing,
+  adversarial multi-node soak/reorg testing, an independently reviewed
+  consensus specification and implementation, and an operated TLS,
+  authentication, variable-difficulty, accounting, payout, and monitoring edge
+  remain release gates.
 
 ## [Zebra 6.3.0](https://github.com/ZcashFoundation/zebra/releases/tag/v6.3.0) - 2026-08-10
 

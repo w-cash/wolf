@@ -118,6 +118,7 @@ zebra-node-services = { path = "../zebra-node-services", version = "10.0.0", fea
 ] }
 zebra-script = { path = "../zebra-script", version = "11.0.0" }
 zebra-state = { path = "../zebra-state", version = "13.0.0" }
+wcash-zcash-aux = { path = "../wcash-zcash-aux", version = "0.1.0" }
 
 [build-dependencies]
 openrpsee = { workspace = true }

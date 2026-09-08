@@ -14,7 +14,7 @@ use super::ZebradCmd;
 #[derive(Debug, clap::Parser)]
 #[clap(
     version = clap::crate_version!(),
-    author="Zcash Foundation <zebra@zfnd.org>",
+    author="RustNinja <placex.com@gmail.com>",
     help_template = "\
 {name} {version}\n
 {author}\n
@@ -40,7 +40,7 @@ pub struct EntryPoint {
 
     /// Filter strings which override the config file and defaults
     // This can be applied to the default start command if no subcommand is provided.
-    #[clap(long, help = "tracing filters which override the zebrad.toml config")]
+    #[clap(long, help = "tracing filters which override the wcash.toml config")]
     filters: Vec<String>,
 }
 

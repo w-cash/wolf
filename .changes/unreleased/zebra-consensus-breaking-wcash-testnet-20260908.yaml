@@ -1,0 +1,4 @@
+project: zebra-consensus
+kind: breaking
+body: "Validate Wcash Equihash AuxPoW and enforce Ironwood-only private coinbase issuance under the isolated Wcash consensus profile ([#1](https://github.com/w-cash/wolf/pull/1))."
+time: 2026-09-08T09:31:13.000000002Z

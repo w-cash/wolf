@@ -34,6 +34,9 @@ progress-bar = [
     "howudoin",
 ]
 
+# Select Wcash network defaults and aggregate monetary bounds.
+wcash-consensus = ["zebra-chain/wcash-consensus"]
+
 # Wait until `arti-client`'s dependency `x25519-dalek v1.2.0` is updated to a higher version. (#5492)
 # tor = ["arti-client", "tor-rtcompat"]
 

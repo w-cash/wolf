@@ -5,9 +5,11 @@ use std::{collections::HashSet, sync::Arc};
 use chrono::{DateTime, Utc};
 
 use mset::MultiSet;
+use wcash_zcash_aux::{AuxPowProof, Target};
 use zebra_chain::{
     amount::{
         Amount, DeferredPoolBalanceChange, Error as AmountError, NegativeAllowed, NonNegative,
+        MAX_WCASH_COINBASE_VALUE,
     },
     block::{Block, Hash, Header, Height},
     parameters::{
@@ -20,8 +22,8 @@ use zebra_chain::{
     transaction::{self, Transaction},
     transparent::{Address, Output},
     work::{
-        difficulty::{ExpandedDifficulty, ParameterDifficulty as _},
-        equihash,
+        difficulty::{ExpandedDifficulty, ParameterDifficulty as _, U256},
+        equihash::{self, WCASH_BLOCK_WIRE_VERSION},
     },
 };
 
@@ -147,6 +149,118 @@ pub fn equihash_solution_is_valid(header: &Header) -> Result<(), equihash::Error
     //
     // https://zips.z.cash/protocol/protocol.pdf#blockheader
     header.solution.check(header)
+}
+
+/// Checks the proof-independent Wcash header rules and returns its witness.
+fn wcash_auxpow_witness<'a>(
+    header: &'a Header,
+    height: &Height,
+    hash: &Hash,
+) -> Result<&'a zebra_chain::work::equihash::WcashSolution, BlockError> {
+    if header.version != WCASH_BLOCK_WIRE_VERSION {
+        return Err(BlockError::InvalidWcashHeaderVersion {
+            height: *height,
+            hash: *hash,
+            actual: header.version,
+            expected: WCASH_BLOCK_WIRE_VERSION,
+        });
+    }
+
+    header
+        .solution
+        .as_wcash()
+        .ok_or(BlockError::MissingWcashAuxPowVariant {
+            height: *height,
+            hash: *hash,
+        })
+}
+
+/// Returns the Wcash AuxPoW target in the little-endian numeric byte order
+/// required by [`Target`].
+fn wcash_auxpow_target(
+    difficulty: ExpandedDifficulty,
+) -> Result<Target, wcash_zcash_aux::AuxPowError> {
+    let difficulty: U256 = difficulty.into();
+    Target::from_le_bytes(difficulty.to_little_endian())
+}
+
+/// Checks the proof-independent Wcash header rules for a block proposal.
+///
+/// Block proposals intentionally skip proof-of-work validation. Their witness
+/// can therefore be the empty template placeholder, but it must use the
+/// dedicated Wcash header version and solution variant. The encoded target is
+/// still required to be canonical and within the configured proof-of-work
+/// limit.
+pub fn wcash_auxpow_proposal_is_valid(
+    header: &Header,
+    network: &Network,
+    height: &Height,
+    hash: &Hash,
+) -> Result<(), BlockError> {
+    let witness = wcash_auxpow_witness(header, height, hash)?;
+    difficulty_threshold_is_valid(header, network, height, hash)?;
+
+    // Genesis is a fixed, proof-free anchor in every validation mode.
+    if height.is_min() && !witness.is_empty() {
+        return Err(BlockError::UnexpectedWcashGenesisAuxPow { hash: *hash });
+    }
+
+    Ok(())
+}
+
+/// Checks the complete Wcash Zcash-parent AuxPoW proof.
+///
+/// Wcash genesis is the sole proof-free block and must use an empty witness.
+/// Every later block must contain one canonical proof whose parent block hash
+/// meets the target encoded in the Wcash header. The child block identifier is
+/// supplied in raw serialized order, matching the AuxPoW commitment format.
+pub fn wcash_auxpow_is_valid(
+    header: &Header,
+    network: &Network,
+    height: &Height,
+    hash: &Hash,
+) -> Result<(), BlockError> {
+    let witness = wcash_auxpow_witness(header, height, hash)?;
+    let difficulty = difficulty_threshold_is_valid(header, network, height, hash)?;
+
+    if height.is_min() {
+        return if witness.is_empty() {
+            Ok(())
+        } else {
+            Err(BlockError::UnexpectedWcashGenesisAuxPow { hash: *hash })
+        };
+    }
+
+    if witness.is_empty() {
+        return Err(BlockError::MissingWcashAuxPow {
+            height: *height,
+            hash: *hash,
+        });
+    }
+
+    let target =
+        wcash_auxpow_target(difficulty).map_err(|source| BlockError::InvalidWcashAuxPow {
+            height: *height,
+            hash: *hash,
+            source,
+        })?;
+    let proof = AuxPowProof::decode(witness.as_bytes()).map_err(|source| {
+        BlockError::InvalidWcashAuxPow {
+            height: *height,
+            hash: *hash,
+            source,
+        }
+    })?;
+
+    proof
+        .validate(hash.0, target)
+        .map_err(|source| BlockError::InvalidWcashAuxPow {
+            height: *height,
+            hash: *hash,
+            source,
+        })?;
+
+    Ok(())
 }
 
 /// Returns `Ok()` with the deferred pool balance change of the coinbase transaction if the block
@@ -352,8 +466,51 @@ pub fn miner_fees_are_valid(
         + expected_deferred_pool_balance_change.value())
     .map_err(|_| SubsidyError::Overflow)?;
 
+    if network.uses_wcash_consensus() && height > Height::MIN {
+        // Ironwood's inherited `ZatBalance` representation limits one transaction to the Zcash
+        // monetary base, even though Wcash's aggregate monetary base is larger. Make that
+        // interoperability limit an explicit consensus rule rather than relying on a later
+        // conversion failure in the proof verifier.
+        let raw_total_input = expected_block_subsidy
+            .zatoshis()
+            .checked_add(block_miner_fees.zatoshis())
+            .ok_or(SubsidyError::Overflow)?;
+        if raw_total_input > MAX_WCASH_COINBASE_VALUE {
+            return Err(SubsidyError::WcashCoinbaseValueTooLarge.into());
+        }
+    }
+
     let total_input_value =
         (expected_block_subsidy + block_miner_fees).map_err(|_| SubsidyError::Overflow)?;
+
+    if network.uses_wcash_consensus() && height > Height::MIN {
+        // Wcash coinbase value is created only in Ironwood. The transparent coinbase input remains
+        // required, but there must be no transparent outputs and no legacy shielded components.
+        if !coinbase_tx.outputs().is_empty() {
+            return Err(SubsidyError::WcashTransparentCoinbaseOutput.into());
+        }
+        if coinbase_tx.has_sapling_shielded_data() {
+            return Err(SubsidyError::WcashSaplingCoinbaseOutput.into());
+        }
+        if coinbase_tx.has_orchard_shielded_data() {
+            return Err(SubsidyError::WcashOrchardCoinbaseOutput.into());
+        }
+        if coinbase_tx.ironwood_actions().next().is_none() {
+            return Err(SubsidyError::WcashIronwoodCoinbaseOutputMissing.into());
+        }
+        crate::transaction::check::wcash_coinbase_outputs_are_private(
+            coinbase_tx,
+            network,
+            height,
+        )?;
+
+        // A negative shielded value balance represents value entering Ironwood. At the eventual
+        // zero-subsidy tail, a zero-fee block has zero total input and therefore a zero value
+        // balance; otherwise all positive coinbase value must enter Ironwood.
+        if !total_input_value.is_zero() && ironwood_value_balance.zatoshis() >= 0 {
+            return Err(SubsidyError::WcashIronwoodValueBalanceNotNegative.into());
+        }
+    }
 
     // # Consensus
     //
@@ -456,4 +613,23 @@ pub fn merkle_root_validity(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod wcash_auxpow_tests {
+    use super::*;
+
+    #[test]
+    fn target_conversion_uses_little_endian_numeric_order() {
+        let mut target_be = [0u8; 32];
+        target_be[0] = 0x01;
+        target_be[7] = 0x23;
+        target_be[23] = 0x45;
+        target_be[31] = 0x67;
+        let difficulty = ExpandedDifficulty::from(U256::from_big_endian(&target_be));
+
+        let target = wcash_auxpow_target(difficulty).expect("the fixture target is nonzero");
+        target_be.reverse();
+        assert_eq!(target.to_le_bytes(), target_be);
+    }
 }

@@ -35,6 +35,22 @@ lazy_static! {
     );
 }
 
+#[test]
+fn nu63_transparent_constructor_rejects_noncanonical_genesis_coinbase() {
+    let transaction = Transaction::from_nu63_transparent_parts(
+        vec![transparent::Input::Coinbase {
+            height: Height::MIN,
+            data: b"not-a-recognized-genesis-script".to_vec(),
+            sequence: u32::MAX,
+        }],
+        Vec::new(),
+        LockTime::unlocked(),
+        Height::MIN,
+    );
+
+    assert!(transaction.is_none());
+}
+
 /// Build a mock output list for pre-V5 transactions, with (index+1)
 /// copies of `output`, which is used to computed the sighash.
 ///

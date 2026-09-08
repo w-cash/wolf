@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     block::{Block, Height},
-    parameters::Network,
+    parameters::{Network, NetworkKind},
     serialization::{SerializationError, ZcashDeserialize, ZcashDeserializeInto},
     transaction,
     transparent::Input,
@@ -214,6 +214,26 @@ fn get_transparent_output_address() -> Result<()> {
         .address(&Network::new_default_testnet())
         .expect("should return address");
     assert_eq!(addr.to_string(), "tmWbBGi7TjExNmLZyMcFpxVh3ZPbGrpbX3H");
+
+    let zcash_regtest = Network::new_regtest(Default::default());
+    let zcash_regtest_addr = transaction.outputs()[1]
+        .address(&zcash_regtest)
+        .expect("should return address");
+    assert_eq!(zcash_regtest_addr.network_kind(), NetworkKind::Testnet);
+    assert_eq!(
+        zcash_regtest_addr.to_string(),
+        "tmWbBGi7TjExNmLZyMcFpxVh3ZPbGrpbX3H"
+    );
+
+    let wcash_regtest = Network::new_wcash_regtest();
+    let wcash_regtest_addr = transaction.outputs()[1]
+        .address(&wcash_regtest)
+        .expect("should return address");
+    assert_eq!(wcash_regtest_addr.network_kind(), NetworkKind::Regtest);
+    assert!(wcash_regtest_addr
+        .encode_wcash(&wcash_regtest)
+        .expect("output address and Wcash network use the same network kind")
+        .starts_with("WR"));
 
     Ok(())
 }

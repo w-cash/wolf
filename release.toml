@@ -16,5 +16,6 @@ allow-branch = [ 'main' ]
 push = false
 tag = false
 
-# Owners for new crates
-owners = [ 'oxarbitrage', 'conradoplg', 'zcashfoundation/owners' ]
+# Crates in this pre-testnet fork are not published. Add reviewed Wcash crates.io
+# owners here only if publication is deliberately enabled later.
+owners = []

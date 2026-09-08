@@ -1,0 +1,121 @@
+name: Wcash Release Gate
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  merged-mining:
+    name: AuxPoW, coordinator, and isolated profiles
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: 1.91.0
+          components: clippy,rustfmt
+          cache-key: wcash-release-gate
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-zebra-build
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test strict AuxPoW codecs in both dependency profiles
+        run: |
+          cargo test --locked -p wcash-zcash-aux
+          cargo test --locked -p wcash-zcash-aux --no-default-features
+          cargo clippy --locked -p wcash-zcash-aux --all-targets -- -D warnings
+          cargo clippy --locked -p wcash-zcash-aux --no-default-features --all-targets -- -D warnings
+
+      - name: Test and lint the native coordinator
+        run: |
+          cargo test --locked -p wcash-merge-miner
+          cargo clippy --locked -p wcash-merge-miner --all-targets -- -D warnings
+
+      - name: Test Wcash consensus-specific paths
+        run: |
+          cargo test --locked -p zebra-chain --lib --features wcash-consensus
+          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash
+          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash_testnet_transfer_gate_covers_block_and_mempool_verifiers
+          cargo test --locked -p zebra-rpc --lib wcash
+          cargo test --locked -p zebra-rpc --lib --features zebra-chain/wcash-consensus wcash
+
+      - name: Test parent RPC payout attestation and serialization
+        run: |
+          cargo test --locked -p zebra-rpc --lib parent_payout_attestation_is_canonical_and_redacted
+          cargo test --locked -p zebra-rpc --test serialization_tests test_get_block_template_wcash_aux_request
+
+      - name: Test state and consensus-profile boundaries
+        run: |
+          cargo test --locked -p zebra-state --lib populated_read_state_responds_correctly
+          cargo test --locked -p zebra-network --lib default_config_uses_ipv6
+          cargo test --locked -p zebra-network --lib --features wcash-consensus default_config_uses_ipv6
+          cargo test --locked -p zebrad --lib start_rejects_wcash_networks
+          cargo test --locked -p zebrad --lib --features wcash-consensus start_rejects_inherited_zcash_networks
+          cargo test --locked -p zebrad --lib start_accepts_default_network_for_selected_consensus
+          cargo test --locked -p zebrad --lib --features wcash-consensus start_accepts_default_network_for_selected_consensus
+          cargo test --locked -p zebrad --lib user_agent_matches_the_selected_consensus_profile
+          cargo test --locked -p zebrad --lib --features wcash-consensus user_agent_matches_the_selected_consensus_profile
+
+      - name: Test frozen Wcash Testnet identity and isolation
+        run: |
+          cargo test --locked -p wcash-genesis public_testnet
+          cargo test --locked -p zebra-chain --lib --features wcash-consensus wcash_testnet
+          cargo test --locked -p zebra-network --lib --features wcash-consensus wcash_
+          cargo test --locked -p zebra-state --lib --features zebra-chain/wcash-consensus wcash_height_one_uses_candidate_height
+          cargo test --locked -p zebra-state --lib --features zebra-chain/wcash-consensus zcash_activation_boundary_uses_candidate_height
+          cargo test --locked -p zebrad --lib --features wcash-consensus local_genesis_bootstrap_selects_exact_built_in_chain
+          cargo test --locked -p zebrad --lib --features wcash-consensus start_accepts_both_built_in_wcash_networks
+
+      - name: Compile the complete Wcash node graph
+        run: cargo check --locked --release -p zebrad --bin zebrad --no-default-features --features wcash-consensus
+
+      - name: Compile the documented Wcash miner graph
+        run: cargo check --locked --release -p zebrad --bin zebrad --features wcash-consensus,internal-miner
+
+      - name: Compile the unmodified Zcash profile separately
+        run: cargo check --locked --release -p zebrad --bin zebrad --no-default-features
+
+      - name: Build isolated binaries for native integration
+        run: |
+          cargo build --locked --release -p zebrad --bin zebrad --no-default-features
+          cp target/release/zebrad target/release/zcash-zebrad
+          cargo build --locked --release -p zebrad --bin zebrad --no-default-features --features wcash-consensus
+          cp target/release/zebrad target/release/wcash-zebrad
+          cargo build --locked --release -p wcash-merge-miner --bin wcash-merge-miner
+
+      - name: Mine both chains through two ZIP-301 pool generations
+        run: scripts/wcash-merged-mining-e2e.sh
+
+      - name: Boot and mine the frozen Wcash Testnet genesis
+        run: scripts/wcash-testnet-e2e.sh
+
+      - name: Upload merged-mining diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wcash-merged-mining-failure-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/wcash-*-e2e.*/*.log
+            /tmp/wcash-*-e2e.*/*.log
+          if-no-files-found: warn
+          retention-days: 7

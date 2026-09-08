@@ -10,11 +10,12 @@ use futures::{Future, FutureExt};
 use zebra_chain::{
     block::{self, Block, Height},
     chain_tip::mock::{MockChainTip, MockChainTipSender},
-    parameters::subsidy::SubsidyError,
+    parameters::{subsidy::SubsidyError, Network},
     serialization::ZcashDeserializeInto,
 };
 use zebra_consensus::{
-    error::TransactionError, Config as ConsensusConfig, RouterError, VerifyBlockError,
+    error::TransactionError, BlockError, Config as ConsensusConfig, RouterError, VerifyBlockError,
+    VerifyCheckpointError,
 };
 use zebra_network::{InventoryResponse, PeerSocketAddr};
 use zebra_state::Config as StateConfig;
@@ -1628,13 +1629,127 @@ async fn behind_tip_height_limit_requeue_is_bounded() {
                 "the hash must not be re-queued after {} retries",
                 sync::MAX_BLOCK_REOBTAIN_RETRIES
             );
-            assert!(
-                !chain_sync.block_reobtain_retries.contains_key(&hash),
-                "exhausted retry bookkeeping must be dropped"
+            assert_eq!(
+                chain_sync.block_reobtain_retries.get(&hash),
+                Some(&sync::MAX_BLOCK_REOBTAIN_RETRIES),
+                "exhausted retry bookkeeping must stay saturated until the sync run resets"
             );
         }
 
-        // Stand in for `reobtain_missing_blocks()`, which drains the set each sync round.
+        // Stand in for `reobtain_missing_blocks()`, which drains the set each retry pass.
+        chain_sync.reobtain_hashes.clear();
+    }
+}
+
+/// Wcash AuxPoW is authorization data that is deliberately excluded from the block ID.
+/// A bad peer can therefore serve invalid witness bytes for an otherwise valid requested ID,
+/// so sync must try another peer instead of treating that ID as permanently invalid.
+#[tokio::test]
+async fn wcash_auxpow_witness_failures_are_requeued_without_restart() {
+    let (mut chain_sync, mut misbehavior_rx) = new_chain_sync_with_misbehavior();
+    let advertiser: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let height = block::Height(42);
+
+    let cases = [
+        RouterError::Block {
+            source: Box::new(VerifyBlockError::Block {
+                source: BlockError::MissingWcashAuxPow {
+                    height,
+                    hash: block::Hash::from([0xA1; 32]),
+                },
+            }),
+        },
+        RouterError::Block {
+            source: Box::new(VerifyBlockError::Block {
+                source: BlockError::InvalidWcashAuxPow {
+                    height,
+                    hash: block::Hash::from([0xA2; 32]),
+                    source: wcash_zcash_aux::AuxPowError::InvalidProofMagic([0; 4]),
+                },
+            }),
+        },
+        RouterError::Checkpoint {
+            source: Box::new(VerifyCheckpointError::VerifyBlock(
+                VerifyBlockError::Block {
+                    source: BlockError::InvalidWcashAuxPow {
+                        height,
+                        hash: block::Hash::from([0xA3; 32]),
+                        source: wcash_zcash_aux::AuxPowError::InvalidProofMagic([0; 4]),
+                    },
+                },
+            )),
+        },
+    ];
+
+    for (index, error) in cases.into_iter().enumerate() {
+        let hash = block::Hash::from([0xB1 + u8::try_from(index).unwrap(); 32]);
+        let expected_score = error.misbehavior_score();
+
+        chain_sync
+            .handle_block_response(Err(BlockDownloadVerifyError::Invalid {
+                error,
+                height,
+                hash,
+                advertiser_addr: Some(advertiser),
+            }))
+            .expect("a proof-independent Wcash witness failure must not restart sync");
+
+        assert!(
+            chain_sync.reobtain_hashes.contains(&hash),
+            "the same Wcash block ID must be fetched from another peer"
+        );
+        assert_eq!(
+            misbehavior_rx.try_recv().ok(),
+            Some((advertiser, expected_score)),
+            "the peer that supplied the invalid witness must still be scored"
+        );
+
+        // Stand in for `reobtain_missing_blocks()`, which drains this set each retry pass.
+        chain_sync.reobtain_hashes.clear();
+    }
+}
+
+/// Wcash witness retries are bounded, stay saturated, and restart sync on exhaustion.
+#[tokio::test]
+async fn wcash_auxpow_witness_requeue_is_bounded() {
+    let (mut chain_sync, _misbehavior_rx) = new_chain_sync_with_misbehavior();
+    let hash = block::Hash::from([0xC1; 32]);
+    let height = block::Height(42);
+
+    for attempt in 1..=sync::MAX_BLOCK_REOBTAIN_RETRIES + 2 {
+        let error = RouterError::Block {
+            source: Box::new(VerifyBlockError::Block {
+                source: BlockError::InvalidWcashAuxPow {
+                    height,
+                    hash,
+                    source: wcash_zcash_aux::AuxPowError::InvalidProofMagic([0; 4]),
+                },
+            }),
+        };
+
+        let result = chain_sync.handle_block_response(Err(BlockDownloadVerifyError::Invalid {
+            error,
+            height,
+            hash,
+            advertiser_addr: None,
+        }));
+
+        if attempt <= sync::MAX_BLOCK_REOBTAIN_RETRIES {
+            result.expect("a Wcash witness failure with retries left must not restart sync");
+            assert!(chain_sync.reobtain_hashes.contains(&hash));
+        } else {
+            assert!(
+                result.is_err(),
+                "an exhausted Wcash witness retry must restart sync"
+            );
+            assert!(chain_sync.reobtain_hashes.is_empty());
+            assert_eq!(
+                chain_sync.block_reobtain_retries.get(&hash),
+                Some(&sync::MAX_BLOCK_REOBTAIN_RETRIES),
+                "later failures must not reset an exhausted retry budget"
+            );
+        }
+
         chain_sync.reobtain_hashes.clear();
     }
 }
@@ -1798,6 +1913,12 @@ fn setup() -> (
     let state_config = StateConfig::ephemeral();
     let config = ZebradConfig {
         consensus: consensus_config,
+        // This helper feeds the syncer Zcash Mainnet block vectors, while the
+        // Wcash executable defaults to its isolated regtest network.
+        network: zebra_network::Config {
+            network: Network::Mainnet,
+            ..Default::default()
+        },
         state: state_config,
         ..Default::default()
     };

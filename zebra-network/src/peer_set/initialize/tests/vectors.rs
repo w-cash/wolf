@@ -1568,6 +1568,7 @@ async fn banned_connected_inbound_peer_is_dropped_from_peer_set() {
 
         ..Config::default()
     };
+    let network = config.network.clone();
 
     let (mut peer_set, address_book, misbehavior_tx) = init(
         config,
@@ -1583,7 +1584,7 @@ async fn banned_connected_inbound_peer_is_dropped_from_peer_set() {
     // Connect over IPv4, so the listener accepts `::ffff:127.0.0.1`.
     let ipv4_listen_addr = SocketAddr::new(peer_ip.into(), listen_addr.port());
     let _connected_peer = connect_isolated_tcp_direct_with_inbound(
-        &Mainnet,
+        &network,
         ipv4_listen_addr,
         "Test peer user agent".to_string(),
         peers_inbound_service,

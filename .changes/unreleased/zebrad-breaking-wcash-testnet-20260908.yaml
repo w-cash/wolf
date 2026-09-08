@@ -1,0 +1,4 @@
+project: zebrad
+kind: breaking
+body: "Add the isolated, mining-only Wcash Testnet runtime and compile-time consensus profile. Wcash deployments require dedicated configuration, storage, and network identity ([#1](https://github.com/w-cash/wolf/pull/1))."
+time: 2026-09-08T09:31:13.000000000Z

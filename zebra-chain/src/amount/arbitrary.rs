@@ -11,7 +11,15 @@ where
     type Parameters = ();
 
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        C::valid_range().prop_map(|v| Self(v, PhantomData)).boxed()
+        // Transaction generators eventually convert amounts through
+        // `zcash_protocol::value`, whose per-transaction range remains bounded
+        // by the Zcash monetary base. Wcash raises the aggregate chain supply
+        // cap, but no individual transaction can use that wider range.
+        let valid_range = C::valid_range();
+        let start = (*valid_range.start()).max(-MAX_SINGLE_TRANSACTION_VALUE);
+        let end = (*valid_range.end()).min(MAX_SINGLE_TRANSACTION_VALUE);
+
+        (start..=end).prop_map(|v| Self(v, PhantomData)).boxed()
     }
 
     type Strategy = BoxedStrategy<Self>;

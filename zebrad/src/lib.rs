@@ -1,63 +1,31 @@
-//! ![Zebra logotype](https://zfnd.org/wp-content/uploads/2022/03/zebra-logotype.png)
+//! # Wcash node
 //!
-//! Zebra is a Zcash full node written in Rust. Follow the [introductory
-//! page](https://zebra.zfnd.org/index.html#documentation) in the Zebra Book to learn more.
+//! Wcash is a privacy-focused proof-of-work cryptocurrency node written in Rust
+//! and based on the Zebra codebase. Its mined coinbase value is created in the
+//! Ironwood shielded pool, and its child blocks are authorized by Zcash-parent
+//! Equihash AuxPoW.
 //!
-//! ## About Zcash
+//! This source tree enables a public, mining-only `WcashTestnet` and an isolated
+//! `WcashRegtest`. Testnet has a frozen identity and genesis for AuxPoW and pool
+//! interoperability, but rejects non-coinbase transactions until Wcash-specific
+//! signature domains are implemented. Mainnet remains disabled.
 //!
-//! Zcash is a cryptocurrency designed to preserve the user's privacy. Like most
-//! cryptocurrencies, it works by a collection of software nodes run by members of
-//! the Zcash community or any other interested parties. The nodes talk to each
-//! other in peer-to-peer fashion in order to maintain the state of the Zcash
-//! blockchain. They also communicate with miners who create new blocks. When a
-//! Zcash user sends Zcash, their wallet broadcasts transactions to these nodes
-//! which will eventually reach miners, and the mined transaction will then go
-//! through Zcash nodes until they reach the recipient's wallet which will report
-//! the received Zcash to the recipient.
-//!
-//! ## Alternative Implementations
-//!
-//! The first Zcash node, `zcashd`, was originally created as a fork of Bitcoin
-//! Core and is no longer maintained. Zebra is an independent Zcash node
-//! implementation, written from scratch, and is the actively maintained node
-//! for the network. Other implementations built on or alongside Zebra also
-//! exist. Because they implement the same protocol, conforming nodes
-//! interoperate and maintain the Zcash network together.
-//!
-//! ## Zebra Advantages
-//!
-//! These are some of the advantages or benefits of Zebra:
-//!
-//! - **Performance**: Zebra is built from scratch in an async, parallelized
-//!   design, giving it high throughput for block validation and syncing.
-//! - **Security**: Zebra is written in Rust, a memory-safe language, which
-//!   reduces the risk of memory-safety and correctness bugs that could
-//!   compromise the node or the environment it runs in.
-//! - **Modularity**: Zebra is organized as a set of reusable crates
-//!   (`zebra-chain`, `zebra-consensus`, `zebra-network`, `zebra-state`,
-//!   `zebra-rpc`, and more). Wallets, indexers, and other tools can build on
-//!   these directly instead of reimplementing core Zcash logic.
-//! - **Broader deployment targets**: Its modular design makes it possible to run
-//!   Zcash consensus code in a wider range of environments, including mobile and
-//!   WebAssembly.
-//! - **Open contribution**: A modern, well-documented Rust codebase lowers the
-//!   barrier for new contributors, widening the pool of developers who can
-//!   review, maintain, and extend the Zcash protocol.
-//! - **Ecosystem foundation**: Because Zebra is independent and openly developed,
-//!   other teams can build implementations, forks, and services on top of it,
-//!   supporting a healthy and decentralized network.
+//! Wcash retains Zebra's modular crates and much of its Zcash validation code.
+//! The upstream architecture and crate names are preserved where changing them
+//! would reduce reviewability or compatibility.
 //!
 //! ## Configuration
 //!
-//! The command below places the generated `zebrad.toml` config file in the default preferences directory of Linux:
+//! The command below places the generated `wcash.toml` config file in the default preferences directory of Linux:
 //!
 //! ```console
-//! zebrad generate -o ~/.config/zebrad.toml
+//! zebrad generate -o ~/.config/wcash.toml
 //! ```
 //!
-//! See [`config::ZebradConfig`] for other OSes default locations or more information about how to configure Zebra.
+//! See [`config::ZebradConfig`] for other operating systems' default locations
+//! and more information about configuring Wcash.
 //!
-//! ## Zebra Feature Flags
+//! ## Wcash feature flags
 //!
 //! The following [Cargo
 //! features](https://doc.rust-lang.org/cargo/reference/features.html#command-line-feature-options)
@@ -66,7 +34,7 @@
 //! ### Metrics
 //!
 //! * configuring a `tracing.progress_bar`: shows key metrics in the terminal using progress bars,
-//!   and automatically configures Zebra to send logs to a file.
+//!   and automatically configures Wcash to send logs to a file.
 //!   (The `progress-bar` feature is activated by default.)
 //! * `prometheus`: export metrics to prometheus.
 //!
@@ -97,15 +65,14 @@
 //! ### Testing
 //!
 //! * `proptest-impl`: enable randomised test data generation.
-//! * `lightwalletd-grpc-tests`: enable Zebra JSON-RPC tests that query `lightwalletd` using gRPC.
+//! * `lightwalletd-grpc-tests`: enable inherited JSON-RPC tests that query `lightwalletd` using gRPC.
 //!
 //! ### Experimental
 //!
 //! * `elasticsearch`: save block data into elasticsearch database. Read the [elasticsearch](https://zebra.zfnd.org/user/elasticsearch.html)
 //!   section of the book for more details.
-//! * `internal-miner`: enable experimental support for mining inside Zebra, without an external
-//!   mining pool. This feature is only supported on testnet. Use a GPU or ASIC on mainnet for
-//!   efficient mining.
+//! * `internal-miner`: enable the local Wcash development miner. It constructs a
+//!   synthetic Zcash parent and is not a live dual-chain production pool.
 //!
 //! ## Zebra crates
 //!

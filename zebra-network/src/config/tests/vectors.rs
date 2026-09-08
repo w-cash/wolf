@@ -18,8 +18,14 @@ use crate::{
 fn parse_config_listen_addr() {
     let _init_guard = zebra_test::init();
 
+    #[cfg(not(feature = "wcash-consensus"))]
+    let (default_ipv4, default_ipv6) = ("0.0.0.0:8233", "[::]:8233");
+
+    #[cfg(feature = "wcash-consensus")]
+    let (default_ipv4, default_ipv6) = ("0.0.0.0:38233", "[::]:38233");
+
     let fixtures = vec![
-        ("listen_addr = '0.0.0.0'", "0.0.0.0:8233"),
+        ("listen_addr = '0.0.0.0'", default_ipv4),
         ("listen_addr = '0.0.0.0:9999'", "0.0.0.0:9999"),
         (
             "listen_addr = '0.0.0.0'\nnetwork = 'Testnet'",
@@ -29,7 +35,7 @@ fn parse_config_listen_addr() {
             "listen_addr = '0.0.0.0:8233'\nnetwork = 'Testnet'",
             "0.0.0.0:8233",
         ),
-        ("listen_addr = '[::]'", "[::]:8233"),
+        ("listen_addr = '[::]'", default_ipv6),
         ("listen_addr = '[::]:9999'", "[::]:9999"),
         ("listen_addr = '[::]'\nnetwork = 'Testnet'", "[::]:18233"),
         (
@@ -87,8 +93,101 @@ fn default_config_uses_ipv6() {
     let _init_guard = zebra_test::init();
     let config = Config::default();
 
-    assert_eq!(config.listen_addr.to_string(), "[::]:8233");
     assert!(config.listen_addr.is_ipv6());
+
+    #[cfg(not(feature = "wcash-consensus"))]
+    {
+        assert_eq!(config.listen_addr.to_string(), "[::]:8233");
+        assert_eq!(config.network, Network::Mainnet);
+        assert_eq!(config.initial_mainnet_peers.len(), 5);
+        assert_eq!(config.initial_testnet_peers.len(), 3);
+    }
+
+    #[cfg(feature = "wcash-consensus")]
+    {
+        assert_eq!(config.listen_addr.to_string(), "[::]:38233");
+        assert_eq!(config.network, Network::new_wcash_testnet());
+        assert!(config.network.uses_wcash_consensus());
+        assert!(!config.network.is_regtest());
+        assert!(config.initial_mainnet_peers.is_empty());
+        assert!(config.initial_testnet_peers.is_empty());
+    }
+}
+
+#[test]
+fn wcash_network_config_round_trip() {
+    for (network, spelling, port) in [
+        (Network::new_wcash_testnet(), "WcashTestnet", 38233),
+        (Network::new_wcash_regtest(), "WcashRegtest", 28233),
+    ] {
+        let config = Config {
+            listen_addr: format!("[::]:{port}")
+                .parse()
+                .expect("hard-coded address is valid"),
+            network,
+            initial_mainnet_peers: [].into(),
+            initial_testnet_peers: [].into(),
+            ..Config::default()
+        };
+        let encoded = toml::to_string(&config).expect("Wcash config serializes");
+        assert!(encoded.contains(&format!("network = \"{spelling}\"")));
+
+        let decoded: Config = toml::from_str(&encoded).expect("Wcash config deserializes");
+        assert_eq!(decoded, config);
+    }
+
+    // Preserve the pre-testnet alias as local regtest. Silently moving an old
+    // configuration onto a public network would be unsafe.
+    let alias: Config = toml::from_str("network = 'Wcash'").expect("Wcash alias parses");
+    assert_eq!(alias.network, Network::new_wcash_regtest());
+    assert_eq!(alias.listen_addr.port(), 28233);
+    assert!(alias.initial_mainnet_peers.is_empty());
+    assert!(alias.initial_testnet_peers.is_empty());
+
+    let minimal_testnet: Config = toml::from_str("network = 'WcashTestnet'")
+        .expect("minimal Wcash Testnet config parses without inherited peers");
+    assert_eq!(minimal_testnet.network, Network::new_wcash_testnet());
+    assert_eq!(minimal_testnet.listen_addr.port(), 38233);
+    assert!(minimal_testnet.initial_mainnet_peers.is_empty());
+    assert!(minimal_testnet.initial_testnet_peers.is_empty());
+}
+
+#[test]
+fn wcash_networks_reject_zcash_seed_inheritance() {
+    for (network, seed) in [
+        ("WcashTestnet", "dnsseed.testnet.z.cash:18233"),
+        ("WcashRegtest", "dnsseed.z.cash:8233"),
+    ] {
+        let config = format!("network = '{network}'\ninitial_testnet_peers = ['{seed}']\n");
+        let error = toml::from_str::<Config>(&config)
+            .expect_err("a Wcash node must never bootstrap from a Zcash seed");
+        assert!(error.to_string().contains("cannot use built-in Zcash"));
+    }
+
+    let custom: Config = toml::from_str(
+        "network = 'WcashTestnet'\ninitial_testnet_peers = ['203.0.113.10:38233']\n",
+    )
+    .expect("an explicitly supplied Wcash peer is allowed");
+    assert_eq!(custom.network, Network::new_wcash_testnet());
+}
+
+#[test]
+fn wcash_peer_cache_paths_are_network_isolated() {
+    let cache = crate::config::CacheDir::custom_path("/tmp/wcash-cache-path-test");
+    let testnet = cache
+        .peer_cache_file_path(&Network::new_wcash_testnet())
+        .expect("custom peer cache is enabled");
+    let regtest = cache
+        .peer_cache_file_path(&Network::new_wcash_regtest())
+        .expect("custom peer cache is enabled");
+    let zcash = cache
+        .peer_cache_file_path(&Network::new_default_testnet())
+        .expect("custom peer cache is enabled");
+
+    assert_ne!(testnet, regtest);
+    assert_ne!(testnet, zcash);
+    assert!(testnet.ends_with("wcashtestnet.peers"));
+    assert!(regtest.ends_with("wcashregtest.peers"));
 }
 
 #[test]

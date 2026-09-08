@@ -10,29 +10,30 @@
 
 ## Running and Debugging
 
-See the [user documentation](https://zebra.zfnd.org/user.html) for details on
-how to build, run, and instrument Zebra.
+Start with the [local Wcash guide](docs/wcash-local.md). The upstream
+[Zebra documentation](https://zebra.zfnd.org/user.html) remains useful for
+inherited build and instrumentation details, but its public-network parameters
+do not apply to Wcash.
 
 ## Bug Reports
 
-Please [create an issue](https://github.com/ZcashFoundation/zebra/issues/new?template=bug_report.yml) on the Zebra issue tracker.
+Please create a non-sensitive bug report in the
+[Wcash issue tracker](https://github.com/w-cash/wolf/issues). Report
+security-sensitive issues through the private process in [SECURITY.md](SECURITY.md).
 
 ## Pull Requests
 
 PRs are welcome, but every PR requires human review time. To make that time count:
 
-1. **Start with an issue.** Check the [issue tracker](https://github.com/ZcashFoundation/zebra/issues) for existing issues or create a new one describing what you want to change and why. **Wait for a team member to respond before writing code** — an issue with no team acknowledgment does not count as prior discussion.
-2. **Coordinate large changes.** For anything beyond a small bug fix, discuss your approach with us via [issue tracker](https://github.com/ZcashFoundation/zebra/issues) or [Discord](https://discord.gg/yVNhQwQE68) before opening a PR.
+1. **Start with an issue.** Check the [Wcash issue tracker](https://github.com/w-cash/wolf/issues) for existing work or create an issue describing what you want to change and why.
+2. **Coordinate consensus changes.** Discuss consensus, networking, genesis, monetary-policy, privacy, and merged-mining changes in a Wcash issue before opening a PR. These changes require explicit test vectors and independent review.
 3. **Keep PRs focused.** One logical change per PR. If you're planning multiple related PRs, discuss the overall plan with the team first.
 4. **Follow conventional commits.** PRs are merged to main with a merge commit, so the PR title becomes the merge commit message and your branch commits are preserved in history. Follow the [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) standard for both.
 5. **Declare breaking changes.** If your change breaks a published crate's public Rust API, add `!` after the type and scope in the PR title (`feat(zebra-chain)!: ...`) **and** in the branch commit that introduces the break. The PR gate reads the title: that is what skips `semver-checks` and requires a `breaking` change fragment. release-plz reads the commits that land on `main`, which now include your branch commits, so the marker belongs on both for the release to bump the major version.
 
-Zebra is a validator node — it excludes features not strictly needed for block validation and chain sync. Features like wallets, block explorers, and mining pools belong in [Zaino](https://github.com/zingolabs/zaino), [Zallet](https://github.com/zcash/wallet), or [librustzcash](https://github.com/zcash/librustzcash).
-
-Check out the [help wanted][hw] or [good first issue][gfi] labels if you're looking for a place to get started.
-
-[hw]: https://github.com/ZcashFoundation/zebra/labels/help%20wanted
-[gfi]: https://github.com/ZcashFoundation/zebra/labels/good%20first%20issue
+The consensus node should remain narrowly scoped, but Wcash's AuxPoW adapters,
+pool interoperability tooling, wallet compatibility, and audit infrastructure
+are in scope when they have clear ownership and test boundaries.
 
 ## AI-Assisted Contributions
 
@@ -54,7 +55,7 @@ Any team member may close a PR. We'll leave a comment explaining why and invite 
 - Feature or refactor nobody requested
 - Low-effort changes (typo fixes, minor formatting) not requested by the team
 - Missing test evidence or inability to explain the changes
-- Out of scope for Zebra (see above)
+- Out of scope for Wcash or incompatible with the reviewed consensus design
 
 This is not personal; it's about managing review capacity. We encourage you to reach out first so your effort counts.
 

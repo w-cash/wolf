@@ -181,6 +181,8 @@ impl FinalizedState {
         #[cfg(feature = "elasticsearch")] enable_elastic_db: bool,
         read_only: bool,
     ) -> Result<Self, StateInitError> {
+        network.assert_compatible_with_compiled_consensus();
+
         #[cfg(feature = "elasticsearch")]
         let elastic_db = if enable_elastic_db {
             use elasticsearch::{

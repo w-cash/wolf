@@ -11,7 +11,13 @@ use std::{
 use chrono::Utc;
 use futures::{channel::mpsc, sink::SinkMapErr, SinkExt};
 
-use zebra_chain::{block::Height, serialization::SerializationError};
+use zebra_chain::{
+    block::{CountedHeader, Height},
+    serialization::{
+        SerializationError, ZcashSerialize, MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
+    },
+    work::equihash::Solution,
+};
 use zebra_test::mock_service::MockService;
 
 use crate::{
@@ -27,6 +33,41 @@ use crate::{
 
 mod prop;
 mod vectors;
+
+#[test]
+fn large_wcash_headers_are_limited_by_exact_wire_size_and_count() {
+    let mut header = zebra_chain::block::genesis::wcash_regtest_genesis_block()
+        .header
+        .as_ref()
+        .clone();
+    header.solution = Solution::for_wcash(vec![0x5a; 128 * 1024])
+        .expect("the large fixture is below the Wcash witness limit");
+    let large_header = CountedHeader {
+        header: Arc::new(header),
+    };
+
+    let oversized = vec![large_header.clone(); MAX_HEADERS_PER_MESSAGE];
+    assert!(oversized.zcash_serialized_size() > MAX_PROTOCOL_MESSAGE_LEN);
+
+    let limited = super::headers_within_message_limits(oversized);
+    assert_eq!(limited.len(), 15, "the sixteenth large header does not fit");
+    assert!(limited.zcash_serialized_size() <= MAX_PROTOCOL_MESSAGE_LEN);
+
+    let mut one_too_many = limited.clone();
+    one_too_many.push(large_header.clone());
+    assert!(one_too_many.zcash_serialized_size() > MAX_PROTOCOL_MESSAGE_LEN);
+
+    let count_limited = super::headers_within_message_limits(vec![
+        CountedHeader {
+            header: zebra_chain::block::genesis::wcash_regtest_genesis_block()
+                .header
+                .clone(),
+        };
+        MAX_HEADERS_PER_MESSAGE + 1
+    ]);
+    assert_eq!(count_limited.len(), MAX_HEADERS_PER_MESSAGE);
+    assert!(count_limited.zcash_serialized_size() <= MAX_PROTOCOL_MESSAGE_LEN);
+}
 
 /// Creates a new [`Connection`] instance for testing.
 fn new_test_connection<A>() -> (

@@ -1,6 +1,6 @@
 //! Mining config
 
-use std::{collections::HashMap, ops::Deref};
+use std::{collections::HashMap, fmt, ops::Deref, str::FromStr};
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{serde_as, DisplayFromStr};
@@ -8,7 +8,10 @@ use serde_with::{serde_as, DisplayFromStr};
 use strum_macros::EnumIter;
 use zcash_address::ZcashAddress;
 use zcash_transparent::coinbase::{MAX_COINBASE_HEIGHT_LEN, MAX_COINBASE_SCRIPT_LEN};
-use zebra_chain::parameters::NetworkKind;
+use zebra_chain::{
+    parameters::{Network, NetworkKind},
+    primitives::{WcashAddress, WcashAddressParseError},
+};
 
 /// The maximum length of the optional, arbitrary data in the script sig field of a coinbase tx.
 pub(crate) const MAX_MINER_DATA_LEN: usize = MAX_COINBASE_SCRIPT_LEN - MAX_COINBASE_HEIGHT_LEN;
@@ -29,16 +32,77 @@ pub(crate) const ZEBRA_COINBASE_SEPARATOR: &str = ": ";
 pub(crate) const MAX_USER_COINBASE_DATA_LEN: usize =
     MAX_MINER_DATA_LEN - ZEBRA_COINBASE_MARKER.len() - ZEBRA_COINBASE_SEPARATOR.len() - 2;
 
+/// A miner payment address in either the Zcash or Wcash textual namespace.
+///
+/// The configured network selects which variant is accepted. Keeping the variants
+/// distinct prevents a valid Zcash address from being reused accidentally on Wcash.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MinerAddress {
+    /// An upstream Zcash address.
+    Zcash(ZcashAddress),
+    /// A Wcash address.
+    Wcash(WcashAddress),
+}
+
+impl fmt::Display for MinerAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zcash(address) => address.fmt(f),
+            Self::Wcash(address) => address.fmt(f),
+        }
+    }
+}
+
+impl FromStr for MinerAddress {
+    type Err = MinerAddressParseError;
+
+    fn from_str(encoded: &str) -> Result<Self, Self::Err> {
+        match encoded.parse::<WcashAddress>() {
+            Ok(address) => Ok(Self::Wcash(address)),
+            Err(WcashAddressParseError::NotWcash) => encoded
+                .parse::<ZcashAddress>()
+                .map(Self::Zcash)
+                .map_err(MinerAddressParseError::Zcash),
+            Err(error) => Err(MinerAddressParseError::Wcash(error)),
+        }
+    }
+}
+
+impl From<ZcashAddress> for MinerAddress {
+    fn from(address: ZcashAddress) -> Self {
+        Self::Zcash(address)
+    }
+}
+
+impl From<WcashAddress> for MinerAddress {
+    fn from(address: WcashAddress) -> Self {
+        Self::Wcash(address)
+    }
+}
+
+/// An invalid miner payment-address encoding.
+#[derive(Debug, thiserror::Error)]
+pub enum MinerAddressParseError {
+    /// A malformed string in a Wcash namespace.
+    #[error(transparent)]
+    Wcash(#[from] WcashAddressParseError),
+    /// A string that is not in a Wcash namespace and is not a valid Zcash address.
+    #[error(transparent)]
+    Zcash(zcash_address::ParseError),
+}
+
 /// Mining configuration section.
 #[serde_as]
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Address for receiving miner subsidy and tx fees.
     ///
     /// Used in coinbase tx constructed in `getblocktemplate` RPC.
+    /// Wcash requires a Unified address containing an Orchard receiver, which is used as the
+    /// recipient for its mandatory Ironwood coinbase output.
     #[serde_as(as = "Option<DisplayFromStr>")]
-    pub miner_address: Option<ZcashAddress>,
+    pub miner_address: Option<MinerAddress>,
 
     /// Optional tag that Zebra appends to the coinbase input of every block it builds, after the
     /// Zebra `🦓` marker and a `: ` separator.
@@ -52,14 +116,33 @@ pub struct Config {
     /// Applies only if [`Self::miner_address`] contains a shielded component.
     pub miner_memo: Option<String>,
 
-    /// Mine blocks using Zebra's internal miner, without an external mining pool or equihash solver.
+    /// Mine blocks using the node's internal solver instead of an external pool.
     ///
-    /// This experimental feature is only supported on regtest as it uses null solutions and skips checking
-    /// for a valid Proof of Work.
+    /// On Wcash regtest this builds a synthetic Zcash parent coinbase, runs the
+    /// real Equihash `(200, 9)` solver, and attaches a fully validated AuxPoW
+    /// witness. It is development tooling, not a live Zcash dual-submit path.
     ///
     /// The internal miner is off by default.
     #[serde(default)]
     pub internal_miner: bool,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field(
+                "miner_address",
+                &self.miner_address.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("extra_coinbase_data", &self.extra_coinbase_data)
+            .field(
+                "miner_memo",
+                &self.miner_memo.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("internal_miner", &self.internal_miner)
+            .finish()
+    }
 }
 
 impl Config {
@@ -147,6 +230,29 @@ pub fn default_miner_address(kind: NetworkKind, addr_type: &MinerAddressType) ->
     MINER_ADDRESS[&kind][addr_type]
 }
 
+/// Returns the default miner address for `network`.
+///
+/// Built-in Wcash networks use their matching Wcash textual namespace and an
+/// address containing the Orchard receiver used for Ironwood. Ordinary Zcash
+/// networks retain their upstream fixtures.
+pub fn default_miner_address_for_network(
+    network: &Network,
+    addr_type: &MinerAddressType,
+) -> String {
+    if !network.uses_wcash_consensus() {
+        return default_miner_address(network.kind(), addr_type).to_owned();
+    }
+
+    let network_kind = network.kind();
+    default_miner_address(network_kind, addr_type)
+        .parse::<ZcashAddress>()
+        .expect("the matching upstream miner-address fixture is valid")
+        .convert::<WcashAddress>()
+        .expect("Wcash supports every non-Sprout upstream miner-address fixture")
+        .with_network(network_kind.into())
+        .encode()
+}
+
 lazy_static::lazy_static! {
     static ref MINER_ADDRESS: HashMap<NetworkKind, HashMap<MinerAddressType, &'static str>> = [
         (NetworkKind::Mainnet, [
@@ -168,4 +274,46 @@ lazy_static::lazy_static! {
             (MinerAddressType::Transparent, "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"),
         ].into()),
     ].into();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_wcash_miner_addresses_follow_the_selected_network() {
+        use zcash_protocol::consensus::NetworkType;
+
+        for (network, expected_network, expected_prefix) in [
+            (Network::new_wcash_testnet(), NetworkType::Test, "wutest1"),
+            (
+                Network::new_wcash_regtest(),
+                NetworkType::Regtest,
+                concat!("w", "u", "regtest", "1"),
+            ),
+        ] {
+            let encoded = default_miner_address_for_network(&network, &MinerAddressType::Unified);
+            let address: WcashAddress = encoded
+                .parse()
+                .expect("the generated Wcash miner address is valid");
+
+            assert_eq!(address.network(), expected_network);
+            assert!(encoded.starts_with(expected_prefix));
+        }
+    }
+
+    #[test]
+    fn mining_config_debug_redacts_payout_material() {
+        let address = "t1T92bmyoPM7PTSWUnaWnLGcxkF6Jp1AwMY";
+        let memo = "private-miner-memo";
+        let config = Config {
+            miner_address: Some(address.parse().expect("valid fixture address")),
+            miner_memo: Some(memo.to_string()),
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(address));
+        assert!(!debug.contains(memo));
+        assert!(debug.contains("[REDACTED]"));
+    }
 }

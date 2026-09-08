@@ -24,6 +24,7 @@ use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
 
+use wcash_zcash_aux::parent_payout_address_commitment;
 use zcash_script::{opcode::PushValue, pv::push_value};
 use zebra_chain::{
     amount::{self, Amount, NonNegative},
@@ -35,13 +36,18 @@ use zebra_chain::{
     parameters::Network,
     serialization::{DateTime32, ZcashDeserializeInto},
     transaction::VerifiedUnminedTx,
-    work::difficulty::{CompactDifficulty, ExpandedDifficulty},
+    work::{
+        difficulty::{CompactDifficulty, ExpandedDifficulty},
+        equihash::WCASH_BLOCK_WIRE_VERSION,
+    },
 };
 // Required for trait method `.bytes_in_display_order()` used indirectly in Debug impl
 #[allow(unused_imports)]
 use zebra_chain::serialization::BytesInDisplayOrder;
 
-use zebra_consensus::{router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS};
+use zebra_consensus::{
+    error::TransactionError, router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS,
+};
 use zebra_node_services::mempool::{self, TransactionDependencies};
 use zebra_state::GetBlockTemplateChainInfo;
 
@@ -63,6 +69,7 @@ use constants::{
 };
 pub use parameters::{
     GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
+    WcashAuxRequest,
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
 
@@ -221,6 +228,16 @@ pub struct BlockTemplateResponse {
     #[serde(rename = "submitold")]
     #[getter(copy)]
     pub(crate) submit_old: Option<bool>,
+
+    /// Domain-separated commitment to the parent node's configured payout
+    /// address, returned only for private `wcashaux` template requests.
+    ///
+    /// This lets the loopback coordinator fail closed on an accidental parent
+    /// payout mismatch without placing the plaintext address in an RPC body.
+    #[serde(rename = "wcashparentpayoutcommitment")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub(crate) wcash_parent_payout_commitment: Option<String>,
 }
 
 impl fmt::Debug for BlockTemplateResponse {
@@ -256,6 +273,13 @@ impl fmt::Debug for BlockTemplateResponse {
             .field("height", &self.height)
             .field("max_time", &self.max_time)
             .field("submit_old", &self.submit_old)
+            .field(
+                "wcash_parent_payout_commitment",
+                &self
+                    .wcash_parent_payout_commitment
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -275,17 +299,19 @@ impl BlockTemplateResponse {
         precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,
         coinbase_cache: Option<CoinbaseCache>,
         miner_params: &MinerParams,
+        wcash_aux: Option<WcashAuxRequest>,
         chain_info: &GetBlockTemplateChainInfo,
         long_poll_id: LongPollId,
         #[cfg(not(test))] mempool_txs: Vec<VerifiedUnminedTx>,
         #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
         submit_old: Option<bool>,
-    ) -> Self {
+    ) -> Result<Self, TransactionError> {
         // Determine the next block height.
-        let height = chain_info
-            .tip_height
-            .next()
-            .expect("chain tip must be below Height::MAX");
+        let height = chain_info.tip_height.next().map_err(|error| {
+            TransactionError::CoinbaseConstruction(format!(
+                "chain tip must be below the maximum block height: {error}"
+            ))
+        })?;
 
         // Convert transactions into TransactionTemplates.
         #[cfg(not(test))]
@@ -326,8 +352,7 @@ impl BlockTemplateResponse {
         let txs_fee = mempool_txs
             .iter()
             .map(|tx| tx.miner_fee)
-            .sum::<amount::Result<Amount<NonNegative>>>()
-            .expect("mempool tx fees must be non-negative");
+            .sum::<amount::Result<Amount<NonNegative>>>()?;
 
         // Prefer the long-poll precomputed coinbase, then the per-block cache, and only build (and
         // re-prove, for a shielded address) as a last resort — caching the result so subsequent
@@ -349,6 +374,30 @@ impl BlockTemplateResponse {
 
                 coinbase_txn
             });
+
+        // Always cache the proof-complete, child-independent coinbase above.
+        // A Wcash request gets its own cheap authenticated-data mutation, so a
+        // later ordinary request or a request for another child can never
+        // inherit a stale commitment from the cache.
+        let coinbase_txn = match wcash_aux {
+            Some(wcash_aux) => {
+                coinbase_txn.with_wcash_aux(wcash_aux.block_hash().0, wcash_aux.nonce())?
+            }
+            None => coinbase_txn,
+        };
+        let wcash_parent_payout_commitment = wcash_aux
+            .map(|_| {
+                miner_params
+                    .parent_payout_address_commitment()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        TransactionError::CoinbaseConstruction(
+                            "wcashaux requires an attested configured parent payout address"
+                                .to_string(),
+                        )
+                    })
+            })
+            .transpose()?;
 
         let default_roots = DefaultRoots::from_coinbase(
             net,
@@ -376,10 +425,14 @@ impl BlockTemplateResponse {
             "creating template ... "
         );
 
-        BlockTemplateResponse {
+        Ok(BlockTemplateResponse {
             capabilities,
 
-            version: ZCASH_BLOCK_VERSION,
+            version: if net.uses_wcash_consensus() {
+                WCASH_BLOCK_WIRE_VERSION
+            } else {
+                ZCASH_BLOCK_VERSION
+            },
 
             previous_block_hash: chain_info.tip_hash,
             block_commitments_hash: default_roots.block_commitments_hash,
@@ -414,7 +467,9 @@ impl BlockTemplateResponse {
             max_time: chain_info.max_time,
 
             submit_old,
-        }
+
+            wcash_parent_payout_commitment,
+        })
     }
 }
 
@@ -448,7 +503,7 @@ impl GetBlockTemplateResponse {
 }
 
 /// Miner parameters.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MinerParams {
     /// Address for receiving miner subsidy and tx fees.
     addr: Address,
@@ -460,6 +515,28 @@ pub struct MinerParams {
     ///
     /// Applies only if [`Self::addr`] contains a shielded component.
     memo: Option<MemoBytes>,
+
+    /// Hex-encoded domain-separated commitment to the canonical configured
+    /// payout address. Test-only conversions that bypass config leave it unset.
+    parent_payout_address_commitment: Option<String>,
+}
+
+impl fmt::Debug for MinerParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MinerParams")
+            .field("addr", &"[REDACTED]")
+            .field("data", &self.data)
+            .field("memo", &self.memo.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "parent_payout_address_commitment",
+                &self
+                    .parent_payout_address_commitment
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 /// Builds the coinbase input data for a block Zebra constructs: the [`ZEBRA_COINBASE_MARKER`],
@@ -479,10 +556,30 @@ impl MinerParams {
     // length-validated), not a recoverable error.
     #[allow(clippy::unwrap_in_result)]
     pub fn new(net: &Network, conf: config::mining::Config) -> Result<Self, MinerParamsError> {
-        let addr = conf
-            .miner_address
-            .map(|addr| Address::try_from_zcash_address(net, addr))
-            .ok_or(MinerParamsError::MissingAddr)??;
+        let configured_address = conf.miner_address.ok_or(MinerParamsError::MissingAddr)?;
+        let parent_payout_address_commitment = Some(hex::encode(parent_payout_address_commitment(
+            &configured_address.to_string(),
+        )));
+        let addr = match (net.uses_wcash_consensus(), configured_address) {
+            (true, config::mining::MinerAddress::Wcash(address)) => {
+                address.convert_if_network::<Address>(net.kind().into())?
+            }
+            (true, config::mining::MinerAddress::Zcash(_)) => {
+                return Err(MinerParamsError::WcashAddressNamespaceRequired)
+            }
+            (false, config::mining::MinerAddress::Zcash(address)) => {
+                Address::try_from_zcash_address(net, address)?
+            }
+            (false, config::mining::MinerAddress::Wcash(_)) => {
+                return Err(MinerParamsError::ZcashAddressNamespaceRequired)
+            }
+        };
+
+        if net.uses_wcash_consensus()
+            && !matches!(&addr, Address::Unified(unified) if unified.orchard().is_some())
+        {
+            return Err(MinerParamsError::WcashRequiresIronwoodReceiver);
+        }
 
         // Always tag the coinbase with the Zebra marker, even without configured
         // `extra_coinbase_data`, so every block Zebra builds is identifiable. The type of
@@ -499,7 +596,12 @@ impl MinerParams {
             .map(|memo| MemoBytes::from_bytes(memo.as_bytes()))
             .transpose()?;
 
-        Ok(Self { addr, data, memo })
+        Ok(Self {
+            addr,
+            data,
+            memo,
+            parent_payout_address_commitment,
+        })
     }
 
     /// Returns the miner address.
@@ -515,6 +617,12 @@ impl MinerParams {
     /// Returns the miner memo.
     pub fn memo(&self) -> Option<&MemoBytes> {
         self.memo.as_ref()
+    }
+
+    /// Returns the private GBT payout-address attestation, when this instance
+    /// originated from validated mining configuration.
+    fn parent_payout_address_commitment(&self) -> Option<&str> {
+        self.parent_payout_address_commitment.as_deref()
     }
 
     /// Randomizes the memo.
@@ -538,6 +646,7 @@ impl From<Address> for MinerParams {
             addr,
             data: None,
             memo: None,
+            parent_payout_address_commitment: None,
         }
     }
 }
@@ -545,10 +654,22 @@ impl From<Address> for MinerParams {
 /// Errors that can occur when creating [`MinerParams`].
 #[derive(Debug, thiserror::Error)]
 pub enum MinerParamsError {
+    /// No miner payment address was configured.
     #[error("Missing miner address")]
     MissingAddr,
+    /// The configured address could not be converted into a supported payment address.
     #[error("Invalid miner address: {0}")]
     InvalidAddr(zcash_address::ConversionError<&'static str>),
+    /// A Wcash address does not contain the Orchard receiver used for Ironwood rewards.
+    #[error("Wcash miner address must be Unified and contain an Orchard receiver for Ironwood")]
+    WcashRequiresIronwoodReceiver,
+    /// A Zcash address was configured while Wcash consensus is active.
+    #[error("Wcash mining requires a Wcash address (w.../W...), not a Zcash address")]
+    WcashAddressNamespaceRequired,
+    /// A Wcash address was configured while Zcash consensus is active.
+    #[error("Zcash mining requires a Zcash address, not a Wcash address")]
+    ZcashAddressNamespaceRequired,
+    /// The configured miner memo is not a valid protocol memo.
     #[error(transparent)]
     InvalidMemo(#[from] zcash_protocol::memo::Error),
 }
@@ -642,7 +763,7 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     /// Miner parameters, including the miner address, data, and memo.
-    miner_params: Option<MinerParams>,
+    miner_params: Result<Option<MinerParams>, Arc<MinerParamsError>>,
 
     /// The chain verifier, used for submitting blocks.
     block_verifier_router: BlockVerifierRouter,
@@ -672,8 +793,14 @@ where
         sync_status: SyncStatus,
         mined_block_sender: Option<mpsc::Sender<(block::Hash, block::Height)>>,
     ) -> Self {
+        let miner_params = match MinerParams::new(net, conf) {
+            Ok(miner_params) => Ok(Some(miner_params)),
+            Err(MinerParamsError::MissingAddr) => Ok(None),
+            Err(error) => Err(Arc::new(error)),
+        };
+
         Self {
-            miner_params: MinerParams::new(net, conf).ok(),
+            miner_params,
             block_verifier_router,
             sync_status,
             mined_block_sender: mined_block_sender
@@ -683,8 +810,11 @@ where
     }
 
     /// Returns the miner parameters, including the address, data, and memo.
-    pub fn miner_params(&self) -> Option<&MinerParams> {
-        self.miner_params.as_ref()
+    pub fn miner_params(&self) -> Result<Option<&MinerParams>, &MinerParamsError> {
+        self.miner_params
+            .as_ref()
+            .map(|params| params.as_ref())
+            .map_err(Arc::as_ref)
     }
 
     /// Overrides the miner parameters used to build coinbase transactions.
@@ -692,7 +822,7 @@ where
     /// Used by the regtest `generatetoaddress` RPC to mine to a caller-specified
     /// address on a cloned handler, without changing the configured default.
     pub fn set_miner_params(&mut self, miner_params: MinerParams) {
-        self.miner_params = Some(miner_params);
+        self.miner_params = Ok(Some(miner_params));
         // Cached coinbases pay the previous miner address, and this handler shares
         // its cache with the handler it was cloned from. Detach to a fresh cache so
         // neither handler can serve a coinbase built for the other's address.
@@ -725,7 +855,7 @@ where
 
     /// Randomizes the coinbase data, if miner parameters are set.
     pub fn randomize_coinbase_data(&mut self) {
-        if let Some(miner_params) = &mut self.miner_params {
+        if let Ok(Some(miner_params)) = &mut self.miner_params {
             miner_params.randomize_data();
             miner_params.randomize_memo();
             // The cached coinbase was built with the previous data, so it's now stale.
@@ -750,13 +880,43 @@ where
 
 // - Parameter checks
 
-/// Checks that `data` is omitted in `Template` mode or provided in `Proposal` mode,
+/// Checks the mode-specific `getblocktemplate` parameters and private Wcash
+/// parent-template extension.
 ///
-/// Returns an error if there's a mismatch between the mode and whether `data` is provided.
-pub fn check_parameters(parameters: &Option<GetBlockTemplateParameters>) -> RpcResult<()> {
+/// Returns an error if there's a mismatch between the mode and whether `data`
+/// is provided, or if `wcashaux` is used outside a fresh Zcash parent-template
+/// request.
+pub fn check_parameters(
+    parameters: &Option<GetBlockTemplateParameters>,
+    net: &Network,
+) -> RpcResult<()> {
     let Some(parameters) = parameters else {
         return Ok(());
     };
+
+    if parameters.wcash_aux.is_some() {
+        if net.uses_wcash_consensus() {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "\"wcashaux\" is only available on a Zcash parent network",
+                None,
+            ));
+        }
+        if parameters.mode != GetBlockTemplateRequestMode::Template {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "\"wcashaux\" is only valid in \"template\" mode",
+                None,
+            ));
+        }
+        if parameters.long_poll_id.is_some() {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "\"wcashaux\" cannot be combined with \"longpollid\"; request a fresh template for each child block",
+                None,
+            ));
+        }
+    }
 
     match parameters {
         GetBlockTemplateParameters {
@@ -936,8 +1096,11 @@ where
 /// `last_seen_tip_hash` from the mempool response doesn't match the tip hash from the state.
 ///
 /// You should call `check_synced_to_tip()` before calling this function.
-/// If the mempool is inactive because Zebra is not synced to the tip, returns no transactions.
+/// Mining-only networks return an exact empty snapshot without querying the mempool. All mempool
+/// service errors are preserved on networks that support non-coinbase transactions.
 pub async fn fetch_mempool_transactions<Mempool>(
+    network: &Network,
+    template_height: block::Height,
     mempool: Mempool,
     chain_tip_hash: block::Hash,
 ) -> RpcResult<Option<(Vec<VerifiedUnminedTx>, TransactionDependencies)>>
@@ -949,6 +1112,15 @@ where
         > + 'static,
     Mempool::Future: Send,
 {
+    // Wcash Testnet is consensus-enforced mining-only until its transaction signature domain is
+    // separated from Zcash. No mempool transaction can be included in a valid block, so avoid
+    // making template availability depend on the sync-gated mempool service. This is deliberately
+    // narrower than `uses_wcash_consensus()`: Wcash Regtest supports transactions and must retain
+    // normal mempool behavior.
+    if network.disables_non_coinbase_transactions(template_height) {
+        return Ok(Some(Default::default()));
+    }
+
     let response = mempool
         .oneshot(mempool::Request::FullTransactions)
         .await

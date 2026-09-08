@@ -518,7 +518,7 @@ async fn rpc_getblock() {
                 ),
                 previous_block_hash: Some(block.header.previous_block_hash),
                 next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
-                solution: Some(block.header.solution),
+                solution: Some(block.header.solution.clone()),
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
@@ -576,7 +576,7 @@ async fn rpc_getblock() {
                 ),
                 previous_block_hash: Some(block.header.previous_block_hash),
                 next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
-                solution: Some(block.header.solution),
+                solution: Some(block.header.solution.clone()),
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
@@ -653,7 +653,7 @@ async fn rpc_getblock() {
             );
             assert_eq!(previous_block_hash, &Some(block.header.previous_block_hash));
             assert_eq!(next_block_hash, &blocks.get(i + 1).map(|b| b.hash()));
-            assert_eq!(solution, &Some(block.header.solution));
+            assert_eq!(solution, &Some(block.header.solution.clone()));
             assert_eq!(
                 *chain_supply,
                 block_info
@@ -753,7 +753,7 @@ async fn rpc_getblock() {
             );
             assert_eq!(previous_block_hash, &Some(block.header.previous_block_hash));
             assert_eq!(next_block_hash, &blocks.get(i + 1).map(|b| b.hash()));
-            assert_eq!(solution, &Some(block.header.solution));
+            assert_eq!(solution, &Some(block.header.solution.clone()));
             assert_eq!(
                 *chain_supply,
                 block_info
@@ -833,7 +833,7 @@ async fn rpc_getblock() {
                 ),
                 previous_block_hash: Some(block.header.previous_block_hash),
                 next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
-                solution: Some(block.header.solution),
+                solution: Some(block.header.solution.clone()),
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
@@ -890,7 +890,7 @@ async fn rpc_getblock() {
                 ),
                 previous_block_hash: Some(block.header.previous_block_hash),
                 next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
-                solution: Some(block.header.solution),
+                solution: Some(block.header.solution.clone()),
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
@@ -1220,7 +1220,7 @@ async fn rpc_getblockheader() {
             sapling_tree_size: sapling_tree.count(),
             time: block.header.time.timestamp(),
             nonce: expected_nonce,
-            solution: block.header.solution,
+            solution: block.header.solution.clone(),
             bits: block.header.difficulty_threshold,
             difficulty: block
                 .header
@@ -2469,7 +2469,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
     mock_sync_status.set_is_close_to_tip(true);
 
     let mining_conf = crate::config::mining::Config {
-        miner_address: Some(addr.clone()),
+        miner_address: Some(addr.clone().into()),
         extra_coinbase_data: None,
         miner_memo: None,
         internal_miner: true,
@@ -3364,6 +3364,130 @@ async fn rpc_z_listunifiedreceivers() {
     assert_eq!(*response.p2sh(), None);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_z_listunifiedreceivers_uses_wcash_namespace() {
+    let _init_guard = zebra_test::init();
+
+    for (network, ua_prefix, sapling_prefix, p2pkh_prefix, p2sh_prefix) in [
+        (
+            zebra_chain::parameters::Network::new_wcash_testnet(),
+            "wutest1",
+            "wtestsapling1",
+            "WT",
+            "WU",
+        ),
+        (
+            zebra_chain::parameters::Network::new_wcash_regtest(),
+            concat!("w", "u", "regtest", "1"),
+            "wregtestsapling1",
+            "WR",
+            "WS",
+        ),
+    ] {
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (rpc, _) = RpcImpl::new(
+            network.clone(),
+            Default::default(),
+            Default::default(),
+            "0.0.1",
+            "RPC test",
+            MockService::build().for_unit_tests(),
+            MockService::build().for_unit_tests(),
+            MockService::build().for_unit_tests(),
+            MockService::build().for_unit_tests(),
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            None,
+        );
+
+        let wcash_address =
+            mining::default_miner_address_for_network(&network, &mining::MinerAddressType::Unified);
+        assert!(wcash_address.starts_with(ua_prefix));
+
+        let response = rpc
+            .z_list_unified_receivers(wcash_address)
+            .await
+            .expect("the Wcash Unified Address is accepted on its matching network");
+
+        assert!(response
+            .orchard()
+            .as_deref()
+            .is_some_and(|address| address.starts_with(ua_prefix)));
+        if let Some(address) = response.sapling() {
+            assert!(address.starts_with(sapling_prefix));
+        }
+        if let Some(address) = response.p2pkh() {
+            assert!(address.starts_with(p2pkh_prefix));
+        }
+        if let Some(address) = response.p2sh() {
+            assert!(address.starts_with(p2sh_prefix));
+        }
+
+        let inherited_zcash_address =
+            mining::default_miner_address(network.kind(), &mining::MinerAddressType::Unified);
+        assert!(rpc
+            .z_list_unified_receivers(inherited_zcash_address.to_owned())
+            .await
+            .is_err());
+
+        let other_wcash_network = if network.is_wcash_testnet() {
+            zebra_chain::parameters::Network::new_wcash_regtest()
+        } else {
+            zebra_chain::parameters::Network::new_wcash_testnet()
+        };
+        let other_wcash_address = mining::default_miner_address_for_network(
+            &other_wcash_network,
+            &mining::MinerAddressType::Unified,
+        );
+        assert!(rpc
+            .z_list_unified_receivers(other_wcash_address)
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_retains_invalid_miner_configuration_error() {
+    let _init_guard = zebra_test::init();
+
+    let inherited_zcash_address =
+        mining::default_miner_address(NetworkKind::Regtest, &mining::MinerAddressType::Unified);
+    let mining_config = mining::Config {
+        miner_address: Some(
+            inherited_zcash_address
+                .parse()
+                .expect("the inherited Zcash miner-address fixture is valid"),
+        ),
+        ..Default::default()
+    };
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _) = RpcImpl::new(
+        zebra_chain::parameters::Network::new_wcash_regtest(),
+        mining_config,
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    assert!(matches!(
+        rpc.gbt
+            .miner_params()
+            .expect_err("wrong-namespace miner configuration must remain an error"),
+        crate::MinerParamsError::WcashAddressNamespaceRequired
+    ));
+}
+
 /// Check that `z_listunifiedreceivers` returns an RPC error (instead of panicking and
 /// aborting `zebrad`) when given a unified address whose Sapling receiver has a valid
 /// length and typecode but a non-canonical Jubjub `pk_d`.
@@ -3425,6 +3549,100 @@ async fn rpc_z_listunifiedreceivers_rejects_bad_sapling_receiver() {
         result.is_err(),
         "z_listunifiedreceivers must return an error for a malformed Sapling receiver, \
          got {result:?}",
+    );
+
+    let wcash_encoded =
+        zebra_chain::primitives::WcashAddress::from_unified(NetworkType::Regtest, unified.clone())
+            .encode();
+    let wcash_network = zebra_chain::parameters::Network::new_wcash_regtest();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (wcash_rpc, _) = RpcImpl::new(
+        wcash_network,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let wcash_result = wcash_rpc.z_list_unified_receivers(wcash_encoded).await;
+    assert!(
+        wcash_result.is_err(),
+        "z_listunifiedreceivers must reject a malformed Wcash Sapling receiver, \
+         got {wcash_result:?}",
+    );
+}
+
+/// Unified Address decoding validates an Orchard receiver's typecode and length,
+/// but semantic validation of its Pallas point is the consumer's responsibility.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_z_listunifiedreceivers_rejects_bad_orchard_receiver() {
+    use zcash_address::unified::{Address as UnifiedAddress, Encoding, Receiver};
+
+    let _init_guard = zebra_test::init();
+
+    let bad_orchard = [0xff; 43];
+    let unified = UnifiedAddress::try_from_items(vec![Receiver::Orchard(bad_orchard)])
+        .expect("unified container construction does not validate receiver contents");
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+    let zcash_result = rpc
+        .z_list_unified_receivers(unified.encode(&NetworkType::Main))
+        .await;
+    assert!(
+        zcash_result.is_err(),
+        "z_listunifiedreceivers must reject a malformed Zcash Orchard receiver, \
+         got {zcash_result:?}",
+    );
+
+    let wcash_encoded =
+        zebra_chain::primitives::WcashAddress::from_unified(NetworkType::Regtest, unified).encode();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (wcash_rpc, _) = RpcImpl::new(
+        zebra_chain::parameters::Network::new_wcash_regtest(),
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+    let wcash_result = wcash_rpc.z_list_unified_receivers(wcash_encoded).await;
+    assert!(
+        wcash_result.is_err(),
+        "z_listunifiedreceivers must reject a malformed Wcash Orchard receiver, \
+         got {wcash_result:?}",
     );
 }
 

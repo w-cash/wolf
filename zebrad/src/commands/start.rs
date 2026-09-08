@@ -92,9 +92,19 @@ use tokio::{
 use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
 
-use zebra_chain::block::genesis::regtest_genesis_block;
+use zebra_chain::{
+    block::{
+        genesis::{
+            regtest_genesis_block, wcash_regtest_genesis_block, wcash_testnet_genesis_block,
+        },
+        Block,
+    },
+    parameters::Network,
+};
 use zebra_consensus::router::BackgroundTaskHandles;
-use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
+use zebra_rpc::{
+    methods::RpcImpl, server::RpcServer, MinerParams, MinerParamsError, SubmitBlockChannel,
+};
 
 use crate::{
     application::{build_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
@@ -118,7 +128,7 @@ use crate::components;
 #[derive(Command, Debug, Default, clap::Parser)]
 pub struct StartCmd {
     /// Filter strings which override the config file and defaults
-    #[clap(help = "tracing filters which override the zebrad.toml config")]
+    #[clap(help = "tracing filters which override the node TOML configuration")]
     filters: Vec<String>,
 
     /// Enable zcashd-compat mode.
@@ -128,6 +138,23 @@ pub struct StartCmd {
     /// Continue startup even when zcashd-compat preflight detects minimum hardware shortfalls.
     #[clap(long = "unsafe-low-specs")]
     unsafe_low_specs: bool,
+}
+
+/// Returns a trusted built-in genesis block that can be committed without a peer.
+///
+/// Public Zcash networks retain their normal sync bootstrap. Wcash has no
+/// project-owned seeds at launch, so both built-in Wcash networks must seed the
+/// exact genesis selected by their consensus parameters before peer sync starts.
+fn locally_seeded_genesis_block(network: &Network) -> Option<Arc<Block>> {
+    if network.is_wcash_testnet() {
+        Some(wcash_testnet_genesis_block())
+    } else if network.is_wcash_regtest() {
+        Some(wcash_regtest_genesis_block())
+    } else if network.is_regtest() {
+        Some(regtest_genesis_block())
+    } else {
+        None
+    }
 }
 
 /// Warns if Linux TCP slow-start-after-idle is enabled, which significantly
@@ -660,36 +687,40 @@ impl StartCmd {
         );
 
         info!("spawning syncer task");
-        // In regtest, commit the genesis block directly (bypassing the syncer's genesis
-        // download, which requires a connected peer). Then run the syncer normally so
-        // that multi-hop block propagation works: gossiped blocks that arrive out of
-        // order (e.g. only the latest tip hash was gossiped) will be recovered by the
-        // syncer using block locators within REGTEST_SYNC_RESTART_DELAY (2 seconds).
-        if is_regtest
-            && !syncer
+        // Commit trusted built-in genesis blocks directly when their networks
+        // cannot rely on a seed peer for the initial download. Then run the
+        // syncer normally so later gossiped blocks and locator recovery work.
+        // Public Zcash networks retain their existing peer-sync bootstrap.
+        if let Some(genesis_block) = locally_seeded_genesis_block(&config.network.network) {
+            if !syncer
                 .state_contains(config.network.network.genesis_hash())
                 .await?
-        {
-            let genesis_hash = block_verifier_router
-                .clone()
-                .oneshot(zebra_consensus::Request::Commit(regtest_genesis_block()))
-                .await
-                .expect("should validate Regtest genesis block");
+            {
+                let genesis_hash = block_verifier_router
+                    .clone()
+                    .oneshot(zebra_consensus::Request::Commit(genesis_block))
+                    .await
+                    .expect("should validate the trusted built-in genesis block");
 
-            assert_eq!(
-                genesis_hash,
-                config.network.network.genesis_hash(),
-                "validated block hash should match network genesis hash"
-            )
+                assert_eq!(
+                    genesis_hash,
+                    config.network.network.genesis_hash(),
+                    "validated block hash should match network genesis hash"
+                )
+            }
         }
         let syncer_task_handle = tokio::spawn(syncer.sync().in_current_span());
 
-        // And finally, spawn the internal Zcash miner, if it is enabled.
+        // And finally, spawn the internal miner, if it is enabled.
         //
         // TODO: add a config to enable the miner rather than a feature.
         #[cfg(feature = "internal-miner")]
         let miner_task_handle = if config.mining.is_internal_miner_enabled() {
-            info!("spawning Zcash miner");
+            if config.network.network.uses_wcash_consensus() {
+                info!("spawning Wcash AuxPoW miner");
+            } else {
+                info!("spawning Zcash miner");
+            }
             components::miner::spawn_init(&config.metrics, rpc_impl)
         } else {
             tokio::spawn(std::future::pending().in_current_span())
@@ -934,7 +965,11 @@ impl StartCmd {
 impl Runnable for StartCmd {
     /// Start the application.
     fn run(&self) {
-        info!("Starting zebrad");
+        if cfg!(feature = "wcash-consensus") {
+            info!("Starting Wcash");
+        } else {
+            info!("Starting zebrad");
+        }
         let rt = APPLICATION
             .state()
             .components_mut()
@@ -946,7 +981,11 @@ impl Runnable for StartCmd {
         rt.expect("runtime should not already be taken")
             .run(self.start());
 
-        info!("stopping zebrad");
+        if cfg!(feature = "wcash-consensus") {
+            info!("stopping Wcash");
+        } else {
+            info!("stopping zebrad");
+        }
     }
 }
 
@@ -955,6 +994,31 @@ impl config::Override<ZebradConfig> for StartCmd {
     // a configuration file using explicit flags taken from command-line
     // arguments.
     fn override_config(&self, mut config: ZebradConfig) -> Result<ZebradConfig, FrameworkError> {
+        #[cfg(feature = "wcash-consensus")]
+        if !config.network.network.uses_wcash_consensus() {
+            return Err(std::io::Error::other(
+                "this Wcash consensus build only supports network = 'WcashTestnet' or 'WcashRegtest'; inherited Zcash networks use different monetary bounds",
+            )
+            .into());
+        }
+
+        #[cfg(not(feature = "wcash-consensus"))]
+        if config.network.network.uses_wcash_consensus() {
+            return Err(std::io::Error::other(
+                "this Zcash consensus build does not support Wcash networks; rebuild with --features wcash-consensus",
+            )
+            .into());
+        }
+
+        match MinerParams::new(&config.network.network, config.mining.clone()) {
+            Ok(_) | Err(MinerParamsError::MissingAddr) => {}
+            Err(error) => {
+                return Err(
+                    std::io::Error::other(format!("invalid mining configuration: {error}")).into(),
+                )
+            }
+        }
+
         if !self.filters.is_empty() {
             config.tracing.filter = Some(self.filters.join(","));
         }
@@ -1003,9 +1067,152 @@ mod tests {
     use abscissa_core::config::Override;
     use color_eyre::eyre::eyre;
 
-    use super::StartCmd;
+    use super::{locally_seeded_genesis_block, StartCmd};
     use crate::components::zcashd_compat;
     use crate::config::ZebradConfig;
+
+    #[cfg(feature = "wcash-consensus")]
+    #[test]
+    fn start_rejects_inherited_zcash_networks() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.network.network = zebra_chain::parameters::Network::Mainnet;
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("the Wcash binary must not run with widened values on Zcash mainnet");
+
+        assert!(error.to_string().contains("only supports network"));
+    }
+
+    #[cfg(not(feature = "wcash-consensus"))]
+    #[test]
+    fn start_rejects_wcash_networks() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        for network in [
+            zebra_chain::parameters::Network::new_wcash_testnet(),
+            zebra_chain::parameters::Network::new_wcash_regtest(),
+        ] {
+            let mut config = ZebradConfig::default();
+            config.network.network = network;
+
+            let error = cmd
+                .override_config(config)
+                .expect_err("the Zcash binary must not use Wcash monetary bounds");
+
+            assert!(error
+                .to_string()
+                .contains("does not support Wcash networks"));
+        }
+    }
+
+    #[test]
+    fn local_genesis_bootstrap_selects_exact_built_in_chain() {
+        let wcash_testnet = zebra_chain::parameters::Network::new_wcash_testnet();
+        let wcash_regtest = zebra_chain::parameters::Network::new_wcash_regtest();
+        let zcash_regtest = zebra_chain::parameters::Network::new_regtest(Default::default());
+
+        for network in [&wcash_testnet, &wcash_regtest, &zcash_regtest] {
+            let block = locally_seeded_genesis_block(network)
+                .expect("built-in local-bootstrap networks have a trusted genesis");
+            assert_eq!(block.hash(), network.genesis_hash());
+        }
+
+        assert_ne!(wcash_testnet.genesis_hash(), wcash_regtest.genesis_hash());
+        assert!(locally_seeded_genesis_block(&zebra_chain::parameters::Network::Mainnet).is_none());
+        assert!(locally_seeded_genesis_block(
+            &zebra_chain::parameters::Network::new_default_testnet()
+        )
+        .is_none());
+    }
+
+    #[cfg(feature = "wcash-consensus")]
+    #[test]
+    fn start_accepts_both_built_in_wcash_networks() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+
+        for network in [
+            zebra_chain::parameters::Network::new_wcash_testnet(),
+            zebra_chain::parameters::Network::new_wcash_regtest(),
+        ] {
+            let mut config = ZebradConfig::default();
+            config.network.network = network.clone();
+            let configured = cmd
+                .override_config(config)
+                .expect("the Wcash binary supports both built-in Wcash networks");
+            assert_eq!(configured.network.network, network);
+        }
+    }
+
+    #[test]
+    fn start_accepts_default_network_for_selected_consensus() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+
+        let config = cmd
+            .override_config(ZebradConfig::default())
+            .expect("the default network must match the selected consensus build");
+
+        assert_eq!(
+            config.network.network.uses_wcash_consensus(),
+            cfg!(feature = "wcash-consensus")
+        );
+
+        #[cfg(not(feature = "wcash-consensus"))]
+        assert_eq!(
+            zebra_chain::amount::MAX_MONEY,
+            21_000_000 * zebra_chain::amount::COIN
+        );
+
+        #[cfg(feature = "wcash-consensus")]
+        assert_eq!(zebra_chain::amount::MAX_MONEY, 3_359_999_978_160_000);
+    }
+
+    #[cfg(feature = "wcash-consensus")]
+    #[test]
+    fn start_rejects_zcash_miner_address_on_wcash() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        let zcash_address = zebra_rpc::config::mining::default_miner_address(
+            zebra_chain::parameters::NetworkKind::Regtest,
+            &zebra_rpc::config::mining::MinerAddressType::Unified,
+        );
+        config.mining.miner_address = Some(
+            zcash_address
+                .parse()
+                .expect("the inherited Zcash miner-address fixture is valid"),
+        );
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("Wcash startup must reject a Zcash miner-address namespace");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Wcash mining requires a Wcash address"),
+            "startup should explain the miner-address namespace mismatch: {error}"
+        );
+    }
 
     #[test]
     fn zcashd_compat_flag_enables_mode() {
