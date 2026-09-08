@@ -82,7 +82,7 @@ internal-miner = [
     "zebra-rpc/internal-miner",
 ]
 
-# Build a Wcash-only node with Wcash network defaults and monetary bounds.
+# Build a Wcash-only node with Wcash network defaults and consensus behavior.
 wcash-consensus = [
     "zebra-chain/wcash-consensus",
     "zebra-consensus/wcash-consensus",

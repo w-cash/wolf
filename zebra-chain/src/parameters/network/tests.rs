@@ -228,9 +228,9 @@ fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
     let five = Amount::<NonNegative>::try_from(WCASH_INITIAL_BLOCK_SUBSIDY / 2)?;
     assert_eq!(block_subsidy(Height::MIN, &network)?, zero);
     assert_eq!(block_subsidy(Height(1), &network)?, ten);
-    assert_eq!(block_subsidy(Height(1_680_000), &network)?, ten);
+    assert_eq!(block_subsidy(Height(1_050_000), &network)?, ten);
     assert_eq!(block_subsidy(WCASH_FIRST_HALVING_HEIGHT, &network)?, five);
-    assert_eq!(halving(Height(1_680_000), &network), 0);
+    assert_eq!(halving(Height(1_050_000), &network), 0);
     assert_eq!(halving(WCASH_FIRST_HALVING_HEIGHT, &network), 1);
     assert_eq!(
         height_for_halving(1, &network),
@@ -250,36 +250,29 @@ fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
     assert!(funding_stream_values(Height(1), &network, ten)?.is_empty());
 
     // Integer truncation leaves 1,999,999,987 zatoshi of per-block subsidy across all eras.
-    // Each era contains exactly 1,680,000 blocks, so the scheduled total is
-    // 33,599,999.78160000 WCASH (3,359,999,978,160,000 zatoshi).
+    // Each era contains exactly 1,050,000 blocks, so the scheduled total is
+    // 20,999,999.86350000 WCASH (2,099,999,986,350,000 zatoshi). Integer-zatoshi
+    // truncation leaves the schedule 0.1365 WCASH below the 21 million hard cap.
     let per_block_era_sum: u64 = (0..64)
         .map(|era| WCASH_INITIAL_BLOCK_SUBSIDY.checked_shr(era).unwrap_or(0))
         .sum();
     assert_eq!(per_block_era_sum, 1_999_999_987);
     let scheduled_supply = per_block_era_sum * (WCASH_HALVING_INTERVAL as u64);
-    assert_eq!(scheduled_supply, 3_359_999_978_160_000);
-
-    #[cfg(feature = "wcash-consensus")]
-    {
-        assert_eq!(
-            MAX_MONEY,
-            i64::try_from(scheduled_supply).expect("the scheduled Wcash supply fits in i64")
-        );
-        assert!(Amount::<NonNegative>::try_from(MAX_MONEY).is_ok());
-        assert!(Amount::<NonNegative>::try_from(MAX_MONEY + 1).is_err());
-    }
-
-    #[cfg(not(feature = "wcash-consensus"))]
-    {
-        assert_eq!(MAX_MONEY, 21_000_000 * crate::amount::COIN);
-        assert!(scheduled_supply > u64::try_from(MAX_MONEY).expect("MAX_MONEY is positive"));
-        assert!(Amount::<NonNegative>::try_from(
-            i64::try_from(scheduled_supply).expect("the scheduled Wcash supply fits in i64")
-        )
-        .is_err());
-    }
-    assert_eq!(block_subsidy(Height(50_400_000), &network)?.zatoshis(), 1);
-    assert_eq!(block_subsidy(Height(50_400_001), &network)?, zero);
+    assert_eq!(scheduled_supply, 2_099_999_986_350_000);
+    assert_eq!(MAX_MONEY, 21_000_000 * crate::amount::COIN);
+    assert_eq!(
+        u64::try_from(MAX_MONEY).expect("MAX_MONEY is positive") - scheduled_supply,
+        13_650_000
+    );
+    assert!(
+        per_block_era_sum * (u64::try_from(WCASH_HALVING_INTERVAL).unwrap() + 1)
+            > u64::try_from(MAX_MONEY).expect("MAX_MONEY is positive"),
+        "increasing the halving interval by one block must exceed the hard cap"
+    );
+    assert!(Amount::<NonNegative>::try_from(MAX_MONEY).is_ok());
+    assert!(Amount::<NonNegative>::try_from(MAX_MONEY + 1).is_err());
+    assert_eq!(block_subsidy(Height(31_500_000), &network)?.zatoshis(), 1);
+    assert_eq!(block_subsidy(Height(31_500_001), &network)?, zero);
 
     for zcash_network in [
         Network::Mainnet,

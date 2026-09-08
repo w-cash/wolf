@@ -467,10 +467,9 @@ pub fn miner_fees_are_valid(
     .map_err(|_| SubsidyError::Overflow)?;
 
     if network.uses_wcash_consensus() && height > Height::MIN {
-        // Ironwood's inherited `ZatBalance` representation limits one transaction to the Zcash
-        // monetary base, even though Wcash's aggregate monetary base is larger. Make that
-        // interoperability limit an explicit consensus rule rather than relying on a later
-        // conversion failure in the proof verifier.
+        // Ironwood's inherited `ZatBalance` representation limits one transaction to the
+        // 21-million-coin monetary base. Make that limit an explicit consensus rule rather than
+        // relying on a later conversion failure in the proof verifier.
         let raw_total_input = expected_block_subsidy
             .zatoshis()
             .checked_add(block_miner_fees.zatoshis())

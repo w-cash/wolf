@@ -20,7 +20,7 @@ Bitcoin block:       965900
 Bitcoin block hash:  0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851
 Anchor audit height: 966011 (112 confirmations counting the anchor)
 Wcash genesis hash:  78b292284bc7b03c6a16b62e29a3ab2015c40d6414cbc27ddcee878225600f10
-P2P magic:           69c75fba
+P2P magic:           f2dfe29f
 P2P port:            38233
 Suggested RPC port:  38232 (loopback only)
 ```

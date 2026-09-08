@@ -14,7 +14,7 @@ fn max_money_matches_selected_consensus() {
     assert_eq!(MAX_MONEY, 21_000_000 * COIN);
 
     #[cfg(feature = "wcash-consensus")]
-    assert_eq!(MAX_MONEY, 3_359_999_978_160_000);
+    assert_eq!(MAX_MONEY, 21_000_000 * COIN);
 
     assert_eq!(MAX_SINGLE_TRANSACTION_VALUE, 21_000_000 * COIN);
 }

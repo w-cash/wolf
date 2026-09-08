@@ -16,7 +16,7 @@ Public Testnet freezes Bitcoin mainnet block 965,900, hash
 The release vector records Bitcoin height 966,011, or 112 confirmations counting
 the anchor block. Its complete Wcash genesis block ID is
 `78b292284bc7b03c6a16b62e29a3ab2015c40d6414cbc27ddcee878225600f10`.
-Its P2P magic is `69c75fba`; its default P2P and recommended loopback RPC
+Its P2P magic is `f2dfe29f`; its default P2P and recommended loopback RPC
 ports are 38233 and 38232. It never inherits Zcash's DNS seeds.
 
 The designated mainnet reference is Bitcoin height 965,954, but that anchor is
@@ -54,30 +54,27 @@ vectors, followed by a network reset or explicit consensus upgrade.
 
 ## Monetary policy
 
-Genesis at height 0 has no subsidy. Heights 1 through 1,680,000 inclusive each
-create 10 WCASH. The first halved block is height 1,680,001, and every later era
-contains exactly 1,680,000 blocks. Subsidies are integer zatoshi values and each
-era uses a right shift, so fractional zatoshi are discarded.
+Genesis at height 0 has no subsidy. Heights 1 through 1,050,000 inclusive each
+create 10 WCASH. The first halved block is height 1,050,001, and every later era
+contains exactly 1,050,000 blocks. At the 75-second target, each era is about
+2.5 years. Subsidies are integer zatoshi values and each era uses a right shift,
+so fractional zatoshi are discarded.
 
 The inherited genesis transaction contains one zero-valued transparent output.
 It creates no spendable coins, and the chain supply at height 0 is exactly zero.
 
-The last non-zero subsidy is 1 zatoshi at height 50,400,000. Subsidy is zero
-from height 50,400,001 onward. Summing every era gives exactly:
+The last non-zero subsidy is 1 zatoshi at height 31,500,000. Subsidy is zero
+from height 31,500,001 onward. Summing every era gives exactly:
 
 ```text
-3,359,999,978,160,000 zatoshi
-= 33,599,999.78160000 WCASH
+2,099,999,986,350,000 zatoshi
+= 20,999,999.86350000 WCASH
 ```
 
-This is scheduled issuance, not a rounded 33.6 million estimate. Transaction
-fees are transfers of existing value and do not increase supply.
-
-The inherited Ironwood transaction value type can represent at most 21 million
-coins in a single transaction. Wcash therefore makes the same 21-million-coin
-limit explicit for one block's subsidy-plus-fees, while aggregate chain value
-uses the larger exact Wcash supply bound. Normal 10-WCASH rewards are nowhere
-near this defensive per-block interoperability limit.
+Wcash enforces a 21,000,000-WCASH monetary-base hard cap
+(2,100,000,000,000,000 zatoshi). Integer-zatoshi halving truncation makes exact
+scheduled subsidy issuance 0.13650000 WCASH lower than the cap. Transaction fees
+are transfers of existing value and do not increase supply.
 
 Wcash has no slow start, founders reward, funding stream, deferred pool,
 lockbox disbursement, premine, or developer tax. The complete subsidy plus fees
@@ -176,7 +173,8 @@ Header deserialization must select the variable-length Wcash witness before a
 Its high bit is deliberately set, which native Zcash consensus forbids, making
 valid Zcash headers and Wcash headers unambiguous. The node runtime still rejects
 every inherited Zcash network configuration because Wcash uses different
-monetary bounds; those definitions remain only for upstream library tests.
+network and consensus rules; those definitions remain isolated in upstream
+library tests.
 
 Wcash Testnet has a frozen identity for public engineering interoperability.
 It is not a production or value-bearing network: wallet/key derivation,

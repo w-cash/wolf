@@ -997,7 +997,7 @@ impl config::Override<ZebradConfig> for StartCmd {
         #[cfg(feature = "wcash-consensus")]
         if !config.network.network.uses_wcash_consensus() {
             return Err(std::io::Error::other(
-                "this Wcash consensus build only supports network = 'WcashTestnet' or 'WcashRegtest'; inherited Zcash networks use different monetary bounds",
+                "this Wcash consensus build only supports network = 'WcashTestnet' or 'WcashRegtest'; inherited Zcash networks use different consensus rules",
             )
             .into());
         }
@@ -1106,7 +1106,7 @@ mod tests {
 
             let error = cmd
                 .override_config(config)
-                .expect_err("the Zcash binary must not use Wcash monetary bounds");
+                .expect_err("the Zcash binary must not use Wcash consensus rules");
 
             assert!(error
                 .to_string()
@@ -1180,7 +1180,10 @@ mod tests {
         );
 
         #[cfg(feature = "wcash-consensus")]
-        assert_eq!(zebra_chain::amount::MAX_MONEY, 3_359_999_978_160_000);
+        assert_eq!(
+            zebra_chain::amount::MAX_MONEY,
+            21_000_000 * zebra_chain::amount::COIN
+        );
     }
 
     #[cfg(feature = "wcash-consensus")]

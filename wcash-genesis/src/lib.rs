@@ -197,13 +197,13 @@ pub const fn network_identity(network: WcashNetwork) -> NetworkIdentity {
         },
         WcashNetwork::Testnet => NetworkIdentity {
             network,
-            domain_label: "Wcash/testnet/v1",
-            p2p_magic: [0x69, 0xc7, 0x5f, 0xba],
+            domain_label: "Wcash/testnet/v2",
+            p2p_magic: [0xf2, 0xdf, 0xe2, 0x9f],
         },
         WcashNetwork::Regtest => NetworkIdentity {
             network,
-            domain_label: "Wcash/regtest/v2",
-            p2p_magic: [0xd5, 0xe2, 0xfc, 0xae],
+            domain_label: "Wcash/regtest/v3",
+            p2p_magic: [0xfc, 0x4a, 0xb0, 0x99],
         },
     }
 }

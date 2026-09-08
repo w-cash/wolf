@@ -252,9 +252,9 @@ impl Network {
     /// Returns true when this network matches the monetary and consensus profile
     /// selected when `zebra-chain` was compiled.
     ///
-    /// Wcash's aggregate monetary base exceeds Zcash's 21 million coin ceiling,
-    /// so Cargo feature unification must never let one verifier process the
-    /// opposite profile. Complete state and consensus services call
+    /// Wcash uses distinct network and consensus rules, so Cargo feature
+    /// unification must never let one verifier process the opposite profile.
+    /// Complete state and consensus services call
     /// [`Self::assert_compatible_with_compiled_consensus`] during initialization.
     pub fn is_compatible_with_compiled_consensus(&self) -> bool {
         self.uses_wcash_consensus() == cfg!(feature = "wcash-consensus")

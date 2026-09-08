@@ -610,20 +610,19 @@ pub const COIN: i64 = 100_000_000;
 #[cfg(not(feature = "wcash-consensus"))]
 pub const MAX_MONEY: i64 = 21_000_000 * COIN;
 
-/// The exact maximum Wcash monetary base, in zatoshis.
+/// The Wcash monetary-base hard cap, in zatoshis.
 ///
-/// The 10 WCASH subsidy, 1,680,000-block halving interval, and integer-zatoshi
-/// truncation issue exactly 33,599,999.7816 WCASH. Using the exact terminal
-/// supply here ensures chain value-pool accounting has no rounding headroom.
+/// The scheduled subsidy remains below this bound because each halving drops
+/// fractional zatoshi. Consensus also rejects any chain value-pool total above
+/// this limit.
 #[cfg(feature = "wcash-consensus")]
-pub const MAX_MONEY: i64 = 3_359_999_978_160_000;
+pub const MAX_MONEY: i64 = 21_000_000 * COIN;
 
 /// Maximum value supported by the inherited Zcash transaction libraries for a
 /// single transaction.
 ///
 /// `zcash_protocol::value::Zatoshis` and `ZatBalance` limit a single transaction's
-/// value to the Zcash monetary base. Wcash keeps that per-transaction bound even
-/// though its aggregate monetary base is larger.
+/// value to the 21-million-coin monetary base.
 pub const MAX_SINGLE_TRANSACTION_VALUE: i64 = 21_000_000 * COIN;
 
 /// Maximum Wcash coinbase value supported by the inherited Zcash transaction libraries.
