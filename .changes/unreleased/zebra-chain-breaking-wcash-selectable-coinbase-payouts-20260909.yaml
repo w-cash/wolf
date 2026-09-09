@@ -1,4 +1,4 @@
 project: zebra-chain
 kind: breaking
-body: "Revise the pre-launch Wcash coinbase payout primitives and validation errors for exclusive transparent or private Ironwood reward modes."
+body: "Revise the pre-launch Wcash coinbase payout primitives and validation errors for exclusive transparent or private Ironwood reward modes ([#5](https://github.com/w-cash/wolf/pull/5))."
 time: 2026-09-09T00:00:00.000000001Z
