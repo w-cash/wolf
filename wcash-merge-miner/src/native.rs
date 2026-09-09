@@ -960,7 +960,33 @@ impl NativePreparedJob {
         solution: &[u8],
         share_target: Target,
     ) -> Result<ValidatedNativeShare, MinerError> {
-        let header = self.job.parent_header(nonce, solution)?;
+        let header_time: [u8; 4] = self.job.parent_header_input()[100..104]
+            .try_into()
+            .expect("the fixed parent header input contains four time bytes");
+        self.validate_submitted_share(header_time, nonce, solution, share_target)
+    }
+
+    /// Validates one externally submitted share against the exact frozen header time.
+    ///
+    /// The time check happens before Equihash verification. The returned value retains every raw
+    /// proof field needed to derive a stable durable share identity in another crate.
+    pub fn validate_submitted_share(
+        &self,
+        header_time: [u8; 4],
+        nonce: &[u8],
+        solution: &[u8],
+        share_target: Target,
+    ) -> Result<ValidatedNativeShare, MinerError> {
+        if header_time != self.job.parent_header_input()[100..104] {
+            return Err(MinerError::SubmittedTimeMismatch);
+        }
+        let nonce: [u8; 32] = nonce
+            .try_into()
+            .map_err(|_| MinerError::InvalidNonceLength(nonce.len()))?;
+        let solution: [u8; EQUIHASH_SOLUTION_BYTES] = solution
+            .try_into()
+            .map_err(|_| MinerError::InvalidSolutionLength(solution.len()))?;
+        let header = self.job.parent_header(&nonce, &solution)?;
         let work = header.validate_work(share_target)?;
         let hash = work.block_hash();
         let hash_bytes = hash.into_le_bytes();
@@ -969,15 +995,19 @@ impl NativePreparedJob {
             .job
             .required_target()
             .is_met_by_le_hash(hash_bytes)
-            .then(|| self.job.finalize(nonce, solution))
+            .then(|| self.job.finalize(&nonce, &solution))
             .transpose()?;
         let parent_block = self
             .parent_target
             .is_met_by_le_hash(hash_bytes)
-            .then(|| self.solved_parent_block(nonce, solution))
+            .then(|| self.solved_parent_block(&nonce, &solution))
             .transpose()?;
 
         Ok(ValidatedNativeShare {
+            job_id: self.job.job_id_bytes(),
+            header_time,
+            nonce,
+            solution: Box::new(solution),
             parent_block_hash: hash,
             accepted_target: share_target,
             wcash_candidate,
@@ -1010,6 +1040,10 @@ impl NativePreparedJob {
 /// A valid pool share, classified against both independent network targets.
 #[derive(Clone, Debug)]
 pub struct ValidatedNativeShare {
+    job_id: [u8; 32],
+    header_time: [u8; 4],
+    nonce: [u8; 32],
+    solution: Box<[u8; EQUIHASH_SOLUTION_BYTES]>,
     parent_block_hash: ParentBlockHash,
     accepted_target: Target,
     wcash_candidate: Option<SolvedAuxPow>,
@@ -1017,6 +1051,26 @@ pub struct ValidatedNativeShare {
 }
 
 impl ValidatedNativeShare {
+    /// Returns the exact frozen generation that validated this share.
+    pub const fn job_id(&self) -> [u8; 32] {
+        self.job_id
+    }
+
+    /// Returns the exact four little-endian header-time bytes submitted by the miner.
+    pub const fn header_time(&self) -> [u8; 4] {
+        self.header_time
+    }
+
+    /// Returns the exact full Equihash nonce submitted by the miner.
+    pub const fn nonce(&self) -> &[u8; 32] {
+        &self.nonce
+    }
+
+    /// Returns the exact raw Equihash `(200, 9)` solution without its CompactSize prefix.
+    pub const fn solution(&self) -> &[u8; EQUIHASH_SOLUTION_BYTES] {
+        &self.solution
+    }
+
     /// Returns the verified parent header hash.
     pub const fn parent_block_hash(&self) -> ParentBlockHash {
         self.parent_block_hash
@@ -1575,6 +1629,70 @@ mod tests {
             descriptor.wcash_payout_verification(),
             NativeWcashPayoutVerification::ExactTransparentRecipient
         );
+    }
+
+    #[test]
+    fn submitted_time_is_bound_before_equihash_or_length_checks() {
+        let job = PreparedJob::new([0x41; 32], Target::MAX, JobConfig::default())
+            .expect("valid native job fixture");
+        let frozen_time: [u8; 4] = job.parent_header_input()[100..104]
+            .try_into()
+            .expect("fixture header has four time bytes");
+        let mut submitted_time = frozen_time;
+        submitted_time[0] ^= 1;
+        let prepared = NativePreparedJob {
+            job,
+            parent_proposal: zebra_chain::block::genesis::wcash_regtest_genesis_block()
+                .as_ref()
+                .clone(),
+            proposal_bytes: Vec::new(),
+            parent_target: Target::MAX,
+            parent_tip_display: "00".repeat(32),
+            parent_height: 1,
+            parent_reward_zatoshis: 0,
+        };
+
+        assert!(matches!(
+            prepared.validate_submitted_share(submitted_time, &[], &[], Target::MAX),
+            Err(MinerError::SubmittedTimeMismatch)
+        ));
+    }
+
+    #[test]
+    fn validated_share_preserves_exact_submitted_proof_fields() {
+        let job = PreparedJob::new([0x51; 32], Target::MAX, JobConfig::default())
+            .expect("valid native job fixture");
+        let mut nonce = [0u8; 32];
+        for (index, byte) in nonce.iter_mut().enumerate() {
+            *byte = u8::try_from(index).expect("nonce index fits in one byte");
+        }
+        let mut solution = [0u8; EQUIHASH_SOLUTION_BYTES];
+        for (index, byte) in solution.iter_mut().enumerate() {
+            *byte = u8::try_from(index % 251).expect("solution residue fits in one byte");
+        }
+        let header_time: [u8; 4] = job.parent_header_input()[100..104]
+            .try_into()
+            .expect("fixture header has four time bytes");
+        let parent_block_hash = job
+            .parent_header(&nonce, &solution)
+            .expect("proof field lengths are canonical")
+            .block_hash();
+        let share = ValidatedNativeShare {
+            job_id: job.job_id_bytes(),
+            header_time,
+            nonce,
+            solution: Box::new(solution),
+            parent_block_hash,
+            accepted_target: Target::MAX,
+            wcash_candidate: None,
+            parent_block: None,
+        };
+
+        assert_eq!(share.job_id(), job.job_id_bytes());
+        assert_eq!(share.header_time(), header_time);
+        assert_eq!(share.nonce(), &nonce);
+        assert_eq!(share.solution(), &solution);
+        assert_eq!(share.accepted_target(), Target::MAX);
     }
 
     #[test]

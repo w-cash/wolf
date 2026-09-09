@@ -84,6 +84,10 @@ pub enum MinerError {
     #[error("Equihash solution is {0} bytes, expected 1344")]
     InvalidSolutionLength(usize),
 
+    /// A submitted header time is not the exact frozen job time.
+    #[error("submitted header time differs from the frozen native job")]
+    SubmittedTimeMismatch,
+
     /// The bounded solver search ended without acceptable work.
     #[error("no target-valid Equihash solution found in {attempted} nonce runs")]
     SolverExhausted {
