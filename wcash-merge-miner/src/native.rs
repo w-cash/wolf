@@ -34,6 +34,7 @@ use zebra_chain::{
 use crate::{
     rpc::{RpcEndpoint, ZebraRpcClient, DEFAULT_RPC_TIMEOUT},
     MinerError, PreparedJob, SolvedAuxPow, EQUIHASH_SOLUTION_BYTES,
+    NATIVE_COINBASE_MATURITY_CONFIRMATIONS, NATIVE_JOB_MAX_AGE_MILLISECONDS,
 };
 
 const HEADER_INPUT_BYTES: usize = 108;
@@ -513,6 +514,173 @@ pub struct NativePreparedJob {
     parent_target: Target,
     parent_tip_display: String,
     parent_height: u32,
+    parent_reward_zatoshis: u64,
+}
+
+/// Strength of the Wcash coinbase-recipient check performed for one generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeWcashPayoutVerification {
+    /// Every positive output was matched to the configured transparent recipient.
+    ExactTransparentRecipient,
+    /// The coinbase creates no value, so there is no recipient to authenticate.
+    NoReward,
+    /// The encrypted value and privacy shape were checked, but the recipient is trusted to the
+    /// private loopback template node because a payment address cannot decrypt its ciphertext.
+    TrustedPrivateTemplateNode,
+}
+
+/// Exact proposal-validated metadata for one native merged-mining generation.
+///
+/// Hashes and transaction IDs use their raw consensus byte order. Targets use
+/// little-endian numeric byte order. This type deliberately contains no pool
+/// protocol types so node and pool releases can remain independently versioned.
+/// Consumers must inspect [`Self::wcash_payout_verification`] before treating
+/// the Wcash value as authenticated to the configured recipient.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeGenerationDescriptor {
+    job_id: [u8; 32],
+    wcash_candidate_hash_le: [u8; 32],
+    parent_header_input: [u8; HEADER_INPUT_BYTES],
+    wcash_previous_hash_le: [u8; 32],
+    zcash_previous_hash_le: [u8; 32],
+    wcash_coinbase_txid_le: [u8; 32],
+    zcash_coinbase_txid_le: [u8; 32],
+    wcash_target_le: [u8; 32],
+    zcash_target_le: [u8; 32],
+    wcash_height: u32,
+    zcash_height: u32,
+    wcash_reward_zatoshis: u64,
+    zcash_reward_zatoshis: u64,
+    wcash_maturity_confirmations: u32,
+    zcash_maturity_confirmations: u32,
+    max_age_milliseconds: u32,
+    wcash_payout_verification: NativeWcashPayoutVerification,
+}
+
+impl NativeGenerationDescriptor {
+    #[allow(clippy::too_many_arguments)]
+    fn from_validated_parts(
+        parent_job: &PreparedJob,
+        parent_target: Target,
+        parent_height: u32,
+        parent_reward_zatoshis: u64,
+        wcash_previous_hash_le: [u8; 32],
+        wcash_coinbase_txid_le: [u8; 32],
+        wcash_height: u32,
+        wcash_reward_zatoshis: u64,
+        wcash_payout_verification: NativeWcashPayoutVerification,
+    ) -> Self {
+        let mut zcash_previous_hash_le = [0; 32];
+        zcash_previous_hash_le.copy_from_slice(&parent_job.parent_header_input()[4..36]);
+
+        Self {
+            job_id: parent_job.job_id_bytes(),
+            wcash_candidate_hash_le: parent_job.child_block_hash(),
+            parent_header_input: *parent_job.parent_header_input(),
+            wcash_previous_hash_le,
+            zcash_previous_hash_le,
+            wcash_coinbase_txid_le,
+            zcash_coinbase_txid_le: parent_job.coinbase_transaction_id(),
+            wcash_target_le: parent_job.required_target().to_le_bytes(),
+            zcash_target_le: parent_target.to_le_bytes(),
+            wcash_height,
+            zcash_height: parent_height,
+            wcash_reward_zatoshis,
+            zcash_reward_zatoshis: parent_reward_zatoshis,
+            wcash_maturity_confirmations: NATIVE_COINBASE_MATURITY_CONFIRMATIONS,
+            zcash_maturity_confirmations: NATIVE_COINBASE_MATURITY_CONFIRMATIONS,
+            max_age_milliseconds: NATIVE_JOB_MAX_AGE_MILLISECONDS,
+            wcash_payout_verification,
+        }
+    }
+
+    /// Returns the exact binary generation identifier.
+    pub const fn job_id(&self) -> [u8; 32] {
+        self.job_id
+    }
+
+    /// Returns the proof-independent Wcash candidate hash in raw byte order.
+    pub const fn wcash_candidate_hash_le(&self) -> [u8; 32] {
+        self.wcash_candidate_hash_le
+    }
+
+    /// Returns parent header bytes from version through compact difficulty.
+    pub const fn parent_header_input(&self) -> &[u8; HEADER_INPUT_BYTES] {
+        &self.parent_header_input
+    }
+
+    /// Returns the Wcash predecessor hash in raw byte order.
+    pub const fn wcash_previous_hash_le(&self) -> [u8; 32] {
+        self.wcash_previous_hash_le
+    }
+
+    /// Returns the Zcash predecessor hash in raw byte order.
+    pub const fn zcash_previous_hash_le(&self) -> [u8; 32] {
+        self.zcash_previous_hash_le
+    }
+
+    /// Returns the Wcash coinbase transaction ID in raw byte order.
+    pub const fn wcash_coinbase_txid_le(&self) -> [u8; 32] {
+        self.wcash_coinbase_txid_le
+    }
+
+    /// Returns the Zcash coinbase transaction ID in raw byte order.
+    pub const fn zcash_coinbase_txid_le(&self) -> [u8; 32] {
+        self.zcash_coinbase_txid_le
+    }
+
+    /// Returns the Wcash network target in little-endian numeric byte order.
+    pub const fn wcash_target_le(&self) -> [u8; 32] {
+        self.wcash_target_le
+    }
+
+    /// Returns the Zcash network target in little-endian numeric byte order.
+    pub const fn zcash_target_le(&self) -> [u8; 32] {
+        self.zcash_target_le
+    }
+
+    /// Returns the candidate Wcash height.
+    pub const fn wcash_height(&self) -> u32 {
+        self.wcash_height
+    }
+
+    /// Returns the candidate Zcash height.
+    pub const fn zcash_height(&self) -> u32 {
+        self.zcash_height
+    }
+
+    /// Returns the validated total Wcash coinbase value in zatoshis.
+    ///
+    /// This value is recipient-authenticated only when indicated by
+    /// [`Self::wcash_payout_verification`].
+    pub const fn wcash_reward_zatoshis(&self) -> u64 {
+        self.wcash_reward_zatoshis
+    }
+
+    /// Returns the validated Zcash payout value in zatoshis.
+    pub const fn zcash_reward_zatoshis(&self) -> u64 {
+        self.zcash_reward_zatoshis
+    }
+
+    /// Returns the required Wcash coinbase maturity depth.
+    pub const fn wcash_maturity_confirmations(&self) -> u32 {
+        self.wcash_maturity_confirmations
+    }
+
+    /// Returns the required Zcash coinbase maturity depth.
+    pub const fn zcash_maturity_confirmations(&self) -> u32 {
+        self.zcash_maturity_confirmations
+    }
+
+    /// Returns the generation maximum age in milliseconds.
+    pub const fn max_age_milliseconds(&self) -> u32 {
+        self.max_age_milliseconds
+    }
+
+    /// Returns how strongly the configured Wcash reward recipient was authenticated.
+    pub const fn wcash_payout_verification(&self) -> NativeWcashPayoutVerification {
+        self.wcash_payout_verification
+    }
 }
 
 impl NativePreparedJob {
@@ -578,11 +746,6 @@ impl NativePreparedJob {
                         .to_string(),
                 )
             })?;
-        if recovered_parent_payout == 0 {
-            return Err(MinerError::InvalidParentTemplate(
-                "parent coinbase does not pay the configured ZCASH_PAYOUT_ADDRESS".to_string(),
-            ));
-        }
         let coinbase_inputs = coinbase.inputs();
         let miner_data = coinbase_inputs
             .first()
@@ -735,6 +898,7 @@ impl NativePreparedJob {
             parent_target,
             parent_tip_display,
             parent_height,
+            parent_reward_zatoshis: recovered_parent_payout,
         })
     }
 
@@ -761,6 +925,32 @@ impl NativePreparedJob {
     /// Returns the candidate parent height.
     pub const fn parent_height(&self) -> u32 {
         self.parent_height
+    }
+
+    /// Returns the validated parent payout value in zatoshis.
+    pub const fn parent_reward_zatoshis(&self) -> u64 {
+        self.parent_reward_zatoshis
+    }
+
+    pub(crate) fn generation_descriptor(
+        &self,
+        wcash_previous_hash_le: [u8; 32],
+        wcash_coinbase_txid_le: [u8; 32],
+        wcash_height: u32,
+        wcash_reward_zatoshis: u64,
+        wcash_payout_verification: NativeWcashPayoutVerification,
+    ) -> NativeGenerationDescriptor {
+        NativeGenerationDescriptor::from_validated_parts(
+            &self.job,
+            self.parent_target,
+            self.parent_height,
+            self.parent_reward_zatoshis,
+            wcash_previous_hash_le,
+            wcash_coinbase_txid_le,
+            wcash_height,
+            wcash_reward_zatoshis,
+            wcash_payout_verification,
+        )
     }
 
     /// Validates one share and independently classifies Wcash and Zcash winners.
@@ -1154,12 +1344,11 @@ fn validate_independent_parent_payout_template(
                 "independent payout template from {endpoint} has outputs that do not match the configured payout address"
             ))
         })?;
-    if validator_payout == 0 {
-        return Err(MinerError::InvalidParentTemplate(format!(
-            "independent payout template from {endpoint} has no positive configured payout"
-        )));
-    }
-
+    validate_matching_parent_payout_presence(
+        prepared.parent_reward_zatoshis,
+        validator_payout,
+        endpoint,
+    )?;
     let prepared_coinbase = prepared
         .parent_proposal
         .transactions
@@ -1176,6 +1365,19 @@ fn validate_independent_parent_payout_template(
         endpoint,
     )?;
 
+    Ok(())
+}
+
+fn validate_matching_parent_payout_presence(
+    prepared_payout: u64,
+    validator_payout: u64,
+    endpoint: &str,
+) -> Result<(), MinerError> {
+    if (validator_payout == 0) != (prepared_payout == 0) {
+        return Err(MinerError::InvalidParentTemplate(format!(
+            "independent payout template from {endpoint} disagrees on whether the configured payout is zero"
+        )));
+    }
     Ok(())
 }
 
@@ -1299,6 +1501,81 @@ mod tests {
     };
 
     use super::*;
+    use crate::{JobConfig, NATIVE_JOB_MAX_AGE_SECONDS};
+
+    #[test]
+    fn generation_descriptor_preserves_exact_consensus_metadata() {
+        let wcash_target = Target::from_le_bytes([0x11; 32]).expect("nonzero Wcash target");
+        let zcash_target = Target::from_le_bytes([0x22; 32]).expect("nonzero Zcash target");
+        let wcash_candidate_hash_le = [0x31; 32];
+        let zcash_previous_hash_le = [0x32; 32];
+        let wcash_previous_hash_le = [0x33; 32];
+        let wcash_coinbase_txid_le = [0x34; 32];
+        let parent_job = PreparedJob::new(
+            wcash_candidate_hash_le,
+            wcash_target,
+            JobConfig {
+                parent_height: 73,
+                previous_block_hash: zcash_previous_hash_le,
+                ..JobConfig::default()
+            },
+        )
+        .expect("valid exact parent job");
+        let descriptor = NativeGenerationDescriptor::from_validated_parts(
+            &parent_job,
+            zcash_target,
+            73,
+            312_500_000,
+            wcash_previous_hash_le,
+            wcash_coinbase_txid_le,
+            91,
+            625_000_000,
+            NativeWcashPayoutVerification::ExactTransparentRecipient,
+        );
+
+        assert_eq!(descriptor.job_id(), parent_job.job_id_bytes());
+        assert_eq!(
+            descriptor.wcash_candidate_hash_le(),
+            wcash_candidate_hash_le
+        );
+        assert_eq!(
+            descriptor.parent_header_input(),
+            parent_job.parent_header_input()
+        );
+        assert_eq!(descriptor.wcash_previous_hash_le(), wcash_previous_hash_le);
+        assert_eq!(descriptor.zcash_previous_hash_le(), zcash_previous_hash_le);
+        assert_eq!(descriptor.wcash_coinbase_txid_le(), wcash_coinbase_txid_le);
+        assert_eq!(
+            descriptor.zcash_coinbase_txid_le(),
+            parent_job.coinbase_transaction_id()
+        );
+        assert_eq!(descriptor.wcash_target_le(), wcash_target.to_le_bytes());
+        assert_eq!(descriptor.zcash_target_le(), zcash_target.to_le_bytes());
+        assert_eq!(descriptor.wcash_height(), 91);
+        assert_eq!(descriptor.zcash_height(), 73);
+        assert_eq!(descriptor.wcash_reward_zatoshis(), 625_000_000);
+        assert_eq!(descriptor.zcash_reward_zatoshis(), 312_500_000);
+        assert_eq!(
+            descriptor.wcash_maturity_confirmations(),
+            NATIVE_COINBASE_MATURITY_CONFIRMATIONS
+        );
+        assert_eq!(
+            descriptor.zcash_maturity_confirmations(),
+            NATIVE_COINBASE_MATURITY_CONFIRMATIONS
+        );
+        assert_eq!(
+            descriptor.max_age_milliseconds(),
+            NATIVE_JOB_MAX_AGE_MILLISECONDS
+        );
+        assert_eq!(
+            u64::from(descriptor.max_age_milliseconds()),
+            NATIVE_JOB_MAX_AGE_SECONDS * 1_000
+        );
+        assert_eq!(
+            descriptor.wcash_payout_verification(),
+            NativeWcashPayoutVerification::ExactTransparentRecipient
+        );
+    }
 
     #[test]
     fn branches_match_consensus_root_functions() {
@@ -1460,6 +1737,16 @@ mod tests {
             "validator",
         )
         .expect("fee-dependent miner output values may differ");
+    }
+
+    #[test]
+    fn independent_parent_templates_must_agree_on_zero_reward_tail() {
+        validate_matching_parent_payout_presence(0, 0, "validator")
+            .expect("two zero-reward templates agree");
+        validate_matching_parent_payout_presence(625_000_000, 625_010_000, "validator")
+            .expect("honest fee divergence keeps both rewards positive");
+        assert!(validate_matching_parent_payout_presence(0, 1, "validator").is_err());
+        assert!(validate_matching_parent_payout_presence(1, 0, "validator").is_err());
     }
 
     #[test]

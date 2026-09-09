@@ -38,8 +38,9 @@ use crate::{
         read_accounting_snapshot_from_reader, AuthenticatedWorker, WorkerAuthenticationProvenance,
     },
     rpc::{RpcEndpoint, ZebraRpcClient, DEFAULT_RPC_TIMEOUT},
-    MinerError, NativePreparedJob, NativeZcashConfig, NativeZcashProvider, ShareProcessor,
-    ValidatedNativeShare,
+    MinerError, NativeGenerationDescriptor, NativePreparedJob, NativeWcashPayoutVerification,
+    NativeZcashConfig, NativeZcashProvider, ShareProcessor, ValidatedNativeShare,
+    NATIVE_JOB_MAX_AGE_SECONDS,
 };
 
 /// Complete native-node configuration for one frozen dual-mining job.
@@ -93,6 +94,7 @@ pub struct NativeMiningCoordinator {
     wcash_node: ZebraRpcClient,
     zcash: NativeZcashProvider,
     job: NativePreparedJob,
+    generation_descriptor: NativeGenerationDescriptor,
     child_height: u32,
     child_previous_hash: String,
     child_candidate_lease: ChildCandidateLease,
@@ -157,9 +159,6 @@ struct JobFreshness {
     active: bool,
     last_checked: Instant,
 }
-
-/// Maximum time one native header generation is advertised before fresh work is prepared.
-pub const NATIVE_JOB_MAX_AGE_SECONDS: u64 = 45;
 
 // Refresh before the common 55-second S-NOMP/ASIC liveness rebroadcast interval.
 // A fresh child and independently proposal-validated parent are required: merely
@@ -386,15 +385,32 @@ impl NativeMiningSupervisor {
                 "createauxblock metadata does not match its serialized candidate".to_string(),
             ));
         }
-        validate_wcash_candidate_payout(
+        let child_payout = validate_wcash_candidate_payout(
             &child_candidate,
             &self.wcash_payout_address,
             &self.wcash_network,
             child.coinbase_value,
             child.height,
         )?;
+        let child_coinbase_txid_le = child_candidate
+            .transactions
+            .first()
+            .ok_or_else(|| {
+                MinerError::InvalidParentTemplate(
+                    "validated createauxblock candidate has no coinbase transaction".to_string(),
+                )
+            })?
+            .hash()
+            .0;
 
         let job = zcash.prepare_job(child_hash, child_target, config.auxiliary_nonce)?;
+        let generation_descriptor = job.generation_descriptor(
+            child_candidate.header.previous_block_hash.0,
+            child_coinbase_txid_le,
+            child.height,
+            child_payout.value_zatoshis,
+            child_payout.verification,
+        );
         let expected_child_height = child.height.checked_sub(1).ok_or_else(|| {
             MinerError::InvalidParentTemplate("child height must be positive".to_string())
         })?;
@@ -425,6 +441,7 @@ impl NativeMiningSupervisor {
             wcash_node,
             zcash,
             job,
+            generation_descriptor,
             child_height: child.height,
             child_previous_hash: child.previous_block_hash,
             child_candidate_lease,
@@ -474,6 +491,11 @@ impl NativeMiningCoordinator {
     /// Returns the exact proposal-gated solver job.
     pub const fn job(&self) -> &NativePreparedJob {
         &self.job
+    }
+
+    /// Returns exact proposal-validated metadata for this frozen generation.
+    pub const fn generation_descriptor(&self) -> &NativeGenerationDescriptor {
+        &self.generation_descriptor
     }
 
     /// Stops issuing this generation and releases its node cache slot when safe.
@@ -690,7 +712,7 @@ fn validate_wcash_candidate_payout(
     network: &Network,
     advertised_value: i64,
     height: u32,
-) -> Result<(), MinerError> {
+) -> Result<ValidatedWcashCandidatePayout, MinerError> {
     if advertised_value < 0 {
         return Err(MinerError::InvalidParentTemplate(
             "createauxblock advertised a negative coinbase value".to_string(),
@@ -707,16 +729,38 @@ fn validate_wcash_candidate_payout(
         ));
     }
 
+    if advertised_value == 0
+        && coinbase.outputs().is_empty()
+        && !coinbase.has_sapling_shielded_data()
+        && !coinbase.has_orchard_shielded_data()
+        && !coinbase.has_ironwood_shielded_data()
+    {
+        return Ok(ValidatedWcashCandidatePayout {
+            value_zatoshis: 0,
+            verification: NativeWcashPayoutVerification::NoReward,
+        });
+    }
+
     match expected_payout.kind() {
         WcashAddressKind::P2pkh(hash) => {
             let expected_script =
                 transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, *hash).script();
-            validate_transparent_wcash_payout(coinbase, &expected_script, advertised_value)
+            let value_zatoshis =
+                validate_transparent_wcash_payout(coinbase, &expected_script, advertised_value)?;
+            Ok(ValidatedWcashCandidatePayout {
+                value_zatoshis,
+                verification: NativeWcashPayoutVerification::ExactTransparentRecipient,
+            })
         }
         WcashAddressKind::P2sh(hash) => {
             let expected_script =
                 transparent::Address::from_script_hash(NetworkKind::Mainnet, *hash).script();
-            validate_transparent_wcash_payout(coinbase, &expected_script, advertised_value)
+            let value_zatoshis =
+                validate_transparent_wcash_payout(coinbase, &expected_script, advertised_value)?;
+            Ok(ValidatedWcashCandidatePayout {
+                value_zatoshis,
+                verification: NativeWcashPayoutVerification::ExactTransparentRecipient,
+            })
         }
         WcashAddressKind::Unified(_) => {
             if !coinbase.outputs().is_empty()
@@ -729,16 +773,17 @@ fn validate_wcash_candidate_payout(
                         .to_string(),
                 ));
             }
-            if coinbase
+            let actual_value = coinbase
                 .ironwood_value_balance()
                 .ironwood_amount()
                 .zatoshis()
-                != advertised_value.checked_neg().ok_or_else(|| {
+                .checked_neg()
+                .ok_or_else(|| {
                     MinerError::InvalidParentTemplate(
                         "createauxblock coinbase value cannot be negated".to_string(),
                     )
-                })?
-            {
+                })?;
+            if actual_value != advertised_value {
                 return Err(MinerError::InvalidParentTemplate(
                     "createauxblock Ironwood value does not match coinbasevalue".to_string(),
                 ));
@@ -752,7 +797,15 @@ fn validate_wcash_candidate_payout(
                     "createauxblock Ironwood payout is publicly recoverable".to_string(),
                 ));
             }
-            Ok(())
+            let value_zatoshis = u64::try_from(actual_value).map_err(|_| {
+                MinerError::InvalidParentTemplate(
+                    "createauxblock coinbase value exceeds u64".to_string(),
+                )
+            })?;
+            Ok(ValidatedWcashCandidatePayout {
+                value_zatoshis,
+                verification: NativeWcashPayoutVerification::TrustedPrivateTemplateNode,
+            })
         }
         WcashAddressKind::Tex(_) => Err(MinerError::InvalidRequest(
             "TEX is not a Wcash coinbase payout mode".to_string(),
@@ -760,11 +813,17 @@ fn validate_wcash_candidate_payout(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidatedWcashCandidatePayout {
+    value_zatoshis: u64,
+    verification: NativeWcashPayoutVerification,
+}
+
 fn validate_transparent_wcash_payout(
     coinbase: &zebra_chain::transaction::Transaction,
     expected_script: &transparent::Script,
     advertised_value: i64,
-) -> Result<(), MinerError> {
+) -> Result<u64, MinerError> {
     if coinbase.outputs().is_empty()
         || coinbase.has_sapling_shielded_data()
         || coinbase.has_orchard_shielded_data()
@@ -779,15 +838,25 @@ fn validate_transparent_wcash_payout(
                 .to_string(),
         ));
     }
-    let actual_value = coinbase.outputs().iter().try_fold(0i64, |total, output| {
-        total.checked_add(output.value().zatoshis())
-    });
-    if actual_value != Some(advertised_value) {
+    let actual_value = coinbase
+        .outputs()
+        .iter()
+        .try_fold(0i64, |total, output| {
+            total.checked_add(output.value().zatoshis())
+        })
+        .ok_or_else(|| {
+            MinerError::InvalidParentTemplate(
+                "createauxblock transparent output value overflows i64".to_string(),
+            )
+        })?;
+    if actual_value != advertised_value {
         return Err(MinerError::InvalidParentTemplate(
             "createauxblock transparent outputs do not match coinbasevalue".to_string(),
         ));
     }
-    Ok(())
+    u64::try_from(actual_value).map_err(|_| {
+        MinerError::InvalidParentTemplate("createauxblock coinbase value exceeds u64".to_string())
+    })
 }
 
 fn retry_pending_winners_with(
@@ -2982,14 +3051,17 @@ mod tests {
         )
     }
 
-    fn assert_invalid_candidate_payout(result: Result<(), MinerError>, expected_message: &str) {
+    fn assert_invalid_candidate_payout(
+        result: Result<ValidatedWcashCandidatePayout, MinerError>,
+        expected_message: &str,
+    ) {
         match result {
             Err(MinerError::InvalidParentTemplate(message)) => assert!(
                 message.contains(expected_message),
                 "expected {expected_message:?} in rejection: {message}"
             ),
             Err(error) => panic!("unexpected candidate-payout rejection: {error}"),
-            Ok(()) => panic!("invalid candidate payout was accepted"),
+            Ok(_) => panic!("invalid candidate payout was accepted"),
         }
     }
 
@@ -2999,8 +3071,14 @@ mod tests {
         let reward = 625_012_345;
         let (candidate, payout) = transparent_wcash_candidate([0x51; 20], reward);
 
-        validate_wcash_candidate_payout(&candidate, &payout, &network, reward, 1)
-            .expect("the exact transparent recipient and value are accepted");
+        assert_eq!(
+            validate_wcash_candidate_payout(&candidate, &payout, &network, reward, 1)
+                .expect("the exact transparent recipient and value are accepted"),
+            ValidatedWcashCandidatePayout {
+                value_zatoshis: u64::try_from(reward).expect("fixture reward is positive"),
+                verification: NativeWcashPayoutVerification::ExactTransparentRecipient,
+            }
+        );
 
         let wrong_payout = WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, [0x52; 20]);
         assert_invalid_candidate_payout(
@@ -3010,6 +3088,35 @@ mod tests {
         assert_invalid_candidate_payout(
             validate_wcash_candidate_payout(&candidate, &payout, &network, reward + 1, 1),
             "transparent outputs do not match coinbasevalue",
+        );
+    }
+
+    #[test]
+    fn zero_value_candidate_needs_no_recipient_authentication() {
+        let network = Network::new_wcash_regtest();
+        let payout = WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, [0x53; 20]);
+        let coinbase = Transaction::test_v6_for_network(
+            &network,
+            Height(1),
+            wcash_coinbase_inputs(),
+            vec![],
+            LockTime::unlocked(),
+            Height(0),
+        );
+        let mut candidate = Arc::unwrap_or_clone(wcash_regtest_genesis_block());
+        candidate.transactions = vec![Arc::new(coinbase)];
+
+        assert_eq!(
+            validate_wcash_candidate_payout(&candidate, &payout, &network, 0, 1)
+                .expect("a zero-value candidate has no recipient to authenticate"),
+            ValidatedWcashCandidatePayout {
+                value_zatoshis: 0,
+                verification: NativeWcashPayoutVerification::NoReward,
+            }
+        );
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout(&candidate, &payout, &network, -1, 1),
+            "negative coinbase value",
         );
     }
 
