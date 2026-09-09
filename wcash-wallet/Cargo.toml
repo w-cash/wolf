@@ -13,8 +13,12 @@ rust-version.workspace = true
 [dependencies]
 async-trait = "0.1"
 blake2b_simd.workspace = true
+bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
+futures-util.workspace = true
 hex.workspace = true
+http-body-util.workspace = true
+prost.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 rusqlite = "0.37"
 secrecy = "0.8"
@@ -24,12 +28,29 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tonic = { workspace = true, features = ["transport"] }
 zcash_address.workspace = true
-zcash_client_backend = { version = "0.24.0", features = ["lightwalletd-tonic-tls-webpki-roots", "lightwalletd-tonic-transport", "orchard", "sync"] }
-zcash_client_sqlite = { version = "0.22.0", features = ["orchard"] }
-zcash_keys = { workspace = true, features = ["orchard", "sapling"] }
-zcash_primitives = { workspace = true, features = ["circuits"] }
+zcash_client_backend = { version = "0.24.0", features = [
+  "lightwalletd-tonic-tls-webpki-roots",
+  "lightwalletd-tonic-transport",
+  "orchard",
+  "sync",
+  "transparent-inputs",
+] }
+zcash_client_sqlite = { version = "0.22.0", features = [
+  "orchard",
+  "transparent-inputs",
+] }
+zcash_keys = { workspace = true, features = [
+  "orchard",
+  "sapling",
+  "transparent-inputs",
+] }
+zcash_primitives = { workspace = true, features = [
+  "circuits",
+  "transparent-inputs",
+] }
 zcash_proofs = { workspace = true, features = ["bundled-prover", "multicore"] }
 zcash_protocol.workspace = true
+zcash_transparent = { workspace = true, features = ["transparent-inputs"] }
 zebra-chain = { path = "../zebra-chain", version = "12.0.0" }
 zip32.workspace = true
 orchard.workspace = true

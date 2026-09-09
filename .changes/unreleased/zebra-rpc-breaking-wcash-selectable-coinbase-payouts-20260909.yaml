@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: breaking
+body: "Replace the pre-launch private-only Wcash mining-address contract with operator-selected transparent or Unified-plus-Orchard payouts, make transparent the configuration default, and preserve Wcash transparent address encodings in lightwalletd address-UTXO replies ([#5](https://github.com/w-cash/wolf/pull/5))."
+time: 2026-09-09T00:00:00.000000003Z

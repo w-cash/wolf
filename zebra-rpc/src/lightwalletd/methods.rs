@@ -23,7 +23,7 @@ use zebra_state::{HashOrHeight, ReadRequest, ReadResponse, ReadState};
 
 use crate::methods::{
     trees::GetTreestateResponse, GetAddressBalanceRequest, GetAddressTxIdsRequest,
-    GetAddressUtxosRequest, GetAddressUtxosResponse, RpcServer as RpcMethods,
+    GetAddressUtxosRequest, GetAddressUtxosResponse, RpcServer as RpcMethods, Utxo as AddressUtxo,
 };
 
 use super::{
@@ -997,20 +997,21 @@ async fn address_utxos<Rpc: RpcMethods>(
         unreachable!("chain info is never requested");
     };
 
-    Ok(utxos
-        .iter()
-        .map(|utxo| GetAddressUtxosReply {
-            address: utxo.address().to_string(),
-            txid: utxo.txid().0.to_vec(),
-            // Cast is safe: output indexes are 32-bit values, and valid indexes are
-            // bounded by the maximum block size.
-            index: utxo.output_index().index() as i32,
-            script: utxo.script().as_raw_bytes().to_vec(),
-            // Cast is safe: the total ZEC supply in zatoshis fits in an `i64`.
-            value_zat: utxo.satoshis() as i64,
-            height: utxo.height().0.into(),
-        })
-        .collect())
+    Ok(utxos.iter().map(address_utxo_reply).collect())
+}
+
+fn address_utxo_reply(utxo: &AddressUtxo) -> GetAddressUtxosReply {
+    GetAddressUtxosReply {
+        address: utxo.encoded_address().to_owned(),
+        txid: utxo.txid().0.to_vec(),
+        // Cast is safe: output indexes are 32-bit values, and valid indexes are
+        // bounded by the maximum block size.
+        index: utxo.output_index().index() as i32,
+        script: utxo.script().as_raw_bytes().to_vec(),
+        // Cast is safe: the total ZEC supply in zatoshis fits in an `i64`.
+        value_zat: utxo.satoshis() as i64,
+        height: utxo.height().0.into(),
+    }
 }
 
 /// Sends every mempool transaction that isn't already in `sent_txids`, adding the ones
@@ -1258,6 +1259,30 @@ mod tests {
 
     fn txid(byte: u8) -> transaction::Hash {
         transaction::Hash::from_bytes_in_display_order(&[byte; 32])
+    }
+
+    #[test]
+    fn address_utxo_reply_preserves_the_active_chain_namespace() {
+        let wcash_address = "WR64VqQpZRujxYnAJmqGK4d4fbqQZRZHazG";
+        let zcash_address = "tm9iMLAuYMzJ6jtFLcA7rzUmfreGuKvr7Ma";
+        for expected_address in [wcash_address, zcash_address] {
+            let utxo: AddressUtxo = serde_json::from_value(serde_json::json!({
+                "address": expected_address,
+                "txid": "00".repeat(32),
+                "outputIndex": 0,
+                "script": format!("76a914{}88ac", "00".repeat(20)),
+                "satoshis": 1,
+                "height": 1,
+            }))
+            .expect("canonical transparent UTXO fixture");
+
+            let reply = address_utxo_reply(&utxo);
+            assert_eq!(reply.address, expected_address);
+            assert_eq!(reply.txid, vec![0; 32]);
+            assert_eq!(reply.index, 0);
+            assert_eq!(reply.value_zat, 1);
+            assert_eq!(reply.height, 1);
+        }
     }
 
     #[test]

@@ -32,35 +32,51 @@ does not by itself make the engineering profile or its wallet production ready.
 | Halving | Every 1,680,000 blocks (about four years); first halved block is 1,680,001 |
 | Monetary cap | 21,000,000 WCASH; exact scheduled issuance is 20,999,999.81520000 WCASH after zatoshi truncation |
 | Development allocation | None: no founders reward, funding stream, lockbox, or developer tax |
-| Coinbase destination | Ironwood only after genesis |
+| Coinbase destination | Transparent Wcash address by default; private Ironwood payout is optional |
 | Public networks | Engineering Testnet profile implemented but not deployed; mainnet disabled |
 | Testnet transfers | Wcash-domain V6 only; inherited Zcash domains and V1-V5 rejected |
 
-Every post-genesis coinbase must create its reward in Ironwood. Transparent,
-Sapling, and Orchard coinbase outputs are rejected. Unlike the standard Zcash
-coinbase recovery convention, Wcash also rejects Ironwood reward outputs that
-can be recovered with the all-zero outgoing viewing key. The recipient and note
-contents are therefore not published by that convention.
+Pool-facing examples pay each post-genesis coinbase to an explicit Wcash
+transparent address, matching the operational model expected by established
+mining software. An operator can instead supply a Wcash Unified Address with an
+Orchard receiver to create a private Ironwood reward. Private Ironwood rewards
+remain unrecoverable with Zcash's conventional all-zero outgoing viewing key.
+Inherited Zcash addresses are rejected in both modes.
 
-Aggregate issuance remains auditable. Subsidy is deterministic, transaction
-fees are checked, and the public Ironwood value balance commits to the net value
-entering the pool. This hides the reward recipient, not the protocol-defined
-gross reward amount; parent-pool metadata can also create off-chain correlation.
+Aggregate issuance remains auditable in either mode. Subsidy and transaction
+fees are deterministic consensus inputs; transparent outputs are public, while
+the Ironwood value balance publicly commits to value entering the private pool.
+Private mode hides the reward recipient, not the protocol-defined gross reward
+amount, and parent-pool metadata can still create off-chain correlation.
+Transparent coinbase outputs mature after 100 blocks and must be shielded on
+their first spend, matching the inherited Zcash public-network policy.
 
 Payment addresses use Wcash-specific namespaces: Unified `wu...`, Sapling
 `ws...`, TEX `wtex...`, and transparent `W...`, with distinct testnet and
-regtest variants. Wcash mining requires a Wcash Unified Address and rejects an
-inherited Zcash address. The node implements payment-address codecs, and the
-workspace contains an experimental one-shot wallet for controlled Testnet and
-regtest transfers. It derives Wcash addresses, scans a local SQLite wallet from
-an attested loopback node, signs Wcash-domain V6 Ironwood transfers, and
-broadcasts the exact signed bytes. It is not a pool payout or durable settlement
-system. Its controlled local Regtest gate has mined three private coinbases,
-scanned and spent one WCASH under the Wcash V6 domain, included the exact
-transaction in the mempool and block template, mined it through AuxPoW, and
-rescanned the recipient and private change. That gate deliberately used the
-explicit Regtest-only one-confirmation override; the public Testnet wallet policy
-remains 100 confirmations. The complete prefix table is in the
+regtest variants. Wcash mining accepts a Wcash transparent address for the
+normal pool-integration path or a Wcash Unified Address with an Orchard receiver
+for an optional private Ironwood reward. It rejects inherited Zcash addresses.
+The node implements payment-address codecs, and the workspace contains an
+experimental one-shot wallet for controlled Testnet and regtest operations. It
+derives a private Wcash Unified Address and a transparent P2PKH coinbase address
+from the same seed, scans both histories into local SQLite, and can build a
+bounded transaction that shields only mature, fully classified coinbase outputs
+into its own Ironwood receiver. It also signs Wcash-domain V6 Ironwood transfers
+and broadcasts exact signed bytes. It is a controlled, single-writer tool, not a
+pool payout or durable settlement system. Its current full local Regtest gate
+has mined three private coinbases, scanned and spent one WCASH under the Wcash
+V6 domain, included the exact transaction in the mempool and block template,
+mined it through AuxPoW, and rescanned the recipient and private change. A
+separate phase mined 101 transparent coinbases through the same AuxPoW path,
+proved the 100-block maturity boundary and pre-maturity rejection, recovered all
+current UTXOs from a deliberately late wallet birthday, shielded one mature
+coinbase with its exact signed bytes in the mempool and template, and mined the
+shielding transaction at height 101. The run conserved the complete
+631.25-WCASH supply across transparent and Ironwood pools and rotated far beyond
+the coordinator's 16-candidate cache bound. Only the private-transfer phase used
+the explicit Regtest-only one-confirmation override; transparent coinbase
+maturity was not shortened. The public Testnet wallet policy remains 100
+confirmations. The complete prefix table is in the
 [consensus snapshot](docs/wcash-consensus.md#payment-address-domains).
 
 ## Run the isolated local network
@@ -86,7 +102,7 @@ This local chain freezes Bitcoin mainnet block 965,910, hash
 which was the Blockstream tip snapshot selected for regtest genesis. It replaces
 the earlier local genesis and uses the `Wcash/regtest/v4` P2P identity.
 
-The native merge-mining coordinator can create a private Wcash candidate,
+The native merge-mining coordinator can create a transparent or private Wcash candidate,
 request a commitment-aware Zcash template, obtain independent proposal
 validation, expose a ZIP-301 backend for Equihash ASIC interoperability testing,
 and durably submit winners to both nodes. It is intentionally loopback-only and
@@ -106,15 +122,15 @@ See:
 ## Release blockers
 
 The mainnet Bitcoin anchor remains deliberately unset, so mainnet activation
-fails closed. The controlled private-coinbase spend lifecycle has passed in
-isolated Regtest, but no public Testnet is deployed and that local result is not
-evidence that a community pool or value-bearing mainnet is ready. Promotion
-still requires an independently reviewed consensus specification and
-implementation, public-network operation under the 100-confirmation wallet
-policy, adversarial multi-node soak and reorg testing, project-controlled seed
-infrastructure, physical ASIC interoperability, and a separately reviewed TLS,
-variable-difficulty, accounting, payout, settlement, and monitoring layer in
-front of the included loopback ZIP-301 service.
+fails closed. The controlled private-transfer and transparent-coinbase shielding
+lifecycles have passed in isolated Regtest, but no public Testnet is deployed
+and those local results are not evidence that a community pool or value-bearing
+mainnet is ready. Promotion still requires an independently reviewed consensus
+specification and implementation, public-network operation under the
+100-confirmation wallet policy, adversarial multi-node soak and reorg testing,
+project-controlled seed infrastructure, physical ASIC interoperability, and a
+separately reviewed TLS, variable-difficulty, accounting, payout, settlement,
+and monitoring layer in front of the included loopback ZIP-301 service.
 
 ## Upstream attribution and license
 

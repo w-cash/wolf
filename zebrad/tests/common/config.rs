@@ -84,11 +84,7 @@ pub fn default_test_config(net: &Network) -> ZebradConfig {
     let mut state = zebra_state::Config::ephemeral();
     state.debug_validity_check_interval = Some(DATABASE_FORMAT_CHECK_INTERVAL);
 
-    let miner_address_type = if net.uses_wcash_consensus() {
-        MinerAddressType::Unified
-    } else {
-        MinerAddressType::Transparent
-    };
+    let miner_address_type = MinerAddressType::Transparent;
 
     ZebradConfig {
         network,

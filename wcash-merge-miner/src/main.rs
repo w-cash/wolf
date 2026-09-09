@@ -66,14 +66,14 @@ Pool administration:
 
 Native node pipeline:
   wcash-merge-miner native-job <wcash-rpc-url> <zcash-template-rpc-url>
-    <zcash-validator-rpc-url> <wcash-unified-address> [auxiliary-nonce]
+    <zcash-validator-rpc-url> <wcash-address> [auxiliary-nonce]
   wcash-merge-miner native-mine <wcash-rpc-url> <zcash-template-rpc-url>
-    <zcash-validator-rpc-url> <wcash-unified-address> [max-runs] [start-nonce]
+    <zcash-validator-rpc-url> <wcash-address> [max-runs] [start-nonce]
   wcash-merge-miner native-serve-once <wcash-rpc-url> <zcash-template-rpc-url>
-    <zcash-validator-rpc-url> <wcash-unified-address> [127.0.0.1:port]
+    <zcash-validator-rpc-url> <wcash-address> [127.0.0.1:port]
     [max-clients] [auxiliary-nonce]
   wcash-merge-miner native-serve <wcash-rpc-url> <zcash-template-rpc-url>
-    <zcash-validator-rpc-url> <wcash-unified-address> [127.0.0.1:port]
+    <zcash-validator-rpc-url> <wcash-address> [127.0.0.1:port]
     [max-clients] [auxiliary-nonce]
 
 The Wcash and Zcash template URLs must be loopback endpoints because those nodes
@@ -91,15 +91,18 @@ order). Every node is pinned to those height-zero hashes before work is issued.
 Both native-serve commands additionally require WCASH_WORKER_CREDENTIALS (the
 path to a private version-1 exact-worker registry) and WCASH_SHARE_TARGET
 (exactly 32 bytes of conventional big-endian target hex).
-The wcash-unified-address argument must be `-`; its value is read from
+The wcash-address argument must be `-`; its value is read from
 WCASH_PAYOUT_ADDRESS to keep it out of process listings and preflight logs.
 ZCASH_PAYOUT_ADDRESS must exactly match the canonical mining.miner_address on
-the parent template node and every proposal validator. The coordinator checks a
-domain-separated private-GBT commitment, publicly recovers every shielded
-recipient in both parent coinbases, and compares their transparent outputs.
-Plaintext payout configuration is omitted from diagnostics, but native preflight
-prints the exact Zcash coinbase and its recipient is publicly recoverable by
-Zcash protocol design.
+the parent template node and every proposal validator. Transparent addresses
+are the normal pool-integration default on both chains; a Wcash Unified Address
+with an Orchard receiver explicitly selects private Ironwood payout. The
+coordinator checks a domain-separated private-GBT commitment and verifies the
+configured payout in the exact Zcash coinbases. It also verifies an exact
+transparent Wcash recipient, or the private-only shape and value of an Ironwood
+reward. A private Wcash recipient remains a trust boundary at the loopback
+template node. Plaintext payout configuration is omitted from diagnostics, but
+native preflight prints the exact Zcash coinbase.
 WCASH_VALIDATION_LIMIT optionally sets the global concurrent share-validation
 limit (default 4, maximum 1024). WCASH_AUTHENTICATION_LIMIT optionally sets the
 global concurrent Argon2id verification limit (default 4, maximum 256).
@@ -591,12 +594,12 @@ fn parse_native_connection(
         wcash_rpc_url: next_required(arguments, "wcash-rpc-url")?,
         zcash_template_rpc_url: next_required(arguments, "zcash-template-rpc-url")?,
         zcash_validator_rpc_url: next_required(arguments, "zcash-validator-rpc-url")?,
-        wcash_payout_address: next_required(arguments, "wcash-unified-address")?,
+        wcash_payout_address: next_required(arguments, "wcash-address")?,
         auxiliary_nonce: 0,
     };
     if connection.wcash_payout_address != "-" {
         return Err(MinerError::InvalidRequest(format!(
-            "wcash-unified-address must be '-' and supplied through {WCASH_PAYOUT_ADDRESS}"
+            "wcash-address must be '-' and supplied through {WCASH_PAYOUT_ADDRESS}"
         )));
     }
     Ok(connection)

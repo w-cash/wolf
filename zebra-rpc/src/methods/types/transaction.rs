@@ -229,8 +229,11 @@ impl TransactionTemplate<NegativeOrZero> {
                 Address::Unified(addr) => addr
                     .orchard()
                     .and_then(|addr| add_shielded_reward(&mut builder, addr)),
+
+                Address::Transparent(addr) => add_transparent_reward(&mut builder, addr),
+
                 _ => Err(TransactionError::CoinbaseConstruction(
-                    "Wcash miner rewards require a Unified address with an Orchard receiver"
+                    "Wcash miner rewards require a transparent address or a Unified address with an Orchard receiver"
                         .to_string(),
                 ))?,
             }

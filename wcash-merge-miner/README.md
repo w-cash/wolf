@@ -25,12 +25,14 @@ remote over HTTPS, but the operator remains responsible for making it a truly
 independent process and failure domain; endpoint inequality cannot prove
 organizational independence.
 
-The coordinator can publicly recover and verify the Zcash coinbase recipient.
-It cannot recover a deliberately private Wcash coinbase from a payment address
-alone, so recipient correctness on the child chain trusts the loopback Wcash
-node and its reviewed `createauxblock` implementation. Consensus still rejects
-transparent or publicly recoverable Wcash coinbases. Protect the child binary,
-configuration, RPC socket, and host as one payout-critical trust boundary.
+The coordinator verifies the configured Zcash coinbase recipient and an exact
+transparent Wcash child recipient directly from their serialized coinbases. A
+Wcash Unified Address with an Orchard receiver explicitly selects a private
+Ironwood child reward whose recipient cannot be publicly recovered. Private
+mode verifies the Ironwood-only shape and value, then trusts the loopback Wcash
+node and its reviewed `createauxblock` implementation for recipient correctness.
+Protect the child binary, configuration, RPC socket, and host as one
+payout-critical trust boundary.
 
 RPC credentials are read only from paired environment variables. Redirects
 are disabled, requests have deadlines, response sizes are bounded, credentials
@@ -49,9 +51,18 @@ export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f
 WCASH_JOURNAL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wcash-native.XXXXXX")"
 chmod 700 "$WCASH_JOURNAL_DIR"
 export WCASH_SHARE_JOURNAL="$WCASH_JOURNAL_DIR/journal.jsonl"
-export WCASH_PAYOUT_ADDRESS='replace-with-a-Wcash-Unified-Address'
-export ZCASH_PAYOUT_ADDRESS='replace-with-the-parent-nodes-shielded-Zcash-address'
+export WCASH_PAYOUT_ADDRESS='replace-with-an-operator-owned-Wcash-address'
+export ZCASH_PAYOUT_ADDRESS='replace-with-the-parent-nodes-Zcash-address'
 ```
+
+Use operator-owned transparent addresses for the normal pool-integration path.
+No fallback payout address is compiled into the coordinator. A transparent
+Wcash coinbase matures after 100 blocks and must be shielded before ordinary
+settlement. The included wallet can derive a controlled transparent coinbase
+address and construct one bounded shielding transaction after synchronization
+has classified mature outputs, but it is not an automatic pool-shielding or
+settlement service. Supplying a Wcash Unified Address with an Orchard receiver
+opts into a direct private Ironwood reward instead.
 
 Prepare and proposal-check one job without serving it:
 
@@ -147,14 +158,17 @@ by `worker-password-hash` and the bundled reference client. A physical ASIC
 needs a separately operated reachable edge because its own `127.0.0.1` is not
 the coordinator host.
 
-`ZCASH_PAYOUT_ADDRESS` must exactly match the canonical shielded
-`mining.miner_address` configured on both parent nodes. It is redacted from
-plaintext diagnostic fields. The template node attests its configuration,
-while the coordinator also recovers recipients from both serialized parent
-coinbases and compares their transparent funding outputs before it releases
-work. Native preflight deliberately prints the exact parent coinbase for
-interoperability inspection; its Zcash recipient remains publicly recoverable
-with the protocol's conventional zero outgoing-viewing key.
+`ZCASH_PAYOUT_ADDRESS` must exactly match the canonical
+`mining.miner_address` configured on both parent nodes. A transparent address is
+the recommended integration default; a supported shielded address is an
+explicit alternative. The value is redacted from plaintext diagnostic fields.
+The template node attests its configuration, while the coordinator verifies
+both serialized parent coinbases. It removes the configured miner outputs and
+compares every remaining funding-stream and lockbox output exactly, allowing
+honest fee-dependent miner amounts to differ between same-tip nodes. Exact
+proposal validation still enforces the candidate's subsidy-plus-fee total
+before work is released. Native preflight deliberately prints the exact parent
+coinbase for interoperability inspection.
 
 The listener supports ZIP-301 `mining.subscribe`, `mining.authorize`, and
 `mining.submit`. It validates the full Equihash proof, session nonce prefix,

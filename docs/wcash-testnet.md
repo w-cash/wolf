@@ -8,8 +8,9 @@ testnet coins must have no monetary value.
 
 > **Transaction-domain test boundary:** Wcash Testnet accepts only post-genesis V6
 > transactions carrying its chain-specific branch ID `0xb3cfd27e`. Zcash
-> domains and V1-V5 are rejected. The controlled spend lifecycle has passed on
-> isolated Regtest, but no coin has monetary value and that local test does not
+> domains and V1-V5 are rejected. The controlled private-transfer and
+> transparent-coinbase shielding lifecycles have passed on isolated Regtest, but
+> no coin has monetary value and those local tests do not
 > make the wallet, a public Testnet, a mining pool, or payout/settlement system
 > production ready.
 
@@ -131,27 +132,41 @@ exists only to test deterministic bootstrap; mining on its templates outside
 the smoke test can build a stale private fork. The Wcash template path uses the
 normal mempool snapshot and can include valid Wcash-domain V6 transactions.
 
-Treat the RPC cookie, node binary, Wcash payout receiver, and host as one
-payout-critical boundary. The private Wcash coinbase deliberately prevents the
-coordinator from publicly recovering its recipient, so the pool must trust its
-loopback child node to construct the requested reward correctly.
+Treat the RPC cookie, node binary, Wcash payout address, and host as one
+payout-critical boundary. The coordinator verifies an exact transparent child
+recipient and value from the serialized candidate. If an operator explicitly
+selects a private Unified Address, its Ironwood recipient is not publicly
+recoverable; the coordinator verifies the private-only shape and value, while
+the pool trusts the loopback child node to construct the requested recipient.
 
 ## Reproduce the local mining and spend E2E
 
 This script is a mandatory local release check. It is intentionally not run by
-GitHub Actions because it performs real proof-of-work solving; hosted CI uses
-fixed Equihash and AuxPoW vectors and exercises the non-solving validation paths.
-It uses ephemeral, loopback-only profiles with no peers, no cookie
-authentication, and no `debug_force_finished_sync` override. It explicitly
-enables the mempool at genesis and exposes loopback lightwalletd gRPC so the
-controlled spend path is deterministic without public peers; both settings are
-test-only and must not be copied into pool operations.
+GitHub Actions because it performs real proof-of-work solving. The checked-in
+hosted workflows are configured to use fixed Equihash and AuxPoW vectors and
+exercise the non-solving validation paths, but repository Actions are currently
+disabled and therefore provide no result for this branch.
+It uses ephemeral, loopback-only profiles with no peers and no cookie
+authentication. The first Wcash Testnet-profile phase does not use a
+`debug_force_finished_sync` override; the isolated Regtest wallet and parent
+profiles do use that explicit test-only shortcut. The script also enables the
+mempool at genesis and exposes loopback lightwalletd gRPC so the controlled
+spend path is deterministic without public peers. None of those Regtest settings
+may be copied into pool operations.
 
 The first phase boots the frozen Testnet profile, asserts its identity and zero
-initial supply, serves a real ZIP-301 job, solves Equihash `(200, 9)`, and
-requires consensus acceptance by the Wcash Testnet-profile node and two isolated
-Zcash Regtest parent nodes. The second phase boots a separate Wcash Regtest node
-against the same parent validators and exercises the controlled wallet lifecycle.
+initial supply, uses explicit transparent Wcash and Zcash test-only payout
+fixtures, serves a real ZIP-301 job, solves Equihash `(200, 9)`, and requires
+consensus acceptance by the Wcash Testnet-profile node and two isolated Zcash
+Regtest parent nodes. The coordinator and Wcash AuxPoW verifier independently
+check the real Equihash solution. The isolated Zcash Regtest profiles disable
+their native proof-of-work check, so their role in this gate is exact parent
+block structure, target, proposal, and chain acceptance rather than a second
+Equihash verification. The second phase boots a separate Wcash Regtest node,
+explicitly selects private Ironwood payout, and exercises the controlled wallet
+lifecycle against the same parent validators. The third phase boots a fresh
+Wcash Regtest node, mines 101 transparent coinbases, and exercises the inherited
+100-block maturity and mandatory-shielding path without reducing confirmations.
 Bounded template retries cover asynchronous RPC, state, mempool, and
 proposal-service startup.
 
@@ -171,19 +186,40 @@ bytes. It then mined the transfer in a fourth real AuxPoW block, rescanned the
 recipient and private change, and verified that all 25 WCASH remained in
 Ironwood while the other pools remained zero.
 
-The Regtest transfer deliberately uses the explicit unsafe one-confirmation
-test override. The public Testnet wallet policy remains 100 confirmations, and
-this local run is not evidence of a deployed public network or production wallet.
+The transparent phase reported all 99 rewards pending at tip 99 and rejected
+premature shielding. At tip 100, only the height-1 reward was spendable by a
+height-101 transaction. A second wallet initialized with birthday 100 recovered
+all 100 current coinbase UTXOs, proving that transparent recovery does not depend
+on the shielded birthday. The primary wallet persisted and broadcast the exact
+V6 transaction that shielded one mature coinbase, matched it in the mempool and
+block template, and mined it through AuxPoW at height 101. Final wallet and node
+checks conserved exactly 631.25 WCASH across the transparent and Ironwood pools.
+Processing 101 distinct child jobs also exercised confirmed-candidate release
+beyond the coordinator's 16-entry active cache.
+
+Only the private Regtest transfer deliberately uses the explicit unsafe
+one-confirmation test override. Transparent coinbase maturity remains 100
+blocks. The public Testnet wallet policy remains 100 confirmations, and these
+local runs are not evidence of a deployed public network or production wallet.
 
 ## Controlled-key spend gate: local result
 
 The spendability gate uses fresh ephemeral state and deterministic test seeds
 supplied outside command-line arguments and logs. The experimental wallet is
-intentionally limited to a one-shot Ironwood transfer against an attested
-loopback Wcash node. It provides Wcash address derivation, SQLite scanning and
-balance reporting, Wcash-domain V6 signing, recovery by exported transaction ID,
-exact-byte broadcast, and transaction-status inspection. It is not a batch
-payout, pool accounting, durable settlement, or idempotent-request system.
+intentionally limited to one-shot operations against an attested loopback Wcash
+node. `derive-address` reports a private Unified Address and its related
+transparent P2PKH coinbase address. Synchronization classifies transparent
+coinbase history, balance output separates mature and pending coinbase value,
+and `shield-coinbase` can build and persist one bounded V6 sweep of mature
+coinbase inputs into the wallet's Ironwood receiver. The wallet also provides
+one-shot Ironwood transfers, recovery by exported transaction ID, bounded and
+paginated `list-pending` recovery with exact signed bytes, exact-byte broadcast,
+and transaction-status inspection. It requires one exclusive writer per wallet
+database. After any ambiguous post-sign outcome, an operator must enumerate all
+pending pages, inspect status, and rebroadcast the persisted bytes; constructing
+a replacement before resolving those records is unsafe. The wallet is not an
+automatic shielding, batch payout, pool accounting, durable settlement, or
+idempotent-request system.
 
 The passing automated run established this controlled local path:
 
@@ -207,6 +243,19 @@ The passing automated run established this controlled local path:
 6. The recipient held exactly one WCASH, the sender retained 24 WCASH, and the
    chain reported exactly 25 WCASH entirely in Ironwood, with transparent,
    Sapling, and Orchard balances remaining zero.
+7. A fresh wallet and chain mined 101 transparent coinbases through AuxPoW,
+   rotating well beyond the coordinator's 16-entry active-candidate cache.
+8. At tip 99, all 99 rewards remained pending and `shield-coinbase` failed. At
+   tip 100, only the height-1 reward was mature for the height-101 transaction.
+9. A wallet initialized with birthday 100 recovered every one of the 100 current
+   transparent coinbase UTXOs through the separate current-UTXO scan.
+10. The primary wallet persisted and broadcast the exact shielding transaction,
+    the node independently decoded its one transparent input, zero transparent
+    outputs, and two-action Ironwood bundle, and the template contained those
+    same bytes and fee.
+11. AuxPoW block 101 mined the transaction. The wallet and chain independently
+    reported 631.25 WCASH total across transparent and Ironwood, with zero value
+    in Sapling and Orchard.
 
 This local pass goes beyond transaction serialization and wallet unit tests. It
 does not supply Internet-facing pool security, miner settlement,
@@ -216,10 +265,11 @@ or pay the same input twice.
 
 ## What is not ready
 
-The controlled private-coinbase spend lifecycle has passed only in isolated
-Regtest. No public Wcash Testnet is deployed, the one-shot wallet remains
-experimental, and public Testnet behavior under its 100-confirmation wallet
-policy has not been exercised by this local test. Project-operated seed
+The controlled private-transfer and transparent-coinbase shielding lifecycles
+have passed only in isolated Regtest. No public Wcash Testnet is deployed, the
+single-writer one-shot wallet remains experimental, and public Testnet behavior
+under its 100-confirmation wallet policy has not been exercised by these local
+tests. Public-network reorg behavior, project-operated seed
 infrastructure and physical ASIC firmware certification are also missing. The
 included pool backend intentionally binds only loopback and uses one fixed share
 target. It does not provide Internet-facing TLS, source-IP abuse controls,
@@ -227,9 +277,10 @@ variable difficulty, multi-generation late-share grace, balances, payouts,
 settlement, monitoring, backups, or incident automation. Wcash mainnet remains
 disabled.
 
-The independent Zcash parent coinbase follows standard Zcash rules and its
-shielded recipient is publicly recoverable; only the Wcash child reward uses
-the stronger private-coinbase policy. Do not advertise hidden Zcash payouts or
-pay miners directly from raw share counts. A separately reviewed accounting
-and settlement service must consume authenticated journal snapshots before a
+The independent Zcash parent coinbase follows standard Zcash rules. The normal
+pool examples use public transparent payouts on both chains; a private Wcash
+child reward is available only when the operator explicitly supplies the
+corresponding Unified Address. Do not advertise hidden Zcash payouts or pay
+miners directly from raw share counts. A separately reviewed accounting and
+settlement service must consume authenticated journal snapshots before a
 community-facing pool can be operated.

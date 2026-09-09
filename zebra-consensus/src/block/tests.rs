@@ -16,7 +16,11 @@ use zebra_chain::{
     },
     parameters::{subsidy::block_subsidy, NetworkUpgrade},
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
-    transaction::{arbitrary::transaction_to_fake_v5, LockTime, Transaction},
+    transaction::{
+        arbitrary::{fake_bundle_for_branch, transaction_to_fake_v5},
+        LockTime, Transaction,
+    },
+    transparent,
     work::{
         difficulty::{ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY},
         equihash::{Solution, WCASH_BLOCK_WIRE_VERSION},
@@ -639,7 +643,7 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
 }
 
 #[test]
-fn wcash_coinbase_rejects_transparent_and_missing_ironwood_outputs() -> Result<(), Report> {
+fn wcash_coinbase_accepts_transparent_payout_and_enforces_value_limits() -> Result<(), Report> {
     let _init_guard = zebra_test::init();
     let network = Network::new_wcash_regtest();
     let height = Height(1);
@@ -653,9 +657,27 @@ fn wcash_coinbase_rejects_transparent_and_missing_ironwood_outputs() -> Result<(
         .first()
         .expect("block contains a coinbase");
 
+    let transparent_output = transparent::Output {
+        value: expected_block_subsidy,
+        lock_script: transparent_coinbase
+            .outputs()
+            .first()
+            .expect("fixture coinbase has a transparent output")
+            .lock_script
+            .clone(),
+    };
+    let valid_transparent_coinbase = Transaction::test_v4(
+        transparent_coinbase.inputs(),
+        vec![transparent_output.clone()],
+        transparent_coinbase
+            .lock_time()
+            .unwrap_or_else(LockTime::unlocked),
+        Height::MIN,
+    );
+
     assert_eq!(
         check::miner_fees_are_valid(
-            transparent_coinbase,
+            &valid_transparent_coinbase,
             height,
             Amount::try_from(MAX_WCASH_COINBASE_VALUE)?,
             expected_block_subsidy,
@@ -667,9 +689,39 @@ fn wcash_coinbase_rejects_transparent_and_missing_ironwood_outputs() -> Result<(
         )))
     );
 
+    check::miner_fees_are_valid(
+        &valid_transparent_coinbase,
+        height,
+        Amount::zero(),
+        expected_block_subsidy,
+        deferred,
+        &network,
+    )?;
+
+    let coinbase_input = vec![transparent::Input::Coinbase {
+        height,
+        data: vec![1, 1],
+        sequence: u32::MAX,
+    }];
+    let ironwood = fake_bundle_for_branch(
+        zcash_protocol::consensus::BranchId::Nu6_3,
+        ::orchard::ValuePool::Ironwood,
+        1,
+        11,
+    )
+    .expect("NU6.3 defines the Ironwood pool");
+    let mixed_coinbase = Transaction::test_v6_with_bundles(
+        NetworkUpgrade::Nu6_3,
+        coinbase_input.clone(),
+        vec![transparent_output.clone()],
+        LockTime::unlocked(),
+        height,
+        None,
+        Some(ironwood),
+    );
     assert_eq!(
         check::miner_fees_are_valid(
-            transparent_coinbase,
+            &mixed_coinbase,
             height,
             Amount::zero(),
             expected_block_subsidy,
@@ -677,7 +729,60 @@ fn wcash_coinbase_rejects_transparent_and_missing_ironwood_outputs() -> Result<(
             &network,
         ),
         Err(BlockError::Transaction(TransactionError::Subsidy(
-            SubsidyError::WcashTransparentCoinbaseOutput,
+            SubsidyError::WcashMixedCoinbaseOutputs,
+        )))
+    );
+
+    let orchard = fake_bundle_for_branch(
+        zcash_protocol::consensus::BranchId::Nu6_3,
+        ::orchard::ValuePool::Orchard,
+        1,
+        12,
+    )
+    .expect("NU6.3 defines the Orchard pool");
+    let legacy_orchard_coinbase = Transaction::test_v6_with_bundles(
+        NetworkUpgrade::Nu6_3,
+        coinbase_input,
+        vec![transparent_output],
+        LockTime::unlocked(),
+        height,
+        Some(orchard),
+        None,
+    );
+    assert_eq!(
+        check::miner_fees_are_valid(
+            &legacy_orchard_coinbase,
+            height,
+            Amount::zero(),
+            expected_block_subsidy,
+            deferred,
+            &network,
+        ),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::WcashOrchardCoinbaseOutput,
+        )))
+    );
+
+    let legacy_sapling_coinbase = Network::Mainnet
+        .block_iter()
+        .map(|(_, bytes)| {
+            Block::zcash_deserialize(*bytes)
+                .expect("the fixed Mainnet block vector must deserialize")
+        })
+        .filter_map(|block| block.transactions.first().cloned())
+        .find(|coinbase| coinbase.has_sapling_shielded_data())
+        .expect("the fixed Mainnet vectors include a Sapling coinbase");
+    assert_eq!(
+        check::miner_fees_are_valid(
+            &legacy_sapling_coinbase,
+            height,
+            Amount::zero(),
+            expected_block_subsidy,
+            deferred,
+            &network,
+        ),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::WcashSaplingCoinbaseOutput,
         )))
     );
 
@@ -699,11 +804,33 @@ fn wcash_coinbase_rejects_transparent_and_missing_ironwood_outputs() -> Result<(
             &network,
         ),
         Err(BlockError::Transaction(TransactionError::Subsidy(
-            SubsidyError::WcashIronwoodCoinbaseOutputMissing,
+            SubsidyError::WcashCoinbaseOutputMissing,
         )))
     );
 
     Ok(())
+}
+
+#[test]
+fn wcash_coinbase_payout_modes_are_exclusive() {
+    use check::WcashCoinbasePayoutMode;
+
+    assert_eq!(
+        check::wcash_coinbase_payout_mode(true, false),
+        Ok(WcashCoinbasePayoutMode::Transparent)
+    );
+    assert_eq!(
+        check::wcash_coinbase_payout_mode(false, true),
+        Ok(WcashCoinbasePayoutMode::Ironwood)
+    );
+    assert_eq!(
+        check::wcash_coinbase_payout_mode(false, false),
+        Err(SubsidyError::WcashCoinbaseOutputMissing)
+    );
+    assert_eq!(
+        check::wcash_coinbase_payout_mode(true, true),
+        Err(SubsidyError::WcashMixedCoinbaseOutputs)
+    );
 }
 
 #[test]

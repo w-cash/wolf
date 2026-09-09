@@ -882,7 +882,7 @@ fn coinbase_at_nu6_3_routes_shielded_output_to_ironwood() {
     zebra_consensus::transaction::check::coinbase_outputs_are_decryptable(&coinbase, &net, height)
         .expect("Ironwood coinbase output is recoverable with the zero outgoing viewing key");
     assert!(
-        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_shielded_value_to(
+        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_value_to(
             &coinbase,
             &expected_address,
         )
@@ -894,7 +894,7 @@ fn coinbase_at_nu6_3_routes_shielded_output_to_ironwood() {
             .parse()
             .expect("hard-coded transparent address is valid");
     assert_eq!(
-        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_shielded_value_to(
+        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_value_to(
             &coinbase,
             &different_address,
         ),
@@ -908,45 +908,85 @@ fn coinbase_at_nu6_3_routes_shielded_output_to_ironwood() {
 fn wcash_miner_payout_addresses_are_bound_to_the_selected_network() {
     let testnet = Network::new_wcash_testnet();
     let regtest = Network::new_wcash_regtest();
-    let testnet_address = default_miner_address_for_network(&testnet, &MinerAddressType::Unified);
-    let regtest_address = default_miner_address_for_network(&regtest, &MinerAddressType::Unified);
     let config_for = |address: &str| Config {
         miner_address: Some(address.parse().expect("hard-coded Wcash address is valid")),
         ..Default::default()
     };
 
-    for (network, matching_address, other_network_address) in [
-        (&testnet, testnet_address.as_str(), regtest_address.as_str()),
-        (&regtest, regtest_address.as_str(), testnet_address.as_str()),
-    ] {
-        MinerParams::new(network, config_for(matching_address))
-            .expect("the matching Wcash payout namespace is accepted");
-        assert!(matches!(
-            MinerParams::new(network, config_for(other_network_address)),
-            Err(super::MinerParamsError::InvalidAddr(_))
-        ));
+    for address_type in [MinerAddressType::Transparent, MinerAddressType::Unified] {
+        let testnet_address = default_miner_address_for_network(&testnet, &address_type);
+        let regtest_address = default_miner_address_for_network(&regtest, &address_type);
+
+        for (network, matching_address, other_network_address) in [
+            (&testnet, testnet_address.as_str(), regtest_address.as_str()),
+            (&regtest, regtest_address.as_str(), testnet_address.as_str()),
+        ] {
+            MinerParams::new(network, config_for(matching_address))
+                .expect("the matching Wcash payout namespace is accepted");
+            assert!(matches!(
+                MinerParams::new(network, config_for(other_network_address)),
+                Err(super::MinerParamsError::InvalidAddr(_))
+            ));
+        }
     }
 }
 
-/// Wcash templates pay the entire coinbase reward privately into Ironwood and reject miner
-/// addresses that cannot receive an Ironwood note.
+/// Wcash templates support conventional transparent payouts and optional private Ironwood
+/// payouts, while rejecting legacy shielded and inherited Zcash addresses.
 #[test]
-fn wcash_coinbase_is_private_and_ironwood_only() {
+fn wcash_coinbase_supports_transparent_and_private_payouts() {
+    use zcash_protocol::consensus::NetworkType;
     use zebra_chain::parameters::subsidy::SubsidyError;
+    use zebra_chain::primitives::WcashAddress;
     use zebra_consensus::error::TransactionError;
 
     let net = Network::new_wcash_regtest();
     let height = Height(1);
+    let transparent_address =
+        default_miner_address_for_network(&net, &MinerAddressType::Transparent);
     let unified_address = default_miner_address_for_network(&net, &MinerAddressType::Unified);
     let config_for = |address: &str| Config {
         miner_address: Some(address.parse().expect("hard-coded address parses")),
         ..Default::default()
     };
-    let miner_params = MinerParams::new(&net, config_for(&unified_address))
+    let transparent_params = MinerParams::new(&net, config_for(&transparent_address))
+        .expect("the Wcash transparent miner address is valid");
+    let private_params = MinerParams::new(&net, config_for(&unified_address))
         .expect("the Wcash Unified miner address is valid");
     let miner_fees = Amount::try_from(12_345).expect("valid fee amount");
 
-    let template = TransactionTemplate::new_coinbase(&net, height, &miner_params, miner_fees)
+    let transparent_template =
+        TransactionTemplate::new_coinbase(&net, height, &transparent_params, miner_fees)
+            .expect("valid transparent Wcash coinbase tx");
+    let transparent_coinbase: Transaction = transparent_template
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
+        .unwrap();
+    assert_eq!(transparent_coinbase.version(), 6);
+    assert!(transparent_coinbase.is_coinbase());
+    assert_eq!(transparent_coinbase.outputs().len(), 1);
+    assert_eq!(
+        transparent_coinbase.outputs()[0].value().zatoshis(),
+        625_012_345
+    );
+    assert!(!transparent_coinbase.has_sapling_shielded_data());
+    assert!(!transparent_coinbase.has_orchard_shielded_data());
+    assert!(transparent_coinbase.ironwood_actions().next().is_none());
+    let matching_zcash_transparent: zcash_address::ZcashAddress =
+        default_miner_address(net.kind(), &MinerAddressType::Transparent)
+            .parse()
+            .expect("the corresponding Zcash transparent fixture is valid");
+    assert_eq!(
+        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_value_to(
+            &transparent_coinbase,
+            &matching_zcash_transparent,
+        ),
+        Some(625_012_345),
+        "independent template checks can authenticate a transparent payout receiver"
+    );
+
+    let template = TransactionTemplate::new_coinbase(&net, height, &private_params, miner_fees)
         .expect("valid private Wcash coinbase tx");
     let coinbase: Transaction = template.data.as_ref().zcash_deserialize_into().unwrap();
 
@@ -955,7 +995,7 @@ fn wcash_coinbase_is_private_and_ironwood_only() {
         .parse()
         .expect("hard-coded Zcash address is valid");
     assert_eq!(
-        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_shielded_value_to(
+        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_value_to(
             &coinbase,
             &public_zcash_address,
         ),
@@ -993,83 +1033,117 @@ fn wcash_coinbase_is_private_and_ironwood_only() {
         ),
         Err(TransactionError::CoinbaseOutputsNotDecryptable)
     ));
+    assert!(MinerParams::new(&net, config_for(&transparent_address)).is_ok());
     assert!(MinerParams::new(&net, config_for(&unified_address)).is_ok());
+
+    let p2sh_address =
+        WcashAddress::from_transparent_p2sh(NetworkType::Regtest, [0x24; 20]).encode();
+    let p2sh_params = MinerParams::new(&net, config_for(&p2sh_address))
+        .expect("a Wcash P2SH address is a supported transparent payout");
+    let p2sh_template =
+        TransactionTemplate::new_coinbase(&net, height, &p2sh_params, Amount::zero())
+            .expect("a Wcash P2SH coinbase is buildable");
+    let p2sh_coinbase: Transaction = p2sh_template
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("the P2SH coinbase deserializes");
+    assert_eq!(p2sh_coinbase.outputs().len(), 1);
+    assert_eq!(
+        p2sh_coinbase.outputs()[0]
+            .address(&net)
+            .expect("the payout has a standard transparent script")
+            .encode_wcash(&net)
+            .expect("the payout belongs to Wcash Regtest"),
+        p2sh_address
+    );
 
     assert!(matches!(
         MinerParams::new(&net, config_for(inherited_zcash_address)),
         Err(super::MinerParamsError::WcashAddressNamespaceRequired)
     ));
 
-    for invalid_type in [MinerAddressType::Sapling, MinerAddressType::Transparent] {
-        let invalid_address = default_miner_address_for_network(&net, &invalid_type);
-        assert!(matches!(
-            MinerParams::new(&net, config_for(&invalid_address)),
-            Err(super::MinerParamsError::WcashRequiresIronwoodReceiver)
-        ));
+    let sapling_address = default_miner_address_for_network(&net, &MinerAddressType::Sapling);
+    assert!(matches!(
+        MinerParams::new(&net, config_for(&sapling_address)),
+        Err(super::MinerParamsError::WcashUnsupportedPayoutAddress)
+    ));
 
-        let invalid_params = MinerParams::new(&net, config_for(&invalid_address))
-            .expect_err("the Wcash coinbase policy rejects non-Unified miner addresses");
-        assert!(matches!(
-            invalid_params,
-            super::MinerParamsError::WcashRequiresIronwoodReceiver
-        ));
-    }
+    let invalid_params = MinerParams::new(&net, config_for(&sapling_address))
+        .expect_err("the Wcash coinbase policy rejects legacy shielded miner addresses");
+    assert!(matches!(
+        invalid_params,
+        super::MinerParamsError::WcashUnsupportedPayoutAddress
+    ));
+
+    let tex_address = WcashAddress::from_tex(NetworkType::Regtest, [0x42; 20]).encode();
+    assert!(matches!(
+        MinerParams::new(&net, config_for(&tex_address)),
+        Err(super::MinerParamsError::WcashUnsupportedPayoutAddress)
+    ));
 
     let excessive_fees = Amount::try_from(MAX_WCASH_COINBASE_VALUE)
         .expect("the per-transaction cap is representable");
     assert!(matches!(
-        TransactionTemplate::new_coinbase(&net, height, &miner_params, excessive_fees),
+        TransactionTemplate::new_coinbase(&net, height, &private_params, excessive_fees),
         Err(TransactionError::Subsidy(
             SubsidyError::WcashCoinbaseValueTooLarge
         ))
     ));
 }
 
-/// Once scheduled issuance reaches zero, Wcash still routes both zero and positive fee totals
-/// through private Ironwood actions rather than falling back to a transparent or empty coinbase.
+/// Once scheduled issuance reaches zero, both supported Wcash payout modes remain buildable.
 #[test]
-fn wcash_zero_subsidy_tail_stays_private() {
+fn wcash_zero_subsidy_tail_supports_both_payout_modes() {
     let net = Network::new_wcash_regtest();
     let height = Height(50_400_001);
-    let unified_address = default_miner_address_for_network(&net, &MinerAddressType::Unified);
-    let miner_params = MinerParams::new(
-        &net,
-        Config {
-            miner_address: Some(
-                unified_address
-                    .parse()
-                    .expect("hard-coded Wcash Unified address is valid"),
-            ),
-            ..Default::default()
-        },
-    )
-    .expect("the Wcash Unified miner address is valid");
-
-    for fee_zatoshis in [0i64, 12_345] {
-        let fees = Amount::try_from(fee_zatoshis).expect("test fee is representable");
-        let template = TransactionTemplate::new_coinbase(&net, height, &miner_params, fees)
-            .expect("a zero-subsidy Wcash coinbase remains buildable");
-        let coinbase: Transaction = template
-            .data
-            .as_ref()
-            .zcash_deserialize_into()
-            .expect("tail coinbase deserializes");
-
-        assert!(coinbase.outputs().is_empty());
-        assert!(!coinbase.has_sapling_shielded_data());
-        assert!(!coinbase.has_orchard_shielded_data());
-        assert!(coinbase.ironwood_actions().next().is_some());
-        assert_eq!(
-            coinbase
-                .ironwood_value_balance()
-                .ironwood_amount()
-                .zatoshis(),
-            -fee_zatoshis
-        );
-        zebra_consensus::transaction::check::wcash_coinbase_outputs_are_private(
-            &coinbase, &net, height,
+    for address_type in [MinerAddressType::Transparent, MinerAddressType::Unified] {
+        let address = default_miner_address_for_network(&net, &address_type);
+        let miner_params = MinerParams::new(
+            &net,
+            Config {
+                miner_address: Some(address.parse().expect("hard-coded Wcash address is valid")),
+                ..Default::default()
+            },
         )
-        .expect("the tail Ironwood actions remain private");
+        .expect("the selected Wcash miner address is valid");
+
+        for fee_zatoshis in [0i64, 12_345] {
+            let fees = Amount::try_from(fee_zatoshis).expect("test fee is representable");
+            let template = TransactionTemplate::new_coinbase(&net, height, &miner_params, fees)
+                .expect("a zero-subsidy Wcash coinbase remains buildable");
+            let coinbase: Transaction = template
+                .data
+                .as_ref()
+                .zcash_deserialize_into()
+                .expect("tail coinbase deserializes");
+
+            assert!(!coinbase.has_sapling_shielded_data());
+            assert!(!coinbase.has_orchard_shielded_data());
+            match address_type {
+                MinerAddressType::Transparent => {
+                    assert_eq!(coinbase.outputs().len(), 1);
+                    assert_eq!(coinbase.outputs()[0].value().zatoshis(), fee_zatoshis);
+                    assert!(coinbase.ironwood_actions().next().is_none());
+                }
+                MinerAddressType::Unified => {
+                    assert!(coinbase.outputs().is_empty());
+                    assert!(coinbase.ironwood_actions().next().is_some());
+                    assert_eq!(
+                        coinbase
+                            .ironwood_value_balance()
+                            .ironwood_amount()
+                            .zatoshis(),
+                        -fee_zatoshis
+                    );
+                    zebra_consensus::transaction::check::wcash_coinbase_outputs_are_private(
+                        &coinbase, &net, height,
+                    )
+                    .expect("the tail Ironwood actions remain private");
+                }
+                MinerAddressType::Sapling => unreachable!("Sapling is not a supported payout"),
+            }
+        }
     }
 }
 

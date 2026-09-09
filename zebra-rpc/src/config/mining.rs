@@ -99,8 +99,8 @@ pub struct Config {
     /// Address for receiving miner subsidy and tx fees.
     ///
     /// Used in coinbase tx constructed in `getblocktemplate` RPC.
-    /// Wcash requires a Unified address containing an Orchard receiver, which is used as the
-    /// recipient for its mandatory Ironwood coinbase output.
+    /// Wcash accepts a transparent address (the normal pool mode) or a Unified address containing
+    /// an Orchard receiver (an optional private Ironwood payout).
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub miner_address: Option<MinerAddress>,
 
@@ -232,9 +232,9 @@ pub fn default_miner_address(kind: NetworkKind, addr_type: &MinerAddressType) ->
 
 /// Returns the default miner address for `network`.
 ///
-/// Built-in Wcash networks use their matching Wcash textual namespace and an
-/// address containing the Orchard receiver used for Ironwood. Ordinary Zcash
-/// networks retain their upstream fixtures.
+/// Built-in Wcash networks use their matching Wcash textual namespace. Ordinary Zcash networks
+/// retain their upstream fixtures. Callers choose the address type; [`MinerAddressType`] defaults
+/// to transparent.
 pub fn default_miner_address_for_network(
     network: &Network,
     addr_type: &MinerAddressType,
@@ -284,21 +284,32 @@ mod tests {
     fn default_wcash_miner_addresses_follow_the_selected_network() {
         use zcash_protocol::consensus::NetworkType;
 
-        for (network, expected_network, expected_prefix) in [
-            (Network::new_wcash_testnet(), NetworkType::Test, "wutest1"),
+        for (network, expected_network, transparent_prefix, unified_prefix) in [
+            (
+                Network::new_wcash_testnet(),
+                NetworkType::Test,
+                "WT",
+                "wutest1",
+            ),
             (
                 Network::new_wcash_regtest(),
                 NetworkType::Regtest,
+                "WR",
                 concat!("w", "u", "regtest", "1"),
             ),
         ] {
-            let encoded = default_miner_address_for_network(&network, &MinerAddressType::Unified);
-            let address: WcashAddress = encoded
-                .parse()
-                .expect("the generated Wcash miner address is valid");
+            for (address_type, expected_prefix) in [
+                (MinerAddressType::default(), transparent_prefix),
+                (MinerAddressType::Unified, unified_prefix),
+            ] {
+                let encoded = default_miner_address_for_network(&network, &address_type);
+                let address: WcashAddress = encoded
+                    .parse()
+                    .expect("the generated Wcash miner address is valid");
 
-            assert_eq!(address.network(), expected_network);
-            assert!(encoded.starts_with(expected_prefix));
+                assert_eq!(address.network(), expected_network);
+                assert!(encoded.starts_with(expected_prefix));
+            }
         }
     }
 

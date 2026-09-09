@@ -1171,8 +1171,9 @@ impl Parameters {
     /// Creates the built-in local Wcash Regtest parameters.
     ///
     /// NU6.3 activates at height 1, so every mined block uses the 75-second post-Blossom target
-    /// spacing and can pay its coinbase reward into Ironwood. Wcash proof-of-work remains enabled
-    /// because its AuxPoW verifier replaces native Equihash validation, including on Regtest.
+    /// spacing and can pay its coinbase reward transparently or into Ironwood. Wcash proof-of-work
+    /// remains enabled because its AuxPoW verifier replaces native Equihash validation, including
+    /// on Regtest.
     pub(super) fn new_wcash_regtest() -> Result<Self, ParametersBuilderError> {
         let genesis_hash = block::genesis::wcash_regtest_genesis_block().hash();
         let parameters = Self::build()

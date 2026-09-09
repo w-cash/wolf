@@ -139,9 +139,10 @@ pub struct CreateAuxBlockResponse {
     #[getter(copy)]
     previous_block_hash: block::Hash,
 
-    /// Total shielded miner reward, including selected transaction fees, in
-    /// zatoshis. The value is public supply accounting; only its recipient and
-    /// note contents are hidden.
+    /// Total miner reward, including selected transaction fees, in zatoshis.
+    ///
+    /// This amount is always public supply accounting. The recipient is public
+    /// for transparent payouts and hidden for private Ironwood payouts.
     #[serde(rename = "coinbasevalue")]
     #[getter(copy)]
     coinbase_value: i64,
