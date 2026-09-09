@@ -25,16 +25,27 @@ pub mod rpc;
 pub mod zip301;
 pub mod zip301_client;
 
+/// Maximum time one native generation can remain available to miners.
+pub const NATIVE_JOB_MAX_AGE_SECONDS: u64 = 45;
+
+/// Millisecond representation of [`NATIVE_JOB_MAX_AGE_SECONDS`] for pool protocols.
+pub const NATIVE_JOB_MAX_AGE_MILLISECONDS: u32 = 45_000;
+
+/// Confirmation depth applied to native Wcash and Zcash coinbase rewards.
+pub const NATIVE_COINBASE_MATURITY_CONFIRMATIONS: u32 =
+    zcash_protocol::consensus::COINBASE_MATURITY_BLOCKS;
+
 pub use coinbase::{build_parent_coinbase, ParentOutput};
 pub use coordinator::{
     CoordinatorConfig, GenerationRetirement, NativeMiningCoordinator, NativeMiningSupervisor,
-    WinnerOutboxStatus, NATIVE_JOB_MAX_AGE_SECONDS,
+    WinnerOutboxStatus,
 };
 pub use error::MinerError;
 pub use job::{JobConfig, PreparedJob, SolvedAuxPow, EQUIHASH_SOLUTION_BYTES};
 pub use native::{
-    NativePreparedJob, NativeZcashConfig, NativeZcashProvider, ParentNodeOutcome,
-    ParentSubmissionReport, ValidatedNativeShare,
+    NativeGenerationDescriptor, NativePreparedJob, NativeWcashPayoutVerification,
+    NativeZcashConfig, NativeZcashProvider, ParentNodeOutcome, ParentSubmissionReport,
+    ValidatedNativeShare,
 };
 pub use zip301::{serve_zip301_loopback, ShareProcessor, Zip301Config, Zip301LoopbackListener};
 pub use zip301_client::{mine_zip301_once, Zip301AcceptedShare, Zip301ClientConfig};
