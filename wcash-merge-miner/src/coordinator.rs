@@ -95,6 +95,7 @@ pub struct NativeMiningCoordinator {
     zcash: NativeZcashProvider,
     job: NativePreparedJob,
     generation_descriptor: NativeGenerationDescriptor,
+    child_candidate_bytes: Arc<[u8]>,
     child_height: u32,
     child_previous_hash: String,
     child_candidate_lease: ChildCandidateLease,
@@ -104,6 +105,50 @@ pub struct NativeMiningCoordinator {
     outbox_retry_requested: AtomicBool,
     outbox_retry_in_progress: AtomicBool,
     journal: Arc<ShareJournal>,
+}
+
+/// One exact consensus block produced by a validated merged-mining share.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeWinnerBlock {
+    block_hash_le: [u8; 32],
+    block_bytes: Vec<u8>,
+}
+
+impl NativeWinnerBlock {
+    /// Returns the winning block hash in raw consensus byte order.
+    pub const fn block_hash_le(&self) -> [u8; 32] {
+        self.block_hash_le
+    }
+
+    /// Returns the exact canonical block bytes submitted to this chain.
+    pub fn block_bytes(&self) -> &[u8] {
+        &self.block_bytes
+    }
+}
+
+/// Exact independently classified winner material for one validated share.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeWinnerMaterial {
+    job_id: [u8; 32],
+    wcash: Option<NativeWinnerBlock>,
+    zcash: Option<NativeWinnerBlock>,
+}
+
+impl NativeWinnerMaterial {
+    /// Returns the frozen generation that produced this material.
+    pub const fn job_id(&self) -> [u8; 32] {
+        self.job_id
+    }
+
+    /// Returns the completed Wcash block only when the Wcash target was met.
+    pub const fn wcash(&self) -> Option<&NativeWinnerBlock> {
+        self.wcash.as_ref()
+    }
+
+    /// Returns the completed Zcash block only when the Zcash target was met.
+    pub const fn zcash(&self) -> Option<&NativeWinnerBlock> {
+        self.zcash.as_ref()
+    }
 }
 
 /// Final cache disposition of a stopped native mining generation.
@@ -428,12 +473,13 @@ impl NativeMiningSupervisor {
                 actual: format!("{child_tip} at height {child_tip_height}"),
             });
         }
+        let child_candidate_bytes: Arc<[u8]> = child_candidate_bytes.into();
         journal.activate_job(ActiveJournalJob {
             job_id: job.job().job_id().to_string(),
             child_hash_display: child.hash.clone(),
             child_height: child.height,
             parent_height: job.parent_height(),
-            child_candidate_bytes: child_candidate_bytes.into(),
+            child_candidate_bytes: Arc::clone(&child_candidate_bytes),
         })?;
         let candidate_created_at = Instant::now();
 
@@ -442,6 +488,7 @@ impl NativeMiningSupervisor {
             zcash,
             job,
             generation_descriptor,
+            child_candidate_bytes,
             child_height: child.height,
             child_previous_hash: child.previous_block_hash,
             child_candidate_lease,
@@ -496,6 +543,47 @@ impl NativeMiningCoordinator {
     /// Returns exact proposal-validated metadata for this frozen generation.
     pub const fn generation_descriptor(&self) -> &NativeGenerationDescriptor {
         &self.generation_descriptor
+    }
+
+    /// Materializes exact winning blocks for a share validated by this generation.
+    ///
+    /// An ordinary accepted share returns no chain blocks. A dual-target winner returns both
+    /// independently classified blocks. The caller can persist this value atomically with its
+    /// durable share receipt before attempting either network submission.
+    pub fn materialize_winners(
+        &self,
+        share: &ValidatedNativeShare,
+    ) -> Result<NativeWinnerMaterial, MinerError> {
+        if share.job_id() != self.generation_descriptor.job_id() {
+            return Err(MinerError::InvalidRequest(
+                "validated share belongs to a different native generation".to_string(),
+            ));
+        }
+
+        let wcash = share
+            .wcash_candidate()
+            .map(|winner| {
+                complete_wcash_candidate(
+                    &self.child_candidate_bytes,
+                    &display_hash(self.generation_descriptor.wcash_candidate_hash_le()),
+                    winner.encoded_proof(),
+                )
+                .map(|block_bytes| NativeWinnerBlock {
+                    block_hash_le: self.generation_descriptor.wcash_candidate_hash_le(),
+                    block_bytes,
+                })
+            })
+            .transpose()?;
+        let zcash = share.parent_block().map(|block_bytes| NativeWinnerBlock {
+            block_hash_le: share.parent_block_hash().into_le_bytes(),
+            block_bytes: block_bytes.to_vec(),
+        });
+
+        Ok(NativeWinnerMaterial {
+            job_id: share.job_id(),
+            wcash,
+            zcash,
+        })
     }
 
     /// Stops issuing this generation and releases its node cache slot when safe.
@@ -3198,6 +3286,31 @@ mod tests {
         assert_eq!(parsed.chain_id, WCASH_AUXILIARY_CHAIN_ID);
         assert_eq!(parsed.coinbase_value, 1_000_000_000);
         assert_eq!(parsed.retire_token, "33".repeat(32));
+    }
+
+    #[test]
+    fn winner_material_preserves_exact_chain_bytes_and_generation() {
+        let wcash = NativeWinnerBlock {
+            block_hash_le: [0x71; 32],
+            block_bytes: vec![0x01, 0x02, 0x03],
+        };
+        let zcash = NativeWinnerBlock {
+            block_hash_le: [0x72; 32],
+            block_bytes: vec![0x04, 0x05],
+        };
+        let material = NativeWinnerMaterial {
+            job_id: [0x70; 32],
+            wcash: Some(wcash.clone()),
+            zcash: Some(zcash.clone()),
+        };
+
+        assert_eq!(material.job_id(), [0x70; 32]);
+        assert_eq!(material.wcash(), Some(&wcash));
+        assert_eq!(material.zcash(), Some(&zcash));
+        assert_eq!(wcash.block_hash_le(), [0x71; 32]);
+        assert_eq!(wcash.block_bytes(), [0x01, 0x02, 0x03]);
+        assert_eq!(zcash.block_hash_le(), [0x72; 32]);
+        assert_eq!(zcash.block_bytes(), [0x04, 0x05]);
     }
 
     #[test]
