@@ -570,9 +570,9 @@ pub trait Rpc {
     /// Creates and caches one exact proof-independent Wcash child-block
     /// candidate for Zcash-parent merged mining.
     ///
-    /// `address` must be a Wcash Unified Address with the receiver required for
-    /// a private Ironwood coinbase. A parent pool commits to the returned
-    /// `hash`, then supplies the same hash and its AuxPoW to
+    /// `address` must be a transparent Wcash address or a Wcash Unified Address
+    /// with an Orchard receiver for an optional private Ironwood coinbase. A
+    /// parent pool commits to the returned `hash`, then supplies the same hash and its AuxPoW to
     /// [`Self::submit_aux_block`]. This method is rejected on Zcash networks.
     #[method(name = "createauxblock")]
     async fn create_aux_block(&self, address: String) -> Result<CreateAuxBlockResponse>;
@@ -3132,10 +3132,9 @@ where
             ));
         }
 
-        // A pool chooses its Wcash payout destination on every request, as in
-        // the established createauxblock API. MinerParams applies Wcash's
-        // stronger rule: only a Unified Address capable of receiving the
-        // private Ironwood coinbase is accepted.
+        // A pool chooses its Wcash payout destination on every request, as in the established
+        // createauxblock API. MinerParams accepts either a Wcash transparent address or a Wcash
+        // Unified Address capable of receiving an optional private Ironwood coinbase.
         let miner_address =
             address
                 .parse()
@@ -4795,6 +4794,11 @@ mod wcash_address_validation_tests {
             serde_json::Value::String("WR64VqQpZRujxYnAJmqGK4d4fbqQZRZHazG".to_string())
         );
         assert_eq!(utxo.address(), &address);
+        assert_eq!(
+            utxo.encoded_address(),
+            "WR64VqQpZRujxYnAJmqGK4d4fbqQZRZHazG"
+        );
+        assert_ne!(utxo.encoded_address(), utxo.address().to_string());
         assert_eq!(serde_json::from_value::<Utxo>(value).unwrap(), utxo);
     }
 
@@ -5675,6 +5679,11 @@ impl Utxo {
     /// Returns this UTXO's decoded transparent address.
     pub fn address(&self) -> &transparent::Address {
         &self.address.address
+    }
+
+    /// Returns this UTXO's transparent address in the active chain namespace.
+    pub fn encoded_address(&self) -> &str {
+        &self.address.encoded
     }
 
     /// Constructs a new instance of [`GetAddressUtxos`].

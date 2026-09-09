@@ -1,0 +1,4 @@
+project: zebra-chain
+kind: breaking
+body: "Revise the pre-launch Wcash coinbase payout primitives and validation errors for exclusive transparent or private Ironwood reward modes."
+time: 2026-09-09T00:00:00.000000001Z

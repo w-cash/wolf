@@ -422,6 +422,7 @@ pub enum SubsidyError {
     #[error("miner fees are invalid")]
     InvalidMinerFees,
 
+    /// Retained for source compatibility with the initial private-only Wcash profile.
     #[error("Wcash coinbase transaction has a transparent output")]
     WcashTransparentCoinbaseOutput,
 
@@ -431,6 +432,13 @@ pub enum SubsidyError {
     #[error("Wcash coinbase transaction has an Orchard component")]
     WcashOrchardCoinbaseOutput,
 
+    #[error("Wcash coinbase transaction has no payout output")]
+    WcashCoinbaseOutputMissing,
+
+    #[error("Wcash coinbase transaction mixes transparent and Ironwood payout outputs")]
+    WcashMixedCoinbaseOutputs,
+
+    /// Retained for source compatibility with the initial private-only Wcash profile.
     #[error("Wcash coinbase transaction has no Ironwood output")]
     WcashIronwoodCoinbaseOutputMissing,
 

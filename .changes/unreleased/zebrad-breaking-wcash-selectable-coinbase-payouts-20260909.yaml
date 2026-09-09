@@ -1,0 +1,4 @@
+project: zebrad
+kind: breaking
+body: "Change the pre-launch Wcash mining profile and pool fixtures to use explicit transparent payouts by default, expose a seed-derived Wcash coinbase address, add bounded one-shot shielding of mature coinbase outputs into Ironwood, and provide paginated exact-byte recovery for locally signed transactions with ambiguous post-sign outcomes. Private direct rewards remain opt-in; nodes and pools must upgrade together."
+time: 2026-09-09T00:00:00.000000004Z

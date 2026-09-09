@@ -26,8 +26,10 @@ enable_cookie_auth = true
 debug_force_finished_sync = false
 
 [mining]
-# Pool software supplies an exact Wcash Testnet Unified Address to
-# `createauxblock`; no transparent or Zcash address is accepted.
+# Pool software supplies an exact, operator-owned Wcash Testnet address to
+# `createauxblock`. A transparent `WT...` address is the normal integration
+# path; a `wutest1...` Unified Address with an Orchard receiver opts into a
+# private Ironwood reward. Inherited Zcash addresses are never accepted.
 internal_miner = false
 extra_coinbase_data = "WcashTestnet"
 

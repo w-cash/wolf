@@ -557,6 +557,14 @@ impl MinerParams {
     #[allow(clippy::unwrap_in_result)]
     pub fn new(net: &Network, conf: config::mining::Config) -> Result<Self, MinerParamsError> {
         let configured_address = conf.miner_address.ok_or(MinerParamsError::MissingAddr)?;
+        let is_wcash_tex = matches!(
+            &configured_address,
+            config::mining::MinerAddress::Wcash(address)
+                if matches!(
+                    address.kind(),
+                    zebra_chain::primitives::WcashAddressKind::Tex(_)
+                )
+        );
         let parent_payout_address_commitment = Some(hex::encode(parent_payout_address_commitment(
             &configured_address.to_string(),
         )));
@@ -575,10 +583,10 @@ impl MinerParams {
             }
         };
 
-        if net.uses_wcash_consensus()
-            && !matches!(&addr, Address::Unified(unified) if unified.orchard().is_some())
-        {
-            return Err(MinerParamsError::WcashRequiresIronwoodReceiver);
+        let is_supported_wcash_payout = matches!(&addr, Address::Transparent(_))
+            || matches!(&addr, Address::Unified(unified) if unified.orchard().is_some());
+        if net.uses_wcash_consensus() && (is_wcash_tex || !is_supported_wcash_payout) {
+            return Err(MinerParamsError::WcashUnsupportedPayoutAddress);
         }
 
         // Always tag the coinbase with the Zebra marker, even without configured
@@ -660,9 +668,11 @@ pub enum MinerParamsError {
     /// The configured address could not be converted into a supported payment address.
     #[error("Invalid miner address: {0}")]
     InvalidAddr(zcash_address::ConversionError<&'static str>),
-    /// A Wcash address does not contain the Orchard receiver used for Ironwood rewards.
-    #[error("Wcash miner address must be Unified and contain an Orchard receiver for Ironwood")]
-    WcashRequiresIronwoodReceiver,
+    /// A Wcash address cannot receive a supported transparent or private Ironwood payout.
+    #[error(
+        "Wcash miner address must be transparent or Unified with an Orchard receiver for Ironwood"
+    )]
+    WcashUnsupportedPayoutAddress,
     /// A Zcash address was configured while Wcash consensus is active.
     #[error("Wcash mining requires a Wcash address (w.../W...), not a Zcash address")]
     WcashAddressNamespaceRequired,
@@ -880,7 +890,7 @@ where
 
 // - Parameter checks
 
-/// Checks the mode-specific `getblocktemplate` parameters and private Wcash
+/// Checks the mode-specific `getblocktemplate` parameters and Wcash
 /// parent-template extension.
 ///
 /// Returns an error if there's a mismatch between the mode and whether `data`

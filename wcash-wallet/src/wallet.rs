@@ -1,36 +1,45 @@
 //! SQLite-backed Wcash wallet operations.
 
-use std::{convert::Infallible, fs, num::NonZeroU32, path::Path};
+use std::{collections::HashMap, convert::Infallible, fs, num::NonZeroU32, path::Path};
 
 use orchard::keys::Scope as OrchardScope;
 use rand_core::{OsRng, RngCore};
+use rusqlite::OptionalExtension;
 use secrecy::SecretVec;
 use serde::Serialize;
 use thiserror::Error;
 use zcash_client_backend::{
     data_api::wallet::{
-        create_proposed_transactions,
+        create_proposed_transactions, decrypt_and_store_transaction,
         input_selection::{GreedyInputSelector, SpendPolicy},
-        propose_transfer, unlock_proposal_inputs, ConfirmationsPolicy, LockRequest, SpendingKeys,
+        propose_shielding_coinbase, propose_transfer, unlock_proposal_inputs, ConfirmationsPolicy,
+        LockRequest, SpendingKeys,
     },
-    data_api::{Account, AccountBirthday, WalletRead, WalletWrite},
+    data_api::{Account, AccountBirthday, NullifierQuery, WalletRead, WalletWrite},
+    decrypt_transaction,
     fees::{standard::SingleOutputChangeStrategy, DustOutputPolicy, StandardFeeRule},
     sync,
-    wallet::{LockOwner, OvkPolicy},
+    wallet::{LockOwner, Note as WalletNote, OvkPolicy},
     zip321::{Payment, TransactionRequest},
+    TransferType,
 };
 use zcash_client_sqlite::{util::SystemClock, wallet::init::init_wallet_db, AccountUuid, WalletDb};
-use zcash_primitives::transaction::TxVersion;
+use zcash_primitives::transaction::{Transaction, TxVersion};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
-    consensus::BlockHeight, memo::MemoBytes, value::Zatoshis, PoolType, ShieldedPool,
+    consensus::{BlockHeight, COINBASE_MATURITY_BLOCKS},
+    memo::MemoBytes,
+    value::Zatoshis,
+    PoolType, ShieldedPool,
 };
+use zcash_transparent::bundle::OutPoint;
 use zebra_chain::{block::Height, parameters::Network};
 
 use crate::{
-    decode_recipient, derive_wallet_seed, derive_wallet_spending_key, encode_orchard_receiver,
-    inspect_signed_transaction, AttestedWcashClient, BlockRef, MemoryBlockCache,
-    WalletAddressError, WalletKeyError, WalletNetwork, WalletRpcError,
+    address::default_transparent_receiver, decode_recipient, derive_wallet_seed,
+    derive_wallet_spending_key, encode_orchard_receiver, encode_transparent_coinbase_receiver,
+    inspect_signed_transaction, rpc::TRANSPARENT_UTXO_PAGE_OUTPUTS, AttestedWcashClient, BlockRef,
+    MemoryBlockCache, WalletAddressError, WalletKeyError, WalletNetwork, WalletRpcError,
 };
 
 /// Maximum compact blocks requested in one synchronization batch.
@@ -41,6 +50,16 @@ pub const MAX_TRANSFER_RECIPIENTS: usize = 100;
 pub const MAX_EXPIRY_DELTA: u32 = 100;
 /// Maximum note-lock lifetime accepted by the wallet.
 pub const MAX_LOCK_FOR_BLOCKS: u32 = 1_000;
+/// Maximum transparent coinbase inputs swept by one shielding transaction.
+pub const MAX_COINBASE_SHIELDING_INPUTS: usize = 100;
+/// Maximum locally-created transactions returned by one recovery page.
+pub const MAX_PENDING_TRANSACTION_PAGE_SIZE: usize = 25;
+/// Consensus maturity required before a transparent coinbase output can be
+/// shielded.
+pub const COINBASE_SHIELDING_MATURITY: u32 = COINBASE_MATURITY_BLOCKS;
+/// The deterministic coinbase receiver is recoverable from height one even if
+/// it was published before this SQLite wallet was initialized.
+pub const TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT: u32 = 1;
 
 /// Concrete SQLite wallet database used by this crate.
 pub type WalletDatabase = WalletDb<rusqlite::Connection, Network, SystemClock, OsRng>;
@@ -93,18 +112,18 @@ pub enum WalletServiceError {
     /// The wallet has not yet scanned to the node's current tip.
     #[error("wallet must be fully synchronized before signing")]
     NotSynchronized,
-    /// The live chain changed after the transaction proposal was selected.
-    #[error("proposal tip or anchor is stale; synchronize and rebuild the transfer")]
+    /// The live chain changed during synchronization or after transaction input selection.
+    #[error("wallet chain state is stale; synchronize and rebuild the transaction")]
     StaleChain,
-    /// Signing succeeded and SQLite contains the transaction, but the final
-    /// canonical-chain check failed.
+    /// Signing succeeded and SQLite contains one or more transactions, but a
+    /// subsequent retrieval or policy check failed.
     #[error(
-        "signed transaction {txid} requires review after final chain validation failed: {reason}; recover its exact bytes with the export command"
+        "persisted signed transactions {txids:?} require review: {reason}; recover exact bytes with list-pending or export and do not build a replacement"
     )]
-    StaleAfterSigning {
-        /// Canonical display-order identifier of the persisted transaction.
-        txid: String,
-        /// Final validation error.
+    PersistedTransactionsRequireReview {
+        /// Canonical display-order identifiers returned by the signer.
+        txids: Vec<String>,
+        /// Retrieval, serialization, policy, or canonical-chain failure.
         reason: String,
     },
     /// The transfer uses a confirmation policy below the public safety floor.
@@ -119,6 +138,15 @@ pub enum WalletServiceError {
     /// The proposal would use a pool other than Ironwood.
     #[error("transfer proposal is not Ironwood-only")]
     NonIronwoodProposal,
+    /// Coinbase shielding found no mature, fully classified coinbase output.
+    #[error(
+        "no mature transparent coinbase output is available; coinbase requires 100 blocks and full transaction classification"
+    )]
+    NoMatureCoinbase,
+    /// A coinbase shielding proposal violated its transparent-input and
+    /// Ironwood-output invariants.
+    #[error("coinbase shielding proposal violates wallet policy")]
+    InvalidCoinbaseShieldingProposal,
     /// Stored viewing authority does not match the supplied spending authority.
     #[error("stored account or deterministic Ironwood change receiver does not match stdin seed")]
     AuthorityMismatch,
@@ -142,6 +170,8 @@ pub struct InitializedWallet {
     pub birthday_height: u32,
     /// Canonical Wcash Unified Address for private receipts.
     pub address: String,
+    /// Default Wcash P2PKH receiver for transparent coinbase payouts.
+    pub transparent_coinbase_address: String,
     /// Whether this invocation created the account.
     pub created: bool,
 }
@@ -178,8 +208,16 @@ pub struct AccountBalanceSummary {
     pub sapling_total_zat: u64,
     /// Total legacy Orchard value, expected to stay zero for pool operation.
     pub orchard_total_zat: u64,
-    /// Total transparent value, expected to stay zero for pool operation.
+    /// Total transparent value.
     pub transparent_total_zat: u64,
+    /// Total mature and immature transparent coinbase value.
+    pub transparent_coinbase_total_zat: u64,
+    /// Mature transparent coinbase value available for shielding.
+    pub transparent_coinbase_spendable_zat: u64,
+    /// Immature or otherwise pending transparent coinbase value.
+    pub transparent_coinbase_pending_zat: u64,
+    /// Transparent non-coinbase value. Pool wallets expect this to remain zero.
+    pub transparent_regular_total_zat: u64,
 }
 
 /// One external shielded recipient supplied to transaction construction.
@@ -224,6 +262,41 @@ pub struct StoredSignedTransaction {
     pub branch_id: String,
     /// Transaction expiry height encoded in the signed transaction.
     pub expiry_height: u32,
+}
+
+/// One bounded page of locally-created, not-currently-mined transactions.
+///
+/// Exact signed bytes are included so a caller that crashed before receiving
+/// the original signing result can recover and rebroadcast the same
+/// transaction rather than creating a conflicting replacement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PendingSignedTransactionPage {
+    /// Signed transactions in SQLite row order.
+    pub transactions: Vec<StoredSignedTransaction>,
+    /// Opaque row cursor for the next page, or `None` when this page is final.
+    pub next_after_row_id: Option<u64>,
+}
+
+#[derive(Debug)]
+struct PendingTransactionRow {
+    row_id: i64,
+    txid: zcash_protocol::TxId,
+    raw: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransferOutputRole {
+    Payment,
+    InternalChange,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundIronwoodOutput {
+    receiver: [u8; 43],
+    value_zat: u64,
+    memo: MemoBytes,
+    role: TransferOutputRole,
+    pool: ShieldedPool,
 }
 
 /// Opens and migrates a wallet database without loading spend authority.
@@ -316,6 +389,7 @@ pub async fn initialize_wallet(
             account_id: account_id.expose_uuid().to_string(),
             birthday_height: account.birthday_height().into(),
             address: encode_orchard_receiver(ufvk, network)?,
+            transparent_coinbase_address: encode_transparent_coinbase_receiver(ufvk, network)?,
             created: false,
         });
     }
@@ -325,8 +399,7 @@ pub async fn initialize_wallet(
         .height
         .checked_add(1)
         .ok_or(WalletServiceError::HeightOverflow)?;
-    let birthday_height =
-        requested_birthday.unwrap_or_else(|| tip.height.saturating_sub(99).max(1));
+    let birthday_height = requested_birthday.unwrap_or_else(|| default_wallet_birthday(tip.height));
     if birthday_height == 0 || birthday_height > maximum_birthday {
         return Err(WalletServiceError::InvalidBirthday(format!(
             "height {birthday_height} is outside 1..={maximum_birthday}"
@@ -350,16 +423,36 @@ pub async fn initialize_wallet(
             Some("stdin-seed-v1"),
         )
         .map_err(database_error)?;
-    let address = encode_orchard_receiver(&usk.to_unified_full_viewing_key(), network)?;
+    let ufvk = usk.to_unified_full_viewing_key();
+    let address = encode_orchard_receiver(&ufvk, network)?;
+    let transparent_coinbase_address = encode_transparent_coinbase_receiver(&ufvk, network)?;
     Ok(InitializedWallet {
         account_id: account_id.expose_uuid().to_string(),
         birthday_height,
         address,
+        transparent_coinbase_address,
         created: true,
     })
 }
 
-/// Synchronizes compact Ironwood blocks into the persistent SQLite wallet.
+/// Synchronizes compact Ironwood blocks and classifies current coinbase UTXOs.
+///
+/// The reviewed synchronizer refreshes the current transparent UTXO set. Wcash
+/// then fetches and verifies each current UTXO's full creator transaction for
+/// the default coinbase receiver, because the lightwalletd UTXO message does
+/// not carry the transaction index needed to classify an output as coinbase.
+/// Repeating this current-set pass after every sync repairs classification after
+/// any upstream rewind without a separate historical cursor.
+///
+/// The current-set query starts at height one rather than the shielded scanning
+/// birthday. The fixed transparent receiver can be derived and published before
+/// SQLite initialization, so this guarantees recovery of every still-unspent
+/// coinbase controlled by the seed without replaying spent history.
+///
+/// A creator transaction with both spent and unspent outputs to this same
+/// receiver is rejected rather than risking resurrection of the spent sibling.
+/// The supported mining path therefore uses one payout-address output in each
+/// coinbase transaction; a nonstandard split creator requires manual recovery.
 pub async fn synchronize_wallet(
     client: &mut AttestedWcashClient,
     path: impl AsRef<Path>,
@@ -372,13 +465,25 @@ pub async fn synchronize_wallet(
         )));
     }
     ensure_client_network(client, network)?;
+    let path = path.as_ref();
     let mut wallet = open_wallet_database(path, network)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
-    only_account(&account_ids)?;
+    let account_id = only_account(&account_ids)?;
+    let account = wallet
+        .get_account(account_id)
+        .map_err(database_error)?
+        .ok_or(WalletServiceError::AuthorityMismatch)?;
+    let coinbase_address = encode_transparent_coinbase_receiver(
+        account
+            .ufvk()
+            .ok_or(WalletServiceError::AuthorityMismatch)?,
+        network,
+    )?;
     let cache = MemoryBlockCache::default();
     let parameters = network.parameters();
+    let mut sync_client = client.sync_client();
     sync::run(
-        client.inner_mut(),
+        &mut sync_client,
         &parameters,
         &cache,
         &mut wallet,
@@ -386,7 +491,79 @@ pub async fn synchronize_wallet(
     )
     .await
     .map_err(|error| WalletServiceError::Synchronization(error.to_string()))?;
+
+    let synced = wallet_balance_summary(&wallet, public_confirmation_policy())?;
+    if !synced.synchronized {
+        return Err(WalletServiceError::NotSynchronized);
+    }
+    let tip_height = synced.chain_tip_height;
+    let expected_tip = BlockRef {
+        height: tip_height,
+        hash: if tip_height == 0 {
+            network.genesis_hash()
+        } else {
+            wallet
+                .get_block_hash(BlockHeight::from_u32(tip_height))
+                .map_err(database_error)?
+                .ok_or(WalletServiceError::NotSynchronized)?
+                .0
+        },
+    };
+    if client.latest_block().await? != expected_tip {
+        return Err(WalletServiceError::StaleChain);
+    }
+    if let Some(mut page_start) = transparent_coinbase_recovery_start(tip_height) {
+        loop {
+            if client.latest_block().await? != expected_tip {
+                return Err(WalletServiceError::StaleChain);
+            }
+            let page = client
+                .transparent_unspent_page(
+                    &coinbase_address,
+                    page_start,
+                    tip_height,
+                    TRANSPARENT_UTXO_PAGE_OUTPUTS,
+                )
+                .await?;
+            if client.latest_block().await? != expected_tip {
+                return Err(WalletServiceError::StaleChain);
+            }
+            let next_start = page.next_start_height(page_start, TRANSPARENT_UTXO_PAGE_OUTPUTS)?;
+            for creator in page.into_complete_creators(next_start) {
+                if client.latest_block().await? != expected_tip {
+                    return Err(WalletServiceError::StaleChain);
+                }
+                let transaction = client.transparent_creator_transaction(creator).await?;
+                if client.latest_block().await? != expected_tip {
+                    return Err(WalletServiceError::StaleChain);
+                }
+                decrypt_and_store_transaction(
+                    &parameters,
+                    &mut wallet,
+                    &transaction.transaction,
+                    Some(BlockHeight::from_u32(transaction.height)),
+                )
+                .map_err(database_error)?;
+                if client.latest_block().await? != expected_tip {
+                    return Err(WalletServiceError::StaleChain);
+                }
+            }
+            match next_start {
+                Some(next_start) => page_start = next_start,
+                None => break,
+            }
+        }
+    }
     wallet_balance_summary(&wallet, public_confirmation_policy())
+}
+
+fn default_wallet_birthday(tip_height: u32) -> u32 {
+    tip_height.saturating_sub(99).max(1)
+}
+
+fn transparent_coinbase_recovery_start(tip_height: u32) -> Option<u32> {
+    (TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT <= tip_height)
+        .then_some(TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT)
 }
 
 /// Returns current SQLite wallet balances without making a network request.
@@ -425,6 +602,138 @@ pub fn stored_signed_transaction(
     })
 }
 
+/// Lists a bounded page of exact signed bytes created by this wallet that are
+/// not currently recorded as mined.
+///
+/// This is the crash-recovery entry point when signing committed to SQLite but
+/// the process exited before it printed a transaction identifier. The cursor is
+/// an opaque local database row identifier and has no consensus meaning.
+pub fn pending_signed_transactions(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    after_row_id: Option<u64>,
+    limit: usize,
+) -> Result<PendingSignedTransactionPage, WalletServiceError> {
+    if limit == 0 || limit > MAX_PENDING_TRANSACTION_PAGE_SIZE {
+        return Err(WalletServiceError::InvalidRequest(format!(
+            "pending transaction page size must be in 1..={MAX_PENDING_TRANSACTION_PAGE_SIZE}"
+        )));
+    }
+    let after_row_id = i64::try_from(after_row_id.unwrap_or(0)).map_err(|_| {
+        WalletServiceError::InvalidRequest("pending transaction cursor is too large".to_owned())
+    })?;
+    let mut wallet = open_wallet_database(path, network)?;
+    let (rows, next_after_row_id) = pending_transaction_rows(&mut wallet, after_row_id, limit)?;
+    let transactions = rows
+        .into_iter()
+        .map(|row| {
+            let inspected = inspect_signed_transaction(&row.raw)?;
+            if inspected.txid() != row.txid {
+                return Err(WalletServiceError::Database(format!(
+                    "persisted transaction {} has mismatched bytes",
+                    row.txid
+                )));
+            }
+            Ok(StoredSignedTransaction {
+                txid: row.txid.to_string(),
+                raw_transaction_hex: hex::encode(row.raw),
+                branch_id: "b3cfd27e".to_owned(),
+                expiry_height: inspected.expiry_height().into(),
+            })
+        })
+        .collect::<Result<Vec<_>, WalletServiceError>>()?;
+    Ok(PendingSignedTransactionPage {
+        transactions,
+        next_after_row_id,
+    })
+}
+
+fn pending_transaction_rows(
+    wallet: &mut WalletDatabase,
+    after_row_id: i64,
+    limit: usize,
+) -> Result<(Vec<PendingTransactionRow>, Option<u64>), WalletServiceError> {
+    wallet.transactionally_with_extension(|_wallet, extension| {
+        let mut rows = Vec::with_capacity(limit);
+        let mut cursor = after_row_id;
+        let mut has_more = false;
+        for _ in 0..=limit {
+            let metadata = extension
+                .query_row(
+                    "SELECT id_tx, txid, length(raw)
+                     FROM transactions
+                     WHERE id_tx > ?1
+                       AND created IS NOT NULL
+                       AND mined_height IS NULL
+                       AND raw IS NOT NULL
+                     ORDER BY id_tx
+                     LIMIT 1",
+                    [cursor],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((row_id, txid_bytes, raw_len)) = metadata else {
+                break;
+            };
+            if rows.len() == limit {
+                has_more = true;
+                break;
+            }
+            if row_id <= cursor || raw_len < 0 {
+                return Err(WalletServiceError::Database(
+                    "invalid pending transaction row metadata".to_owned(),
+                ));
+            }
+            let raw_len = usize::try_from(raw_len).map_err(|_| {
+                WalletServiceError::Database(
+                    "pending transaction length is not representable".to_owned(),
+                )
+            })?;
+            if raw_len > zcash_protocol::constants::MAX_BLOCK_BYTES {
+                return Err(WalletServiceError::Database(format!(
+                    "pending transaction row {row_id} exceeds the consensus block-size bound"
+                )));
+            }
+            let txid = zcash_protocol::TxId::from_bytes(txid_bytes.try_into().map_err(|_| {
+                WalletServiceError::Database(format!(
+                    "pending transaction row {row_id} has an invalid transaction identifier"
+                ))
+            })?);
+            let raw = extension.query_row(
+                "SELECT raw FROM transactions WHERE id_tx = ?1",
+                [row_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            if raw.len() != raw_len {
+                return Err(WalletServiceError::Database(format!(
+                    "pending transaction row {row_id} changed during recovery"
+                )));
+            }
+            rows.push(PendingTransactionRow { row_id, txid, raw });
+            cursor = row_id;
+        }
+        let next_after_row_id = if has_more {
+            rows.last()
+                .map(|row| u64::try_from(row.row_id))
+                .transpose()
+                .map_err(|_| {
+                    WalletServiceError::Database(
+                        "pending transaction cursor is not representable".to_owned(),
+                    )
+                })?
+        } else {
+            None
+        };
+        Ok((rows, next_after_row_id))
+    })
+}
+
 fn wallet_balance_summary(
     wallet: &WalletDatabase,
     confirmations: ConfirmationsPolicy,
@@ -436,9 +745,12 @@ fn wallet_balance_summary(
     let mut accounts = Vec::with_capacity(summary.account_balances().len());
     for (account_id, balance) in summary.account_balances() {
         let ironwood = balance.ironwood_balance();
-        let transparent_total = (balance.unshielded_regular_balance().total()
-            + balance.unshielded_coinbase_balance().total())
-        .ok_or_else(|| WalletServiceError::Database("transparent balance overflow".to_owned()))?;
+        let transparent_regular = balance.unshielded_regular_balance();
+        let transparent_coinbase = balance.unshielded_coinbase_balance();
+        let transparent_total = (transparent_regular.total() + transparent_coinbase.total())
+            .ok_or_else(|| {
+                WalletServiceError::Database("transparent balance overflow".to_owned())
+            })?;
         accounts.push(AccountBalanceSummary {
             account_id: account_id.expose_uuid().to_string(),
             ironwood_total_zat: ironwood.total().into_u64(),
@@ -449,6 +761,12 @@ fn wallet_balance_summary(
             sapling_total_zat: balance.sapling_balance().total().into_u64(),
             orchard_total_zat: balance.orchard_balance().total().into_u64(),
             transparent_total_zat: transparent_total.into_u64(),
+            transparent_coinbase_total_zat: transparent_coinbase.total().into_u64(),
+            transparent_coinbase_spendable_zat: transparent_coinbase.spendable_value().into_u64(),
+            transparent_coinbase_pending_zat: transparent_coinbase
+                .value_pending_spendability()
+                .into_u64(),
+            transparent_regular_total_zat: transparent_regular.total().into_u64(),
         });
     }
     accounts.sort_by(|left, right| left.account_id.cmp(&right.account_id));
@@ -500,7 +818,7 @@ pub async fn create_signed_transfer(
     let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
-    let confirmations_policy = ConfirmationsPolicy::new_symmetrical(confirmation_count);
+    let confirmations_policy = ConfirmationsPolicy::new_symmetrical(confirmation_count, false);
     let summary = wallet
         .get_wallet_summary(confirmations_policy)
         .map_err(database_error)?
@@ -509,10 +827,14 @@ pub async fn create_signed_transfer(
         return Err(WalletServiceError::NotSynchronized);
     }
 
-    let payments = recipients
+    let prepared_payments = recipients
         .iter()
         .map(|recipient| {
             let address = decode_recipient(&recipient.address, network)?;
+            let receiver = address
+                .orchard()
+                .copied()
+                .ok_or(WalletServiceError::NonIronwoodProposal)?;
             let amount = Zatoshis::from_u64(recipient.amount_zat)
                 .map_err(|error| WalletServiceError::InvalidRequest(error.to_string()))?;
             if amount == Zatoshis::ZERO {
@@ -528,7 +850,8 @@ pub async fn create_signed_transfer(
                         .map_err(|error| WalletServiceError::InvalidRequest(error.to_string()))?,
                 )
             };
-            Payment::new(
+            let expected_memo = memo.clone().unwrap_or_else(MemoBytes::empty);
+            let payment = Payment::new(
                 address.to_zcash_address(network.address_network()),
                 Some(amount),
                 memo,
@@ -536,9 +859,27 @@ pub async fn create_signed_transfer(
                 None,
                 vec![],
             )
-            .map_err(|error| WalletServiceError::InvalidRequest(error.to_string()))
+            .map_err(|error| WalletServiceError::InvalidRequest(error.to_string()))?;
+            Ok((
+                payment,
+                BoundIronwoodOutput {
+                    receiver: receiver.to_raw_address_bytes(),
+                    value_zat: amount.into_u64(),
+                    memo: expected_memo,
+                    role: TransferOutputRole::Payment,
+                    pool: ShieldedPool::Ironwood,
+                },
+            ))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, WalletServiceError>>()?;
+    let payments = prepared_payments
+        .iter()
+        .map(|(payment, _)| payment.clone())
+        .collect();
+    let expected_payment_outputs = prepared_payments
+        .into_iter()
+        .map(|(_, output)| output)
+        .collect::<Vec<_>>();
     let request = TransactionRequest::new(payments)
         .map_err(|error| WalletServiceError::InvalidRequest(error.to_string()))?;
     let expected_request = request.clone();
@@ -615,7 +956,7 @@ pub async fn create_signed_transfer(
         let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
         return Err(WalletServiceError::StaleChain);
     }
-    let expected_chain = match expected_chain_refs(&wallet, target_height, anchor_height) {
+    let expected_chain = match expected_chain_refs(&wallet, network, target_height, anchor_height) {
         Ok(expected) => expected,
         Err(error) => {
             let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
@@ -639,6 +980,428 @@ pub async fn create_signed_transfer(
         return Err(error);
     }
     if let Err(error) = verify_internal_change_receiver(&wallet, account_id, &usk) {
+        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+        return Err(error);
+    }
+    let stored_ufvk = match wallet.get_account(account_id).map_err(database_error) {
+        Ok(Some(account)) => match account.ufvk() {
+            Some(ufvk) => ufvk.clone(),
+            None => {
+                let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+                return Err(WalletServiceError::AuthorityMismatch);
+            }
+        },
+        Ok(None) => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::AuthorityMismatch);
+        }
+        Err(error) => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(error);
+        }
+    };
+    let internal_change_receiver = match stored_ufvk.orchard() {
+        Some(fvk) => fvk.address_at(0u32, OrchardScope::Internal),
+        None => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::AuthorityMismatch);
+        }
+    };
+    let orchard_fvk = stored_ufvk
+        .orchard()
+        .expect("the internal receiver check requires an Orchard viewing key");
+    let expected_nullifiers = match proposal.steps().first().shielded_inputs().map(|inputs| {
+        inputs
+            .notes()
+            .iter()
+            .map(|received| match received.note() {
+                WalletNote::Orchard {
+                    note,
+                    pool: orchard::ValuePool::Ironwood,
+                } => Some(note.nullifier(orchard_fvk).to_bytes()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+    }) {
+        Some(Some(nullifiers)) if !nullifiers.is_empty() => nullifiers,
+        _ => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::NonIronwoodProposal);
+        }
+    };
+    let known_wallet_nullifiers = match wallet.get_ironwood_nullifiers(NullifierQuery::All) {
+        Ok(nullifiers) => nullifiers
+            .into_iter()
+            .filter_map(|(known_account, nullifier)| {
+                (known_account == account_id).then_some(nullifier.to_bytes())
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(database_error(error));
+        }
+    };
+    let expected_ironwood_actions = match proposal.steps().first().ironwood_action_count(
+        proposal.steps().first().ironwood_bundle_padding(),
+        orchard::bundle::BundleVersion::ironwood_v3(),
+    ) {
+        Ok(count) => count,
+        Err(error) => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::Proposal(error.to_owned()));
+        }
+    };
+    let expected_change_outputs = proposal
+        .steps()
+        .first()
+        .balance()
+        .proposed_change()
+        .iter()
+        .map(|change| BoundIronwoodOutput {
+            receiver: internal_change_receiver.to_raw_address_bytes(),
+            value_zat: change.value().into_u64(),
+            memo: change.memo().cloned().unwrap_or_else(MemoBytes::empty),
+            role: TransferOutputRole::InternalChange,
+            pool: ShieldedPool::Ironwood,
+        })
+        .collect::<Vec<_>>();
+
+    let expiry_height_u32 = match target_height_u32.checked_add(expiry_delta) {
+        Some(height) if height <= u32::from(Height::MAX_EXPIRY_HEIGHT) => height,
+        None => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::HeightOverflow);
+        }
+        Some(_) => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::InvalidRequest(format!(
+                "transaction expiry height must not exceed {}",
+                u32::from(Height::MAX_EXPIRY_HEIGHT)
+            )));
+        }
+    };
+    let prover = LocalTxProver::bundled();
+    let created = match create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+        &mut wallet,
+        &parameters,
+        &prover,
+        &prover,
+        &SpendingKeys::from_unified_spending_key(usk),
+        OvkPolicy::Sender,
+        &proposal,
+        Some(BlockHeight::from_u32(expiry_height_u32)),
+    ) {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::Signing(format!("{error:?}")));
+        }
+    };
+    if created.is_empty() {
+        return Err(WalletServiceError::MissingSignedTransaction);
+    }
+    if created.len() != 1 {
+        return Err(persisted_transactions_require_review(
+            &created,
+            "the signer returned an unexpected number of transactions",
+        ));
+    }
+    let txid = created[0];
+    let transaction = match wallet.get_transaction(txid) {
+        Ok(Some(transaction)) => transaction,
+        Ok(None) => {
+            return Err(persisted_transactions_require_review(
+                &created,
+                "the signed transaction could not be read back from SQLite",
+            ));
+        }
+        Err(error) => {
+            return Err(persisted_transactions_require_review(
+                &created,
+                format!("SQLite readback failed: {error:?}"),
+            ));
+        }
+    };
+    let mut raw = Vec::new();
+    if let Err(error) = transaction.write(&mut raw) {
+        return Err(persisted_transactions_require_review(
+            &created,
+            format!("signed transaction serialization failed: {error}"),
+        ));
+    }
+    let inspected = inspect_signed_transaction(&raw).map_err(|error| {
+        persisted_transactions_require_review(
+            &created,
+            format!("signed transaction policy inspection failed: {error}"),
+        )
+    })?;
+    let fee_zat = proposal.steps().first().balance().fee_required().into_u64();
+    let actual_fee = inspected
+        .fee_paid(|_| Ok::<_, zcash_protocol::value::BalanceError>(None))
+        .ok()
+        .flatten()
+        .map(Zatoshis::into_u64);
+    let serialized_outputs_match = signed_transfer_outputs_match(
+        &inspected,
+        &parameters,
+        account_id,
+        &stored_ufvk,
+        target_height_u32,
+        &expected_payment_outputs,
+        &expected_change_outputs,
+        &expected_nullifiers,
+        &known_wallet_nullifiers,
+        expected_ironwood_actions,
+    );
+    if inspected.txid() != txid
+        || inspected.transparent_bundle().is_some()
+        || u32::from(inspected.expiry_height()) != expiry_height_u32
+        || actual_fee != Some(fee_zat)
+        || !serialized_outputs_match
+    {
+        return Err(persisted_transactions_require_review(
+            &created,
+            "signed transfer identifier, expiry, inputs, fee, recipients, or change differs from the checked proposal",
+        ));
+    }
+    drop(wallet);
+    if let Err(error) =
+        revalidate_canonical_ancestors(client, expected_chain, expiry_height_u32).await
+    {
+        return Err(persisted_transactions_require_review(
+            &created,
+            format!("final canonical-chain validation failed: {error}"),
+        ));
+    }
+    Ok(SignedTransaction {
+        txid: txid.to_string(),
+        raw_transaction_hex: hex::encode(raw),
+        branch_id: "b3cfd27e".to_owned(),
+        target_height: target_height_u32,
+        expiry_height: expiry_height_u32,
+        fee_zat,
+        internal_change_receiver_verified: true,
+    })
+}
+
+/// Shields only mature, fully classified transparent coinbase outputs into the
+/// wallet's own private Ironwood receiver.
+///
+/// This operation deliberately exposes no maturity override. The reviewed
+/// `propose_shielding_coinbase` API selects coinbase outputs exclusively and
+/// applies the 100-block consensus maturity rule. It creates one private
+/// payment for the selected input value minus the ZIP 317 fee, with no
+/// transparent or shielded change.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_signed_coinbase_shielding(
+    client: &mut AttestedWcashClient,
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    master_seed: &SecretVec<u8>,
+    maximum_inputs: usize,
+    expiry_delta: u32,
+    lock_for_blocks: u32,
+) -> Result<SignedTransaction, WalletServiceError> {
+    ensure_client_network(client, network)?;
+    if maximum_inputs == 0 || maximum_inputs > MAX_COINBASE_SHIELDING_INPUTS {
+        return Err(WalletServiceError::InvalidRequest(format!(
+            "coinbase input limit must be in 1..={MAX_COINBASE_SHIELDING_INPUTS}"
+        )));
+    }
+    if expiry_delta == 0
+        || expiry_delta > MAX_EXPIRY_DELTA
+        || lock_for_blocks < expiry_delta
+        || lock_for_blocks > MAX_LOCK_FOR_BLOCKS
+    {
+        return Err(WalletServiceError::InvalidRequest(format!(
+            "expiry must be in 1..={MAX_EXPIRY_DELTA}, and lock lifetime must cover expiry without exceeding {MAX_LOCK_FOR_BLOCKS}"
+        )));
+    }
+
+    let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
+    let account_ids = wallet.get_account_ids().map_err(database_error)?;
+    let account_id = only_account(&account_ids)?;
+    let summary = wallet
+        .get_wallet_summary(public_confirmation_policy())
+        .map_err(database_error)?
+        .ok_or(WalletServiceError::NotSynchronized)?;
+    if !summary.is_synced() {
+        return Err(WalletServiceError::NotSynchronized);
+    }
+    let coinbase_balance = summary
+        .account_balances()
+        .get(&account_id)
+        .ok_or(WalletServiceError::AuthorityMismatch)?
+        .unshielded_coinbase_balance();
+    if coinbase_balance.spendable_value() == Zatoshis::ZERO {
+        return Err(WalletServiceError::NoMatureCoinbase);
+    }
+
+    let account = wallet
+        .get_account(account_id)
+        .map_err(database_error)?
+        .ok_or(WalletServiceError::AuthorityMismatch)?;
+    let stored_ufvk = account
+        .ufvk()
+        .ok_or(WalletServiceError::AuthorityMismatch)?
+        .clone();
+    let source = default_transparent_receiver(&stored_ufvk)?;
+    let private_destination =
+        decode_recipient(&encode_orchard_receiver(&stored_ufvk, network)?, network)?;
+    let destination_receiver = *private_destination
+        .orchard()
+        .ok_or(WalletServiceError::AuthorityMismatch)?;
+    let destination = private_destination.to_zcash_address(network.address_network());
+
+    let usk = derive_wallet_spending_key(master_seed, network, 0)?;
+    verify_seed_authority(&wallet, account_id, master_seed, network)?;
+    verify_internal_change_receiver(&wallet, account_id, &usk)?;
+    if default_transparent_receiver(&usk.to_unified_full_viewing_key())? != source {
+        return Err(WalletServiceError::AuthorityMismatch);
+    }
+
+    let selector = GreedyInputSelector::new();
+    let fee_rule = StandardFeeRule::Zip317;
+    let lock_owner = LockOwner::new(random_lock_owner());
+    let parameters = network.parameters();
+    let proposal = propose_shielding_coinbase::<
+        _,
+        _,
+        _,
+        _,
+        zcash_client_sqlite::wallet::commitment_tree::Error,
+    >(
+        &mut wallet,
+        &parameters,
+        &selector,
+        &fee_rule,
+        Zatoshis::ZERO,
+        &[source],
+        destination.clone(),
+        None,
+        Some(maximum_inputs),
+        Some(LockRequest::new(lock_owner, lock_for_blocks)),
+    )
+    .map_err(|error| WalletServiceError::Proposal(format!("{error:?}")))?
+    .with_proposed_version(Some(TxVersion::V6));
+
+    let target_height = BlockHeight::from(proposal.min_target_height());
+    let target_height_u32: u32 = target_height.into();
+    let step = proposal.steps().first();
+    let payment = step.transaction_request().payments().values().next();
+    let input_total = step
+        .transparent_inputs()
+        .iter()
+        .try_fold(0u64, |total, input| {
+            total.checked_add(input.value().into_u64())
+        });
+    let payment_total = payment
+        .and_then(|payment| payment.amount())
+        .map(Zatoshis::into_u64);
+    let fee_zat = step.balance().fee_required().into_u64();
+    let values_balance = input_total
+        .and_then(|total| {
+            payment_total
+                .and_then(|payment| payment.checked_add(fee_zat).map(|spent| (total, spent)))
+        })
+        .is_some_and(|(total, spent)| total == spent);
+    let inputs_are_mature = step.transparent_inputs().iter().all(|input| {
+        input
+            .mined_height()
+            .is_some_and(|height| coinbase_is_mature(u32::from(height), target_height_u32))
+    });
+    let valid_proposal = proposal.steps().len() == 1
+        && proposal.proposed_version() == Some(TxVersion::V6)
+        // This reviewed API intentionally uses the explicit-payment proposal
+        // shape (`is_shielding == false`), rather than legacy all-in-change
+        // shielding. The transparent-only input and Ironwood-only payment
+        // invariants below define the operation.
+        && !step.is_shielding()
+        && !step.transparent_inputs().is_empty()
+        && step.transparent_inputs().len() <= maximum_inputs
+        && step
+            .transparent_inputs()
+            .iter()
+            .all(|input| input.recipient_address() == &source)
+        && inputs_are_mature
+        && proposal.input_count_in_pool(PoolType::Transparent) == step.transparent_inputs().len()
+        && proposal.input_count_in_pool(PoolType::SAPLING) == 0
+        && proposal.input_count_in_pool(PoolType::ORCHARD) == 0
+        && proposal.input_count_in_pool(PoolType::IRONWOOD) == 0
+        && step.transaction_request().payments().len() == 1
+        && payment.is_some_and(|payment| payment.recipient_address() == &destination)
+        && step.payment_pools().len() == 1
+        && step
+            .payment_pools()
+            .values()
+            .all(|pool| *pool == PoolType::IRONWOOD)
+        && step.balance().proposed_change().is_empty()
+        && step.prior_step_inputs().is_empty()
+        && values_balance;
+    if !valid_proposal {
+        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+        return Err(WalletServiceError::InvalidCoinbaseShieldingProposal);
+    }
+
+    let known_wallet_nullifiers = match wallet.get_ironwood_nullifiers(NullifierQuery::All) {
+        Ok(nullifiers) => nullifiers
+            .into_iter()
+            .filter_map(|(known_account, nullifier)| {
+                (known_account == account_id).then_some(nullifier.to_bytes())
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(database_error(error));
+        }
+    };
+    let expected_ironwood_actions = match step.ironwood_action_count(
+        step.ironwood_bundle_padding(),
+        orchard::bundle::BundleVersion::ironwood_v3(),
+    ) {
+        Ok(count) => count,
+        Err(error) => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::Proposal(error.to_owned()));
+        }
+    };
+
+    let expected_outpoints = step
+        .transparent_inputs()
+        .iter()
+        .map(|input| input.outpoint().clone())
+        .collect::<Vec<_>>();
+    let anchor_height = match step.anchor_height() {
+        Some(height) => height,
+        None => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::InvalidCoinbaseShieldingProposal);
+        }
+    };
+    let current_heights =
+        match wallet.get_target_and_anchor_heights(proposal.confirmations_policy().trusted()) {
+            Ok(Some(heights)) => heights,
+            Ok(None) => {
+                let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+                return Err(WalletServiceError::StaleChain);
+            }
+            Err(error) => {
+                let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+                return Err(database_error(error));
+            }
+        };
+    if BlockHeight::from(current_heights.0) != target_height || current_heights.1 != anchor_height {
+        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+        return Err(WalletServiceError::StaleChain);
+    }
+    let expected_chain = match expected_chain_refs(&wallet, network, target_height, anchor_height) {
+        Ok(expected) => expected,
+        Err(error) => {
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            return Err(error);
+        }
+    };
+    if let Err(error) = revalidate_exact_chain_tip(client, expected_chain).await {
         let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
         return Err(error);
     }
@@ -674,31 +1437,85 @@ pub async fn create_signed_transfer(
             return Err(WalletServiceError::Signing(format!("{error:?}")));
         }
     };
-    if created.len() != 1 {
+    if created.is_empty() {
         return Err(WalletServiceError::MissingSignedTransaction);
+    }
+    if created.len() != 1 {
+        return Err(persisted_transactions_require_review(
+            &created,
+            "the signer returned an unexpected number of transactions",
+        ));
     }
     let txid = created[0];
-    let transaction = wallet
-        .get_transaction(txid)
-        .map_err(database_error)?
-        .ok_or(WalletServiceError::MissingSignedTransaction)?;
+    let transaction = match wallet.get_transaction(txid) {
+        Ok(Some(transaction)) => transaction,
+        Ok(None) => {
+            return Err(persisted_transactions_require_review(
+                &created,
+                "the signed transaction could not be read back from SQLite",
+            ));
+        }
+        Err(error) => {
+            return Err(persisted_transactions_require_review(
+                &created,
+                format!("SQLite readback failed: {error:?}"),
+            ));
+        }
+    };
     let mut raw = Vec::new();
-    transaction
-        .write(&mut raw)
-        .map_err(|error| WalletServiceError::Signing(error.to_string()))?;
-    let inspected = inspect_signed_transaction(&raw)?;
-    if inspected.txid() != txid {
-        return Err(WalletServiceError::MissingSignedTransaction);
+    if let Err(error) = transaction.write(&mut raw) {
+        return Err(persisted_transactions_require_review(
+            &created,
+            format!("signed transaction serialization failed: {error}"),
+        ));
     }
-    let fee_zat = proposal.steps().first().balance().fee_required().into_u64();
+    let inspected = inspect_signed_transaction(&raw).map_err(|error| {
+        persisted_transactions_require_review(
+            &created,
+            format!("signed transaction policy inspection failed: {error}"),
+        )
+    })?;
+    let exact_inputs = inspected.transparent_bundle().is_some_and(|bundle| {
+        let actual_outpoints = bundle
+            .vin
+            .iter()
+            .map(|input| input.prevout().clone())
+            .collect::<Vec<_>>();
+        bundle.vout.is_empty() && unique_outpoint_sets_match(&expected_outpoints, &actual_outpoints)
+    });
+    let serialized_policy_matches =
+        input_total
+            .zip(payment_total)
+            .is_some_and(|(input_total, payment_total)| {
+                signed_coinbase_shielding_matches(
+                    &inspected,
+                    &parameters,
+                    account_id,
+                    &stored_ufvk,
+                    destination_receiver,
+                    target_height_u32,
+                    expiry_height_u32,
+                    input_total,
+                    payment_total,
+                    fee_zat,
+                    &known_wallet_nullifiers,
+                    expected_ironwood_actions,
+                )
+            });
+    if inspected.txid() != txid || !exact_inputs || !serialized_policy_matches {
+        return Err(persisted_transactions_require_review(
+            &created,
+            "signed transaction inputs, expiry, value, or private destination differ from the checked proposal",
+        ));
+    }
     drop(wallet);
     if let Err(error) =
         revalidate_canonical_ancestors(client, expected_chain, expiry_height_u32).await
     {
-        return Err(WalletServiceError::StaleAfterSigning {
-            txid: txid.to_string(),
-            reason: error.to_string(),
-        });
+        return Err(persisted_transactions_require_review(
+            &created,
+            format!("final canonical-chain validation failed: {error}"),
+        ));
     }
     Ok(SignedTransaction {
         txid: txid.to_string(),
@@ -722,6 +1539,238 @@ fn random_lock_owner() -> [u8; 32] {
     }
 }
 
+fn persisted_transactions_require_review<'a>(
+    txids: impl IntoIterator<Item = &'a zcash_protocol::TxId>,
+    reason: impl Into<String>,
+) -> WalletServiceError {
+    WalletServiceError::PersistedTransactionsRequireReview {
+        txids: txids.into_iter().map(ToString::to_string).collect(),
+        reason: reason.into(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_transfer_outputs_match(
+    transaction: &Transaction,
+    parameters: &Network,
+    account_id: AccountUuid,
+    stored_ufvk: &zcash_keys::keys::UnifiedFullViewingKey,
+    target_height: u32,
+    expected_payments: &[BoundIronwoodOutput],
+    expected_change: &[BoundIronwoodOutput],
+    expected_nullifiers: &[[u8; 32]],
+    known_wallet_nullifiers: &[[u8; 32]],
+    expected_action_count: usize,
+) -> bool {
+    let Some(bundle) = transaction.ironwood_bundle() else {
+        return false;
+    };
+    let actual_nullifiers = bundle
+        .actions()
+        .iter()
+        .map(|action| action.nullifier().to_bytes())
+        .collect::<Vec<_>>();
+    if !ironwood_input_shape_matches(
+        expected_nullifiers,
+        known_wallet_nullifiers,
+        &actual_nullifiers,
+        expected_action_count,
+    ) {
+        return false;
+    }
+
+    let ufvks = HashMap::from([(account_id, stored_ufvk.clone())]);
+    let decrypted = decrypt_transaction(
+        parameters,
+        None,
+        target_height.checked_sub(1).map(BlockHeight::from_u32),
+        transaction,
+        &ufvks,
+    );
+    if !decrypted.sapling_outputs().is_empty() || !decrypted.orchard_outputs().is_empty() {
+        return false;
+    }
+
+    let mut actual = Vec::with_capacity(decrypted.ironwood_outputs().len());
+    for output in decrypted.ironwood_outputs() {
+        if output.account() != &account_id
+            || output.value_pool() != ShieldedPool::Ironwood
+            || output.note().1 != orchard::ValuePool::Ironwood
+        {
+            return false;
+        }
+        let role = match output.transfer_type() {
+            TransferType::Incoming | TransferType::Outgoing => TransferOutputRole::Payment,
+            TransferType::AccountInternal => TransferOutputRole::InternalChange,
+            TransferType::WalletInternal => return false,
+        };
+        actual.push(BoundIronwoodOutput {
+            receiver: output.note().0.recipient().to_raw_address_bytes(),
+            value_zat: output.note().0.value().inner(),
+            memo: output.memo().clone(),
+            role,
+            pool: output.value_pool(),
+        });
+    }
+
+    let mut expected = Vec::with_capacity(expected_payments.len() + expected_change.len());
+    expected.extend_from_slice(expected_payments);
+    expected.extend_from_slice(expected_change);
+    exact_bound_output_multisets_match(&expected, &actual)
+}
+
+fn ironwood_input_shape_matches(
+    expected_real_nullifiers: &[[u8; 32]],
+    known_wallet_nullifiers: &[[u8; 32]],
+    actual_action_nullifiers: &[[u8; 32]],
+    expected_action_count: usize,
+) -> bool {
+    let unique_count = |values: &[[u8; 32]]| {
+        let mut values = values.to_vec();
+        values.sort_unstable();
+        values.dedup();
+        values.len()
+    };
+    let mut expected_wallet_intersection = expected_real_nullifiers.to_vec();
+    expected_wallet_intersection.sort_unstable();
+    let mut actual_wallet_intersection = actual_action_nullifiers
+        .iter()
+        .filter(|nullifier| known_wallet_nullifiers.contains(nullifier))
+        .copied()
+        .collect::<Vec<_>>();
+    actual_wallet_intersection.sort_unstable();
+
+    actual_action_nullifiers.len() == expected_action_count
+        && unique_count(expected_real_nullifiers) == expected_real_nullifiers.len()
+        && unique_count(known_wallet_nullifiers) == known_wallet_nullifiers.len()
+        && unique_count(actual_action_nullifiers) == actual_action_nullifiers.len()
+        && actual_wallet_intersection == expected_wallet_intersection
+}
+
+fn exact_bound_output_multisets_match(
+    expected: &[BoundIronwoodOutput],
+    actual: &[BoundIronwoodOutput],
+) -> bool {
+    if expected.len() != actual.len() {
+        return false;
+    }
+    let mut unmatched = expected.to_vec();
+    for output in actual {
+        let Some(index) = unmatched.iter().position(|expected| expected == output) else {
+            return false;
+        };
+        unmatched.swap_remove(index);
+    }
+    unmatched.is_empty()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_coinbase_shielding_matches(
+    transaction: &Transaction,
+    parameters: &Network,
+    account_id: AccountUuid,
+    stored_ufvk: &zcash_keys::keys::UnifiedFullViewingKey,
+    destination_receiver: orchard::Address,
+    target_height: u32,
+    expiry_height: u32,
+    input_total_zat: u64,
+    payment_total_zat: u64,
+    fee_zat: u64,
+    known_wallet_nullifiers: &[[u8; 32]],
+    expected_action_count: usize,
+) -> bool {
+    let Some(bundle) = transaction.ironwood_bundle() else {
+        return false;
+    };
+    let actual_nullifiers = bundle
+        .actions()
+        .iter()
+        .map(|action| action.nullifier().to_bytes())
+        .collect::<Vec<_>>();
+    if !ironwood_input_shape_matches(
+        &[],
+        known_wallet_nullifiers,
+        &actual_nullifiers,
+        expected_action_count,
+    ) {
+        return false;
+    }
+
+    let expected_payment = input_total_zat.checked_sub(fee_zat);
+    let expected_balance = i64::try_from(payment_total_zat)
+        .ok()
+        .and_then(i64::checked_neg);
+    let actual_balance = Some(i64::from_le_bytes(bundle.value_balance().to_i64_le_bytes()));
+    if !shielding_amounts_match(
+        u32::from(transaction.expiry_height()),
+        actual_balance,
+        expiry_height,
+        input_total_zat,
+        payment_total_zat,
+        fee_zat,
+    ) || expected_payment != Some(payment_total_zat)
+        || actual_balance != expected_balance
+    {
+        return false;
+    }
+
+    let ufvks = HashMap::from([(account_id, stored_ufvk.clone())]);
+    let decrypted = decrypt_transaction(
+        parameters,
+        None,
+        target_height.checked_sub(1).map(BlockHeight::from_u32),
+        transaction,
+        &ufvks,
+    );
+    decrypted.sapling_outputs().is_empty()
+        && decrypted.orchard_outputs().is_empty()
+        && matches!(
+            decrypted.ironwood_outputs(),
+            [output]
+                if output.account() == &account_id
+                    && output.value_pool() == ShieldedPool::Ironwood
+                    && output.note().1 == orchard::ValuePool::Ironwood
+                    && output.note().0.recipient() == destination_receiver
+                    && output.note().0.value().inner() == payment_total_zat
+                    && output.transfer_type() == TransferType::Incoming
+        )
+}
+
+fn shielding_amounts_match(
+    actual_expiry_height: u32,
+    actual_ironwood_balance: Option<i64>,
+    expected_expiry_height: u32,
+    input_total_zat: u64,
+    payment_total_zat: u64,
+    fee_zat: u64,
+) -> bool {
+    let expected_balance = i64::try_from(payment_total_zat)
+        .ok()
+        .and_then(i64::checked_neg);
+    actual_expiry_height == expected_expiry_height
+        && input_total_zat.checked_sub(fee_zat) == Some(payment_total_zat)
+        && actual_ironwood_balance == expected_balance
+}
+
+fn coinbase_is_mature(mined_height: u32, spend_height: u32) -> bool {
+    spend_height
+        .checked_sub(mined_height)
+        .is_some_and(|confirmations| confirmations >= COINBASE_SHIELDING_MATURITY)
+}
+
+fn unique_outpoint_sets_match(expected: &[OutPoint], actual: &[OutPoint]) -> bool {
+    if expected.len() != actual.len() {
+        return false;
+    }
+    let mut expected = expected.to_vec();
+    let mut actual = actual.to_vec();
+    expected.sort_unstable();
+    actual.sort_unstable();
+    let has_duplicate =
+        |outpoints: &[OutPoint]| outpoints.windows(2).any(|pair| pair[0] == pair[1]);
+    !has_duplicate(&expected) && !has_duplicate(&actual) && expected == actual
+}
+
 fn validate_confirmation_policy(
     network: WalletNetwork,
     confirmations: u32,
@@ -738,7 +1787,10 @@ fn validate_confirmation_policy(
 }
 
 fn public_confirmation_policy() -> ConfirmationsPolicy {
-    ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(100).expect("100 is nonzero"))
+    ConfirmationsPolicy::new_symmetrical(
+        NonZeroU32::new(COINBASE_SHIELDING_MATURITY).expect("100 is nonzero"),
+        false,
+    )
 }
 
 fn only_account(account_ids: &[AccountUuid]) -> Result<AccountUuid, WalletServiceError> {
@@ -801,6 +1853,7 @@ fn verify_internal_change_receiver(
 
 fn expected_chain_refs(
     wallet: &WalletDatabase,
+    network: WalletNetwork,
     target_height: BlockHeight,
     anchor_height: BlockHeight,
 ) -> Result<(BlockRef, BlockRef), WalletServiceError> {
@@ -810,25 +1863,33 @@ fn expected_chain_refs(
         .map(BlockHeight::from_u32)
         .ok_or(WalletServiceError::HeightOverflow)?;
     let expected_tip_u32: u32 = expected_tip.into();
-    let stored_tip_hash = wallet
-        .get_block_hash(expected_tip)
-        .map_err(database_error)?
-        .ok_or(WalletServiceError::StaleChain)?;
     let anchor_height_u32: u32 = anchor_height.into();
-    let stored_anchor_hash = wallet
-        .get_block_hash(anchor_height)
+    Ok((
+        expected_chain_ref(wallet, network, expected_tip_u32)?,
+        expected_chain_ref(wallet, network, anchor_height_u32)?,
+    ))
+}
+
+fn expected_chain_ref(
+    wallet: &WalletDatabase,
+    network: WalletNetwork,
+    height: u32,
+) -> Result<BlockRef, WalletServiceError> {
+    if height == 0 {
+        return Ok(BlockRef {
+            height,
+            hash: network.genesis_hash(),
+        });
+    }
+
+    let stored_hash = wallet
+        .get_block_hash(BlockHeight::from_u32(height))
         .map_err(database_error)?
         .ok_or(WalletServiceError::StaleChain)?;
-    Ok((
-        BlockRef {
-            height: expected_tip_u32,
-            hash: stored_tip_hash.0,
-        },
-        BlockRef {
-            height: anchor_height_u32,
-            hash: stored_anchor_hash.0,
-        },
-    ))
+    Ok(BlockRef {
+        height,
+        hash: stored_hash.0,
+    })
 }
 
 async fn revalidate_exact_chain_tip(
@@ -937,6 +1998,229 @@ mod tests {
     }
 
     #[test]
+    fn transparent_coinbase_maturity_boundary_is_exactly_one_hundred_blocks() {
+        assert!(!coinbase_is_mature(10, 109));
+        assert!(coinbase_is_mature(10, 110));
+        assert!(!coinbase_is_mature(110, 10));
+        assert_eq!(COINBASE_SHIELDING_MATURITY, 100);
+        assert_eq!(TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT, 1);
+    }
+
+    #[test]
+    fn transparent_coinbase_recovery_precedes_a_late_default_birthday() {
+        let tip_height = 250;
+        let shielded_birthday = default_wallet_birthday(tip_height);
+        assert_eq!(shielded_birthday, 151);
+        assert_eq!(transparent_coinbase_recovery_start(tip_height), Some(1));
+        assert!(TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT < shielded_birthday);
+        assert!(coinbase_is_mature(
+            TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT,
+            tip_height + 1,
+        ));
+        assert_eq!(transparent_coinbase_recovery_start(0), None);
+    }
+
+    #[test]
+    fn signed_shielding_amounts_bind_expiry_fee_and_ironwood_value() {
+        assert!(shielding_amounts_match(
+            140,
+            Some(-624_990_000),
+            140,
+            625_000_000,
+            624_990_000,
+            10_000,
+        ));
+        assert!(!shielding_amounts_match(
+            141,
+            Some(-624_990_000),
+            140,
+            625_000_000,
+            624_990_000,
+            10_000,
+        ));
+        assert!(!shielding_amounts_match(
+            140,
+            Some(-624_980_000),
+            140,
+            625_000_000,
+            624_990_000,
+            10_000,
+        ));
+        assert!(!shielding_amounts_match(
+            140,
+            Some(-624_990_000),
+            140,
+            625_000_001,
+            624_990_000,
+            10_000,
+        ));
+    }
+
+    #[test]
+    fn signed_transfer_outputs_bind_recipient_value_memo_role_and_pool() {
+        let payment = BoundIronwoodOutput {
+            receiver: [1; 43],
+            value_zat: 60_000,
+            memo: MemoBytes::from_bytes(b"payout-17").unwrap(),
+            role: TransferOutputRole::Payment,
+            pool: ShieldedPool::Ironwood,
+        };
+        let change = BoundIronwoodOutput {
+            receiver: [2; 43],
+            value_zat: 30_000,
+            memo: MemoBytes::empty(),
+            role: TransferOutputRole::InternalChange,
+            pool: ShieldedPool::Ironwood,
+        };
+        let expected = vec![payment.clone(), change.clone()];
+
+        assert!(exact_bound_output_multisets_match(
+            &expected,
+            &[change.clone(), payment.clone()]
+        ));
+
+        for mutated in [
+            BoundIronwoodOutput {
+                receiver: [3; 43],
+                ..payment.clone()
+            },
+            BoundIronwoodOutput {
+                value_zat: payment.value_zat + 1,
+                ..payment.clone()
+            },
+            BoundIronwoodOutput {
+                memo: MemoBytes::from_bytes(b"wrong memo").unwrap(),
+                ..payment.clone()
+            },
+            BoundIronwoodOutput {
+                role: TransferOutputRole::InternalChange,
+                ..payment.clone()
+            },
+            BoundIronwoodOutput {
+                pool: ShieldedPool::Orchard,
+                ..payment.clone()
+            },
+        ] {
+            assert!(!exact_bound_output_multisets_match(
+                &expected,
+                &[mutated, change.clone()]
+            ));
+        }
+        assert!(!exact_bound_output_multisets_match(
+            &expected,
+            std::slice::from_ref(&payment)
+        ));
+        assert!(!exact_bound_output_multisets_match(
+            &expected,
+            &[payment.clone(), change.clone(), change.clone()]
+        ));
+        assert!(!exact_bound_output_multisets_match(
+            &expected,
+            &[payment.clone(), payment]
+        ));
+    }
+
+    #[test]
+    fn signed_transfer_contains_every_selected_nullifier_and_exact_action_shape() {
+        let first = [1; 32];
+        let second = [2; 32];
+        let dummy = [3; 32];
+        let other_wallet_note = [4; 32];
+        assert!(ironwood_input_shape_matches(
+            &[first, second],
+            &[first, second, other_wallet_note],
+            &[dummy, second, first],
+            3,
+        ));
+        assert!(!ironwood_input_shape_matches(
+            &[first, second],
+            &[first, second, other_wallet_note],
+            &[dummy, first],
+            2,
+        ));
+        assert!(!ironwood_input_shape_matches(
+            &[first, second],
+            &[first, second, other_wallet_note],
+            &[other_wallet_note, second, first],
+            3,
+        ));
+        assert!(!ironwood_input_shape_matches(
+            &[first, second],
+            &[first, second, other_wallet_note],
+            &[dummy, second, first],
+            2,
+        ));
+        assert!(!ironwood_input_shape_matches(
+            &[first, second],
+            &[first, second, other_wallet_note],
+            &[first, second, second],
+            3,
+        ));
+        assert!(!ironwood_input_shape_matches(
+            &[first, first],
+            &[first, second, other_wallet_note],
+            &[dummy, second, first],
+            3,
+        ));
+        assert!(!ironwood_input_shape_matches(
+            &[first, second],
+            &[first, second, second],
+            &[dummy, second, first],
+            3,
+        ));
+    }
+
+    #[test]
+    fn signed_coinbase_shielding_rejects_any_known_wallet_note_input() {
+        let known_wallet_note = [1; 32];
+        let first_dummy = [2; 32];
+        let second_dummy = [3; 32];
+
+        assert!(ironwood_input_shape_matches(
+            &[],
+            &[known_wallet_note],
+            &[first_dummy, second_dummy],
+            2,
+        ));
+        assert!(!ironwood_input_shape_matches(
+            &[],
+            &[known_wallet_note],
+            &[known_wallet_note, first_dummy],
+            2,
+        ));
+        assert!(!ironwood_input_shape_matches(
+            &[],
+            &[known_wallet_note],
+            &[first_dummy, second_dummy],
+            3,
+        ));
+        assert!(!ironwood_input_shape_matches(
+            &[],
+            &[known_wallet_note],
+            &[first_dummy, first_dummy],
+            2,
+        ));
+    }
+
+    #[test]
+    fn signed_coinbase_inputs_must_match_the_exact_unique_proposal_set() {
+        let first = OutPoint::new([1; 32], 0);
+        let second = OutPoint::new([2; 32], 1);
+        assert!(unique_outpoint_sets_match(
+            &[first.clone(), second.clone()],
+            &[second.clone(), first.clone()],
+        ));
+        assert!(!unique_outpoint_sets_match(
+            &[first.clone(), second],
+            &[first.clone(), first.clone()],
+        ));
+        assert!(!unique_outpoint_sets_match(
+            &[first.clone(), first.clone()],
+            &[first.clone(), first],
+        ));
+    }
+
+    #[test]
     fn post_proof_policy_accepts_advanced_canonical_tip_only_before_expiry() {
         let expected_tip = block_ref(10, 10);
         let expected_anchor = block_ref(7, 7);
@@ -989,13 +2273,103 @@ mod tests {
     }
 
     #[test]
-    fn post_signing_error_exposes_recovery_txid() {
-        let error = WalletServiceError::StaleAfterSigning {
-            txid: "11".repeat(32),
+    fn expected_chain_refs_use_only_the_frozen_genesis_without_stored_block_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let network = WalletNetwork::Regtest;
+        let wallet = open_wallet_database(&wallet_path, network).unwrap();
+
+        assert_eq!(
+            expected_chain_ref(&wallet, network, 0).unwrap(),
+            BlockRef {
+                height: 0,
+                hash: network.genesis_hash(),
+            }
+        );
+        assert!(matches!(
+            expected_chain_ref(&wallet, network, 1),
+            Err(WalletServiceError::StaleChain)
+        ));
+        drop(wallet);
+
+        let stored_hash = [0x5a; 32];
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO blocks (height, hash, time, sapling_tree)
+                 VALUES (1, ?1, 0, X'')",
+                rusqlite::params![stored_hash],
+            )
+            .unwrap();
+        drop(connection);
+
+        let wallet = open_wallet_database(&wallet_path, network).unwrap();
+        assert_eq!(
+            expected_chain_ref(&wallet, network, 1).unwrap(),
+            BlockRef {
+                height: 1,
+                hash: stored_hash,
+            }
+        );
+    }
+
+    #[test]
+    fn post_signing_error_exposes_every_recovery_txid() {
+        let error = WalletServiceError::PersistedTransactionsRequireReview {
+            txids: vec!["11".repeat(32), "22".repeat(32)],
             reason: "test reorg".to_owned(),
         };
         assert!(error.to_string().contains(&"11".repeat(32)));
-        assert!(error.to_string().contains("export"));
+        assert!(error.to_string().contains(&"22".repeat(32)));
+        assert!(error.to_string().contains("list-pending"));
+    }
+
+    #[test]
+    fn pending_transaction_rows_survive_restart_and_page_without_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        drop(open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap());
+
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        for (index, marker) in [1u8, 2, 3].into_iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO transactions
+                     (txid, created, expiry_height, raw, target_height, min_observed_height)
+                     VALUES (?1, '2026-09-09T00:00:00Z', 20, ?2, 10, 1)",
+                    rusqlite::params![vec![marker; 32], vec![marker; index + 1]],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO transactions
+                 (txid, created, mined_height, expiry_height, raw, target_height, min_observed_height)
+                 VALUES (?1, '2026-09-09T00:00:00Z', 11, 20, ?2, 10, 1)",
+                rusqlite::params![vec![9u8; 32], vec![9u8]],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut wallet = open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap();
+        let (first, next) = pending_transaction_rows(&mut wallet, 0, 2).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].txid, zcash_protocol::TxId::from_bytes([1; 32]));
+        assert_eq!(first[0].raw, vec![1]);
+        let next = next.expect("a third unmined transaction remains");
+        drop(wallet);
+
+        let mut reopened = open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap();
+        let (second, next) = pending_transaction_rows(
+            &mut reopened,
+            i64::try_from(next).expect("test cursor fits"),
+            2,
+        )
+        .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].txid, zcash_protocol::TxId::from_bytes([3; 32]));
+        assert_eq!(second[0].raw, vec![3; 3]);
+        assert_eq!(next, None);
     }
 
     #[cfg(unix)]

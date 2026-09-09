@@ -1,0 +1,4 @@
+project: zebra-consensus
+kind: breaking
+body: "Expand the pre-launch Wcash consensus set from private Ironwood-only coinbases to exactly one transparent or private Ironwood payout mode while retaining exact subsidy validation."
+time: 2026-09-09T00:00:00.000000002Z

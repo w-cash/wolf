@@ -27,7 +27,7 @@ debug_force_finished_sync = true
 [mining]
 # Must exactly equal ZCASH_PAYOUT_ADDRESS. This public regtest fixture is not a
 # spendable operator payout address.
-miner_address = "uregtest1efxggx6lduhm2fx5lnrhxv7h7kpztlpa3ahf3n4w0q0zj5epj4av9xjq6ljsja3xk8z7rzd067kc7mgpy9448rdfzpfjz5gq389zdmpgnk6rp4ykk0xk6cmqw6zqcrnmsuaxv3yzsvcwsd4gagtalh0uzrdvy03nhmltjz2eu0232qlcs0zvxuqyut73yucd9gy5jaudnyt7yqhgpqv"
+miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
 extra_coinbase_data = "WcashParent"
 
 [tracing]

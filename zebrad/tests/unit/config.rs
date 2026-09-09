@@ -1182,7 +1182,7 @@ fn config_wcash_regtest_miner_address_uses_wcash_namespace() {
     let network = Network::new_wcash_regtest();
     let miner_address = zebra_rpc::config::mining::default_miner_address_for_network(
         &network,
-        &zebra_rpc::config::mining::MinerAddressType::Unified,
+        &zebra_rpc::config::mining::MinerAddressType::Transparent,
     );
     let toml_string = format!(
         r#"[network]

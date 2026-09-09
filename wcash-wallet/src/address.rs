@@ -5,6 +5,7 @@ use zcash_keys::{
     address::UnifiedAddress,
     keys::{UnifiedAddressRequest, UnifiedFullViewingKey},
 };
+use zcash_transparent::{address::TransparentAddress, keys::IncomingViewingKey};
 use zebra_chain::primitives::{WcashAddress, WcashAddressKind, WcashAddressParseError};
 
 use crate::WalletNetwork;
@@ -15,6 +16,9 @@ pub enum WalletAddressError {
     /// The wallet could not derive an Orchard-only receiver.
     #[error("could not derive an Orchard-only address: {0}")]
     Derivation(String),
+    /// The wallet full viewing key has no usable transparent component.
+    #[error("could not derive the default transparent coinbase address: {0}")]
+    TransparentDerivation(String),
     /// The encoded value is not a canonical Wcash address.
     #[error("invalid Wcash address: {0}")]
     Parse(#[from] WcashAddressParseError),
@@ -43,6 +47,48 @@ pub fn encode_orchard_receiver(
         .map_err(|_| WalletAddressError::InvalidUnified("receiver conversion failed"))?;
 
     Ok(container.encode())
+}
+
+/// Encodes the wallet's default external P2PKH receiver in the Wcash namespace.
+///
+/// This receiver is derived from the transparent component of the same
+/// domain-separated unified spending key that owns the wallet's private
+/// Ironwood receiver. It is intended only for receiving coinbase payouts that
+/// will later be shielded by this wallet.
+pub fn encode_transparent_coinbase_receiver(
+    ufvk: &UnifiedFullViewingKey,
+    network: WalletNetwork,
+) -> Result<String, WalletAddressError> {
+    default_transparent_receiver(ufvk)
+        .map(|receiver| encode_wcash_transparent_receiver(receiver, network))
+}
+
+pub(crate) fn default_transparent_receiver(
+    ufvk: &UnifiedFullViewingKey,
+) -> Result<TransparentAddress, WalletAddressError> {
+    let account_key = ufvk.transparent().ok_or_else(|| {
+        WalletAddressError::TransparentDerivation(
+            "unified full viewing key has no transparent component".to_owned(),
+        )
+    })?;
+    let incoming = account_key
+        .derive_external_ivk()
+        .map_err(|error| WalletAddressError::TransparentDerivation(error.to_string()))?;
+    Ok(incoming.default_address().0)
+}
+
+pub(crate) fn encode_wcash_transparent_receiver(
+    receiver: TransparentAddress,
+    network: WalletNetwork,
+) -> String {
+    match receiver {
+        TransparentAddress::PublicKeyHash(bytes) => {
+            WcashAddress::from_transparent_p2pkh(network.address_network(), bytes).encode()
+        }
+        TransparentAddress::ScriptHash(bytes) => {
+            WcashAddress::from_transparent_p2sh(network.address_network(), bytes).encode()
+        }
+    }
 }
 
 /// Decodes a Wcash recipient into the receiver type expected by librustzcash.
@@ -98,6 +144,21 @@ mod tests {
     }
 
     #[test]
+    fn wallet_exposes_a_disjoint_default_transparent_coinbase_receiver() {
+        let ufvk = test_ufvk(WalletNetwork::Testnet);
+        let encoded = encode_transparent_coinbase_receiver(&ufvk, WalletNetwork::Testnet).unwrap();
+        assert!(encoded.starts_with("WT"));
+        assert!(WcashAddress::try_from_encoded(&encoded).is_ok());
+
+        let zcash = zcash_keys::encoding::encode_transparent_address_p(
+            &WalletNetwork::Testnet.parameters(),
+            &default_transparent_receiver(&ufvk).unwrap(),
+        );
+        assert!(zcash.starts_with("tm"));
+        assert_ne!(encoded, zcash);
+    }
+
+    #[test]
     fn cross_network_and_zcash_addresses_are_rejected() {
         let ufvk = test_ufvk(WalletNetwork::Testnet);
         let encoded = encode_orchard_receiver(&ufvk, WalletNetwork::Testnet).unwrap();
@@ -133,6 +194,14 @@ mod tests {
         assert_eq!(
             encode_orchard_receiver(&regtest, WalletNetwork::Regtest).unwrap(),
             "wuregtest1m6qlf78t724tks6lxvpy7dylmuae5df0xrwaacykakred0jv8tez5v4lqhwhwvrpg9wp4qyf5ty5a9z9ultvqf9h3yd6rgdh6vvdnemk"
+        );
+        assert_eq!(
+            encode_transparent_coinbase_receiver(&testnet, WalletNetwork::Testnet).unwrap(),
+            "WT8oP4F1BxcHH8stAz2ApZaEVAAnaLCeck4"
+        );
+        assert_eq!(
+            encode_transparent_coinbase_receiver(&regtest, WalletNetwork::Regtest).unwrap(),
+            "WRDJdnmDX9oT7aUYzysJUdAZrsJ6Xu5doSf"
         );
     }
 }

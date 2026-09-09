@@ -19,10 +19,11 @@ enable_cookie_auth = false
 debug_force_finished_sync = true
 
 [mining]
-# Public regtest fixture only. Replace it with an address whose keys you control.
-miner_address = "wuregtest1d677slm064f84p6eqwz76ze3w5yuxn4vghyft5rv6nv5shxyza4jxqgt22ar0fsvpxa3ma4gkswum0ytnwpyhzm5xewjpa8dxszt62ck7ms9qka8qmfuradh3f0rwgu9k4sqzxkryre4450uj3fk8lhh9dcyhq5zmj8w7krpesuw9t6nt8pxyrpvwswy7akv0sux45sgjx9c5zgldrt"
+# Public transparent regtest fixture only. Replace it with an address whose
+# keys you control. Use a Wcash Unified Address with an Orchard receiver only
+# when explicitly testing private Ironwood rewards.
+miner_address = "WR64VqQpZRujxYnAJmqGK4d4fbqQZRZHazG"
 extra_coinbase_data = "Wcash"
-miner_memo = "Wcash local regtest reward"
 internal_miner = true
 
 [tracing]

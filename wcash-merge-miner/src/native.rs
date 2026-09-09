@@ -14,15 +14,17 @@ use wcash_zcash_aux::{
     parent_payout_address_commitment, sha256d_merkle_root, validate_miner_data_commitment,
     ParentBlockHash, Target, MAX_COINBASE_BYTES,
 };
-use zcash_address::ZcashAddress;
+use zcash_address::{unified::Receiver, ZcashAddress};
 use zebra_chain::{
     block::{
         self,
         merkle::{AuthDataRoot, AUTH_DIGEST_PLACEHOLDER},
         Block, ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Header,
     },
+    parameters::Network,
     serialization::{BytesInDisplayOrder, DateTime32, ZcashDeserializeInto, ZcashSerialize},
     transaction::{AuthDigest, Hash as TransactionHash, Transaction},
+    transparent,
     work::{
         difficulty::{CompactDifficulty, ExpandedDifficulty},
         equihash::Solution,
@@ -566,13 +568,14 @@ impl NativePreparedJob {
         let coinbase = decode_template_coinbase(&template.coinbase_txn)?;
         let coinbase_bytes = coinbase.zcash_serialize_to_vec()?;
         let recovered_parent_payout =
-            zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_shielded_value_to(
+            zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_value_to(
                 &coinbase,
                 expected_parent_payout_address,
             )
             .ok_or_else(|| {
                 MinerError::InvalidParentTemplate(
-                    "parent coinbase payout outputs are not publicly recoverable".to_string(),
+                    "parent coinbase payout outputs do not match the configured address"
+                        .to_string(),
                 )
             })?;
         if recovered_parent_payout == 0 {
@@ -1142,18 +1145,18 @@ fn validate_independent_parent_payout_template(
 
     let validator_coinbase = decode_template_coinbase(&validator_template.coinbase_txn)?;
     let validator_payout =
-        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_shielded_value_to(
+        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_value_to(
             &validator_coinbase,
             expected_address,
         )
         .ok_or_else(|| {
             MinerError::InvalidParentTemplate(format!(
-                "independent payout template from {endpoint} does not pay only the configured shielded receiver"
+                "independent payout template from {endpoint} has outputs that do not match the configured payout address"
             ))
         })?;
     if validator_payout == 0 {
         return Err(MinerError::InvalidParentTemplate(format!(
-            "independent payout template from {endpoint} has no positive configured shielded payout"
+            "independent payout template from {endpoint} has no positive configured payout"
         )));
     }
 
@@ -1166,13 +1169,76 @@ fn validate_independent_parent_payout_template(
                 "prepared parent proposal has no coinbase transaction".to_string(),
             )
         })?;
-    if validator_coinbase.outputs() != prepared_coinbase.outputs() {
+    validate_matching_non_payout_transparent_outputs(
+        &prepared_coinbase.outputs(),
+        &validator_coinbase.outputs(),
+        expected_address,
+        endpoint,
+    )?;
+
+    Ok(())
+}
+
+/// Checks every transparent output other than payments to the configured miner.
+///
+/// Two honest nodes can select different mempool transactions on the same tip, so
+/// their transparent miner outputs can legitimately differ by the selected fees.
+/// Funding-stream and lockbox outputs are independent of those fees and must still
+/// match exactly. The exact prepared block is subsequently checked in proposal
+/// mode, which enforces its consensus subsidy and fee total.
+fn validate_matching_non_payout_transparent_outputs(
+    prepared_outputs: &[transparent::Output],
+    validator_outputs: &[transparent::Output],
+    expected_address: &ZcashAddress,
+    endpoint: &str,
+) -> Result<(), MinerError> {
+    let prepared_non_payout = non_payout_transparent_outputs(prepared_outputs, expected_address)?;
+    let validator_non_payout = non_payout_transparent_outputs(validator_outputs, expected_address)?;
+
+    if prepared_non_payout != validator_non_payout {
         return Err(MinerError::InvalidParentTemplate(format!(
-            "parent template transparent coinbase outputs differ from independent payout template at {endpoint}"
+            "parent template non-payout transparent coinbase outputs differ from independent payout template at {endpoint}"
         )));
     }
 
     Ok(())
+}
+
+fn non_payout_transparent_outputs<'a>(
+    outputs: &'a [transparent::Output],
+    expected_address: &ZcashAddress,
+) -> Result<Vec<&'a transparent::Output>, MinerError> {
+    outputs
+        .iter()
+        .filter_map(|output| match transparent_output_receiver(output) {
+            Ok(receiver) if expected_address.matches_receiver(&receiver) => None,
+            Ok(_) => Some(Ok(output)),
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+fn transparent_output_receiver(output: &transparent::Output) -> Result<Receiver, MinerError> {
+    // The selected network only changes textual address encoding; the receiver
+    // payload recovered from a P2PKH or P2SH script is network-independent.
+    match output.address(&Network::Mainnet).ok_or_else(|| {
+        MinerError::InvalidParentTemplate(
+            "parent coinbase contains a non-standard transparent output".to_string(),
+        )
+    })? {
+        transparent::Address::PayToPublicKeyHash { pub_key_hash, .. } => {
+            Ok(Receiver::P2pkh(pub_key_hash))
+        }
+        transparent::Address::PayToScriptHash { script_hash, .. } => {
+            Ok(Receiver::P2sh(script_hash))
+        }
+        // A TEX address uses the same P2PKH output script and is therefore
+        // indistinguishable on chain from its P2PKH receiver.
+        transparent::Address::Tex {
+            validating_key_hash,
+            ..
+        } => Ok(Receiver::P2pkh(validating_key_hash)),
+    }
 }
 
 fn parse_template_hex<T>(encoded: &str, field: &str) -> Result<T, MinerError>
@@ -1224,7 +1290,13 @@ fn decode_template_bytes(
 #[cfg(test)]
 mod tests {
     use wcash_zcash_aux::{auth_data_merkle_root, PROOF_VERSION};
-    use zebra_chain::transaction::AuthDigest;
+    use zcash_address::ToAddress;
+    use zcash_protocol::consensus::NetworkType;
+    use zebra_chain::{
+        amount::{Amount, NonNegative},
+        parameters::NetworkKind,
+        transaction::AuthDigest,
+    };
 
     use super::*;
 
@@ -1346,6 +1418,72 @@ mod tests {
         assert_eq!(template.previous_block_hash.len(), 64);
         assert!(template.transactions.is_empty());
         assert_eq!(template.parent_payout_commitment, Some("55".repeat(32)));
+    }
+
+    fn transparent_output(receiver: Receiver, value: i64) -> transparent::Output {
+        let address = match receiver {
+            Receiver::P2pkh(hash) => {
+                transparent::Address::from_pub_key_hash(NetworkKind::Testnet, hash)
+            }
+            Receiver::P2sh(hash) => {
+                transparent::Address::from_script_hash(NetworkKind::Testnet, hash)
+            }
+            _ => panic!("transparent output fixture requires a transparent receiver"),
+        };
+        transparent::Output::new(
+            Amount::<NonNegative>::try_from(value).expect("fixture value is non-negative"),
+            address.script(),
+        )
+    }
+
+    #[test]
+    fn independent_transparent_payout_allows_honest_fee_divergence() {
+        let payout_hash = [0x11; 20];
+        let funding_output = transparent_output(Receiver::P2sh([0x22; 20]), 25_000);
+        let expected_address = ZcashAddress::from_transparent_p2pkh(NetworkType::Test, payout_hash);
+
+        // Both nodes extend the same tip and have the same mandatory output, but
+        // their selected mempool fees produce different legitimate miner values.
+        let prepared_outputs = vec![
+            transparent_output(Receiver::P2pkh(payout_hash), 625_010_000),
+            funding_output.clone(),
+        ];
+        let validator_outputs = vec![
+            transparent_output(Receiver::P2pkh(payout_hash), 625_030_000),
+            funding_output,
+        ];
+
+        validate_matching_non_payout_transparent_outputs(
+            &prepared_outputs,
+            &validator_outputs,
+            &expected_address,
+            "validator",
+        )
+        .expect("fee-dependent miner output values may differ");
+    }
+
+    #[test]
+    fn independent_transparent_payout_rejects_extra_non_miner_output() {
+        let payout_hash = [0x11; 20];
+        let funding_output = transparent_output(Receiver::P2sh([0x22; 20]), 25_000);
+        let expected_address = ZcashAddress::from_transparent_p2pkh(NetworkType::Test, payout_hash);
+        let prepared_outputs = vec![
+            transparent_output(Receiver::P2pkh(payout_hash), 625_010_000),
+            funding_output.clone(),
+            transparent_output(Receiver::P2pkh([0x33; 20]), 10_000),
+        ];
+        let validator_outputs = vec![
+            transparent_output(Receiver::P2pkh(payout_hash), 625_030_000),
+            funding_output,
+        ];
+
+        assert!(validate_matching_non_payout_transparent_outputs(
+            &prepared_outputs,
+            &validator_outputs,
+            &expected_address,
+            "validator",
+        )
+        .is_err());
     }
 
     #[test]

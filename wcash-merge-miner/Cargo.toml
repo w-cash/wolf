@@ -24,10 +24,15 @@ sha2 = "0.10"
 thiserror = "2"
 wcash-zcash-aux = { path = "../wcash-zcash-aux" }
 zcash_address.workspace = true
+zcash_protocol.workspace = true
 zebra-chain = { path = "../zebra-chain", version = "12.0.0" }
 
 [dev-dependencies]
+orchard.workspace = true
 tempfile.workspace = true
+zebra-chain = { path = "../zebra-chain", version = "12.0.0", features = [
+  "proptest-impl",
+] }
 
 [lints.rust]
 unsafe_code = "forbid"

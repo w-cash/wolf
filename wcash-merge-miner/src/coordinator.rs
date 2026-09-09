@@ -19,9 +19,14 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use wcash_zcash_aux::{AuxPowProof, Target, WCASH_AUXILIARY_CHAIN_ID};
+use zcash_address::unified::{Container, Receiver};
+use zcash_protocol::consensus::NetworkType;
 use zebra_chain::{
-    block::Block,
+    block::{Block, Height},
+    parameters::{Network, NetworkKind},
+    primitives::{WcashAddress, WcashAddressKind},
     serialization::{ZcashDeserializeInto, ZcashSerialize},
+    transparent,
     work::{
         difficulty::{CompactDifficulty, ExpandedDifficulty, U256},
         equihash::{Solution, WCASH_BLOCK_WIRE_VERSION},
@@ -46,7 +51,7 @@ pub struct CoordinatorConfig {
     pub expected_wcash_genesis_hash: String,
     /// Parent template and proposal-validation node set.
     pub zcash: NativeZcashConfig,
-    /// Wcash Unified Address that receives the private child coinbase.
+    /// Wcash address that receives the child coinbase.
     pub wcash_payout_address: String,
     /// Auxiliary-tree nonce; one-child native jobs normally use zero.
     pub auxiliary_nonce: u32,
@@ -74,6 +79,8 @@ impl fmt::Debug for CoordinatorConfig {
 /// exactly once. Each subsequent generation reuses that validated state.
 pub struct NativeMiningSupervisor {
     config: CoordinatorConfig,
+    wcash_network: Network,
+    wcash_payout_address: WcashAddress,
     wcash_node: ZebraRpcClient,
     zcash: NativeZcashProvider,
     journal: Arc<ShareJournal>,
@@ -145,7 +152,7 @@ impl NativeMiningSupervisor {
         }
         if !config.wcash_node.is_loopback() {
             return Err(MinerError::RpcConfiguration(
-                "the Wcash template node must be loopback: it chooses the private child coinbase recipient"
+                "the Wcash template node must be loopback: it chooses the child coinbase recipient"
                     .to_string(),
             ));
         }
@@ -154,11 +161,17 @@ impl NativeMiningSupervisor {
             &config.expected_wcash_genesis_hash,
             "expected Wcash genesis hash",
         )?;
+        let (wcash_network, wcash_payout_address) = validate_wcash_payout_configuration(
+            &config.wcash_payout_address,
+            &config.expected_wcash_genesis_hash,
+        )?;
         let journal = Arc::new(ShareJournal::open(journal_path)?);
         let wcash_node = ZebraRpcClient::new(config.wcash_node.clone(), DEFAULT_RPC_TIMEOUT)?;
         let zcash = NativeZcashProvider::connect(config.zcash.clone())?;
         Ok(Self {
             config,
+            wcash_network,
+            wcash_payout_address,
             wcash_node,
             zcash,
             journal,
@@ -282,6 +295,13 @@ impl NativeMiningSupervisor {
                 "createauxblock metadata does not match its serialized candidate".to_string(),
             ));
         }
+        validate_wcash_candidate_payout(
+            &child_candidate,
+            &self.wcash_payout_address,
+            &self.wcash_network,
+            child.coinbase_value,
+            child.height,
+        )?;
 
         let job = zcash.prepare_job(child_hash, child_target, config.auxiliary_nonce)?;
         let expected_child_height = child.height.checked_sub(1).ok_or_else(|| {
@@ -490,6 +510,153 @@ fn require_wcash_network_identity(
     Ok(())
 }
 
+fn validate_wcash_payout_configuration(
+    encoded: &str,
+    expected_genesis_hash: &str,
+) -> Result<(Network, WcashAddress), MinerError> {
+    let payout = WcashAddress::try_from_encoded(encoded).map_err(|error| {
+        MinerError::InvalidRequest(format!("invalid Wcash payout address: {error}"))
+    })?;
+    let network = match payout.network() {
+        NetworkType::Test => Network::new_wcash_testnet(),
+        NetworkType::Regtest => Network::new_wcash_regtest(),
+        NetworkType::Main => {
+            return Err(MinerError::InvalidRequest(
+                "Wcash mainnet payouts are disabled".to_string(),
+            ))
+        }
+    };
+    if !network
+        .genesis_hash()
+        .to_string()
+        .eq_ignore_ascii_case(expected_genesis_hash)
+    {
+        return Err(MinerError::InvalidRequest(
+            "Wcash payout address network does not match the pinned child genesis".to_string(),
+        ));
+    }
+    match payout.kind() {
+        WcashAddressKind::P2pkh(_) | WcashAddressKind::P2sh(_) => {}
+        WcashAddressKind::Unified(address)
+            if address
+                .items()
+                .iter()
+                .any(|receiver| matches!(receiver, Receiver::Orchard(_))) => {}
+        _ => {
+            return Err(MinerError::InvalidRequest(
+                "Wcash payout must be transparent or Unified with an Orchard receiver".to_string(),
+            ))
+        }
+    }
+    Ok((network, payout))
+}
+
+fn validate_wcash_candidate_payout(
+    candidate: &Block,
+    expected_payout: &WcashAddress,
+    network: &Network,
+    advertised_value: i64,
+    height: u32,
+) -> Result<(), MinerError> {
+    if advertised_value < 0 {
+        return Err(MinerError::InvalidParentTemplate(
+            "createauxblock advertised a negative coinbase value".to_string(),
+        ));
+    }
+    let coinbase = candidate.transactions.first().ok_or_else(|| {
+        MinerError::InvalidParentTemplate(
+            "createauxblock candidate has no coinbase transaction".to_string(),
+        )
+    })?;
+    if !coinbase.is_coinbase() {
+        return Err(MinerError::InvalidParentTemplate(
+            "createauxblock candidate does not start with a coinbase transaction".to_string(),
+        ));
+    }
+
+    match expected_payout.kind() {
+        WcashAddressKind::P2pkh(hash) => {
+            let expected_script =
+                transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, *hash).script();
+            validate_transparent_wcash_payout(coinbase, &expected_script, advertised_value)
+        }
+        WcashAddressKind::P2sh(hash) => {
+            let expected_script =
+                transparent::Address::from_script_hash(NetworkKind::Mainnet, *hash).script();
+            validate_transparent_wcash_payout(coinbase, &expected_script, advertised_value)
+        }
+        WcashAddressKind::Unified(_) => {
+            if !coinbase.outputs().is_empty()
+                || coinbase.has_sapling_shielded_data()
+                || coinbase.has_orchard_shielded_data()
+                || coinbase.ironwood_actions().next().is_none()
+            {
+                return Err(MinerError::InvalidParentTemplate(
+                    "createauxblock candidate does not use an Ironwood-only private payout"
+                        .to_string(),
+                ));
+            }
+            if coinbase
+                .ironwood_value_balance()
+                .ironwood_amount()
+                .zatoshis()
+                != advertised_value.checked_neg().ok_or_else(|| {
+                    MinerError::InvalidParentTemplate(
+                        "createauxblock coinbase value cannot be negated".to_string(),
+                    )
+                })?
+            {
+                return Err(MinerError::InvalidParentTemplate(
+                    "createauxblock Ironwood value does not match coinbasevalue".to_string(),
+                ));
+            }
+            if !zebra_chain::primitives::zcash_note_encryption::ironwood_outputs_are_private_from_zero_ovk(
+                coinbase,
+                network,
+                Height(height),
+            ) {
+                return Err(MinerError::InvalidParentTemplate(
+                    "createauxblock Ironwood payout is publicly recoverable".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        WcashAddressKind::Sapling(_) | WcashAddressKind::Tex(_) => Err(MinerError::InvalidRequest(
+            "Sapling and TEX are not Wcash coinbase payout modes".to_string(),
+        )),
+    }
+}
+
+fn validate_transparent_wcash_payout(
+    coinbase: &zebra_chain::transaction::Transaction,
+    expected_script: &transparent::Script,
+    advertised_value: i64,
+) -> Result<(), MinerError> {
+    if coinbase.outputs().is_empty()
+        || coinbase.has_sapling_shielded_data()
+        || coinbase.has_orchard_shielded_data()
+        || coinbase.has_ironwood_shielded_data()
+        || coinbase
+            .outputs()
+            .iter()
+            .any(|output| &output.lock_script != expected_script)
+    {
+        return Err(MinerError::InvalidParentTemplate(
+            "createauxblock candidate does not pay only the configured transparent Wcash address"
+                .to_string(),
+        ));
+    }
+    let actual_value = coinbase.outputs().iter().try_fold(0i64, |total, output| {
+        total.checked_add(output.value().zatoshis())
+    });
+    if actual_value != Some(advertised_value) {
+        return Err(MinerError::InvalidParentTemplate(
+            "createauxblock transparent outputs do not match coinbasevalue".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn retry_pending_winners_with(
     wcash_node: &ZebraRpcClient,
     zcash: &NativeZcashProvider,
@@ -655,6 +822,17 @@ fn wcash_confirmation_depth(
     };
     match status {
         WcashAuxBlockStatus::BestChain { confirmations } => {
+            // Durable outbox replay uses `submitblock` so it remains valid after
+            // the node's proof-free candidate cache expires or the node
+            // restarts. Once authoritative status proves the exact witness is
+            // on the best chain, repeat the same witness through
+            // `submitauxblock`. Its idempotent best-chain path releases the
+            // now-obsolete active candidate; otherwise long maturity runs can
+            // fill the bounded cache even though every issued job won.
+            let _release = node.call_value(
+                "submitauxblock",
+                json!([expected_hash, hex::encode(witness.as_bytes())]),
+            );
             WinnerObservation::Present { confirmations }
         }
         WcashAuxBlockStatus::SideChain | WcashAuxBlockStatus::Unknown => WinnerObservation::Absent,
@@ -2198,11 +2376,23 @@ fn decode_bounded_hex(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        io::{ErrorKind, Read},
+        net::TcpListener,
+    };
 
     use hex::FromHex;
     use tempfile::tempdir;
-    use zebra_chain::block::genesis::wcash_regtest_genesis_block;
+    use zcash_address::unified::Encoding;
+    use zcash_protocol::consensus::{BranchId, NetworkType};
+    use zebra_chain::{
+        amount::{Amount, NonNegative},
+        block::genesis::wcash_regtest_genesis_block,
+        parameters::{NetworkKind, NetworkUpgrade},
+        transaction::{LockTime, Transaction},
+        transparent,
+    };
 
     use super::*;
 
@@ -2218,6 +2408,94 @@ mod tests {
             .expect("mainnet block fixture is hex")
             .zcash_deserialize_into()
             .expect("mainnet block fixture is a block")
+    }
+
+    fn read_test_rpc_request(stream: &mut std::net::TcpStream) -> serde_json::Value {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set test RPC read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4_096];
+        let (body_start, content_length) = loop {
+            let count = stream.read(&mut buffer).expect("read test RPC request");
+            assert!(count > 0, "test RPC request ended before its body");
+            request.extend_from_slice(&buffer[..count]);
+            assert!(request.len() <= 64 * 1_024, "test RPC request is bounded");
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let body_start = header_end + 4;
+            let headers =
+                std::str::from_utf8(&request[..header_end]).expect("test RPC headers are UTF-8");
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("valid content length"))
+                })
+                .expect("test RPC request has a content length");
+            if request.len() >= body_start + content_length {
+                break (body_start, content_length);
+            }
+        };
+        serde_json::from_slice(&request[body_start..body_start + content_length])
+            .expect("test RPC body is JSON")
+    }
+
+    fn spawn_wcash_status_server() -> (RpcEndpoint, thread::JoinHandle<Vec<serde_json::Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test RPC server");
+        listener
+            .set_nonblocking(true)
+            .expect("make test RPC listener nonblocking");
+        let endpoint = RpcEndpoint::new(
+            format!(
+                "http://{}/",
+                listener.local_addr().expect("test RPC address")
+            ),
+            None,
+            None,
+        )
+        .expect("loopback test RPC endpoint");
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut requests = Vec::new();
+            while requests.len() < 2 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_test_rpc_request(&mut stream);
+                        let id = request["id"].clone();
+                        let result = if requests.is_empty() {
+                            json!({"state": "best_chain", "confirmations": 1})
+                        } else {
+                            json!(true)
+                        };
+                        let response = serde_json::to_vec(&json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": result,
+                        }))
+                        .expect("serialize test RPC response");
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            response.len()
+                        )
+                        .expect("write test RPC headers");
+                        stream
+                            .write_all(&response)
+                            .expect("write test RPC response");
+                        requests.push(request);
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test RPC accept failed: {error}"),
+                }
+            }
+            requests
+        });
+        (endpoint, server)
     }
 
     fn journal_share_id(job_id: &str, parent_hash_le: [u8; 32]) -> String {
@@ -2279,6 +2557,224 @@ mod tests {
         assert_eq!(raw, std::array::from_fn(|index| 31 - index as u8));
         assert!(parse_display_target(&"00".repeat(32)).is_err());
         assert!(parse_display_hash("00", "hash").is_err());
+    }
+
+    #[test]
+    fn confirmed_wcash_winner_releases_the_exact_active_candidate() {
+        let (endpoint, server) = spawn_wcash_status_server();
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+        let mut block = wcash_regtest_genesis_block().as_ref().clone();
+        let witness = vec![0x51, 0x52, 0x53];
+        Arc::make_mut(&mut block.header).solution =
+            Solution::for_wcash(witness.clone()).expect("test witness is bounded");
+        let block_bytes = block
+            .zcash_serialize_to_vec()
+            .expect("test Wcash block serializes");
+        let block_hash = display_hash(block.hash().0);
+
+        assert_eq!(
+            wcash_confirmation_depth(&client, 0, &block_hash, &block_bytes),
+            WinnerObservation::Present { confirmations: 1 }
+        );
+
+        let requests = server.join().expect("test RPC server exits");
+        assert_eq!(
+            requests.len(),
+            2,
+            "status must be followed by cache release"
+        );
+        assert_eq!(requests[0]["method"], "getauxblockstatus");
+        assert_eq!(requests[1]["method"], "submitauxblock");
+        let expected_params = json!([block_hash, hex::encode(witness)]);
+        assert_eq!(requests[0]["params"], expected_params);
+        assert_eq!(requests[1]["params"], expected_params);
+    }
+
+    fn orchard_unified_wcash_address(network: NetworkType) -> WcashAddress {
+        let zcash_fixture = match network {
+            NetworkType::Test => "utest10a8k6aw5w33kvyt7x6fryzu7vvsjru5vgcfnvr288qx2zm6p63ygcajtaze0px08t583dyrgr42vasazjhhnntus2tqrpkzu0dm2l4cgf3ld6wdqdrf3jv8mvfx9c80e73syer9l2wlgawjtf7yvj0eqwdf354trtelxnr0fhpw9792eaf49ghstkyftc9lwqqwy4ye0cleagp4nzyt",
+            NetworkType::Regtest => "uregtest1efxggx6lduhm2fx5lnrhxv7h7kpztlpa3ahf3n4w0q0zj5epj4av9xjq6ljsja3xk8z7rzd067kc7mgpy9448rdfzpfjz5gq389zdmpgnk6rp4ykk0xk6cmqw6zqcrnmsuaxv3yzsvcwsd4gagtalh0uzrdvy03nhmltjz2eu0232qlcs0zvxuqyut73yucd9gy5jaudnyt7yqhgpqv",
+            NetworkType::Main => unreachable!("Wcash mainnet is disabled"),
+        };
+        zcash_fixture
+            .parse::<zcash_address::ZcashAddress>()
+            .expect("the upstream Unified fixture is valid")
+            .convert::<WcashAddress>()
+            .expect("the Unified fixture is supported by Wcash")
+            .with_network(network)
+    }
+
+    fn assert_invalid_wcash_payout(encoded: &str, genesis: &str, expected: &str) {
+        match validate_wcash_payout_configuration(encoded, genesis) {
+            Err(MinerError::InvalidRequest(message)) => assert!(
+                message.contains(expected),
+                "expected {expected:?} in rejection: {message}"
+            ),
+            Err(error) => panic!("unexpected payout rejection: {error}"),
+            Ok(_) => panic!("unsupported payout was accepted: {encoded}"),
+        }
+    }
+
+    #[test]
+    fn wcash_payout_configuration_accepts_public_and_private_test_network_modes() {
+        for (network, network_type) in [
+            (Network::new_wcash_testnet(), NetworkType::Test),
+            (Network::new_wcash_regtest(), NetworkType::Regtest),
+        ] {
+            let genesis = network.genesis_hash().to_string();
+            for payout in [
+                WcashAddress::from_transparent_p2pkh(network_type, [0; 20]),
+                WcashAddress::from_transparent_p2sh(network_type, [1; 20]),
+                orchard_unified_wcash_address(network_type),
+            ] {
+                let encoded = payout.encode();
+                let (selected_network, selected_payout) =
+                    validate_wcash_payout_configuration(&encoded, &genesis)
+                        .expect("the matching Wcash payout is accepted");
+                assert_eq!(selected_network, network);
+                assert_eq!(selected_payout, payout);
+            }
+        }
+    }
+
+    #[test]
+    fn wcash_payout_configuration_rejects_wrong_network_and_unsupported_types() {
+        let testnet = Network::new_wcash_testnet();
+        let regtest = Network::new_wcash_regtest();
+        let testnet_genesis = testnet.genesis_hash().to_string();
+        let regtest_genesis = regtest.genesis_hash().to_string();
+        let testnet_transparent =
+            WcashAddress::from_transparent_p2pkh(NetworkType::Test, [0; 20]).encode();
+
+        assert_invalid_wcash_payout(
+            &testnet_transparent,
+            &regtest_genesis,
+            "network does not match",
+        );
+        assert_invalid_wcash_payout(
+            "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV",
+            &testnet_genesis,
+            "invalid Wcash payout address",
+        );
+
+        let unsupported = [
+            WcashAddress::from_sapling(NetworkType::Test, [0; 43]),
+            WcashAddress::from_tex(NetworkType::Test, [0; 20]),
+            WcashAddress::from_unified(
+                NetworkType::Test,
+                zcash_address::unified::Address::try_from_items(vec![Receiver::Sapling([0; 43])])
+                    .expect("the Sapling-only Unified fixture is structurally valid"),
+            ),
+        ];
+        for payout in unsupported {
+            assert_invalid_wcash_payout(
+                &payout.encode(),
+                &testnet_genesis,
+                "transparent or Unified with an Orchard receiver",
+            );
+        }
+
+        let mainnet = WcashAddress::from_transparent_p2pkh(NetworkType::Main, [0; 20]);
+        assert_invalid_wcash_payout(
+            &mainnet.encode(),
+            &Network::Mainnet.genesis_hash().to_string(),
+            "mainnet payouts are disabled",
+        );
+    }
+
+    fn wcash_coinbase_inputs() -> Vec<transparent::Input> {
+        vec![transparent::Input::Coinbase {
+            height: Height(1),
+            data: vec![0x51],
+            sequence: u32::MAX,
+        }]
+    }
+
+    fn transparent_wcash_candidate(payout_hash: [u8; 20], reward: i64) -> (Block, WcashAddress) {
+        let network = Network::new_wcash_regtest();
+        let output = transparent::Output::new(
+            Amount::<NonNegative>::try_from(reward).expect("fixture reward is non-negative"),
+            transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, payout_hash).script(),
+        );
+        let coinbase = Transaction::test_v6_for_network(
+            &network,
+            Height(1),
+            wcash_coinbase_inputs(),
+            vec![output],
+            LockTime::unlocked(),
+            Height(0),
+        );
+        let mut candidate = Arc::unwrap_or_clone(wcash_regtest_genesis_block());
+        candidate.transactions = vec![Arc::new(coinbase)];
+        (
+            candidate,
+            WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, payout_hash),
+        )
+    }
+
+    fn assert_invalid_candidate_payout(result: Result<(), MinerError>, expected_message: &str) {
+        match result {
+            Err(MinerError::InvalidParentTemplate(message)) => assert!(
+                message.contains(expected_message),
+                "expected {expected_message:?} in rejection: {message}"
+            ),
+            Err(error) => panic!("unexpected candidate-payout rejection: {error}"),
+            Ok(()) => panic!("invalid candidate payout was accepted"),
+        }
+    }
+
+    #[test]
+    fn wcash_candidate_requires_exact_transparent_recipient_and_value() {
+        let network = Network::new_wcash_regtest();
+        let reward = 625_012_345;
+        let (candidate, payout) = transparent_wcash_candidate([0x51; 20], reward);
+
+        validate_wcash_candidate_payout(&candidate, &payout, &network, reward, 1)
+            .expect("the exact transparent recipient and value are accepted");
+
+        let wrong_payout = WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, [0x52; 20]);
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout(&candidate, &wrong_payout, &network, reward, 1),
+            "only the configured transparent Wcash address",
+        );
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout(&candidate, &payout, &network, reward + 1, 1),
+            "transparent outputs do not match coinbasevalue",
+        );
+    }
+
+    #[test]
+    fn wcash_transparent_candidate_rejects_a_mixed_shielded_pool() {
+        use zebra_chain::transaction::arbitrary::fake_bundle_for_branch;
+
+        let network = Network::new_wcash_regtest();
+        let reward = 625_012_345;
+        let payout_hash = [0x61; 20];
+        let payout = WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, payout_hash);
+        let output = transparent::Output::new(
+            Amount::<NonNegative>::try_from(reward).expect("fixture reward is non-negative"),
+            transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, payout_hash).script(),
+        );
+        let ironwood_bundle =
+            fake_bundle_for_branch(BranchId::Nu6_3, orchard::ValuePool::Ironwood, 1, 0x5eed)
+                .expect("NU6.3 defines the Ironwood pool");
+        let coinbase = Transaction::test_v6_with_bundles(
+            NetworkUpgrade::Nu6_3,
+            wcash_coinbase_inputs(),
+            vec![output],
+            LockTime::unlocked(),
+            Height(0),
+            None,
+            Some(ironwood_bundle),
+        );
+        let mut candidate = Arc::unwrap_or_clone(wcash_regtest_genesis_block());
+        candidate.transactions = vec![Arc::new(coinbase)];
+
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout(&candidate, &payout, &network, reward, 1),
+            "only the configured transparent Wcash address",
+        );
     }
 
     #[test]

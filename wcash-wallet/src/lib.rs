@@ -12,7 +12,10 @@ mod network;
 mod rpc;
 mod wallet;
 
-pub use address::{decode_recipient, encode_orchard_receiver, WalletAddressError};
+pub use address::{
+    decode_recipient, encode_orchard_receiver, encode_transparent_coinbase_receiver,
+    WalletAddressError,
+};
 pub use cache::{MemoryBlockCache, MemoryBlockCacheError};
 pub use keys::{derive_wallet_seed, derive_wallet_spending_key, WalletKeyError};
 pub use network::WalletNetwork;
@@ -29,9 +32,12 @@ pub use rpc::{
     TransactionStatus, WalletRpcError,
 };
 pub use wallet::{
-    create_signed_transfer, initialize_wallet, open_wallet_database, stored_signed_transaction,
+    create_signed_coinbase_shielding, create_signed_transfer, initialize_wallet,
+    open_wallet_database, pending_signed_transactions, stored_signed_transaction,
     synchronize_wallet, wallet_balance, AccountBalanceSummary, InitializedWallet,
-    SignedTransaction, StoredSignedTransaction, TransferRecipient, WalletBalanceSummary,
-    WalletDatabase, WalletServiceError, MAX_EXPIRY_DELTA, MAX_LOCK_FOR_BLOCKS, MAX_SYNC_BATCH_SIZE,
-    MAX_TRANSFER_RECIPIENTS,
+    PendingSignedTransactionPage, SignedTransaction, StoredSignedTransaction, TransferRecipient,
+    WalletBalanceSummary, WalletDatabase, WalletServiceError, COINBASE_SHIELDING_MATURITY,
+    MAX_COINBASE_SHIELDING_INPUTS, MAX_EXPIRY_DELTA, MAX_LOCK_FOR_BLOCKS,
+    MAX_PENDING_TRANSACTION_PAGE_SIZE, MAX_SYNC_BATCH_SIZE, MAX_TRANSFER_RECIPIENTS,
+    TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT,
 };

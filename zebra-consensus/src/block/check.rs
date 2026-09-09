@@ -483,31 +483,33 @@ pub fn miner_fees_are_valid(
         (expected_block_subsidy + block_miner_fees).map_err(|_| SubsidyError::Overflow)?;
 
     if network.uses_wcash_consensus() && height > Height::MIN {
-        // Wcash coinbase value is created only in Ironwood. The transparent coinbase input remains
-        // required, but there must be no transparent outputs and no legacy shielded components.
-        if !coinbase_tx.outputs().is_empty() {
-            return Err(SubsidyError::WcashTransparentCoinbaseOutput.into());
-        }
+        // Wcash accepts exactly one coinbase payout mode: transparent outputs for conventional
+        // pool integration, or private Ironwood actions for miners that opt in to shielded
+        // rewards. Legacy Sapling and Orchard components are never valid Wcash coinbase outputs.
         if coinbase_tx.has_sapling_shielded_data() {
             return Err(SubsidyError::WcashSaplingCoinbaseOutput.into());
         }
         if coinbase_tx.has_orchard_shielded_data() {
             return Err(SubsidyError::WcashOrchardCoinbaseOutput.into());
         }
-        if coinbase_tx.ironwood_actions().next().is_none() {
-            return Err(SubsidyError::WcashIronwoodCoinbaseOutputMissing.into());
-        }
-        crate::transaction::check::wcash_coinbase_outputs_are_private(
-            coinbase_tx,
-            network,
-            height,
-        )?;
+        let has_transparent_outputs = !coinbase_tx.outputs().is_empty();
+        let has_ironwood_outputs = coinbase_tx.ironwood_actions().next().is_some();
+        match wcash_coinbase_payout_mode(has_transparent_outputs, has_ironwood_outputs)? {
+            WcashCoinbasePayoutMode::Ironwood => {
+                crate::transaction::check::wcash_coinbase_outputs_are_private(
+                    coinbase_tx,
+                    network,
+                    height,
+                )?;
 
-        // A negative shielded value balance represents value entering Ironwood. At the eventual
-        // zero-subsidy tail, a zero-fee block has zero total input and therefore a zero value
-        // balance; otherwise all positive coinbase value must enter Ironwood.
-        if !total_input_value.is_zero() && ironwood_value_balance.zatoshis() >= 0 {
-            return Err(SubsidyError::WcashIronwoodValueBalanceNotNegative.into());
+                // A negative shielded value balance represents value entering Ironwood. At the
+                // eventual zero-subsidy tail, a zero-fee block has zero total input and therefore
+                // a zero value balance; otherwise all positive coinbase value must enter Ironwood.
+                if !total_input_value.is_zero() && ironwood_value_balance.zatoshis() >= 0 {
+                    return Err(SubsidyError::WcashIronwoodValueBalanceNotNegative.into());
+                }
+            }
+            WcashCoinbasePayoutMode::Transparent => {}
         }
     }
 
@@ -526,6 +528,24 @@ pub fn miner_fees_are_valid(
     };
 
     Ok(())
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum WcashCoinbasePayoutMode {
+    Transparent,
+    Ironwood,
+}
+
+pub(super) fn wcash_coinbase_payout_mode(
+    has_transparent_outputs: bool,
+    has_ironwood_outputs: bool,
+) -> Result<WcashCoinbasePayoutMode, SubsidyError> {
+    match (has_transparent_outputs, has_ironwood_outputs) {
+        (false, false) => Err(SubsidyError::WcashCoinbaseOutputMissing),
+        (true, true) => Err(SubsidyError::WcashMixedCoinbaseOutputs),
+        (true, false) => Ok(WcashCoinbasePayoutMode::Transparent),
+        (false, true) => Ok(WcashCoinbasePayoutMode::Ironwood),
+    }
 }
 
 /// Returns `Ok(())` if `header.time` is less than or equal to

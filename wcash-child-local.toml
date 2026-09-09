@@ -20,7 +20,9 @@ enable_cookie_auth = false
 debug_force_finished_sync = true
 
 [mining]
-# `createauxblock` requires and validates the payout address on each request.
+# `createauxblock` requires and validates an operator-owned Wcash address on
+# each request. A transparent `WR...` address is the normal pool path; a
+# `wuregtest1...` Unified Address opts into a private Ironwood reward.
 extra_coinbase_data = "Wcash"
 internal_miner = false
 

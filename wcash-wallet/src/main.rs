@@ -10,10 +10,11 @@ use secrecy::SecretVec;
 use serde::Serialize;
 use thiserror::Error;
 use wcash_wallet::{
-    create_signed_transfer, derive_wallet_spending_key, encode_orchard_receiver, initialize_wallet,
-    stored_signed_transaction, synchronize_wallet, wallet_balance, AttestedWcashClient,
-    TransferRecipient, WalletAddressError, WalletKeyError, WalletNetwork, WalletRpcError,
-    WalletServiceError,
+    create_signed_coinbase_shielding, create_signed_transfer, derive_wallet_spending_key,
+    encode_orchard_receiver, encode_transparent_coinbase_receiver, initialize_wallet,
+    pending_signed_transactions, stored_signed_transaction, synchronize_wallet, wallet_balance,
+    AttestedWcashClient, TransferRecipient, WalletAddressError, WalletKeyError, WalletNetwork,
+    WalletRpcError, WalletServiceError,
 };
 use zcash_protocol::TxId;
 use zeroize::Zeroizing;
@@ -111,6 +112,18 @@ enum Command {
     },
     /// Print the locally stored pool-separated wallet balance.
     Balance,
+    /// Shield mature transparent coinbase outputs into this wallet's Ironwood receiver.
+    ShieldCoinbase {
+        /// Maximum mature coinbase UTXOs to sweep, highest value first.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..=100))]
+        max_inputs: u64,
+        /// Number of blocks after the proposal target at which the transaction expires.
+        #[arg(long, default_value_t = 40, value_parser = clap::value_parser!(u32).range(1..=100))]
+        expiry_delta: u32,
+        /// Number of blocks for which selected coinbase outputs remain locked.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1_000))]
+        lock_for_blocks: u32,
+    },
     /// Create and persist one Ironwood-only V6 transfer using a hex seed on stdin.
     Transfer {
         /// Canonical Wcash Unified Address.
@@ -141,6 +154,15 @@ enum Command {
         #[arg(long)]
         txid: String,
     },
+    /// List exact bytes for locally-created transactions not currently recorded as mined.
+    ListPending {
+        /// Opaque cursor returned by the previous page.
+        #[arg(long)]
+        after_row_id: Option<u64>,
+        /// Maximum rows to return in this page.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u64).range(1..=25))]
+        limit: u64,
+    },
     /// Broadcast exact signed transaction hex read from stdin.
     Broadcast,
     /// Query the exact transaction identifier from the attested Wcash node.
@@ -156,6 +178,7 @@ struct DerivedAddress {
     network: WalletNetwork,
     account: u32,
     address: String,
+    transparent_coinbase_address: String,
 }
 
 #[derive(Serialize)]
@@ -182,11 +205,13 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::DeriveAddress { account } => {
             let seed = read_seed()?;
             let spending_key = derive_wallet_spending_key(&seed, network, account)?;
+            let viewing_key = spending_key.to_unified_full_viewing_key();
             print_json(&DerivedAddress {
                 network,
                 account,
-                address: encode_orchard_receiver(
-                    &spending_key.to_unified_full_viewing_key(),
+                address: encode_orchard_receiver(&viewing_key, network)?,
+                transparent_coinbase_address: encode_transparent_coinbase_receiver(
+                    &viewing_key,
                     network,
                 )?,
             })
@@ -216,6 +241,29 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             print_json(&result)
         }
         Command::Balance => print_json(&wallet_balance(required_database(&cli.db)?, network)?),
+        Command::ShieldCoinbase {
+            max_inputs,
+            expiry_delta,
+            lock_for_blocks,
+        } => {
+            let mut client = connect_required(&cli.lightwalletd, network).await?;
+            let seed = read_seed()?;
+            let result = create_signed_coinbase_shielding(
+                &mut client,
+                required_database(&cli.db)?,
+                network,
+                &seed,
+                usize::try_from(max_inputs).map_err(|_| {
+                    WalletServiceError::InvalidRequest(
+                        "coinbase input limit is not representable".to_owned(),
+                    )
+                })?,
+                expiry_delta,
+                lock_for_blocks,
+            )
+            .await?;
+            print_json(&result)
+        }
         Command::Transfer {
             recipient,
             amount_zat,
@@ -252,6 +300,19 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             required_database(&cli.db)?,
             network,
             parse_txid(&txid)?,
+        )?),
+        Command::ListPending {
+            after_row_id,
+            limit,
+        } => print_json(&pending_signed_transactions(
+            required_database(&cli.db)?,
+            network,
+            after_row_id,
+            usize::try_from(limit).map_err(|_| {
+                WalletServiceError::InvalidRequest(
+                    "pending transaction page size is not representable".to_owned(),
+                )
+            })?,
         )?),
         Command::Broadcast => {
             let raw = read_hex_stdin("signed transaction", MAX_RAW_TRANSACTION_HEX_INPUT)?;
@@ -379,6 +440,16 @@ mod tests {
             "--amount-zat",
             "1",
             "--expiry-delta",
+            "101",
+        ])
+        .is_err());
+
+        assert!(Cli::try_parse_from([
+            "wcash-wallet",
+            "--network",
+            "regtest",
+            "shield-coinbase",
+            "--max-inputs",
             "101",
         ])
         .is_err());
