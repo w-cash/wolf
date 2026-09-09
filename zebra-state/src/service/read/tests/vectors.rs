@@ -26,6 +26,7 @@ use crate::{
         non_finalized_state::Chain,
         read::{orchard_subtrees, sapling_subtrees},
     },
+    tests::setup::{test_network, uses_wcash_consensus},
     Config, ReadRequest, ReadResponse,
 };
 
@@ -36,7 +37,7 @@ async fn empty_read_state_still_responds_to_requests() -> Result<()> {
 
     let transcript = Transcript::from(empty_state_test_cases());
 
-    let network = Mainnet;
+    let network = test_network();
     let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
         init_test_services(&network).await;
 
@@ -51,7 +52,7 @@ async fn empty_read_state_still_responds_to_requests() -> Result<()> {
 async fn find_fork_point_rejects_over_long_locator() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    let network = Mainnet;
+    let network = test_network();
     let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
         init_test_services(&network).await;
 
@@ -75,6 +76,10 @@ async fn find_fork_point_rejects_over_long_locator() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn populated_read_state_responds_correctly() -> Result<()> {
     let _init_guard = zebra_test::init();
+    if uses_wcash_consensus() {
+        // The continuous fixture below is a frozen Zcash chain.
+        return Ok(());
+    }
 
     // Create a continuous chain of mainnet blocks from genesis
     let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
@@ -448,6 +453,10 @@ fn new_ephemeral_db() -> ZebraDb {
 #[tokio::test(flavor = "multi_thread")]
 async fn any_chain_block_test() -> Result<()> {
     let _init_guard = zebra_test::init();
+    if uses_wcash_consensus() {
+        // The continuous fixture below is a frozen Zcash chain.
+        return Ok(());
+    }
 
     // Create a continuous chain of mainnet blocks from genesis
     let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
@@ -520,6 +529,12 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
     use zebra_chain::{amount::NonNegative, value_balance::ValueBalance};
 
     let _init_guard = zebra_test::init();
+
+    if uses_wcash_consensus() {
+        // This fixture relies on pre-Heartwood Zcash blocks. Wcash side-chain
+        // storage is covered by its native state lifecycle test.
+        return Ok(());
+    }
 
     let network = Mainnet;
 

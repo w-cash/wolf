@@ -37,6 +37,7 @@ use crate::{
         disk_format::{tests::KV, RawBytes},
         FinalizedState,
     },
+    tests::setup::uses_wcash_consensus,
     Config, ReadDisk,
 };
 
@@ -46,6 +47,11 @@ use crate::{
 #[test]
 fn test_raw_rocksdb_column_families() {
     let _init_guard = zebra_test::init();
+    if uses_wcash_consensus() {
+        // The committed snapshots encode frozen Zcash blocks and network
+        // suffixes. Wcash database behavior has dedicated native coverage.
+        return;
+    }
     for network in Network::iter() {
         test_raw_rocksdb_column_families_with_network(network);
     }

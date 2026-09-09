@@ -43,7 +43,9 @@ use crate::{
 
 pub mod service_trait;
 
-#[cfg(test)]
+// Router checkpoint tests consume Zcash historical block fixtures. Wcash has
+// a frozen genesis but no post-genesis checkpoint fixture yet.
+#[cfg(all(test, not(feature = "wcash-consensus")))]
 mod tests;
 
 /// The bound for the chain verifier and transaction verifier buffers.

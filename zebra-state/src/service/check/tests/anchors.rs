@@ -18,7 +18,9 @@ use crate::{
         check::anchors::tx_anchors_refer_to_final_treestates,
         write::validate_and_commit_non_finalized,
     },
-    tests::setup::{new_state_with_mainnet_genesis, transaction_v4_from_coinbase},
+    tests::setup::{
+        new_state_with_mainnet_genesis, transaction_v4_from_coinbase, uses_wcash_consensus,
+    },
     DiskWriteBatch, SemanticallyVerifiedBlock, ValidateContextError,
 };
 
@@ -29,6 +31,10 @@ use crate::{
 #[test]
 fn check_sprout_anchors() {
     let _init_guard = zebra_test::init();
+
+    if uses_wcash_consensus() {
+        return;
+    }
 
     let (finalized_state, mut non_finalized_state, _genesis) = new_state_with_mainnet_genesis();
 
@@ -302,6 +308,10 @@ fn parse_compact_size_bytes(bytes: &[u8], pos: &mut usize) -> u64 {
 #[test]
 fn check_sapling_anchors() {
     let _init_guard = zebra_test::init();
+
+    if uses_wcash_consensus() {
+        return;
+    }
 
     let (finalized_state, mut non_finalized_state, _genesis) = new_state_with_mainnet_genesis();
 

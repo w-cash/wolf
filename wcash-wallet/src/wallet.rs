@@ -590,14 +590,14 @@ pub fn stored_signed_transaction(
     transaction
         .write(&mut raw)
         .map_err(|error| WalletServiceError::Signing(error.to_string()))?;
-    let inspected = inspect_signed_transaction(&raw)?;
+    let inspected = inspect_signed_transaction(&raw, network)?;
     if inspected.txid() != txid {
         return Err(WalletServiceError::MissingSignedTransaction);
     }
     Ok(StoredSignedTransaction {
         txid: txid.to_string(),
         raw_transaction_hex: hex::encode(raw),
-        branch_id: "b3cfd27e".to_owned(),
+        branch_id: network.branch_id_hex(),
         expiry_height: inspected.expiry_height().into(),
     })
 }
@@ -627,7 +627,7 @@ pub fn pending_signed_transactions(
     let transactions = rows
         .into_iter()
         .map(|row| {
-            let inspected = inspect_signed_transaction(&row.raw)?;
+            let inspected = inspect_signed_transaction(&row.raw, network)?;
             if inspected.txid() != row.txid {
                 return Err(WalletServiceError::Database(format!(
                     "persisted transaction {} has mismatched bytes",
@@ -637,7 +637,7 @@ pub fn pending_signed_transactions(
             Ok(StoredSignedTransaction {
                 txid: row.txid.to_string(),
                 raw_transaction_hex: hex::encode(row.raw),
-                branch_id: "b3cfd27e".to_owned(),
+                branch_id: network.branch_id_hex(),
                 expiry_height: inspected.expiry_height().into(),
             })
         })
@@ -1129,7 +1129,7 @@ pub async fn create_signed_transfer(
             format!("signed transaction serialization failed: {error}"),
         ));
     }
-    let inspected = inspect_signed_transaction(&raw).map_err(|error| {
+    let inspected = inspect_signed_transaction(&raw, network).map_err(|error| {
         persisted_transactions_require_review(
             &created,
             format!("signed transaction policy inspection failed: {error}"),
@@ -1176,7 +1176,7 @@ pub async fn create_signed_transfer(
     Ok(SignedTransaction {
         txid: txid.to_string(),
         raw_transaction_hex: hex::encode(raw),
-        branch_id: "b3cfd27e".to_owned(),
+        branch_id: network.branch_id_hex(),
         target_height: target_height_u32,
         expiry_height: expiry_height_u32,
         fee_zat,
@@ -1469,7 +1469,7 @@ pub async fn create_signed_coinbase_shielding(
             format!("signed transaction serialization failed: {error}"),
         ));
     }
-    let inspected = inspect_signed_transaction(&raw).map_err(|error| {
+    let inspected = inspect_signed_transaction(&raw, network).map_err(|error| {
         persisted_transactions_require_review(
             &created,
             format!("signed transaction policy inspection failed: {error}"),
@@ -1520,7 +1520,7 @@ pub async fn create_signed_coinbase_shielding(
     Ok(SignedTransaction {
         txid: txid.to_string(),
         raw_transaction_hex: hex::encode(raw),
-        branch_id: "b3cfd27e".to_owned(),
+        branch_id: network.branch_id_hex(),
         target_height: target_height_u32,
         expiry_height: expiry_height_u32,
         fee_zat,

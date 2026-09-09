@@ -202,7 +202,7 @@ impl TxVersion {
             BranchId::Nu6_1 => TxVersion::V5,
             BranchId::Nu6_2 => TxVersion::V5,
             BranchId::Nu6_3 => TxVersion::V6,
-            BranchId::WcashTestnetV1 => TxVersion::V6,
+            BranchId::WcashTestnetV1 | BranchId::WcashRegtestV1 => TxVersion::V6,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => TxVersion::V6,
         }
@@ -220,7 +220,7 @@ impl TxVersion {
                 Sprout | Overwinter => false,
                 Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
                 Nu6_3 => true,
-                WcashTestnetV1 => false,
+                WcashTestnetV1 | WcashRegtestV1 => false,
                 #[cfg(zcash_unstable = "nu7")]
                 Nu7 => false, // ZIP 2003
             },
@@ -228,14 +228,14 @@ impl TxVersion {
                 Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => false,
                 Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
                 Nu6_3 => true,
-                WcashTestnetV1 => false,
+                WcashTestnetV1 | WcashRegtestV1 => false,
                 #[cfg(zcash_unstable = "nu7")]
                 Nu7 => true,
             },
             TxVersion::V6 => match consensus_branch_id {
                 Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6
                 | Nu6_1 | Nu6_2 => false,
-                Nu6_3 | WcashTestnetV1 => true, // Ironwood / NU6.3 semantics
+                Nu6_3 | WcashTestnetV1 | WcashRegtestV1 => true, // Ironwood / NU6.3 semantics
                 #[cfg(zcash_unstable = "nu7")]
                 Nu7 => true, // ZIP 230 or ZIP 248, whichever is chosen for activation
             },
@@ -1207,7 +1207,9 @@ pub mod testing {
             BranchId::Nu6_1 => Just(TxVersion::V5).boxed(),
             BranchId::Nu6_2 => Just(TxVersion::V5).boxed(),
             BranchId::Nu6_3 => Just(TxVersion::V6).boxed(),
-            BranchId::WcashTestnetV1 => Just(TxVersion::V6).boxed(),
+            BranchId::WcashTestnetV1 | BranchId::WcashRegtestV1 => {
+                Just(TxVersion::V6).boxed()
+            }
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => Just(TxVersion::V6).boxed(),
         }

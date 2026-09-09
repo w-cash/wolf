@@ -11,8 +11,13 @@ use zebra_chain::{
 };
 
 use crate::{
-    arbitrary::Prepare, service::finalized_state::FinalizedState, tests::FakeChainHelper, Config,
-    NonFinalizedState, WatchReceiver,
+    arbitrary::Prepare,
+    service::finalized_state::FinalizedState,
+    tests::{
+        setup::{test_genesis, test_network, wcash_fake_children},
+        FakeChainHelper,
+    },
+    Config, NonFinalizedState, WatchReceiver,
 };
 
 use super::NonFinalizedBlocksListener;
@@ -22,6 +27,10 @@ use super::NonFinalizedBlocksListener;
 /// The first block is a pre-Heartwood block so committing the fake children doesn't trigger
 /// history tree updates in the non-finalized state.
 fn fake_chain(network: &Network, len: usize) -> Vec<Arc<Block>> {
+    if network.uses_wcash_consensus() {
+        return wcash_fake_children(network, len);
+    }
+
     let mut blocks = vec![Arc::new(network.test_block(653599, 583999).unwrap())];
     while blocks.len() < len {
         let child = blocks.last().unwrap().make_fake_child().set_work(10);
@@ -41,13 +50,18 @@ fn state_from_chain(network: &Network, blocks: &[Arc<Block>]) -> NonFinalizedSta
 /// committed as a child, so a fork only needs to list the blocks above its fork point. Each chain
 /// must be in ascending height order.
 fn state_from_chains(network: &Network, chains: &[&[Arc<Block>]]) -> NonFinalizedState {
-    let finalized_state = FinalizedState::new(
+    let mut finalized_state = FinalizedState::new(
         &Config::ephemeral(),
         network,
         #[cfg(feature = "elasticsearch")]
         false,
     )
     .expect("opening an ephemeral database should succeed");
+    if network.uses_wcash_consensus() {
+        finalized_state
+            .commit_finalized_direct(test_genesis(network).into(), None, "listener tests")
+            .expect("the built-in Wcash genesis should commit");
+    }
     finalized_state.set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
 
     let (best_chain, forks) = chains
@@ -91,7 +105,7 @@ async fn assert_idle(rx: &mut mpsc::Receiver<(block::Hash, Arc<Block>)>) {
 /// ascending height order.
 #[tokio::test]
 async fn sends_all_blocks_when_no_known_tips() {
-    let network = Network::Mainnet;
+    let network = test_network();
     let blocks = fake_chain(&network, 3);
     let hashes: Vec<_> = blocks.iter().map(|b| b.hash()).collect();
 
@@ -112,13 +126,19 @@ async fn sends_all_blocks_when_no_known_tips() {
 /// ordinary initial send.
 #[tokio::test]
 async fn sends_blocks_shared_between_chains_once() {
-    let network = Network::Mainnet;
+    let network = test_network();
     let blocks = fake_chain(&network, 3);
     let hashes: Vec<_> = blocks.iter().map(|b| b.hash()).collect();
 
     // A second chain forking at block2: it shares block1 and block2 with the best chain, and its
     // tip has less work than block3, so the best chain stays first in the chain order.
-    let fork_tip = blocks[1].make_fake_child().set_work(5);
+    let fork_tip = if network.uses_wcash_consensus() {
+        // Reuse the valid height-3 Wcash history commitment, then change only
+        // the work so this is a distinct sibling of the best-chain tip.
+        blocks[2].clone().set_work(5)
+    } else {
+        blocks[1].make_fake_child().set_work(5)
+    };
     let fork_tip_hash = fork_tip.hash();
     assert_ne!(
         fork_tip_hash, hashes[2],
@@ -141,7 +161,7 @@ async fn sends_blocks_shared_between_chains_once() {
 /// the tip and its ancestors are skipped.
 #[tokio::test]
 async fn skips_blocks_at_or_below_known_tip() {
-    let network = Network::Mainnet;
+    let network = test_network();
     let blocks = fake_chain(&network, 3);
     let hashes: Vec<_> = blocks.iter().map(|b| b.hash()).collect();
 
@@ -160,7 +180,7 @@ async fn skips_blocks_at_or_below_known_tip() {
 /// until the state changes.
 #[tokio::test]
 async fn sends_nothing_when_caller_has_the_tip() {
-    let network = Network::Mainnet;
+    let network = test_network();
     let blocks = fake_chain(&network, 3);
     let tip = blocks.last().unwrap().hash();
 
@@ -176,7 +196,7 @@ async fn sends_nothing_when_caller_has_the_tip() {
 /// the one-time `known_chain_tips` check doesn't re-filter later updates.
 #[tokio::test]
 async fn sends_only_new_blocks_on_update() {
-    let network = Network::Mainnet;
+    let network = test_network();
     let blocks = fake_chain(&network, 4);
     let hashes: Vec<_> = blocks.iter().map(|b| b.hash()).collect();
 

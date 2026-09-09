@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 pub const PROJECT_NAME: &str = "Wcash";
 
 /// Currency ticker used by Wcash software.
-pub const CURRENCY_TICKER: &str = "WCASH";
+pub const CURRENCY_TICKER: &str = "WEC";
 
 /// Canonical configuration-file name.
 pub const CONFIG_FILE_NAME: &str = "wcash.toml";
@@ -27,7 +27,11 @@ pub const DATA_DIRECTORY_NAME: &str = "wcash";
 pub const USER_AGENT_PREFIX: &str = "/Wcash:";
 
 /// Human-readable timestamp prefix embedded in every Wcash genesis statement.
-pub const GENESIS_TIMESTAMP_TEXT: &str = "06/Sep/2026 Wcash";
+///
+/// The project name and currency ticker are both consensus-committed here so
+/// a genesis block cannot be mistaken for an earlier prelaunch build that used
+/// a different ticker.
+pub const GENESIS_TIMESTAMP_TEXT: &str = "06/Sep/2026 Wcash (WEC)";
 
 /// Bitcoin mainnet height designated for a possible Wcash mainnet anchor.
 pub const DESIGNATED_MAINNET_BITCOIN_HEIGHT: u32 = 965_954;
@@ -197,13 +201,13 @@ pub const fn network_identity(network: WcashNetwork) -> NetworkIdentity {
         },
         WcashNetwork::Testnet => NetworkIdentity {
             network,
-            domain_label: "Wcash/testnet/v3",
-            p2p_magic: [0x8e, 0xe5, 0x6b, 0x56],
+            domain_label: "Wcash/testnet/v4",
+            p2p_magic: [0x2f, 0x22, 0x9b, 0x8c],
         },
         WcashNetwork::Regtest => NetworkIdentity {
             network,
-            domain_label: "Wcash/regtest/v4",
-            p2p_magic: [0xbe, 0x4b, 0x3e, 0xac],
+            domain_label: "Wcash/regtest/v5",
+            p2p_magic: [0x4c, 0x23, 0x72, 0x61],
         },
     }
 }
@@ -513,7 +517,7 @@ impl BitcoinAnchor {
     #[must_use]
     pub fn genesis_statement(self) -> String {
         format!(
-            "{GENESIS_TIMESTAMP_TEXT}: BTC #{} {}",
+            "{GENESIS_TIMESTAMP_TEXT} BTC #{} {}",
             self.bitcoin_height, self.bitcoin_block_hash,
         )
     }
@@ -790,6 +794,11 @@ mod tests {
 
     #[test]
     fn identity_values_are_domain_derived_and_not_zcash_magic() {
+        assert_eq!(PROJECT_NAME, "Wcash");
+        assert_eq!(CURRENCY_TICKER, "WEC");
+        assert!(GENESIS_TIMESTAMP_TEXT.contains(PROJECT_NAME));
+        assert!(GENESIS_TIMESTAMP_TEXT.contains(CURRENCY_TICKER));
+
         let zcash_magics = [
             [0x24, 0xe9, 0x27, 0x64],
             [0xfa, 0x1a, 0xf9, 0xbf],
@@ -846,11 +855,11 @@ mod tests {
         assert_eq!(
             REGTEST_ANCHOR.genesis_statement(),
             concat!(
-                "06/Sep/2026 Wcash: BTC #965910 ",
+                "06/Sep/2026 Wcash (WEC) BTC #965910 ",
                 "00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146"
             )
         );
-        assert!(REGTEST_ANCHOR.genesis_statement().len() <= 100);
+        assert_eq!(REGTEST_ANCHOR.genesis_statement().len(), 100);
     }
 
     #[test]
@@ -889,11 +898,11 @@ mod tests {
         assert_eq!(
             TESTNET_ANCHOR.genesis_statement(),
             concat!(
-                "06/Sep/2026 Wcash: BTC #965900 ",
+                "06/Sep/2026 Wcash (WEC) BTC #965900 ",
                 "0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851"
             )
         );
-        assert!(TESTNET_ANCHOR.genesis_statement().len() <= 100);
+        assert_eq!(TESTNET_ANCHOR.genesis_statement().len(), 100);
         assert_eq!(encode_hex(TESTNET_ANCHOR.encode()), TESTNET_ENCODING);
         assert_eq!(encode_hex(TESTNET_ANCHOR.commitment()), TESTNET_COMMITMENT);
         assert_eq!(

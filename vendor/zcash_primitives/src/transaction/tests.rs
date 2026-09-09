@@ -79,9 +79,16 @@ fn wcash_testnet_v1_requires_v6() {
         TxVersion::suggested_for_branch(BranchId::WcashTestnetV1),
         TxVersion::V6
     );
+    assert_eq!(
+        TxVersion::suggested_for_branch(BranchId::WcashRegtestV1),
+        TxVersion::V6
+    );
     assert!(!TxVersion::V4.valid_in_branch(BranchId::WcashTestnetV1));
     assert!(!TxVersion::V5.valid_in_branch(BranchId::WcashTestnetV1));
     assert!(TxVersion::V6.valid_in_branch(BranchId::WcashTestnetV1));
+    assert!(!TxVersion::V4.valid_in_branch(BranchId::WcashRegtestV1));
+    assert!(!TxVersion::V5.valid_in_branch(BranchId::WcashRegtestV1));
+    assert!(TxVersion::V6.valid_in_branch(BranchId::WcashRegtestV1));
 }
 
 #[cfg(all(test, not(zcash_unstable = "nu7")))]

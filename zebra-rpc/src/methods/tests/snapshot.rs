@@ -54,7 +54,7 @@ use zebra_test::{
 
 use crate::methods::{
     hex_data::HexData,
-    tests::utils::fake_history_tree,
+    tests::utils::{fake_history_tree, zcash_historical_fixtures_are_compatible},
     types::{
         get_block_template::GetBlockTemplateRequestMode,
         long_poll::{LongPollId, LONG_POLL_ID_LENGTH},
@@ -74,6 +74,9 @@ pub const EXCESSIVE_BLOCK_HEIGHT: u32 = MAX_ON_DISK_HEIGHT.0 + 1;
 #[tokio::test(flavor = "multi_thread")]
 async fn test_rpc_response_data() {
     let _init_guard = zebra_test::init();
+    if !zcash_historical_fixtures_are_compatible() {
+        return;
+    }
     let default_testnet = Network::new_default_testnet();
     let nu6_testnet = testnet::Parameters::build()
         .with_network_name("NU6Testnet")
@@ -111,6 +114,9 @@ async fn test_rpc_response_data() {
 #[tokio::test]
 async fn test_z_get_treestate() {
     let _init_guard = zebra_test::init();
+    if !zcash_historical_fixtures_are_compatible() {
+        return;
+    }
     const SAPLING_ACTIVATION_HEIGHT: u32 = 2;
 
     let custom_testnet = Parameters::build()

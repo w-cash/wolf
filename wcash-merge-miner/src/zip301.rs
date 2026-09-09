@@ -1,7 +1,7 @@
 //! Stock-ASIC compatible ZIP-301 frontend for a proposal-validated native job.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -37,6 +37,7 @@ const NONCE_1_BYTES: usize = 4;
 const NONCE_2_BYTES: usize = 32 - NONCE_1_BYTES;
 const SOLUTION_PREFIX: [u8; 3] = [0xfd, 0x40, 0x05];
 const MAX_SHARES_PER_JOB: usize = 100_000;
+const MAX_NETWORK_WINNERS_PER_JOB: usize = MAX_SHARES_PER_JOB;
 const MAX_AUTHORIZED_WORKERS_PER_CONNECTION: usize = 16;
 const MAX_SUBMISSIONS_PER_SECOND_PER_CONNECTION: usize = 64;
 const MAX_AUTHORIZATIONS_PER_MINUTE_PER_CONNECTION: usize = 32;
@@ -333,7 +334,7 @@ fn serve_zip301_generation(
         config,
         processor,
         next_nonce: AtomicU32::new(1),
-        duplicates: Mutex::new(DuplicateCache::default()),
+        duplicates: Mutex::new(DuplicateCache::new(maximum_clients)),
         authentications: ConnectionLimiter::new(maximum_parallel_authentications),
         validations: ConnectionLimiter::new(maximum_parallel_validations),
         shutdown: Arc::clone(&shutdown),
@@ -736,40 +737,31 @@ fn submit(
     nonce[..NONCE_1_BYTES].copy_from_slice(&nonce_1);
     nonce[NONCE_1_BYTES..].copy_from_slice(&nonce_2);
     let solution = &encoded_solution[3..];
-    let validation_permit = loop {
-        if let Some(permit) = state.validations.try_acquire() {
-            break permit;
-        }
-        if state.shutdown.load(Ordering::Acquire) {
-            return Err(SubmitError {
-                code: 21,
-                message: "active job was retired while waiting for validation".to_string(),
-            });
-        }
-        thread::sleep(VALIDATION_RETRY_DELAY);
-    };
-    let share = state
+    let submitted_identity = Arc::new(SubmittedShareIdentity::new(job_id, time, nonce, solution));
+    let parent_block_identity = state
         .job
-        .validate_share(&nonce, solution, state.config.share_target)
-        .map_err(|error| match error {
-            MinerError::AuxPow(AuxPowError::InsufficientParentWork { .. }) => SubmitError {
-                code: 23,
-                message: "low difficulty share".to_string(),
-            },
-            other => SubmitError::other(format!("invalid share: {other}")),
-        })?;
-    // Equihash validation is the CPU-heavy bounded operation. Release this
-    // admission slot before serialized journal durability and winner RPCs so a
-    // parent-node outage cannot starve validation or hide a later winner.
-    drop(validation_permit);
+        .job()
+        .parent_header(&nonce, solution)
+        .map_err(share_validation_error)?
+        .block_hash()
+        .into_le_bytes();
+    let (share, mut replay_reservation) = validate_reserved_share(
+        &state.duplicates,
+        &state.validations,
+        &state.shutdown,
+        submitted_identity,
+        parent_block_identity,
+        || {
+            state
+                .job
+                .validate_share(&nonce, solution, state.config.share_target)
+                .map_err(share_validation_error)
+        },
+    )?;
 
-    let duplicate_key = duplicate_key(job_id, &time, &nonce, solution);
-    let mut duplicates = state
-        .duplicates
-        .lock()
-        .map_err(|_| SubmitError::other("share replay cache is poisoned; rotate the active job"))?;
+    let validated_parent_identity = share.parent_block_hash().into_le_bytes();
     let is_network_winner = share.wcash_candidate().is_some() || share.parent_block().is_some();
-    match duplicates.insert(duplicate_key, is_network_winner) {
+    match replay_reservation.promote(validated_parent_identity, is_network_winner)? {
         DuplicateInsert::Inserted => {}
         DuplicateInsert::Duplicate => {
             return Err(SubmitError {
@@ -783,15 +775,11 @@ fn submit(
             ))
         }
     }
-    drop(duplicates);
 
     if let Err(error) = state
         .processor
         .process_authenticated(processor_worker, &share)
     {
-        if let Ok(mut duplicates) = state.duplicates.lock() {
-            duplicates.remove(duplicate_key);
-        }
         let code = if matches!(
             &error,
             MinerError::StaleNativeJob(_)
@@ -807,7 +795,53 @@ fn submit(
             message: format!("share processing failed: {error}"),
         });
     }
+    replay_reservation.retain();
     Ok(())
+}
+
+fn share_validation_error(error: MinerError) -> SubmitError {
+    match error {
+        MinerError::AuxPow(AuxPowError::InsufficientParentWork { .. }) => SubmitError {
+            code: 23,
+            message: "low difficulty share".to_string(),
+        },
+        other => SubmitError::other(format!("invalid share: {other}")),
+    }
+}
+
+fn validate_reserved_share<'a, T, F>(
+    duplicates: &'a Mutex<DuplicateCache>,
+    validations: &ConnectionLimiter,
+    shutdown: &AtomicBool,
+    submitted_identity: Arc<SubmittedShareIdentity>,
+    parent_block_identity: [u8; 32],
+    validate: F,
+) -> Result<(T, ReplayReservation<'a>), SubmitError>
+where
+    F: FnOnce() -> Result<T, SubmitError>,
+{
+    // Reserve the exact canonical submission before waiting for scarce CPU.
+    // Replays therefore never occupy an Equihash-validation permit.
+    let reservation =
+        ReplayReservation::reserve(duplicates, submitted_identity, parent_block_identity)?;
+    let validation_permit = loop {
+        if let Some(permit) = validations.try_acquire() {
+            break permit;
+        }
+        if shutdown.load(Ordering::Acquire) {
+            return Err(SubmitError {
+                code: 21,
+                message: "active job was retired while waiting for validation".to_string(),
+            });
+        }
+        thread::sleep(VALIDATION_RETRY_DELAY);
+    };
+    let result = validate();
+    // Equihash validation is the CPU-heavy bounded operation. Release this
+    // admission slot before serialized journal durability and winner RPCs so a
+    // parent-node outage cannot starve validation or hide a later winner.
+    drop(validation_permit);
+    Ok((result?, reservation))
 }
 
 struct AuthorizationPolicy {
@@ -1009,16 +1043,6 @@ fn allocate_session_nonce(counter: &AtomicU32) -> Result<[u8; NONCE_1_BYTES], Mi
     Ok(value.to_le_bytes())
 }
 
-fn duplicate_key(job_id: &str, time: &[u8; 4], nonce: &[u8; 32], solution: &[u8]) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"Wcash/ZIP301/share/v1\0");
-    hash.update(job_id.as_bytes());
-    hash.update(time);
-    hash.update(nonce);
-    hash.update(solution);
-    hash.finalize().into()
-}
-
 fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
     left.iter()
         .zip(right)
@@ -1026,32 +1050,298 @@ fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
         == 0
 }
 
-#[derive(Default)]
+#[derive(Debug, Eq, PartialEq)]
+struct SubmittedShareIdentity {
+    job_id: Box<str>,
+    time: [u8; 4],
+    nonce: [u8; 32],
+    solution: Box<[u8; EQUIHASH_SOLUTION_BYTES]>,
+}
+
+impl SubmittedShareIdentity {
+    fn new(job_id: &str, time: [u8; 4], nonce: [u8; 32], solution: &[u8]) -> Self {
+        let solution = solution
+            .try_into()
+            .expect("the submitted solution has fixed length after fixed-size ZIP-301 decoding");
+        Self {
+            job_id: job_id.into(),
+            time,
+            nonce,
+            solution: Box::new(solution),
+        }
+    }
+}
+
 struct DuplicateCache {
-    keys: HashSet<[u8; 32]>,
-    winner_keys: HashSet<[u8; 32]>,
+    entries: HashMap<[u8; 32], CachedShare>,
+    in_flight: usize,
+    accepted_shares: usize,
+    network_winners: usize,
+    maximum_in_flight: usize,
+    next_reservation: u64,
+}
+
+struct CachedShare {
+    reservation: u64,
+    state: CachedShareState,
+}
+
+enum CachedShareState {
+    // Exact canonical wire fields are retained until validation finishes, so
+    // a failed pre-validation identity collision can be rolled back safely.
+    InFlight(Arc<SubmittedShareIdentity>),
+    Accepted,
+    NetworkWinner,
 }
 
 impl DuplicateCache {
-    fn insert(&mut self, key: [u8; 32], is_network_winner: bool) -> DuplicateInsert {
-        if self.keys.contains(&key) || self.winner_keys.contains(&key) {
-            return DuplicateInsert::Duplicate;
+    fn new(maximum_in_flight: usize) -> Self {
+        assert!(
+            maximum_in_flight > 0,
+            "in-flight share limit must be positive"
+        );
+        Self {
+            entries: HashMap::new(),
+            in_flight: 0,
+            accepted_shares: 0,
+            network_winners: 0,
+            maximum_in_flight,
+            next_reservation: 1,
         }
-        if is_network_winner {
-            self.winner_keys.insert(key);
-            return DuplicateInsert::Inserted;
-        }
-        if self.keys.len() >= MAX_SHARES_PER_JOB {
-            return DuplicateInsert::Full;
-        }
-        self.keys.insert(key);
-        DuplicateInsert::Inserted
     }
 
-    fn remove(&mut self, key: [u8; 32]) {
-        self.keys.remove(&key);
-        self.winner_keys.remove(&key);
+    fn reserve(
+        &mut self,
+        submitted: Arc<SubmittedShareIdentity>,
+        parent_block: [u8; 32],
+    ) -> DuplicateReservation {
+        if self.entries.contains_key(&parent_block) {
+            return DuplicateReservation::Duplicate;
+        }
+        if self.in_flight >= self.maximum_in_flight {
+            return DuplicateReservation::Full;
+        }
+        let Some(next_reservation) = self.next_reservation.checked_add(1) else {
+            return DuplicateReservation::Full;
+        };
+        let reservation = self.next_reservation;
+        self.next_reservation = next_reservation;
+        self.entries.insert(
+            parent_block,
+            CachedShare {
+                reservation,
+                state: CachedShareState::InFlight(submitted),
+            },
+        );
+        self.in_flight += 1;
+        DuplicateReservation::Reserved(reservation)
     }
+
+    fn promote(
+        &mut self,
+        submitted: &Arc<SubmittedShareIdentity>,
+        reserved_parent_block: [u8; 32],
+        validated_parent_block: [u8; 32],
+        reservation: u64,
+        is_network_winner: bool,
+    ) -> Result<DuplicateInsert, &'static str> {
+        if reserved_parent_block != validated_parent_block {
+            return Err("validated parent identity differs from its replay reservation");
+        }
+        match self.entries.get(&validated_parent_block) {
+            Some(CachedShare {
+                reservation: current,
+                state: CachedShareState::InFlight(current_submission),
+            }) if current == &reservation && current_submission == submitted => {}
+            Some(CachedShare {
+                state: CachedShareState::Accepted | CachedShareState::NetworkWinner,
+                ..
+            }) => return Ok(DuplicateInsert::Duplicate),
+            _ => return Err("share replay reservation was lost"),
+        }
+        if is_network_winner {
+            if self.network_winners >= MAX_NETWORK_WINNERS_PER_JOB {
+                return Ok(DuplicateInsert::Full);
+            }
+            self.network_winners += 1;
+        } else {
+            if self.accepted_shares >= MAX_SHARES_PER_JOB {
+                return Ok(DuplicateInsert::Full);
+            }
+            self.accepted_shares += 1;
+        }
+        self.in_flight = self
+            .in_flight
+            .checked_sub(1)
+            .expect("promotion removes one tracked in-flight reservation");
+        self.entries
+            .get_mut(&validated_parent_block)
+            .expect("the promoted reservation was checked above")
+            .state = if is_network_winner {
+            CachedShareState::NetworkWinner
+        } else {
+            CachedShareState::Accepted
+        };
+        Ok(DuplicateInsert::Inserted)
+    }
+
+    fn rollback(
+        &mut self,
+        submitted: &Arc<SubmittedShareIdentity>,
+        parent_block: [u8; 32],
+        reservation: u64,
+        state: ReplayReservationState,
+    ) {
+        let matches_reservation = match (self.entries.get(&parent_block), state) {
+            (
+                Some(CachedShare {
+                    reservation: current,
+                    state: CachedShareState::InFlight(current_submission),
+                }),
+                ReplayReservationState::InFlight,
+            ) => current == &reservation && current_submission == submitted,
+            (
+                Some(CachedShare {
+                    reservation: current,
+                    state: CachedShareState::Accepted,
+                }),
+                ReplayReservationState::Accepted {
+                    is_network_winner: false,
+                },
+            )
+            | (
+                Some(CachedShare {
+                    reservation: current,
+                    state: CachedShareState::NetworkWinner,
+                }),
+                ReplayReservationState::Accepted {
+                    is_network_winner: true,
+                },
+            ) => current == &reservation,
+            _ => false,
+        };
+        if !matches_reservation {
+            return;
+        }
+        self.entries.remove(&parent_block);
+        let counter = match state {
+            ReplayReservationState::InFlight => &mut self.in_flight,
+            ReplayReservationState::Accepted {
+                is_network_winner: false,
+            } => &mut self.accepted_shares,
+            ReplayReservationState::Accepted {
+                is_network_winner: true,
+            } => &mut self.network_winners,
+            ReplayReservationState::Retained => return,
+        };
+        *counter = counter
+            .checked_sub(1)
+            .expect("rollback removes one tracked replay-cache entry");
+    }
+}
+
+struct ReplayReservation<'a> {
+    cache: &'a Mutex<DuplicateCache>,
+    submitted: Arc<SubmittedShareIdentity>,
+    parent_block: [u8; 32],
+    reservation: u64,
+    state: ReplayReservationState,
+}
+
+impl<'a> ReplayReservation<'a> {
+    fn reserve(
+        cache: &'a Mutex<DuplicateCache>,
+        submitted: Arc<SubmittedShareIdentity>,
+        parent_block: [u8; 32],
+    ) -> Result<Self, SubmitError> {
+        let reservation = cache
+            .lock()
+            .map_err(|_| {
+                SubmitError::other("share replay cache is poisoned; rotate the active job")
+            })?
+            .reserve(Arc::clone(&submitted), parent_block);
+        match reservation {
+            DuplicateReservation::Reserved(reservation) => Ok(Self {
+                cache,
+                submitted,
+                parent_block,
+                reservation,
+                state: ReplayReservationState::InFlight,
+            }),
+            DuplicateReservation::Duplicate => Err(SubmitError {
+                code: 22,
+                message: "duplicate share".to_string(),
+            }),
+            DuplicateReservation::Full => Err(SubmitError::other(
+                "share replay cache is full; rotate the job before accepting more work",
+            )),
+        }
+    }
+
+    fn promote(
+        &mut self,
+        validated_parent_block: [u8; 32],
+        is_network_winner: bool,
+    ) -> Result<DuplicateInsert, SubmitError> {
+        let insertion = self
+            .cache
+            .lock()
+            .map_err(|_| {
+                SubmitError::other("share replay cache is poisoned; rotate the active job")
+            })?
+            .promote(
+                &self.submitted,
+                self.parent_block,
+                validated_parent_block,
+                self.reservation,
+                is_network_winner,
+            )
+            .map_err(SubmitError::other)?;
+        if insertion == DuplicateInsert::Inserted {
+            self.state = ReplayReservationState::Accepted { is_network_winner };
+        }
+        Ok(insertion)
+    }
+
+    fn retain(&mut self) {
+        debug_assert!(matches!(
+            self.state,
+            ReplayReservationState::Accepted { .. }
+        ));
+        self.state = ReplayReservationState::Retained;
+    }
+}
+
+impl Drop for ReplayReservation<'_> {
+    fn drop(&mut self) {
+        if self.state == ReplayReservationState::Retained {
+            return;
+        }
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.rollback(
+            &self.submitted,
+            self.parent_block,
+            self.reservation,
+            self.state,
+        );
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ReplayReservationState {
+    InFlight,
+    Accepted { is_network_winner: bool },
+    Retained,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum DuplicateReservation {
+    Reserved(u64),
+    Duplicate,
+    Full,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1470,23 +1760,305 @@ mod tests {
             .is_err());
     }
 
+    fn submitted_share(marker: u8) -> Arc<SubmittedShareIdentity> {
+        let mut nonce = [0; 32];
+        nonce[0] = marker;
+        Arc::new(SubmittedShareIdentity::new(
+            "test-job",
+            [1, 2, 3, 4],
+            nonce,
+            &[marker; EQUIHASH_SOLUTION_BYTES],
+        ))
+    }
+
     #[test]
     fn duplicate_cache_is_bounded_and_rejects_replays() {
-        let mut cache = DuplicateCache::default();
-        assert_eq!(cache.insert([1; 32], false), DuplicateInsert::Inserted);
-        assert_eq!(cache.insert([1; 32], true), DuplicateInsert::Duplicate);
-        for value in 0..MAX_SHARES_PER_JOB {
-            let mut key = [0; 32];
-            key[..8].copy_from_slice(
-                &u64::try_from(value)
-                    .expect("test range fits in u64")
-                    .to_le_bytes(),
-            );
-            cache.insert(key, false);
+        let cache = Mutex::new(DuplicateCache::new(1));
+        let first_share = submitted_share(1);
+        let first_block = [1; 32];
+        let mut first = ReplayReservation::reserve(&cache, first_share, first_block)
+            .expect("first reservation has capacity");
+        let duplicate = ReplayReservation::reserve(&cache, submitted_share(1), first_block)
+            .err()
+            .expect("an in-flight replay is rejected");
+        assert_eq!(duplicate.code, 22);
+        let full = ReplayReservation::reserve(&cache, submitted_share(2), [2; 32])
+            .err()
+            .expect("unique in-flight work is bounded");
+        assert_eq!(full.code, 20);
+        assert_eq!(
+            first
+                .promote(first_block, false)
+                .expect("the reserved identity is intact"),
+            DuplicateInsert::Inserted
+        );
+        first.retain();
+        let accepted_replay = ReplayReservation::reserve(&cache, submitted_share(1), first_block)
+            .err()
+            .expect("an accepted replay is rejected");
+        assert_eq!(accepted_replay.code, 22);
+
+        {
+            let mut cache = cache.lock().expect("replay cache mutex");
+            for value in 1..MAX_SHARES_PER_JOB {
+                let mut key = [0; 32];
+                key[..8].copy_from_slice(
+                    &u64::try_from(value)
+                        .expect("test range fits in u64")
+                        .to_le_bytes(),
+                );
+                cache.entries.insert(
+                    key,
+                    CachedShare {
+                        reservation: u64::try_from(value).expect("test token"),
+                        state: CachedShareState::Accepted,
+                    },
+                );
+                cache.accepted_shares += 1;
+            }
         }
-        assert_eq!(cache.keys.len(), MAX_SHARES_PER_JOB);
-        assert_eq!(cache.insert([0xfe; 32], false), DuplicateInsert::Full);
-        assert_eq!(cache.insert([0xff; 32], true), DuplicateInsert::Inserted);
-        assert_eq!(cache.insert([0xff; 32], true), DuplicateInsert::Duplicate);
+        let mut overflow = ReplayReservation::reserve(&cache, submitted_share(3), [0xfe; 32])
+            .expect("accepted-share capacity is checked after validation");
+        assert_eq!(
+            overflow
+                .promote([0xfe; 32], false)
+                .expect("the reservation is intact"),
+            DuplicateInsert::Full
+        );
+        drop(overflow);
+
+        let mut winner = ReplayReservation::reserve(&cache, submitted_share(4), [0xff; 32])
+            .expect("a winner can bypass an ordinary-share full cache");
+        assert_eq!(
+            winner
+                .promote([0xff; 32], true)
+                .expect("the winner reservation is intact"),
+            DuplicateInsert::Inserted
+        );
+        winner.retain();
+        let cache = cache.lock().expect("replay cache mutex");
+        assert_eq!(cache.accepted_shares, MAX_SHARES_PER_JOB);
+        assert_eq!(cache.network_winners, 1);
+        assert_eq!(cache.in_flight, 0);
+        drop(cache);
+
+        let winner_cache = Mutex::new(DuplicateCache::new(1));
+        {
+            let mut cache = winner_cache.lock().expect("winner replay cache mutex");
+            for value in 0..MAX_NETWORK_WINNERS_PER_JOB {
+                let mut key = [0; 32];
+                key[..8].copy_from_slice(
+                    &u64::try_from(value)
+                        .expect("test range fits in u64")
+                        .to_le_bytes(),
+                );
+                cache.entries.insert(
+                    key,
+                    CachedShare {
+                        reservation: u64::try_from(value).expect("test token"),
+                        state: CachedShareState::NetworkWinner,
+                    },
+                );
+                cache.network_winners += 1;
+            }
+        }
+        let mut winner_overflow =
+            ReplayReservation::reserve(&winner_cache, submitted_share(5), [0xfd; 32])
+                .expect("winner capacity is checked after validation");
+        assert_eq!(
+            winner_overflow
+                .promote([0xfd; 32], true)
+                .expect("the winner reservation is intact"),
+            DuplicateInsert::Full
+        );
+    }
+
+    #[test]
+    fn concurrent_replays_do_not_consume_validation_permits_or_repeat_validation() {
+        let duplicates = Arc::new(Mutex::new(DuplicateCache::new(8)));
+        let validations = ConnectionLimiter::new(2);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let submitted = submitted_share(7);
+        let parent_block = [7; 32];
+        let validation_calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let first_duplicates = Arc::clone(&duplicates);
+        let first_validations = validations.clone();
+        let first_shutdown = Arc::clone(&shutdown);
+        let first_submitted = Arc::clone(&submitted);
+        let first_calls = Arc::clone(&validation_calls);
+        let first_release = Arc::clone(&release);
+        let first = thread::spawn(move || {
+            let ((), mut reservation) = validate_reserved_share(
+                &first_duplicates,
+                &first_validations,
+                &first_shutdown,
+                first_submitted,
+                parent_block,
+                || {
+                    first_calls.fetch_add(1, Ordering::AcqRel);
+                    entered_tx.send(()).expect("test receiver remains live");
+                    let (released, condition) = &*first_release;
+                    let guard = released.lock().expect("release mutex");
+                    let _guard = condition
+                        .wait_while(guard, |released| !*released)
+                        .expect("release mutex remains healthy");
+                    Ok(())
+                },
+            )?;
+            let inserted = reservation.promote(parent_block, false)?;
+            assert_eq!(inserted, DuplicateInsert::Inserted);
+            reservation.retain();
+            Ok::<(), SubmitError>(())
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first validation started");
+
+        let mut replays = Vec::new();
+        for _ in 0..32 {
+            let duplicates = Arc::clone(&duplicates);
+            let validations = validations.clone();
+            let shutdown = Arc::clone(&shutdown);
+            let submitted = Arc::clone(&submitted);
+            let calls = Arc::clone(&validation_calls);
+            replays.push(thread::spawn(move || {
+                validate_reserved_share(
+                    &duplicates,
+                    &validations,
+                    &shutdown,
+                    submitted,
+                    parent_block,
+                    || {
+                        calls.fetch_add(1, Ordering::AcqRel);
+                        Ok(())
+                    },
+                )
+                .err()
+                .map(|error| error.code)
+            }));
+        }
+        for replay in replays {
+            let error = replay
+                .join()
+                .expect("replay worker did not panic")
+                .expect("concurrent replay is rejected");
+            assert_eq!(error, 22);
+        }
+        assert_eq!(validation_calls.load(Ordering::Acquire), 1);
+        assert_eq!(validations.active.load(Ordering::Acquire), 1);
+        let spare = validations
+            .try_acquire()
+            .expect("replays left the second validation permit available");
+        drop(spare);
+
+        let (released, condition) = &*release;
+        *released.lock().expect("release mutex") = true;
+        condition.notify_all();
+        first
+            .join()
+            .expect("validation worker did not panic")
+            .expect("first share was retained");
+
+        let calls = Arc::clone(&validation_calls);
+        let replay = validate_reserved_share(
+            &duplicates,
+            &validations,
+            &shutdown,
+            submitted,
+            parent_block,
+            || {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        )
+        .err()
+        .expect("accepted replay is rejected before validation");
+        assert_eq!(replay.code, 22);
+        assert_eq!(validation_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn failed_or_colliding_in_flight_identity_does_not_poison_a_valid_retry() {
+        let duplicates = Mutex::new(DuplicateCache::new(2));
+        let validations = ConnectionLimiter::new(1);
+        let shutdown = AtomicBool::new(false);
+        let shared_parent_identity = [9; 32];
+        let validation_calls = AtomicUsize::new(0);
+
+        let invalid = validate_reserved_share(
+            &duplicates,
+            &validations,
+            &shutdown,
+            submitted_share(8),
+            shared_parent_identity,
+            || {
+                validation_calls.fetch_add(1, Ordering::AcqRel);
+                Err::<(), _>(SubmitError::other("invalid share fixture"))
+            },
+        )
+        .err()
+        .expect("invalid share is rejected");
+        assert_eq!(invalid.code, 20);
+
+        // This byte-distinct submission deliberately reuses the precomputed
+        // block identity. The failed reservation was rolled back, so it can be
+        // validated and promoted rather than being poisoned permanently.
+        let ((), mut valid) = validate_reserved_share(
+            &duplicates,
+            &validations,
+            &shutdown,
+            submitted_share(9),
+            shared_parent_identity,
+            || {
+                validation_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        )
+        .expect("failed reservation was removed");
+        assert_eq!(
+            valid
+                .promote(shared_parent_identity, false)
+                .expect("validated identity matches the reservation"),
+            DuplicateInsert::Inserted
+        );
+        valid.retain();
+        assert_eq!(validation_calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn promotion_requires_authoritative_identity_and_processing_commit() {
+        let cache = Mutex::new(DuplicateCache::new(2));
+        let mismatched_block = [0x40; 32];
+        let mut mismatched =
+            ReplayReservation::reserve(&cache, submitted_share(0x40), mismatched_block)
+                .expect("reserve share before validating its block identity");
+        let mismatch = mismatched
+            .promote([0x41; 32], false)
+            .expect_err("post-validation identity mismatch must fail closed");
+        assert_eq!(mismatch.code, 20);
+        drop(mismatched);
+        let retry = ReplayReservation::reserve(&cache, submitted_share(0x40), mismatched_block)
+            .expect("mismatched validation did not poison the reservation");
+        drop(retry);
+
+        let different_block = [0x43; 32];
+        let mut uncommitted =
+            ReplayReservation::reserve(&cache, submitted_share(0x43), different_block)
+                .expect("reserve a processable share");
+        assert_eq!(
+            uncommitted
+                .promote(different_block, false)
+                .expect("promote a processable share"),
+            DuplicateInsert::Inserted
+        );
+        // A processor failure returns before `retain`; dropping must make the
+        // same valid share eligible for an idempotent processing retry.
+        drop(uncommitted);
+        let retry = ReplayReservation::reserve(&cache, submitted_share(0x43), different_block)
+            .expect("uncommitted accepted identity was rolled back");
+        drop(retry);
     }
 }

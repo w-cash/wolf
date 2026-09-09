@@ -9,10 +9,9 @@
 //! Bech32m checksum. A Wcash Unified Address is therefore not a Zcash address
 //! with its visible prefix replaced.
 
-use std::convert::Infallible;
 use std::{fmt, str::FromStr};
 
-use bech32::{primitives::decode::CheckedHrpstring, Bech32, Bech32m, Hrp};
+use bech32::{primitives::decode::CheckedHrpstring, Bech32m, Hrp};
 use zcash_address::{
     unified::{Address as UnifiedAddress, Bech32mZip316, Container, Encoding, Item, Receiver},
     ConversionError, TryFromAddress,
@@ -27,12 +26,12 @@ pub const HRP_UNIFIED_TESTNET: &str = "wutest";
 /// Regtest Wcash Unified Address HRP.
 pub const HRP_UNIFIED_REGTEST: &str = "wuregtest";
 
-/// Mainnet Wcash Sapling payment-address HRP.
-pub const HRP_SAPLING_MAINNET: &str = "ws";
-/// Testnet Wcash Sapling payment-address HRP.
-pub const HRP_SAPLING_TESTNET: &str = "wtestsapling";
-/// Regtest Wcash Sapling payment-address HRP.
-pub const HRP_SAPLING_REGTEST: &str = "wregtestsapling";
+// Permanently reserved legacy-pool namespaces. Wcash never encodes or accepts
+// Sapling payment addresses, but reserving the prefixes prevents them from
+// being reinterpreted as another Wcash address type in the future.
+const RESERVED_SAPLING_MAINNET: &str = "ws";
+const RESERVED_SAPLING_TESTNET: &str = "wtestsapling";
+const RESERVED_SAPLING_REGTEST: &str = "wregtestsapling";
 
 /// Mainnet Wcash transparent-source-only address HRP.
 pub const HRP_TEX_MAINNET: &str = "wtex";
@@ -59,8 +58,6 @@ const ZIP316_PADDING_LEN: usize = 16;
 /// A decoded Wcash payment-address payload.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum WcashAddressKind {
-    /// A standalone Sapling receiver.
-    Sapling([u8; 43]),
     /// A ZIP 316 container. Ironwood recipients use the Orchard receiver slot.
     Unified(UnifiedAddress),
     /// A transparent pay-to-public-key-hash receiver.
@@ -92,23 +89,27 @@ pub enum WcashAddressParseError {
     /// The Unified Address payload violates ZIP 316 container rules.
     #[error("invalid Wcash Unified Address: {0}")]
     InvalidUnified(String),
+
+    /// The Unified Address does not contain the receiver used by Ironwood.
+    #[error("Wcash Unified Addresses must contain an Ironwood receiver")]
+    MissingIronwoodReceiver,
+
+    /// The address contains a receiver for a pool Wcash does not activate.
+    #[error("Wcash does not support {0} receivers")]
+    UnsupportedReceiver(&'static str),
 }
 
 impl WcashAddress {
-    /// Constructs a standalone Sapling payment address.
-    pub fn from_sapling(network: NetworkType, data: [u8; 43]) -> Self {
-        Self {
-            network,
-            kind: WcashAddressKind::Sapling(data),
-        }
-    }
-
-    /// Constructs a Unified Address.
-    pub fn from_unified(network: NetworkType, data: UnifiedAddress) -> Self {
-        Self {
+    /// Constructs an Ironwood-capable Unified Address.
+    pub fn from_unified(
+        network: NetworkType,
+        data: UnifiedAddress,
+    ) -> Result<Self, WcashAddressParseError> {
+        validate_unified_receivers(&data)?;
+        Ok(Self {
             network,
             kind: WcashAddressKind::Unified(data),
-        }
+        })
     }
 
     /// Constructs a transparent pay-to-public-key-hash address.
@@ -173,7 +174,6 @@ impl WcashAddress {
     /// parser to accept Wcash strings.
     pub fn convert<T: TryFromAddress>(self) -> Result<T, ConversionError<T::Error>> {
         match self.kind {
-            WcashAddressKind::Sapling(data) => T::try_from_sapling(self.network, data),
             WcashAddressKind::Unified(data) => T::try_from_unified(self.network, data),
             WcashAddressKind::P2pkh(data) => T::try_from_transparent_p2pkh(self.network, data),
             WcashAddressKind::P2sh(data) => T::try_from_transparent_p2sh(self.network, data),
@@ -198,20 +198,13 @@ impl WcashAddress {
 }
 
 impl TryFromAddress for WcashAddress {
-    type Error = Infallible;
-
-    fn try_from_sapling(
-        network: NetworkType,
-        data: [u8; 43],
-    ) -> Result<Self, ConversionError<Self::Error>> {
-        Ok(Self::from_sapling(network, data))
-    }
+    type Error = WcashAddressParseError;
 
     fn try_from_unified(
         network: NetworkType,
         data: UnifiedAddress,
     ) -> Result<Self, ConversionError<Self::Error>> {
-        Ok(Self::from_unified(network, data))
+        Self::from_unified(network, data).map_err(ConversionError::User)
     }
 
     fn try_from_transparent_p2pkh(
@@ -239,9 +232,6 @@ impl TryFromAddress for WcashAddress {
 impl fmt::Display for WcashAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let encoded = match &self.kind {
-            WcashAddressKind::Sapling(data) => {
-                encode_bech32::<Bech32>(sapling_hrp(self.network), data)
-            }
             WcashAddressKind::Unified(address) => encode_unified(self.network, address),
             WcashAddressKind::P2pkh(data) => encode_base58(p2pkh_prefix(self.network), data),
             WcashAddressKind::P2sh(data) => encode_base58(p2sh_prefix(self.network), data),
@@ -263,21 +253,7 @@ impl FromStr for WcashAddress {
                 let data = parsed.byte_iter().collect::<Vec<_>>();
                 let address = decode_unified(hrp, data)?;
 
-                return Ok(Self::from_unified(network, address));
-            }
-        }
-
-        if let Ok(parsed) = CheckedHrpstring::new::<Bech32>(encoded) {
-            let parsed_hrp = parsed.hrp();
-            let hrp = parsed_hrp.as_str();
-            if let Some(network) = sapling_network(hrp) {
-                let data: [u8; 43] = parsed
-                    .byte_iter()
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .map_err(|_| WcashAddressParseError::InvalidEncoding("Sapling"))?;
-
-                return Ok(Self::from_sapling(network, data));
+                return Self::from_unified(network, address);
             }
         }
 
@@ -395,6 +371,29 @@ fn decode_unified(
         .map_err(|error| WcashAddressParseError::InvalidUnified(error.to_string()))
 }
 
+fn validate_unified_receivers(address: &UnifiedAddress) -> Result<(), WcashAddressParseError> {
+    let mut has_ironwood_receiver = false;
+
+    for receiver in address.items() {
+        match receiver {
+            Receiver::Orchard(_) => has_ironwood_receiver = true,
+            Receiver::Sapling(_) => {
+                return Err(WcashAddressParseError::UnsupportedReceiver("Sapling"));
+            }
+            Receiver::Unknown { .. } => {
+                return Err(WcashAddressParseError::UnsupportedReceiver("unknown"));
+            }
+            _ => {}
+        }
+    }
+
+    if has_ironwood_receiver {
+        Ok(())
+    } else {
+        Err(WcashAddressParseError::MissingIronwoodReceiver)
+    }
+}
+
 fn encode_bech32<Ck: bech32::Checksum>(hrp: &str, data: &[u8]) -> String {
     bech32::encode::<Ck>(
         Hrp::parse(hrp).expect("Wcash address HRPs are compile-time constants"),
@@ -423,23 +422,6 @@ fn unified_network(hrp: &str) -> Option<NetworkType> {
         HRP_UNIFIED_MAINNET => Some(NetworkType::Main),
         HRP_UNIFIED_TESTNET => Some(NetworkType::Test),
         HRP_UNIFIED_REGTEST => Some(NetworkType::Regtest),
-        _ => None,
-    }
-}
-
-fn sapling_hrp(network: NetworkType) -> &'static str {
-    match network {
-        NetworkType::Main => HRP_SAPLING_MAINNET,
-        NetworkType::Test => HRP_SAPLING_TESTNET,
-        NetworkType::Regtest => HRP_SAPLING_REGTEST,
-    }
-}
-
-fn sapling_network(hrp: &str) -> Option<NetworkType> {
-    match hrp {
-        HRP_SAPLING_MAINNET => Some(NetworkType::Main),
-        HRP_SAPLING_TESTNET => Some(NetworkType::Test),
-        HRP_SAPLING_REGTEST => Some(NetworkType::Regtest),
         _ => None,
     }
 }
@@ -500,9 +482,9 @@ fn looks_like_wcash_address(encoded: &str) -> bool {
         HRP_UNIFIED_MAINNET,
         HRP_UNIFIED_TESTNET,
         HRP_UNIFIED_REGTEST,
-        HRP_SAPLING_MAINNET,
-        HRP_SAPLING_TESTNET,
-        HRP_SAPLING_REGTEST,
+        RESERVED_SAPLING_MAINNET,
+        RESERVED_SAPLING_TESTNET,
+        RESERVED_SAPLING_REGTEST,
         HRP_TEX_MAINNET,
         HRP_TEX_TESTNET,
         HRP_TEX_REGTEST,
@@ -521,12 +503,8 @@ mod tests {
     use super::*;
     use zcash_address::{unified::Receiver, ZcashAddress};
 
-    fn zero_sapling_unified_address() -> UnifiedAddress {
-        UnifiedAddress::try_from_items(vec![Receiver::Sapling([0; 43])]).unwrap()
-    }
-
-    fn local_miner_unified_address() -> UnifiedAddress {
-        let encoded = "uregtest1efxggx6lduhm2fx5lnrhxv7h7kpztlpa3ahf3n4w0q0zj5epj4av9xjq6ljsja3xk8z7rzd067kc7mgpy9448rdfzpfjz5gq389zdmpgnk6rp4ykk0xk6cmqw6zqcrnmsuaxv3yzsvcwsd4gagtalh0uzrdvy03nhmltjz2eu0232qlcs0zvxuqyut73yucd9gy5jaudnyt7yqhgpqv";
+    fn orchard_unified_address() -> UnifiedAddress {
+        let encoded = "uregtest1pszqlgxaf5w8mu2yd9uygg8cswp0ec4f7eejqnqc35tztw4tk0sxnt3pym2f3s2872cy2ruuc5n8y9cen5q6ngzlmzu8ztrjesv8zm9j";
         let (network, unified) = UnifiedAddress::decode(encoded).unwrap();
         assert_eq!(network, NetworkType::Regtest);
         unified
@@ -539,25 +517,28 @@ mod tests {
 
     #[test]
     fn unified_golden_vectors() {
-        let unified = zero_sapling_unified_address();
+        let unified = orchard_unified_address();
 
         round_trip(
-            WcashAddress::from_unified(NetworkType::Main, unified.clone()),
-            "wu19e3hlzcy7zns6l49wcc0nq5uy3v54rdvvrpdynnxvas5v5vgumhkeyr7nwwf4ukrvg0s6dvlqlk98jlmuxxsvqrlj5qxvyqvtcp45aat",
+            WcashAddress::from_unified(NetworkType::Main, unified.clone())
+                .expect("the Orchard-only fixture is supported"),
+            "wu1fup0tyn04mp2hktdx25hk6tvh4gm8me04egwhdtycdxqvsphl5dna89ghj3j3gahlxsqxdy35vezp2r7xzvmcx4cs2p9c5yqsswmrjwq",
         );
         round_trip(
-            WcashAddress::from_unified(NetworkType::Test, unified.clone()),
-            "wutest1cwrarnk07jmfzfjs2r26h4jnd7cjan6v06cxgvyfajeuxqzzvhx88jjmn9yduqtjvnd6lgtftuvry782fd7ywqy5quvrnz3m0sctdca4",
+            WcashAddress::from_unified(NetworkType::Test, unified.clone())
+                .expect("the Orchard-only fixture is supported"),
+            "wutest12ky95e9c6mu3qveefsekul4tk949ahkllsu8yglndurppu8j8qeleyd20r7z6jaacwhnwar5wlrmw0nynugqr2yldvc9cv9y9gfktz8k",
         );
         round_trip(
-            WcashAddress::from_unified(NetworkType::Regtest, unified),
-            "wuregtest12awr47z53xf5qyyrw4mhwy2vag2tm6wy9783ejxnyn40f5fzu35v4uscyfmjqt9q9edge7nalwg85pyq0wd82ce02us69mcdjycmuksz",
+            WcashAddress::from_unified(NetworkType::Regtest, unified)
+                .expect("the Orchard-only fixture is supported"),
+            "wuregtest1ctr282fk80mmwz0t69s4kywtstpyh0lr23u6ynpy54m7lufs0qyrautm3kjg7sxk5mu0lp0ck4hea672xhvrdzz2863afkz6ss423hgj",
         );
     }
 
     #[test]
     fn unified_codec_matches_zip_316_reference_for_zcash_hrps() {
-        let unified = zero_sapling_unified_address();
+        let unified = orchard_unified_address();
 
         for (network, hrp) in [
             (NetworkType::Main, "u"),
@@ -577,8 +558,8 @@ mod tests {
 
     #[test]
     fn local_miner_unified_address_has_wcash_encoding() {
-        let address =
-            WcashAddress::from_unified(NetworkType::Regtest, local_miner_unified_address());
+        let address = WcashAddress::from_unified(NetworkType::Regtest, orchard_unified_address())
+            .expect("the Orchard-only fixture is supported");
         let encoded = address.encode();
         assert!(encoded.starts_with(concat!("w", "uregtest1")));
         assert_eq!(encoded.parse::<WcashAddress>().unwrap(), address);
@@ -596,18 +577,59 @@ mod tests {
     }
 
     #[test]
-    fn sapling_golden_vectors() {
-        round_trip(
-            WcashAddress::from_sapling(NetworkType::Main, [0; 43]),
+    fn reserved_sapling_namespaces_are_rejected() {
+        for encoded in [
             "ws1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpp4jev",
-        );
-        round_trip(
-            WcashAddress::from_sapling(NetworkType::Test, [0; 43]),
             "wtestsapling1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwrl5x9",
-        );
-        round_trip(
-            WcashAddress::from_sapling(NetworkType::Regtest, [0; 43]),
             "wregtestsapling1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9ezcf5",
+        ] {
+            assert!(matches!(
+                encoded.parse::<WcashAddress>(),
+                Err(WcashAddressParseError::InvalidEncoding(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn unified_addresses_reject_sapling_receivers() {
+        let sapling = UnifiedAddress::try_from_items(vec![Receiver::Sapling([0; 43])])
+            .expect("a Sapling-only Unified Address is structurally valid");
+        assert_eq!(
+            WcashAddress::from_unified(NetworkType::Main, sapling.clone()),
+            Err(WcashAddressParseError::UnsupportedReceiver("Sapling")),
+        );
+
+        let encoded = encode_unified(NetworkType::Main, &sapling);
+        assert_eq!(
+            encoded.parse::<WcashAddress>(),
+            Err(WcashAddressParseError::UnsupportedReceiver("Sapling")),
+        );
+    }
+
+    #[test]
+    fn unified_addresses_require_an_ironwood_receiver_and_known_receivers() {
+        let unknown_only = UnifiedAddress::try_from_items(vec![Receiver::Unknown {
+            typecode: 65_536,
+            data: vec![0; 43],
+        }])
+        .expect("an unknown shielded receiver is structurally valid");
+
+        assert_eq!(
+            WcashAddress::from_unified(NetworkType::Main, unknown_only.clone()),
+            Err(WcashAddressParseError::UnsupportedReceiver("unknown")),
+        );
+
+        let orchard_with_unknown = UnifiedAddress::try_from_items(vec![
+            Receiver::Orchard([0; 43]),
+            Receiver::Unknown {
+                typecode: 65_536,
+                data: vec![0; 43],
+            },
+        ])
+        .expect("the mixed receiver fixture is structurally valid");
+        assert_eq!(
+            WcashAddress::from_unified(NetworkType::Main, orchard_with_unknown),
+            Err(WcashAddressParseError::UnsupportedReceiver("unknown")),
         );
     }
 
@@ -711,8 +733,8 @@ mod tests {
         }
 
         let wcash_addresses = [
-            WcashAddress::from_unified(NetworkType::Main, zero_sapling_unified_address()),
-            WcashAddress::from_sapling(NetworkType::Main, [0; 43]),
+            WcashAddress::from_unified(NetworkType::Main, orchard_unified_address())
+                .expect("the Orchard-only fixture is supported"),
             WcashAddress::from_transparent_p2pkh(NetworkType::Main, [0; 20]),
             WcashAddress::from_transparent_p2sh(NetworkType::Main, [0; 20]),
             WcashAddress::from_tex(NetworkType::Main, [0; 20]),
@@ -744,8 +766,9 @@ mod tests {
 
     #[test]
     fn converts_into_existing_zebra_address_type() {
-        let (_, valid_unified) = UnifiedAddress::decode("uregtest1efxggx6lduhm2fx5lnrhxv7h7kpztlpa3ahf3n4w0q0zj5epj4av9xjq6ljsja3xk8z7rzd067kc7mgpy9448rdfzpfjz5gq389zdmpgnk6rp4ykk0xk6cmqw6zqcrnmsuaxv3yzsvcwsd4gagtalh0uzrdvy03nhmltjz2eu0232qlcs0zvxuqyut73yucd9gy5jaudnyt7yqhgpqv").unwrap();
-        let wcash = WcashAddress::from_unified(NetworkType::Regtest, valid_unified);
+        let valid_unified = orchard_unified_address();
+        let wcash = WcashAddress::from_unified(NetworkType::Regtest, valid_unified)
+            .expect("the fixture has an Orchard receiver and no Sapling receiver");
         let converted = wcash
             .convert_if_network::<crate::primitives::Address>(NetworkType::Regtest)
             .unwrap();
@@ -756,8 +779,10 @@ mod tests {
 
     #[test]
     fn rejects_corrupted_and_cross_network_unified_addresses() {
-        let unified = zero_sapling_unified_address();
-        let regtest = WcashAddress::from_unified(NetworkType::Regtest, unified.clone()).encode();
+        let unified = orchard_unified_address();
+        let regtest = WcashAddress::from_unified(NetworkType::Regtest, unified.clone())
+            .expect("the Orchard-only fixture is supported")
+            .encode();
 
         let mut corrupted = regtest.clone().into_bytes();
         let last = corrupted.last_mut().unwrap();
@@ -776,7 +801,9 @@ mod tests {
             Err(WcashAddressParseError::InvalidEncoding(_))
         ));
 
-        let mainnet = WcashAddress::from_unified(NetworkType::Main, unified).encode();
+        let mainnet = WcashAddress::from_unified(NetworkType::Main, unified)
+            .expect("the Orchard-only fixture is supported")
+            .encode();
         assert_ne!(mainnet, regtest);
     }
 

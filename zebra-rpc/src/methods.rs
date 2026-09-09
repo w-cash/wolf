@@ -136,13 +136,17 @@ use types::{
     transaction::TransactionObject,
     unified_address::ZListUnifiedReceiversResponse,
     validate_address::ValidateAddressResponse,
-    wcash_aux_block::{AuxPowHex, CreateAuxBlockResponse, GetAuxBlockStatusResponse},
+    wcash_aux_block::{
+        AuxPowHex, CreateAuxBlockResponse, GetAuxBlockStatusResponse, RetireAuxBlockResponse,
+        RetireToken,
+    },
     z_validate_address::ZValidateAddressResponse,
 };
 use wcash_aux_block::{
     classify_committed_wcash_submission, is_invalid_wcash_auxpow, maximum_completed_block_size,
     AuxBlockCandidateCache, CandidateChainState, CandidateInsertError, CandidateLookupError,
-    CandidateSubmissionState, AUX_BLOCK_VERIFY_TIMEOUT,
+    CandidateRetirement, CandidateRetirementError, CandidateSubmissionState,
+    AUX_BLOCK_VERIFY_TIMEOUT,
 };
 
 include!(concat!(env!("OUT_DIR"), "/rpc_openrpc.rs"));
@@ -172,6 +176,8 @@ pub(super) const PARAM_ADDRESS_STRINGS_DESC: &str = "The addresses to return.";
 pub(super) const PARAM_ADDR_DESC: &str = "The address to return.";
 pub(super) const PARAM_HEX_DATA_DESC: &str = "The hex-encoded data to return.";
 pub(super) const PARAM_AUX_POW_DESC: &str = "The hex-encoded Wcash AuxPoW proof.";
+pub(super) const PARAM_RETIRE_TOKEN_DESC: &str =
+    "The 32-byte hexadecimal capability returned by createauxblock for this candidate.";
 pub(super) const PARAM_TXID_DESC: &str = "The transaction ID to return.";
 pub(super) const PARAM_HASH_OR_HEIGHT_DESC: &str = "The block hash or height to return.";
 pub(super) const PARAM_PARAMETERS_DESC: &str = "The parameters for the command.";
@@ -576,6 +582,19 @@ pub trait Rpc {
     /// [`Self::submit_aux_block`]. This method is rejected on Zcash networks.
     #[method(name = "createauxblock")]
     async fn create_aux_block(&self, address: String) -> Result<CreateAuxBlockResponse>;
+
+    /// Authenticates retirement of an issued candidate that received no AuxPoW
+    /// submission, releasing its bounded cache slot before the normal TTL.
+    ///
+    /// The unguessable `retire_token` comes from the matching
+    /// [`Self::create_aux_block`] response. Calls are idempotent, but retirement
+    /// is refused after any canonically decoded submission begins.
+    #[method(name = "retireauxblock")]
+    async fn retire_aux_block(
+        &self,
+        block_hash: String,
+        retire_token: RetireToken,
+    ) -> Result<RetireAuxBlockResponse>;
 
     /// Attaches a canonical Zcash-parent AuxPoW proof to an exact cached Wcash
     /// candidate, then submits it through normal consensus validation.
@@ -3338,7 +3357,7 @@ where
                 None,
             ));
         }
-        let cached_hash = self
+        let candidate_lease = self
             .wcash_aux_blocks
             .insert(Arc::clone(&candidate))
             .map_err(|error| match error {
@@ -3347,18 +3366,28 @@ where
                     "Wcash auxiliary candidate cache is full of active jobs; retry after a job expires",
                     None,
                 ),
+                CandidateInsertError::Publishing => ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "the same Wcash auxiliary candidate is being published concurrently; retry createauxblock",
+                    None,
+                ),
             })?;
-        debug_assert_eq!(cached_hash, hash);
+        debug_assert_eq!(candidate_lease.id(), hash);
         if self.latest_chain_tip.best_tip_hash() != Some(expected_tip) {
+            // This reservation was never returned to a pool. Discard only the
+            // exact unpublished lease owned by this call; a previously
+            // published identical candidate must remain retryable.
+            self.wcash_aux_blocks.discard_unpublished(candidate_lease);
             return Err(ErrorObject::borrowed(
                 ErrorCode::InternalError.code(),
                 "Wcash tip changed while publishing the candidate; retry createauxblock",
                 None,
             ));
         }
+        self.wcash_aux_blocks.publish(candidate_lease);
 
         Ok(CreateAuxBlockResponse::new(
-            hash,
+            (hash, RetireToken::new(candidate_lease.retire_token())),
             candidate_data,
             candidate.header.previous_block_hash,
             coinbase_value,
@@ -3366,6 +3395,43 @@ where
             bits,
             height.0,
         ))
+    }
+
+    async fn retire_aux_block(
+        &self,
+        block_hash: String,
+        retire_token: RetireToken,
+    ) -> Result<RetireAuxBlockResponse> {
+        if !self.network.uses_wcash_consensus() {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InvalidRequest.code(),
+                "retireauxblock is only available on a Wcash network",
+                None,
+            ));
+        }
+
+        let block_hash = block::Hash::from_hex(block_hash).map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                format!("invalid Wcash auxiliary block hash: {error}"),
+                None::<()>,
+            )
+        })?;
+        match self
+            .wcash_aux_blocks
+            .retire(block_hash, retire_token.into_bytes())
+        {
+            Ok(CandidateRetirement::Retired) => Ok(RetireAuxBlockResponse::Retired),
+            Ok(CandidateRetirement::AlreadyAbsent) => Ok(RetireAuxBlockResponse::AlreadyAbsent),
+            Ok(CandidateRetirement::SubmissionStarted) => {
+                Ok(RetireAuxBlockResponse::SubmissionStarted)
+            }
+            Err(CandidateRetirementError::Unauthorized) => Err(ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "Wcash auxiliary candidate retirement was not authorized",
+                None,
+            )),
+        }
     }
 
     async fn get_aux_block_status(
@@ -3453,6 +3519,12 @@ where
             )
         })?;
 
+        // Atomically protect this exact candidate from administrative
+        // retirement before any asynchronous state read or verifier call. A
+        // cache miss is retained so the idempotent committed-state path still
+        // works after TTL eviction or a node restart.
+        let cached_candidate = self.wcash_aux_blocks.begin_submission(block_hash);
+
         match self.wcash_submission_state(block_hash, &aux_pow).await? {
             CandidateSubmissionState::BestChain(committed) => {
                 self.advertise_wcash_best_chain_block(block_hash, &committed)?;
@@ -3482,10 +3554,7 @@ where
             }
             CandidateSubmissionState::Unknown => {}
         }
-        let candidate = self
-            .wcash_aux_blocks
-            .get(block_hash)
-            .map_err(|error| {
+        let candidate = cached_candidate.map_err(|error| {
                 let message = match error {
                     CandidateLookupError::Unknown => {
                         "Wcash auxiliary block ID is not in the local active-job cache; submission status is inconclusive"
@@ -3971,7 +4040,15 @@ where
                     let addr = zcash_address::unified::Address::try_from_items(vec![item])
                         .expect("using data already decoded as valid");
                     orchard = Some(if uses_wcash_consensus {
-                        WcashAddress::from_unified(network, addr).encode()
+                        WcashAddress::from_unified(network, addr)
+                            .map_err(|error| {
+                                ErrorObject::owned(
+                                    server::error::LegacyCode::InvalidParameter.into(),
+                                    error.to_string(),
+                                    None::<()>,
+                                )
+                            })?
+                            .encode()
                     } else {
                         addr.encode(&network)
                     });
@@ -3980,11 +4057,15 @@ where
                     let addr = zebra_chain::primitives::Address::try_from_sapling(network, data)
                         .map_error(server::error::LegacyCode::InvalidParameter)?;
 
-                    sapling = Some(if uses_wcash_consensus {
-                        WcashAddress::from_sapling(network, data).encode()
-                    } else {
-                        addr.payment_address().unwrap_or_default()
-                    });
+                    if uses_wcash_consensus {
+                        return Err(ErrorObject::owned(
+                            server::error::LegacyCode::InvalidParameter.into(),
+                            "Wcash does not support Sapling receivers",
+                            None::<()>,
+                        ));
+                    }
+
+                    sapling = Some(addr.payment_address().unwrap_or_default());
                 }
                 zcash_address::unified::Receiver::P2pkh(data) => {
                     p2pkh = Some(if uses_wcash_consensus {
@@ -5571,7 +5652,7 @@ impl<'de> serde::Deserialize<'de> for RpcTransparentAddress {
                 transparent::Address::from_script_hash(network_kind, *hash)
             }
             WcashAddressKind::Tex(hash) => transparent::Address::from_tex(network_kind, *hash),
-            WcashAddressKind::Sapling(_) | WcashAddressKind::Unified(_) => {
+            WcashAddressKind::Unified(_) => {
                 return Err(serde::de::Error::custom(
                     "getaddressutxos requires a transparent address",
                 ));

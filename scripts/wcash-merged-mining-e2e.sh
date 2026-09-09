@@ -147,7 +147,7 @@ if [[ -z "$wcash_payout_address" || -z "$zcash_payout_address" ]]; then
   exit 1
 fi
 
-export WCASH_EXPECTED_GENESIS_HASH=b0ebe8618354e0563091d10b73ba03842cb3c112a801012616489269e58dbd61
+export WCASH_EXPECTED_GENESIS_HASH=70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c
 export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327
 # `native-job` durably activates its job identifier. Keep its inspection-only
 # activation in a separate journal so the following `native-mine` invocation

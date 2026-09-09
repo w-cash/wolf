@@ -1,0 +1,4 @@
+project: zebra-consensus
+kind: breaking
+body: "Reject Sprout, Sapling, and legacy Orchard components under Wcash consensus, and enforce network-specific version-6 replay domains in block and mempool validation."
+time: 2026-09-09T12:00:00.000000002Z

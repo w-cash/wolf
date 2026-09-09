@@ -55,6 +55,7 @@ use crate::{
         },
         read::ADDRESS_HEIGHTS_FULL_RANGE,
     },
+    tests::setup::uses_wcash_consensus,
     Config,
 };
 
@@ -154,6 +155,11 @@ impl TransactionData {
 #[test]
 fn test_block_and_transaction_data() {
     let _init_guard = zebra_test::init();
+    if uses_wcash_consensus() {
+        // These snapshots deliberately freeze Zcash block and transaction
+        // bytes. Wcash finalized storage has a native genesis round-trip test.
+        return;
+    }
     for network in Network::iter() {
         test_block_and_transaction_data_with_network(network);
     }

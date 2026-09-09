@@ -20,6 +20,7 @@ use crate::{
     arbitrary::Prepare,
     request::ContextuallyVerifiedBlock,
     service::{arbitrary::PreparedChain, non_finalized_state::Chain},
+    tests::setup::uses_wcash_consensus,
 };
 
 /// The default number of proptest cases for long partial chain tests.
@@ -462,6 +463,12 @@ fn rejection_restores_internal_state_genesis() -> Result<()> {
     };
 
     let _init_guard = zebra_test::init();
+
+    if uses_wcash_consensus() {
+        // PreparedChain currently emits Zcash Canopy/NU5 histories. The Wcash
+        // lifecycle test covers rejection without importing legacy pools.
+        return Ok(());
+    }
 
     proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
                                .ok()

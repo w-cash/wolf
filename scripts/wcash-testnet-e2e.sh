@@ -9,7 +9,7 @@ declare -a child_pids=()
 wcash_rpc=http://127.0.0.1:38232
 zcash_template_rpc=http://127.0.0.1:18232
 zcash_validator_rpc=http://127.0.0.1:18242
-wcash_genesis=78b292284bc7b03c6a16b62e29a3ab2015c40d6414cbc27ddcee878225600f10
+wcash_genesis=d95a9f2f1daf07d48fb3c863ad7334ec630a4a7077da98c8f7e65f8c0e277cf1
 wcash_payout_address=WT6kWkxJzyp4LdwrjtvvuVFRbkMhH2SsBeq
 
 cleanup() {
@@ -161,7 +161,7 @@ rpc_call "$wcash_rpc" getblockchaininfo | python3 -c '
 import json,sys
 result=json.load(sys.stdin)["result"]
 assert result["blocks"] == 0, result
-assert result["bestblockhash"] == "78b292284bc7b03c6a16b62e29a3ab2015c40d6414cbc27ddcee878225600f10", result
+assert result["bestblockhash"] == "d95a9f2f1daf07d48fb3c863ad7334ec630a4a7077da98c8f7e65f8c0e277cf1", result
 assert result["chainSupply"]["chainValueZat"] == 0, result
 assert all(pool["chainValueZat"] == 0 for pool in result["valuePools"]), result
 '
@@ -222,9 +222,36 @@ assert result["height"] == 1, result
 assert result["previousblockhash"] == sys.argv[2], result
 assert result["coinbasevalue"] == 625_000_000, result
 assert len(result["hash"]) == 64, result
+assert len(result["retiretoken"]) == 64, result
 assert len(result["target"]) == 64, result
 assert result["data"], result
 PY
+
+read -r startup_candidate startup_retire_token < <(
+  python3 - "$runtime_dir/createauxblock.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response_file:
+    result = json.load(response_file)["result"]
+print(result["hash"], result["retiretoken"])
+PY
+)
+rpc_call "$wcash_rpc" retireauxblock \
+  "[\"$startup_candidate\",\"$startup_retire_token\"]" \
+  >"$runtime_dir/retireauxblock.json"
+python3 - "$runtime_dir/retireauxblock.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response_file:
+    response = json.load(response_file)
+assert response.get("error") in (None, False), response
+assert response["result"] == {"state": "retired"}, response
+PY
+rpc_call "$wcash_rpc" retireauxblock \
+  "[\"$startup_candidate\",\"$startup_retire_token\"]" |
+  python3 -c 'import json,sys; response=json.load(sys.stdin); assert response["result"] == {"state": "already_absent"}, response'
 
 zcash_payout_address="$(sed -n "s/^export ZCASH_PAYOUT_ADDRESS='\([^']*\)'/\1/p" "$repo_root/docs/wcash-local.md")"
 if [[ -z "$zcash_payout_address" ]]; then
@@ -391,10 +418,10 @@ echo "Wcash Testnet genesis and native ZIP-301 mining phase passed at $wcash_gen
 # and spendable without weakening the public Testnet 100-confirmation policy.
 wcash_wallet_rpc=http://127.0.0.1:48232
 wcash_wallet_grpc=http://127.0.0.1:48234
-wcash_regtest_genesis=b0ebe8618354e0563091d10b73ba03842cb3c112a801012616489269e58dbd61
+wcash_regtest_genesis=70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c
 sender_seed=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
 recipient_seed=202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
-expected_sender_address=wuregtest1m6qlf78t724tks6lxvpy7dylmuae5df0xrwaacykakred0jv8tez5v4lqhwhwvrpg9wp4qyf5ty5a9z9ultvqf9h3yd6rgdh6vvdnemk
+expected_sender_address=wuregtest1xryxj7ddyajw4mv7jpelftnfhkwu3v5w03smp88kk6fkmfvlewpzrs26pxqs4wycul43485lg0h9ry8zzxkj9q8gvh7dmg0uh5e2t28k
 sender_db="$runtime_dir/sender.sqlite"
 recipient_db="$runtime_dir/recipient.sqlite"
 
@@ -550,7 +577,7 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as result_file:
     result = json.load(result_file)
-assert result["branch_id"] == "b3cfd27e", result
+assert result["branch_id"] == "c3a6678a", result
 assert result["target_height"] == 4, result
 assert result["expiry_height"] == 44, result
 assert result["internal_change_receiver_verified"] is True, result
@@ -971,7 +998,7 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as result_file:
     result = json.load(result_file)
-assert result["branch_id"] == "b3cfd27e", result
+assert result["branch_id"] == "c3a6678a", result
 assert result["target_height"] == 101, result
 assert result["expiry_height"] == 141, result
 assert result["internal_change_receiver_verified"] is True, result

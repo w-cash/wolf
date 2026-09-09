@@ -36,11 +36,16 @@ fn find_fork_point_locates_the_fork() {
             finalized_state::FinalizedState, non_finalized_state::NonFinalizedState,
             read::find_fork_point,
         },
-        tests::FakeChainHelper,
+        tests::{setup::uses_wcash_consensus, FakeChainHelper},
         Config,
     };
 
     let _init_guard = zebra_test::init();
+    if uses_wcash_consensus() {
+        // This fork fixture deliberately uses a pre-Heartwood Zcash block.
+        // Wcash fork handling is covered by its native state lifecycle test.
+        return;
+    }
     let network = Mainnet;
 
     // Pre-Heartwood block as a base, to avoid history-tree complications (matches the

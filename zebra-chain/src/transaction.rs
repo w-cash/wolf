@@ -1602,6 +1602,35 @@ impl Transaction {
         *self = self.clone().with_transparent_outputs(outputs);
     }
 
+    /// Rebuild this transaction with a replaced Sapling bundle (recomputes txid).
+    ///
+    /// Test helper for checking consensus rules that reject Sapling data in a
+    /// transaction version which can still represent the inherited field.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn with_sapling_bundle(
+        self,
+        bundle: Option<
+            sapling_crypto::Bundle<
+                sapling_crypto::bundle::Authorized,
+                zcash_protocol::value::ZatBalance,
+            >,
+        >,
+    ) -> Self {
+        let data = &*self.0;
+        let tx_data = compat::transaction_data_from_parts(
+            data.version(),
+            data.consensus_branch_id(),
+            data.lock_time(),
+            data.expiry_height(),
+            data.transparent_bundle().cloned(),
+            data.sprout_bundle().cloned(),
+            bundle,
+            data.orchard_bundle().cloned(),
+            data.ironwood_bundle().cloned(),
+        );
+        Transaction(tx_data.freeze().expect("rebuilt from valid transaction"))
+    }
+
     /// Rebuild this transaction with a replaced Orchard bundle (recomputes txid).
     ///
     /// Test helper for synthesizing transactions with malformed orchard data
@@ -1623,6 +1652,29 @@ impl Transaction {
             data.sapling_bundle().cloned(),
             bundle,
             data.ironwood_bundle().cloned(),
+        );
+        Transaction(tx_data.freeze().expect("rebuilt from valid transaction"))
+    }
+
+    /// Rebuild this transaction with a replaced Ironwood bundle (recomputes txid).
+    ///
+    /// Test helper for checking pool-specific V6 consensus rules.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn with_ironwood_bundle(
+        self,
+        bundle: Option<::orchard::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
+    ) -> Self {
+        let data = &*self.0;
+        let tx_data = compat::transaction_data_from_parts(
+            data.version(),
+            data.consensus_branch_id(),
+            data.lock_time(),
+            data.expiry_height(),
+            data.transparent_bundle().cloned(),
+            data.sprout_bundle().cloned(),
+            data.sapling_bundle().cloned(),
+            data.orchard_bundle().cloned(),
+            bundle,
         );
         Transaction(tx_data.freeze().expect("rebuilt from valid transaction"))
     }

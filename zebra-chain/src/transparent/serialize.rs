@@ -33,16 +33,16 @@ pub const GENESIS_COINBASE_SCRIPT_SIG: [u8; 77] = [
 /// This local vector commits to the independently checked Bitcoin block
 /// 965,910. Public Wcash Testnet has a separate frozen statement below; Wcash
 /// mainnet remains disabled.
-pub const WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 95] =
-    b"06/Sep/2026 Wcash: BTC #965910 00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146";
+pub const WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 100] =
+    b"06/Sep/2026 Wcash (WEC) BTC #965910 00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146";
 
 /// The exact public Wcash-testnet genesis statement.
 ///
 /// This statement commits to the independently checked Bitcoin mainnet block
 /// 965,900. Its Wcash-network discriminator is separately committed in the
 /// header's anchor commitment.
-pub const WCASH_TESTNET_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 95] =
-    b"06/Sep/2026 Wcash: BTC #965900 0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851";
+pub const WCASH_TESTNET_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 100] =
+    b"06/Sep/2026 Wcash (WEC) BTC #965900 0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851";
 
 /// Returns true for one of the exact, frozen genesis coinbase scripts.
 ///

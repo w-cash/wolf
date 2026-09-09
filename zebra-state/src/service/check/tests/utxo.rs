@@ -20,7 +20,9 @@ use crate::{
         check, finalized_state::FinalizedState, non_finalized_state::NonFinalizedState, read,
         write::validate_and_commit_non_finalized,
     },
-    tests::setup::{new_state_with_mainnet_genesis, transaction_v4_from_coinbase},
+    tests::setup::{
+        new_state_with_mainnet_genesis, transaction_v4_from_coinbase, uses_wcash_consensus,
+    },
     CheckpointVerifiedBlock, SemanticallyVerifiedBlock,
     ValidateContextError::{
         DuplicateTransparentSpend, EarlyTransparentSpend, ImmatureTransparentCoinbaseSpend,
@@ -222,10 +224,17 @@ const DEFAULT_UTXO_PROPTEST_CASES: u32 = 16;
 
 proptest! {
     #![proptest_config(
-        proptest::test_runner::Config::with_cases(env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_UTXO_PROPTEST_CASES))
+        proptest::test_runner::Config::with_cases(if uses_wcash_consensus() {
+            // These inherited contextual fixtures embed V4 transactions in
+            // frozen Zcash blocks. Wcash-native coinbase spend restrictions
+            // remain covered by the unit tests above and end-to-end tests.
+            0
+        } else {
+            env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_UTXO_PROPTEST_CASES)
+        })
     )]
 
     /// Make sure an arbitrary transparent spend from a previous transaction in this block
@@ -243,6 +252,9 @@ proptest! {
         use_finalized_state in any::<bool>(),
     ) {
         let _init_guard = zebra_test::init();
+        if uses_wcash_consensus() {
+            return Ok(());
+        }
 
         let mut block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into::<Block>()
@@ -329,6 +341,9 @@ proptest! {
         mut use_finalized_state_spend in any::<bool>(),
     ) {
         let _init_guard = zebra_test::init();
+        if uses_wcash_consensus() {
+            return Ok(());
+        }
 
         // if we use the non-finalized state for the first block,
         // we have to use it for the second as well
@@ -425,6 +440,9 @@ proptest! {
         mut prevout_input2 in TypeNameToDebug::<transparent::Input>::arbitrary_with(None),
     ) {
         let _init_guard = zebra_test::init();
+        if uses_wcash_consensus() {
+            return Ok(());
+        }
 
         let mut block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into::<Block>()
@@ -490,6 +508,9 @@ proptest! {
         use_finalized_state_output in any::<bool>(),
     ) {
         let _init_guard = zebra_test::init();
+        if uses_wcash_consensus() {
+            return Ok(());
+        }
 
         let mut block2 = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
             .zcash_deserialize_into::<Block>()
@@ -567,6 +588,9 @@ proptest! {
         use_finalized_state_output in any::<bool>(),
     ) {
         let _init_guard = zebra_test::init();
+        if uses_wcash_consensus() {
+            return Ok(());
+        }
 
         let mut block2 = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
             .zcash_deserialize_into::<Block>()
@@ -652,6 +676,9 @@ proptest! {
         mut use_finalized_state_spend in any::<bool>(),
     ) {
         let _init_guard = zebra_test::init();
+        if uses_wcash_consensus() {
+            return Ok(());
+        }
 
         // if we use the non-finalized state for the first block,
         // we have to use it for the second as well
@@ -804,6 +831,9 @@ proptest! {
         prevout_input in TypeNameToDebug::<transparent::Input>::arbitrary_with(None),
     ) {
         let _init_guard = zebra_test::init();
+        if uses_wcash_consensus() {
+            return Ok(());
+        }
 
         let mut block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into::<Block>()
@@ -860,6 +890,9 @@ proptest! {
         mut prevout_input in TypeNameToDebug::<transparent::Input>::arbitrary_with(None),
     ) {
         let _init_guard = zebra_test::init();
+        if uses_wcash_consensus() {
+            return Ok(());
+        }
 
         let mut block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into::<Block>()

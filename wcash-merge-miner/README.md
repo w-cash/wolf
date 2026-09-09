@@ -46,7 +46,7 @@ Use the three-node procedure in
 the network pins and an isolated journal:
 
 ```sh
-export WCASH_EXPECTED_GENESIS_HASH=b0ebe8618354e0563091d10b73ba03842cb3c112a801012616489269e58dbd61
+export WCASH_EXPECTED_GENESIS_HASH=70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c
 export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327
 WCASH_JOURNAL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wcash-native.XXXXXX")"
 chmod 700 "$WCASH_JOURNAL_DIR"
@@ -76,7 +76,8 @@ cargo run --release -p wcash-merge-miner -- native-job \
 
 `native-job` is not a read-only dry run: startup replays any pending winners
 from the selected durable journal, then asks the child node to reserve a fresh
-candidate before checking the parent proposal.
+candidate before checking the parent proposal. After producing the preflight
+result it retires that unsolved candidate with its authenticated lease.
 
 `native-mine` uses the real Equihash solver and submits any Wcash and Zcash
 winners independently:
@@ -193,6 +194,16 @@ and independently proposal-validating fresh work. A generation is limited to
 45 seconds and can rotate earlier when either chain tip or the child candidate
 becomes stale. This avoids a rebind/`TIME_WAIT` failure and avoids presenting a
 frozen header as a fake refreshed job; clients must reconnect after rotation.
+
+Each `createauxblock` response carries a random, candidate-specific retirement
+capability. After all generation connections and share handlers have joined,
+the coordinator calls `retireauxblock` for unsolved and parent-only work. It
+never makes that call while the durable outbox contains a Wcash winner, and the
+node independently refuses retirement after a decoded AuxPoW submission starts.
+Retirement retries are idempotent. A transient retirement failure blocks the
+next generation with bounded backoff, so rapid parent-tip rotation cannot fill
+the node's 16-entry cache. Treat the capability as an RPC secret; the
+coordinator redacts it from debug output.
 
 To exercise the actual pool wire path with a real Equihash solution, run this
 from another terminal while `native-serve` is listening:

@@ -85,6 +85,7 @@ pub struct NativeMiningSupervisor {
     zcash: NativeZcashProvider,
     journal: Arc<ShareJournal>,
     generation_preparation: Mutex<()>,
+    pending_candidate_retirement: Mutex<Option<ChildCandidateLease>>,
 }
 
 /// A fully prepared dual-chain job and its submission backend.
@@ -94,12 +95,48 @@ pub struct NativeMiningCoordinator {
     job: NativePreparedJob,
     child_height: u32,
     child_previous_hash: String,
+    child_candidate_lease: ChildCandidateLease,
     candidate_created_at: Instant,
     freshness: Mutex<JobFreshness>,
     last_outbox_retry: Mutex<Instant>,
     outbox_retry_requested: AtomicBool,
     outbox_retry_in_progress: AtomicBool,
     journal: Arc<ShareJournal>,
+}
+
+/// Final cache disposition of a stopped native mining generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenerationRetirement {
+    /// The candidate was removed, or was already absent after a retry/restart.
+    Retired,
+    /// A durable Wcash winner still references this candidate.
+    RetainedForWcashWinner,
+    /// A canonically decoded submission already began at the Wcash node.
+    RetainedForSubmission,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct ChildCandidateLease {
+    hash: String,
+    retire_token: String,
+}
+
+impl fmt::Debug for ChildCandidateLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChildCandidateLease")
+            .field("hash", &self.hash)
+            .field("retire_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+enum RetireAuxBlockResponse {
+    Retired,
+    AlreadyAbsent,
+    SubmissionStarted,
 }
 
 /// Operator-visible durable winner-outbox counts.
@@ -134,6 +171,46 @@ const MAX_CHILD_BLOCK_BYTES: usize = 2_000_000;
 const WINNER_RETENTION_CONFIRMATIONS: u32 = 100;
 
 impl NativeMiningSupervisor {
+    fn retry_pending_candidate_retirement(&self) -> Result<(), MinerError> {
+        let pending = self
+            .pending_candidate_retirement
+            .lock()
+            .map_err(|_| coordinator_mutex_error("pending candidate retirement"))?
+            .take();
+        let Some(lease) = pending else {
+            return Ok(());
+        };
+
+        match retire_child_candidate(&self.wcash_node, &lease) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                *self
+                    .pending_candidate_retirement
+                    .lock()
+                    .map_err(|_| coordinator_mutex_error("pending candidate retirement"))? =
+                    Some(lease);
+                Err(error)
+            }
+        }
+    }
+
+    fn retire_failed_preparation(&self, lease: ChildCandidateLease) {
+        if let Err(error) = retire_child_candidate(&self.wcash_node, &lease) {
+            eprintln!(
+                "failed to retire an unpublished native child generation: {error}; no new candidate will be requested until retirement is retried"
+            );
+            match self.pending_candidate_retirement.lock() {
+                Ok(mut pending) => {
+                    debug_assert!(pending.is_none());
+                    *pending = Some(lease);
+                }
+                Err(_) => eprintln!(
+                    "pending candidate retirement mutex is poisoned; stop this supervisor before issuing more work"
+                ),
+            }
+        }
+    }
+
     /// Opens and crash-recovers one durable journal for this process lifetime.
     pub fn open(
         config: CoordinatorConfig,
@@ -176,6 +253,7 @@ impl NativeMiningSupervisor {
             zcash,
             journal,
             generation_preparation: Mutex::new(()),
+            pending_candidate_retirement: Mutex::new(None),
         })
     }
 
@@ -222,12 +300,26 @@ impl NativeMiningSupervisor {
             )?;
         }
         wcash_identity?;
+        // A transient failure after a prior `createauxblock` must be resolved
+        // before another candidate is requested. This makes preparation
+        // retries cache-capacity neutral even during a prolonged parent outage.
+        self.retry_pending_candidate_retirement()?;
         zcash_identity?;
 
         let child: ChildTemplate = wcash_node.call(
             "createauxblock",
             json!([config.wcash_payout_address.clone()]),
         )?;
+        let child_hash = parse_display_hash(&child.hash, "createauxblock hash")?;
+        parse_canonical_capability(&child.retire_token, "createauxblock retiretoken")?;
+        let child_candidate_lease = ChildCandidateLease {
+            hash: child.hash.clone(),
+            retire_token: child.retire_token.clone(),
+        };
+        let mut preparation_guard = CandidatePreparationGuard {
+            supervisor: self,
+            lease: Some(child_candidate_lease.clone()),
+        };
         if child.chain_id != WCASH_AUXILIARY_CHAIN_ID {
             return Err(MinerError::InvalidParentTemplate(format!(
                 "Wcash node returned chain id 0x{:08x}, expected 0x{WCASH_AUXILIARY_CHAIN_ID:08x}",
@@ -239,7 +331,6 @@ impl NativeMiningSupervisor {
                 "Wcash auxiliary candidate height is zero".to_string(),
             ));
         }
-        let child_hash = parse_display_hash(&child.hash, "createauxblock hash")?;
         let child_candidate_bytes =
             decode_bounded_hex(&child.data, "createauxblock data", MAX_CHILD_BLOCK_BYTES)?;
         let child_candidate: Block = child_candidate_bytes
@@ -336,6 +427,7 @@ impl NativeMiningSupervisor {
             job,
             child_height: child.height,
             child_previous_hash: child.previous_block_hash,
+            child_candidate_lease,
             candidate_created_at,
             freshness: Mutex::new(JobFreshness {
                 active: true,
@@ -346,7 +438,27 @@ impl NativeMiningSupervisor {
             outbox_retry_in_progress: AtomicBool::new(false),
             journal,
         };
+        preparation_guard.disarm();
         Ok(coordinator)
+    }
+}
+
+struct CandidatePreparationGuard<'a> {
+    supervisor: &'a NativeMiningSupervisor,
+    lease: Option<ChildCandidateLease>,
+}
+
+impl CandidatePreparationGuard<'_> {
+    fn disarm(&mut self) {
+        self.lease = None;
+    }
+}
+
+impl Drop for CandidatePreparationGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.supervisor.retire_failed_preparation(lease);
+        }
     }
 }
 
@@ -362,6 +474,27 @@ impl NativeMiningCoordinator {
     /// Returns the exact proposal-gated solver job.
     pub const fn job(&self) -> &NativePreparedJob {
         &self.job
+    }
+
+    /// Stops issuing this generation and releases its node cache slot when safe.
+    ///
+    /// Callers must first stop the listener and join every accepted share
+    /// handler. The mutable borrow enforces that rule for the built-in native
+    /// server, whose handlers share this coordinator through an `Arc`.
+    pub fn retire_generation(&mut self) -> Result<GenerationRetirement, MinerError> {
+        self.freshness
+            .get_mut()
+            .map_err(|_| coordinator_mutex_error("job freshness"))?
+            .active = false;
+
+        if self
+            .journal
+            .has_pending_wcash_winner(self.job.job().job_id())?
+        {
+            return Ok(GenerationRetirement::RetainedForWcashWinner);
+        }
+
+        retire_child_candidate(&self.wcash_node, &self.child_candidate_lease)
     }
 
     /// Returns current durable outbox counts for health reporting.
@@ -621,8 +754,8 @@ fn validate_wcash_candidate_payout(
             }
             Ok(())
         }
-        WcashAddressKind::Sapling(_) | WcashAddressKind::Tex(_) => Err(MinerError::InvalidRequest(
-            "Sapling and TEX are not Wcash coinbase payout modes".to_string(),
+        WcashAddressKind::Tex(_) => Err(MinerError::InvalidRequest(
+            "TEX is not a Wcash coinbase payout mode".to_string(),
         )),
     }
 }
@@ -924,6 +1057,8 @@ impl ShareProcessor for NativeMiningCoordinator {
 #[serde(deny_unknown_fields)]
 struct ChildTemplate {
     hash: String,
+    #[serde(rename = "retiretoken")]
+    retire_token: String,
     data: String,
     #[serde(rename = "chainid")]
     chain_id: u32,
@@ -1469,6 +1604,14 @@ impl ShareJournal {
             .values()
             .cloned()
             .collect())
+    }
+
+    fn has_pending_wcash_winner(&self, job_id: &str) -> Result<bool, MinerError> {
+        Ok(self
+            .lock_state()?
+            .pending_winners
+            .values()
+            .any(|winner| winner.key.chain == WinnerChain::Wcash && winner.job_id == job_id))
     }
 
     fn status(&self) -> Result<WinnerOutboxStatus, MinerError> {
@@ -2231,6 +2374,35 @@ fn complete_wcash_candidate(
     Ok(completed)
 }
 
+fn retire_child_candidate(
+    node: &ZebraRpcClient,
+    lease: &ChildCandidateLease,
+) -> Result<GenerationRetirement, MinerError> {
+    parse_display_hash(&lease.hash, "retired Wcash candidate hash")?;
+    parse_canonical_capability(&lease.retire_token, "Wcash candidate retire token")?;
+    let response: RetireAuxBlockResponse =
+        node.call("retireauxblock", json!([lease.hash, lease.retire_token]))?;
+    match response {
+        RetireAuxBlockResponse::Retired | RetireAuxBlockResponse::AlreadyAbsent => {
+            Ok(GenerationRetirement::Retired)
+        }
+        RetireAuxBlockResponse::SubmissionStarted => {
+            Ok(GenerationRetirement::RetainedForSubmission)
+        }
+    }
+}
+
+fn parse_canonical_capability(encoded: &str, field: &'static str) -> Result<[u8; 32], MinerError> {
+    let decoded = parse_raw_hash(encoded, field)?;
+    if encoded != hex::encode(decoded) {
+        return Err(MinerError::InvalidHexField {
+            field,
+            reason: "expected canonical lowercase hexadecimal".to_string(),
+        });
+    }
+    Ok(decoded)
+}
+
 fn parse_job_id(encoded: &str) -> Result<[u8; 32], MinerError> {
     parse_journal_id(encoded, "job")
 }
@@ -2498,6 +2670,62 @@ mod tests {
         (endpoint, server)
     }
 
+    fn spawn_retirement_server(
+        results: Vec<serde_json::Value>,
+    ) -> (RpcEndpoint, thread::JoinHandle<Vec<serde_json::Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test RPC server");
+        listener
+            .set_nonblocking(true)
+            .expect("make test RPC listener nonblocking");
+        let endpoint = RpcEndpoint::new(
+            format!(
+                "http://{}/",
+                listener.local_addr().expect("test RPC address")
+            ),
+            None,
+            None,
+        )
+        .expect("loopback test RPC endpoint");
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut requests = Vec::new();
+            for result in results {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "test retirement RPC request timed out"
+                            );
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("test RPC accept failed: {error}"),
+                    }
+                };
+                let request = read_test_rpc_request(&mut stream);
+                let response = serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result,
+                }))
+                .expect("serialize test RPC response");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                )
+                .expect("write test RPC headers");
+                stream
+                    .write_all(&response)
+                    .expect("write test RPC response");
+                requests.push(request);
+            }
+            requests
+        });
+        (endpoint, server)
+    }
+
     fn journal_share_id(job_id: &str, parent_hash_le: [u8; 32]) -> String {
         let mut hash = Sha256::new();
         hash.update(b"Wcash/share-journal/v2\0");
@@ -2560,6 +2788,46 @@ mod tests {
     }
 
     #[test]
+    fn candidate_retirement_is_authenticated_idempotent_and_submission_safe() {
+        let results = vec![
+            json!({"state": "retired"}),
+            json!({"state": "already_absent"}),
+            json!({"state": "submission_started"}),
+        ];
+        let (endpoint, server) = spawn_retirement_server(results);
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+        let lease = ChildCandidateLease {
+            hash: "11".repeat(32),
+            retire_token: "22".repeat(32),
+        };
+        let debug = format!("{lease:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(&"22".repeat(32)));
+
+        assert_eq!(
+            retire_child_candidate(&client, &lease).expect("first retirement succeeds"),
+            GenerationRetirement::Retired
+        );
+        assert_eq!(
+            retire_child_candidate(&client, &lease).expect("retirement retry is idempotent"),
+            GenerationRetirement::Retired
+        );
+        assert_eq!(
+            retire_child_candidate(&client, &lease)
+                .expect("a started submission is preserved without an RPC error"),
+            GenerationRetirement::RetainedForSubmission
+        );
+
+        let requests = server.join().expect("test RPC server exits");
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            assert_eq!(request["method"], "retireauxblock");
+            assert_eq!(request["params"], json!([lease.hash, lease.retire_token]));
+        }
+    }
+
+    #[test]
     fn confirmed_wcash_winner_releases_the_exact_active_candidate() {
         let (endpoint, server) = spawn_wcash_status_server();
         let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
@@ -2593,8 +2861,8 @@ mod tests {
 
     fn orchard_unified_wcash_address(network: NetworkType) -> WcashAddress {
         let zcash_fixture = match network {
-            NetworkType::Test => "utest10a8k6aw5w33kvyt7x6fryzu7vvsjru5vgcfnvr288qx2zm6p63ygcajtaze0px08t583dyrgr42vasazjhhnntus2tqrpkzu0dm2l4cgf3ld6wdqdrf3jv8mvfx9c80e73syer9l2wlgawjtf7yvj0eqwdf354trtelxnr0fhpw9792eaf49ghstkyftc9lwqqwy4ye0cleagp4nzyt",
-            NetworkType::Regtest => "uregtest1efxggx6lduhm2fx5lnrhxv7h7kpztlpa3ahf3n4w0q0zj5epj4av9xjq6ljsja3xk8z7rzd067kc7mgpy9448rdfzpfjz5gq389zdmpgnk6rp4ykk0xk6cmqw6zqcrnmsuaxv3yzsvcwsd4gagtalh0uzrdvy03nhmltjz2eu0232qlcs0zvxuqyut73yucd9gy5jaudnyt7yqhgpqv",
+            NetworkType::Test => "utest10zg6frxk32ma8980kdv9473e4aclw7clq9hydzcj6l349pkqzxk2mmj3cn7j5x38w6l4wyryv50whnlrw0k9agzpdf5fxyj7kq96ukcp",
+            NetworkType::Regtest => "uregtest1pszqlgxaf5w8mu2yd9uygg8cswp0ec4f7eejqnqc35tztw4tk0sxnt3pym2f3s2872cy2ruuc5n8y9cen5q6ngzlmzu8ztrjesv8zm9j",
             NetworkType::Main => unreachable!("Wcash mainnet is disabled"),
         };
         zcash_fixture
@@ -2658,22 +2926,23 @@ mod tests {
             "invalid Wcash payout address",
         );
 
-        let unsupported = [
-            WcashAddress::from_sapling(NetworkType::Test, [0; 43]),
-            WcashAddress::from_tex(NetworkType::Test, [0; 20]),
-            WcashAddress::from_unified(
-                NetworkType::Test,
-                zcash_address::unified::Address::try_from_items(vec![Receiver::Sapling([0; 43])])
-                    .expect("the Sapling-only Unified fixture is structurally valid"),
-            ),
-        ];
-        for payout in unsupported {
-            assert_invalid_wcash_payout(
-                &payout.encode(),
-                &testnet_genesis,
-                "transparent or Unified with an Orchard receiver",
-            );
-        }
+        let tex = WcashAddress::from_tex(NetworkType::Test, [0; 20]);
+        assert_invalid_wcash_payout(
+            &tex.encode(),
+            &testnet_genesis,
+            "transparent or Unified with an Orchard receiver",
+        );
+
+        assert_invalid_wcash_payout(
+            "wtestsapling1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwrl5x9",
+            &testnet_genesis,
+            "invalid Wcash payout address",
+        );
+
+        let sapling_only =
+            zcash_address::unified::Address::try_from_items(vec![Receiver::Sapling([0; 43])])
+                .expect("the Sapling-only Unified fixture is structurally valid");
+        assert!(WcashAddress::from_unified(NetworkType::Test, sapling_only).is_err());
 
         let mainnet = WcashAddress::from_transparent_p2pkh(NetworkType::Main, [0; 20]);
         assert_invalid_wcash_payout(
@@ -2808,6 +3077,7 @@ mod tests {
     fn child_template_accepts_exact_createauxblock_shape() {
         let response = json!({
             "hash": "11".repeat(32),
+            "retiretoken": "33".repeat(32),
             "data": "00",
             "chainid": WCASH_AUXILIARY_CHAIN_ID,
             "previousblockhash": "22".repeat(32),
@@ -2820,6 +3090,7 @@ mod tests {
             serde_json::from_value(response).expect("exact RPC response decodes");
         assert_eq!(parsed.chain_id, WCASH_AUXILIARY_CHAIN_ID);
         assert_eq!(parsed.coinbase_value, 1_000_000_000);
+        assert_eq!(parsed.retire_token, "33".repeat(32));
     }
 
     #[test]

@@ -157,6 +157,7 @@ where
     /// mempool setup channel receiver.
     #[cfg(test)]
     pub fn new_for_tests(network: &Network, state: ZS) -> Self {
+        network.assert_compatible_with_compiled_consensus();
         Self {
             network: network.clone(),
             state: Timeout::new(state, UTXO_LOOKUP_TIMEOUT),
@@ -790,6 +791,23 @@ fn check_common_consensus_rules(
         && tx.tx_version() != TxVersion::V6
     {
         return Err(TransactionError::WcashRequiresV6(tx.version()));
+    }
+
+    // Wcash launches with exactly two value pools: transparent and Ironwood.
+    // Reject inherited shielded pools here so the block and mempool verifiers
+    // enforce the same consensus rule before any proof or state work begins.
+    if network.uses_wcash_consensus() {
+        if tx.has_sprout_joinsplit_data() {
+            return Err(TransactionError::WcashSproutPoolDisabled);
+        }
+
+        if tx.has_sapling_shielded_data() {
+            return Err(TransactionError::WcashSaplingPoolDisabled);
+        }
+
+        if tx.has_orchard_shielded_data() {
+            return Err(TransactionError::WcashOrchardPoolDisabled);
+        }
     }
 
     check_structure_and_network_rules(tx, height, network)?;

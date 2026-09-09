@@ -29,13 +29,13 @@ use constants::{
     POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
 };
 
-/// Wcash starts at 6.25 WCASH per mined block.
+/// Wcash starts at 6.25 WEC per mined block.
 pub(crate) const WCASH_INITIAL_BLOCK_SUBSIDY: u64 = 625_000_000;
 
 /// Wcash halves every 1,680,000 blocks, approximately four years at 75 seconds per block.
 ///
-/// Together with the 6.25 WCASH initial subsidy, this interval keeps total
-/// scheduled issuance below the 21 million WCASH monetary-base hard cap.
+/// Together with the 6.25 WEC initial subsidy, this interval keeps total
+/// scheduled issuance below the 21 million WEC monetary-base hard cap.
 pub(crate) const WCASH_HALVING_INTERVAL: HeightDiff = 1_680_000;
 
 /// The first Wcash block paid at half the initial subsidy.
@@ -422,10 +422,6 @@ pub enum SubsidyError {
     #[error("miner fees are invalid")]
     InvalidMinerFees,
 
-    /// Retained for source compatibility with the initial private-only Wcash profile.
-    #[error("Wcash coinbase transaction has a transparent output")]
-    WcashTransparentCoinbaseOutput,
-
     #[error("Wcash coinbase transaction has a Sapling component")]
     WcashSaplingCoinbaseOutput,
 
@@ -437,10 +433,6 @@ pub enum SubsidyError {
 
     #[error("Wcash coinbase transaction mixes transparent and Ironwood payout outputs")]
     WcashMixedCoinbaseOutputs,
-
-    /// Retained for source compatibility with the initial private-only Wcash profile.
-    #[error("Wcash coinbase transaction has no Ironwood output")]
-    WcashIronwoodCoinbaseOutputMissing,
 
     #[error("Wcash coinbase transaction does not shield its positive reward into Ironwood")]
     WcashIronwoodValueBalanceNotNegative,

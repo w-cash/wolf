@@ -189,19 +189,19 @@ mod tests {
 
         assert_eq!(
             encode_orchard_receiver(&testnet, WalletNetwork::Testnet).unwrap(),
-            "wutest1qpdhnp6kuttafgxvkyz23a0g0ezcl2v0a6y76dst0xn8mahxkfwrxw7e08ty9du42ur2e44u3nam6s7hv0f8zkea83t5r7f4lsfhdzjd"
+            "wutest1y8vqv8yds0dsh0fd8q8nm37q84fkjf33vy8e4cwyx29yl55avhq4udaevvtygde7ae5pvav8y02yqrggm36gnmphazpaqerxj5ja8grr"
         );
         assert_eq!(
             encode_orchard_receiver(&regtest, WalletNetwork::Regtest).unwrap(),
-            "wuregtest1m6qlf78t724tks6lxvpy7dylmuae5df0xrwaacykakred0jv8tez5v4lqhwhwvrpg9wp4qyf5ty5a9z9ultvqf9h3yd6rgdh6vvdnemk"
+            "wuregtest1xryxj7ddyajw4mv7jpelftnfhkwu3v5w03smp88kk6fkmfvlewpzrs26pxqs4wycul43485lg0h9ry8zzxkj9q8gvh7dmg0uh5e2t28k"
         );
         assert_eq!(
             encode_transparent_coinbase_receiver(&testnet, WalletNetwork::Testnet).unwrap(),
-            "WT8oP4F1BxcHH8stAz2ApZaEVAAnaLCeck4"
+            "WTES2x4gFzRan36RGCoc2ZNb9SwFMQf2Pbg"
         );
         assert_eq!(
             encode_transparent_coinbase_receiver(&regtest, WalletNetwork::Regtest).unwrap(),
-            "WRDJdnmDX9oT7aUYzysJUdAZrsJ6Xu5doSf"
+            "WRHUq9CTLZFa52NmAyHH5usN21Q8jZVskN1"
         );
     }
 }

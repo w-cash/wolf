@@ -314,9 +314,7 @@ impl Address {
             WcashAddressKind::Tex(validating_key_hash) => {
                 Ok(Self::from_tex(actual, *validating_key_hash))
             }
-            WcashAddressKind::Sapling(_) | WcashAddressKind::Unified(_) => {
-                Err(WcashTransparentAddressError::NotTransparent)
-            }
+            WcashAddressKind::Unified(_) => Err(WcashTransparentAddressError::NotTransparent),
         }
     }
 
@@ -604,8 +602,15 @@ mod tests {
             })
         ));
 
+        use zcash_address::unified::{Address as UnifiedAddress, Encoding};
+
+        let (_, orchard) = UnifiedAddress::decode(
+            "u1hmfjpqdxaec3mvqypl7fkqcy53u438csydljpuepsfs7jx6sjwyznuzlna8qsslj3tg6sn9ua4q653280aqv4m2fjd4csptwxq3fjpwy",
+        )
+        .expect("the Orchard-only fixture is valid");
         let shielded =
-            WcashAddress::from_sapling(zcash_protocol::consensus::NetworkType::Main, [0; 43])
+            WcashAddress::from_unified(zcash_protocol::consensus::NetworkType::Main, orchard)
+                .expect("an Orchard receiver is a valid Wcash Ironwood destination")
                 .encode();
         assert_eq!(
             Address::parse_wcash(&shielded, &mainnet),

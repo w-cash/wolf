@@ -238,19 +238,28 @@ pub fn default_miner_address(kind: NetworkKind, addr_type: &MinerAddressType) ->
 pub fn default_miner_address_for_network(
     network: &Network,
     addr_type: &MinerAddressType,
-) -> String {
+) -> Option<String> {
     if !network.uses_wcash_consensus() {
-        return default_miner_address(network.kind(), addr_type).to_owned();
+        return Some(default_miner_address(network.kind(), addr_type).to_owned());
     }
 
     let network_kind = network.kind();
-    default_miner_address(network_kind, addr_type)
+    let encoded = match addr_type {
+        MinerAddressType::Unified => match network_kind {
+            NetworkKind::Mainnet => "u1hmfjpqdxaec3mvqypl7fkqcy53u438csydljpuepsfs7jx6sjwyznuzlna8qsslj3tg6sn9ua4q653280aqv4m2fjd4csptwxq3fjpwy",
+            NetworkKind::Testnet => "utest10zg6frxk32ma8980kdv9473e4aclw7clq9hydzcj6l349pkqzxk2mmj3cn7j5x38w6l4wyryv50whnlrw0k9agzpdf5fxyj7kq96ukcp",
+            NetworkKind::Regtest => "uregtest1pszqlgxaf5w8mu2yd9uygg8cswp0ec4f7eejqnqc35tztw4tk0sxnt3pym2f3s2872cy2ruuc5n8y9cen5q6ngzlmzu8ztrjesv8zm9j",
+        },
+        MinerAddressType::Transparent => default_miner_address(network_kind, addr_type),
+        MinerAddressType::Sapling => return None,
+    };
+
+    encoded
         .parse::<ZcashAddress>()
-        .expect("the matching upstream miner-address fixture is valid")
+        .ok()?
         .convert::<WcashAddress>()
-        .expect("Wcash supports every non-Sprout upstream miner-address fixture")
-        .with_network(network_kind.into())
-        .encode()
+        .ok()
+        .map(|address| address.with_network(network_kind.into()).encode())
 }
 
 lazy_static::lazy_static! {
@@ -302,7 +311,8 @@ mod tests {
                 (MinerAddressType::default(), transparent_prefix),
                 (MinerAddressType::Unified, unified_prefix),
             ] {
-                let encoded = default_miner_address_for_network(&network, &address_type);
+                let encoded = default_miner_address_for_network(&network, &address_type)
+                    .expect("the selected address type is supported by Wcash");
                 let address: WcashAddress = encoded
                     .parse()
                     .expect("the generated Wcash miner address is valid");

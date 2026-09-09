@@ -33,7 +33,6 @@ use zcash_primitives::{
     block::BlockHash,
     transaction::{Transaction, TxVersion},
 };
-use zcash_protocol::consensus::BranchId;
 use zcash_protocol::{constants::MAX_BLOCK_BYTES, TxId};
 use zcash_transparent::address::{Script, TransparentAddress};
 use zebra_chain::primitives::{WcashAddress, WcashAddressKind};
@@ -230,7 +229,7 @@ impl AttestedWcashClient {
         &mut self,
         txid: zcash_protocol::TxId,
     ) -> Result<TransactionStatus, WalletRpcError> {
-        transaction_status(&mut self.inner, txid).await
+        transaction_status(&mut self.inner, txid, self.network).await
     }
 
     /// Submits exact signed transaction bytes idempotently.
@@ -242,7 +241,7 @@ impl AttestedWcashClient {
         &mut self,
         raw: Vec<u8>,
     ) -> Result<BroadcastResult, WalletRpcError> {
-        broadcast_raw_transaction(&mut self.inner, raw).await
+        broadcast_raw_transaction(&mut self.inner, raw, self.network).await
     }
 
     /// Creates a synchronizer client whose transparent UTXO requests use the
@@ -411,7 +410,7 @@ impl AttestedWcashClient {
                 encoded_bytes: raw.data.len(),
             });
         }
-        let transaction = parse_wcash_v6_transaction(&raw.data)?;
+        let transaction = parse_wcash_v6_transaction(&raw.data, self.network)?;
         ensure_expected_txid(transaction.txid(), txid)?;
         let receiver = outputs
             .first()
@@ -1006,9 +1005,13 @@ async fn compact_block_ref(
     Ok(BlockRef { height, hash })
 }
 
-fn parse_wcash_v6_transaction(raw: &[u8]) -> Result<Transaction, WalletRpcError> {
+fn parse_wcash_v6_transaction(
+    raw: &[u8],
+    network: WalletNetwork,
+) -> Result<Transaction, WalletRpcError> {
+    let expected_branch_id = network.branch_id();
     let mut reader = Cursor::new(raw);
-    let transaction = Transaction::read(&mut reader, BranchId::WcashTestnetV1)
+    let transaction = Transaction::read(&mut reader, expected_branch_id)
         .map_err(|error| WalletRpcError::InvalidTransaction(error.to_string()))?;
     if usize::try_from(reader.position()).ok() != Some(raw.len()) {
         return Err(WalletRpcError::InvalidTransaction(
@@ -1020,9 +1023,9 @@ fn parse_wcash_v6_transaction(raw: &[u8]) -> Result<Transaction, WalletRpcError>
             "only transaction version 6 is permitted",
         ));
     }
-    if transaction.consensus_branch_id() != BranchId::WcashTestnetV1 {
+    if transaction.consensus_branch_id() != expected_branch_id {
         return Err(WalletRpcError::TransactionPolicy(
-            "transaction does not use the Wcash Testnet V1 branch",
+            "transaction does not use the selected Wcash network branch",
         ));
     }
     Ok(transaction)
@@ -1033,8 +1036,11 @@ fn parse_wcash_v6_transaction(raw: &[u8]) -> Result<Transaction, WalletRpcError>
 /// Private transfers are Ironwood-only. Coinbase shielding additionally has
 /// one or more transparent inputs and no transparent outputs. Sapling, legacy
 /// Orchard, transparent change, and coinbase transactions are rejected.
-pub fn inspect_signed_transaction(raw: &[u8]) -> Result<Transaction, WalletRpcError> {
-    let transaction = parse_wcash_v6_transaction(raw)?;
+pub fn inspect_signed_transaction(
+    raw: &[u8],
+    network: WalletNetwork,
+) -> Result<Transaction, WalletRpcError> {
+    let transaction = parse_wcash_v6_transaction(raw, network)?;
     if transaction.sapling_bundle().is_some() || transaction.orchard_bundle().is_some() {
         return Err(WalletRpcError::TransactionPolicy(
             "wallet transactions must not contain Sapling or legacy Orchard components",
@@ -1058,6 +1064,7 @@ pub fn inspect_signed_transaction(raw: &[u8]) -> Result<Transaction, WalletRpcEr
 async fn transaction_status(
     client: &mut LightwalletdClient,
     txid: zcash_protocol::TxId,
+    network: WalletNetwork,
 ) -> Result<TransactionStatus, WalletRpcError> {
     match client
         .get_transaction(TxFilter {
@@ -1067,7 +1074,7 @@ async fn transaction_status(
         })
         .await
     {
-        Ok(response) => verified_status_response(response.into_inner(), txid),
+        Ok(response) => verified_status_response(response.into_inner(), txid, network),
         Err(status) if status.code() == Code::NotFound => Ok(TransactionStatus::Unknown),
         Err(status) => Err(status.into()),
     }
@@ -1076,8 +1083,9 @@ async fn transaction_status(
 fn verified_status_response(
     response: RawTransaction,
     requested_txid: zcash_protocol::TxId,
+    network: WalletNetwork,
 ) -> Result<TransactionStatus, WalletRpcError> {
-    let returned = inspect_signed_transaction(&response.data)?;
+    let returned = inspect_signed_transaction(&response.data, network)?;
     ensure_expected_txid(returned.txid(), requested_txid)?;
     match response.height {
         0 => Ok(TransactionStatus::Mempool),
@@ -1102,10 +1110,11 @@ fn ensure_expected_txid(
 async fn broadcast_raw_transaction(
     client: &mut LightwalletdClient,
     raw: Vec<u8>,
+    network: WalletNetwork,
 ) -> Result<BroadcastResult, WalletRpcError> {
-    let transaction = inspect_signed_transaction(&raw)?;
+    let transaction = inspect_signed_transaction(&raw, network)?;
     let txid = transaction.txid();
-    let before = transaction_status(client, txid).await?;
+    let before = transaction_status(client, txid, network).await?;
     if is_live_status(&before) {
         return Ok(BroadcastResult {
             txid: txid.to_string(),
@@ -1123,7 +1132,7 @@ async fn broadcast_raw_transaction(
     {
         Ok(response) => response.into_inner(),
         Err(send_error) => {
-            return match transaction_status(client, txid).await {
+            return match transaction_status(client, txid, network).await {
                 Ok(status) if is_live_status(&status) => Ok(BroadcastResult {
                     txid: txid.to_string(),
                     disposition: BroadcastDisposition::AlreadyKnown,
@@ -1146,7 +1155,7 @@ async fn broadcast_raw_transaction(
         }
     };
     if response.error_code != 0 {
-        return match transaction_status(client, txid).await {
+        return match transaction_status(client, txid, network).await {
             Ok(after) if is_live_status(&after) => Ok(BroadcastResult {
                 txid: txid.to_string(),
                 disposition: BroadcastDisposition::AlreadyKnown,
@@ -1169,7 +1178,7 @@ async fn broadcast_raw_transaction(
         };
     }
 
-    match transaction_status(client, txid).await {
+    match transaction_status(client, txid, network).await {
         Ok(status) if is_live_status(&status) => Ok(BroadcastResult {
             txid: txid.to_string(),
             disposition: BroadcastDisposition::Submitted,
@@ -1272,7 +1281,7 @@ mod tests {
     #[test]
     fn malformed_or_foreign_raw_transaction_is_rejected() {
         assert!(matches!(
-            inspect_signed_transaction(&[1, 2, 3]),
+            inspect_signed_transaction(&[1, 2, 3], WalletNetwork::Regtest),
             Err(WalletRpcError::InvalidTransaction(_))
         ));
     }
@@ -1367,6 +1376,7 @@ mod tests {
                     height: 0,
                 },
                 first,
+                WalletNetwork::Regtest,
             ),
             Err(WalletRpcError::InvalidTransaction(_))
         ));
@@ -1458,7 +1468,7 @@ mod tests {
 
     #[test]
     fn full_creator_validation_rejects_an_unreported_spent_sibling() {
-        use zcash_protocol::value::Zatoshis;
+        use zcash_protocol::{consensus::BranchId, value::Zatoshis};
         use zcash_transparent::bundle::{Authorized, Bundle, OutPoint, TxIn, TxOut};
 
         let receiver = TransparentAddress::PublicKeyHash([0x55; 20]);

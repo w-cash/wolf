@@ -18,7 +18,7 @@ use crate::{
         arbitrary::PreparedChain,
         finalized_state::{CheckpointVerifiedBlock, FinalizedState},
     },
-    tests::FakeChainHelper,
+    tests::{setup::uses_wcash_consensus, FakeChainHelper},
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -26,6 +26,11 @@ const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
 #[test]
 fn blocks_with_v5_transactions() -> Result<()> {
     let _init_guard = zebra_test::init();
+    if uses_wcash_consensus() {
+        // PreparedChain currently generates Zcash V5 histories. Wcash accepts
+        // V6 transactions and is covered by its native finalized-state test.
+        return Ok(());
+    }
     proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -57,6 +62,11 @@ fn blocks_with_v5_transactions() -> Result<()> {
 #[allow(clippy::print_stderr)]
 fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<()> {
     let _init_guard = zebra_test::init();
+    if uses_wcash_consensus() {
+        // This is intentionally a Zcash historical-upgrade fixture. Wcash has
+        // one height-1 Ironwood activation rather than the legacy schedule.
+        return Ok(());
+    }
 
     let network = ParametersBuilder::default()
         .with_activation_heights(ConfiguredActivationHeights {

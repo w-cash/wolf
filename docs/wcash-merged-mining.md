@@ -49,12 +49,13 @@ non-palindromic vector are documented in
 
 ## Node RPC contract
 
-The Wcash child node exposes two Namecoin-shaped methods:
+The Wcash child node exposes an exact-candidate mining API:
 
 ```text
 createauxblock("<Wcash payout address>")
 submitauxblock("<candidate hash in display order>", "<AuxPoW v2 hex>")
 getauxblockstatus("<candidate hash in display order>", "<AuxPoW v2 hex>")
+retireauxblock("<candidate hash in display order>", "<retire token>")
 ```
 
 `createauxblock` accepts an exact Wcash address in the selected network's
@@ -62,11 +63,24 @@ namespace. A transparent address selects the normal pool-integration path; a
 Unified Address with an Orchard receiver explicitly selects a private Ironwood
 coinbase. It proposal-validates the proof-free child,
 rechecks the tip, and caches the exact block. The response includes `hash`, the
-canonical proof-free block `data`, `chainid`, `previousblockhash`,
+canonical proof-free block `data`, a secret 32-byte `retiretoken`, `chainid`, `previousblockhash`,
 `coinbasevalue`, `target`, `bits`, and `height`. The coordinator independently
 decodes `data` and verifies its hash, height, predecessor, wire version,
-difficulty, and empty witness. Candidates are bounded to 16 entries, expire
-after ten minutes, and become invalid immediately when the child tip changes.
+difficulty, and empty witness. Candidates are bounded to 16 entries and expire
+after ten minutes. A candidate remains exact and retryable across a shallow
+child reorg while its parent is retained in either committed chain.
+
+`retireauxblock` lets the pool release an unsolved or parent-only generation
+when every listener and in-flight share handler has stopped. Its per-candidate
+capability is generated from the operating system CSPRNG, is redacted from
+coordinator diagnostics, and authorizes no other cache entry. Retirement is
+idempotent after a successful call or node restart. Once any canonically
+decoded `submitauxblock` attempt begins, retirement refuses to remove the
+candidate; exact-witness retry and reorg safety take precedence over reclaiming
+that slot. The native coordinator also refuses retirement while its durable
+outbox contains a Wcash winner for the generation. Preparation failures are
+retired before another candidate can be requested, and transient retirement
+failures block rotation with bounded backoff instead of consuming more slots.
 
 `submitauxblock` accepts a bounded canonical proof, attaches only the witness,
 checks that the proof-independent block ID is unchanged, and submits through
@@ -173,7 +187,8 @@ low-difficulty, duplicate, and stale shares, bounds frames and sessions, and
 binds a literal loopback IP only. It also bounds concurrent Equihash validation,
 serializes journal durability, and applies a sliding submission-rate limit per
 connection. The `native-serve` supervisor retires stale
-generations and proposal-checks replacements with bounded retry backoff. It
+generations through the authenticated candidate lease and proposal-checks
+replacements with bounded retry backoff. It
 disconnects miners during rotation; a public deployment should add a bounded
 multi-generation grace window as well as TLS, per-account authentication, rate
 limiting, variable difficulty, payout accounting, and monitoring in front of
@@ -237,9 +252,9 @@ height-zero node without the debug sync override, obtains a child candidate,
 mines through the ZIP-301 listener, and requires Wcash plus two Zcash processes
 to accept the resulting work. The same release script also passes a separate
 controlled Regtest wallet lifecycle: three private coinbases are scanned, a
-one-WCASH V6 transfer is matched in the mempool and block template, rejected by
+one-WEC V6 transfer is matched in the mempool and block template, rejected by
 both standard Zcash Regtest nodes, mined in a fourth AuxPoW block, and rescanned
-with the full 25-WCASH supply remaining in Ironwood. That transfer uses the
+with the full 25-WEC supply remaining in Ironwood. That transfer uses the
 explicit Regtest-only unsafe one-confirmation override; the public Testnet wallet
 policy remains 100 confirmations.
 
@@ -248,7 +263,7 @@ path. It rejects shielding at tip 99, enforces the 100-block maturity boundary a
 tip 100, recovers every current UTXO from a deliberately late wallet birthday,
 persists and broadcasts the exact shielding transaction, matches it in the
 mempool and block template, and mines it at height 101. Final wallet and chain
-checks conserve exactly 631.25 WCASH across transparent and Ironwood pools.
+checks conserve exactly 631.25 WEC across transparent and Ironwood pools.
 Rotating more than 16 accepted child candidates also covers release of confirmed
 winners beyond the coordinator's bounded active-candidate cache. Transparent
 maturity is not overridden.
