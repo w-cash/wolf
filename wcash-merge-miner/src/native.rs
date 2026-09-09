@@ -1038,7 +1038,7 @@ impl NativePreparedJob {
 }
 
 /// A valid pool share, classified against both independent network targets.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ValidatedNativeShare {
     job_id: [u8; 32],
     header_time: [u8; 4],
@@ -1048,6 +1048,22 @@ pub struct ValidatedNativeShare {
     accepted_target: Target,
     wcash_candidate: Option<SolvedAuxPow>,
     parent_block: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for ValidatedNativeShare {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ValidatedNativeShare")
+            .field("job_id", &hex::encode(self.job_id))
+            .field("header_time", &self.header_time)
+            .field("nonce", &"[REDACTED 32 bytes]")
+            .field("solution", &"[REDACTED 1344 bytes]")
+            .field("parent_block_hash", &self.parent_block_hash)
+            .field("accepted_target", &self.accepted_target)
+            .field("wcash_candidate", &self.wcash_candidate.is_some())
+            .field("parent_block", &self.parent_block.is_some())
+            .finish()
+    }
 }
 
 impl ValidatedNativeShare {
@@ -1693,6 +1709,10 @@ mod tests {
         assert_eq!(share.nonce(), &nonce);
         assert_eq!(share.solution(), &solution);
         assert_eq!(share.accepted_target(), Target::MAX);
+        let debug = format!("{share:?}");
+        assert!(debug.contains("[REDACTED 32 bytes]"));
+        assert!(debug.contains("[REDACTED 1344 bytes]"));
+        assert!(!debug.contains("solution: ["));
     }
 
     #[test]
