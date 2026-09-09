@@ -934,7 +934,7 @@ impl<P, U> Builder<P, U> {
             // Ironwood is available only when the target version carries an Ironwood bundle
             // (V6) and the consensus branch is one in which Ironwood is active.
             let ironwood_branch = match self.consensus_branch_id {
-                BranchId::Nu6_3 | BranchId::WcashTestnetV1 => true,
+                BranchId::Nu6_3 | BranchId::WcashTestnetV1 | BranchId::WcashRegtestV1 => true,
                 #[cfg(zcash_unstable = "nu7")]
                 BranchId::Nu7 => true,
                 _ => false,

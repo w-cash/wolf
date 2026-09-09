@@ -12,7 +12,8 @@ Upstream provenance:
   `403d5be1e96339534be098e3377fb8a78d68ca7585b1780133d884b810277418`
 
 The downstream changes teach the transaction implementation about
-`BranchId::WcashTestnetV1` from the adjacent vendored `zcash_protocol` crate:
+`BranchId::WcashTestnetV1` and the separate `BranchId::WcashRegtestV1` from the
+adjacent vendored `zcash_protocol` crate:
 
 - the branch uses NU6.3 / Ironwood bundle and circuit semantics;
 - only transaction version 6 is valid for this Wcash branch, so every
@@ -23,4 +24,6 @@ The downstream changes teach the transaction implementation about
   chain-boundary code. It rejects a caller-supplied ID unless it exactly matches
   the ID selected by the consensus parameters at the target height.
 
-Standard Zcash branch mappings and transaction-version rules are unchanged.
+The two Wcash branch IDs use identical protocol rules but remain distinct hash
+and signature domains. Standard Zcash branch mappings and transaction-version
+rules are unchanged.

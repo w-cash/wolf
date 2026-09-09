@@ -373,7 +373,14 @@ impl Network {
 
     /// Return the lowercase network name.
     pub fn lowercase_name(&self) -> String {
-        self.to_string().to_ascii_lowercase()
+        match self.wcash_network() {
+            // Version Wcash cache roots whenever pre-launch consensus changes,
+            // so an updated binary cannot silently trust state accepted by an
+            // incompatible prototype.
+            Some(wcash_genesis::WcashNetwork::Testnet) => "wcashtestnet-v4".to_owned(),
+            Some(wcash_genesis::WcashNetwork::Regtest) => "wcashregtest-v5".to_owned(),
+            _ => self.to_string().to_ascii_lowercase(),
+        }
     }
 
     /// Returns `true` if this network is a testing network.
@@ -528,10 +535,21 @@ impl zcash_protocol::consensus::Parameters for Network {
         &self,
         nu: zcash_protocol::consensus::NetworkUpgrade,
     ) -> zcash_protocol::consensus::BranchId {
-        if self.uses_wcash_consensus() && nu == zcash_protocol::consensus::NetworkUpgrade::Nu6_3 {
-            zcash_protocol::consensus::BranchId::WcashTestnetV1
-        } else {
-            nu.branch_id()
+        if nu == zcash_protocol::consensus::NetworkUpgrade::Nu6_3 {
+            match self.wcash_network() {
+                Some(wcash_genesis::WcashNetwork::Testnet) => {
+                    return zcash_protocol::consensus::BranchId::WcashTestnetV1;
+                }
+                Some(wcash_genesis::WcashNetwork::Regtest) => {
+                    return zcash_protocol::consensus::BranchId::WcashRegtestV1;
+                }
+                Some(wcash_genesis::WcashNetwork::Mainnet) => {
+                    panic!("Wcash Mainnet has no activated transaction signature domain")
+                }
+                None => {}
+            }
         }
+
+        nu.branch_id()
     }
 }

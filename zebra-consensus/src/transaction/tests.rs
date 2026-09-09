@@ -7,39 +7,55 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use chrono::{DateTime, TimeZone, Utc};
+#[cfg(not(feature = "wcash-consensus"))]
+use chrono::TimeZone;
+use chrono::{DateTime, Utc};
 use color_eyre::eyre::Report;
+#[cfg(not(feature = "wcash-consensus"))]
 use futures::{FutureExt, TryFutureExt};
+#[cfg(not(feature = "wcash-consensus"))]
 use tokio::time::timeout;
-use tower::{buffer::Buffer, service_fn, ServiceExt};
+#[cfg(not(feature = "wcash-consensus"))]
+use tower::buffer::Buffer;
+use tower::service_fn;
+use tower::ServiceExt;
 
 use zebra_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, Height},
-    parameters::{
-        testnet::{ConfiguredActivationHeights, Parameters},
-        Network, NetworkUpgrade,
-    },
-    primitives::{ed25519, x25519, Groth16Proof},
-    sapling,
-    serialization::{DateTime32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
-    sprout,
+    parameters::{testnet::ConfiguredActivationHeights, Network, NetworkUpgrade},
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction::{
         arbitrary::{
-            insert_fake_orchard_shielded_data, test_transactions, transactions_from_blocks,
-            v5_transactions, with_garbage_orchard_authorization, with_orchard_flags,
+            insert_fake_orchard_shielded_data, test_transactions, v5_transactions,
             with_orchard_value_balance,
         },
-        zip317, Hash, HashType, JoinSplitData, LockTime, Transaction,
+        zip317, Hash, HashType, LockTime, Transaction,
     },
-    transparent::{self, CoinbaseSpendRestriction},
+    transparent,
 };
 
+#[cfg(not(feature = "wcash-consensus"))]
+use zebra_chain::parameters::testnet::Parameters;
+#[cfg(not(feature = "wcash-consensus"))]
+use zebra_chain::primitives::{ed25519, x25519, Groth16Proof};
+#[cfg(not(feature = "wcash-consensus"))]
+use zebra_chain::serialization::DateTime32;
+#[cfg(not(feature = "wcash-consensus"))]
+use zebra_chain::transaction::arbitrary::{with_garbage_orchard_authorization, with_orchard_flags};
+#[cfg(not(feature = "wcash-consensus"))]
+use zebra_chain::transaction::{arbitrary::transactions_from_blocks, JoinSplitData};
+#[cfg(not(feature = "wcash-consensus"))]
+use zebra_chain::{sapling, sprout, transparent::CoinbaseSpendRestriction};
+#[cfg(not(feature = "wcash-consensus"))]
 use zebra_node_services::mempool;
+#[cfg(not(feature = "wcash-consensus"))]
 use zebra_state::ValidateContextError;
 use zebra_test::mock_service::MockService;
 
-use crate::{error::TransactionError, transaction::POLL_MEMPOOL_DELAY};
+use crate::error::TransactionError;
+#[cfg(not(feature = "wcash-consensus"))]
+use crate::transaction::POLL_MEMPOOL_DELAY;
 
 use super::{
     check, check_common_consensus_rules, BlockRequest, BlockTxVerifier, MempoolRequest,
@@ -51,6 +67,7 @@ mod prop;
 
 /// Returns the timeout duration for tests, extended when running under coverage
 /// instrumentation to account for the performance overhead.
+#[cfg(not(feature = "wcash-consensus"))]
 fn test_timeout() -> std::time::Duration {
     // Check if we're running under cargo-llvm-cov by looking for its environment variables
     if std::env::var("LLVM_COV_FLAGS").is_ok() || std::env::var("CARGO_LLVM_COV").is_ok() {
@@ -59,6 +76,14 @@ fn test_timeout() -> std::time::Duration {
     } else {
         std::time::Duration::from_secs(30)
     }
+}
+
+#[cfg(feature = "wcash-consensus")]
+#[test]
+#[should_panic(expected = "incompatible with this binary's compiled consensus profile")]
+fn wcash_mempool_test_verifier_rejects_zcash_networks() {
+    let state: MockService<_, _, _, _> = MockService::build().for_unit_tests();
+    let _verifier = MempoolTxVerifier::new_for_tests(&Network::Mainnet, state);
 }
 
 #[test]
@@ -84,6 +109,7 @@ fn v5_transactions_basic_check() -> Result<(), Report> {
 #[test]
 fn wcash_requires_v6_and_exact_branch_domain() {
     let wcash = Network::new_wcash_testnet();
+    let wcash_regtest = Network::new_wcash_regtest();
     let wcash_height = Height(1);
     let zcash_mainnet = Network::Mainnet;
     let zcash_mainnet_height = NetworkUpgrade::Nu6_3
@@ -114,6 +140,14 @@ fn wcash_requires_v6_and_exact_branch_domain() {
         LockTime::Height(Height::MIN),
         Height(2),
     );
+    let wcash_regtest_tx = Transaction::test_v6_for_network(
+        &wcash_regtest,
+        wcash_height,
+        vec![input.clone()],
+        vec![output.clone()],
+        LockTime::Height(Height::MIN),
+        Height(2),
+    );
     let zcash_tx = Transaction::test_v6(
         NetworkUpgrade::Nu6_3,
         vec![input.clone()],
@@ -132,6 +166,20 @@ fn wcash_requires_v6_and_exact_branch_domain() {
         "a Zcash NU6.3 transaction must not replay on Wcash",
     );
     assert_eq!(
+        check::consensus_branch_id(&wcash_regtest_tx, wcash_height, &wcash_regtest),
+        Ok(())
+    );
+    assert_eq!(
+        check::consensus_branch_id(&wcash_regtest_tx, wcash_height, &wcash),
+        Err(TransactionError::WrongConsensusBranchId),
+        "a Wcash Regtest transaction must not replay on Wcash Testnet",
+    );
+    assert_eq!(
+        check::consensus_branch_id(&wcash_tx, wcash_height, &wcash_regtest),
+        Err(TransactionError::WrongConsensusBranchId),
+        "a Wcash Testnet transaction must not replay on Wcash Regtest",
+    );
+    assert_eq!(
         check::consensus_branch_id(&wcash_tx, zcash_mainnet_height, &zcash_mainnet),
         Err(TransactionError::WrongConsensusBranchId),
         "a Wcash transaction must not replay on Zcash Mainnet",
@@ -142,11 +190,18 @@ fn wcash_requires_v6_and_exact_branch_domain() {
         "a Wcash transaction must not replay on Zcash Testnet",
     );
     assert_eq!(
+        check::consensus_branch_id(&wcash_regtest_tx, zcash_testnet_height, &zcash_testnet,),
+        Err(TransactionError::WrongConsensusBranchId),
+        "a Wcash Regtest transaction must not replay on Zcash Testnet",
+    );
+    assert_eq!(
         check::consensus_branch_id(&zcash_tx, zcash_mainnet_height, &zcash_mainnet),
         Ok(()),
         "standard Zcash NU6.3 behavior must remain unchanged",
     );
+    assert_ne!(wcash_tx.hash(), wcash_regtest_tx.hash());
     assert_ne!(wcash_tx.hash(), zcash_tx.hash());
+    assert_ne!(wcash_regtest_tx.hash(), zcash_tx.hash());
     let previous_outputs = Arc::new(vec![output.clone()]);
     let wcash_sighash = wcash_tx
         .sighash(
@@ -156,6 +211,14 @@ fn wcash_requires_v6_and_exact_branch_domain() {
             Some((0, vec![0x51])),
         )
         .expect("the Wcash V6 transparent signature hash is defined");
+    let wcash_regtest_sighash = wcash_regtest_tx
+        .sighash(
+            NetworkUpgrade::Nu6_3,
+            HashType::ALL,
+            previous_outputs.clone(),
+            Some((0, vec![0x51])),
+        )
+        .expect("the Wcash Regtest V6 transparent signature hash is defined");
     let zcash_sighash = zcash_tx
         .sighash(
             NetworkUpgrade::Nu6_3,
@@ -167,6 +230,14 @@ fn wcash_requires_v6_and_exact_branch_domain() {
     assert_ne!(
         wcash_sighash, zcash_sighash,
         "the Wcash branch ID must domain-separate transparent signatures as well as transaction IDs",
+    );
+    assert_ne!(
+        wcash_sighash, wcash_regtest_sighash,
+        "Wcash Testnet and Regtest signatures must have separate domains",
+    );
+    assert_ne!(
+        wcash_regtest_sighash, zcash_sighash,
+        "Wcash Regtest and Zcash signatures must have separate domains",
     );
 
     let legacy_transactions = [
@@ -233,6 +304,128 @@ fn wcash_requires_v6_and_exact_branch_domain() {
         Ok(()),
         "the V6 rule must retain the trusted genesis exception",
     );
+}
+
+#[cfg(feature = "wcash-consensus")]
+#[tokio::test]
+async fn wcash_rejects_inherited_shielded_pools_in_blocks_and_mempool() {
+    use zebra_chain::transaction::arbitrary::fake_bundle_for_branch;
+
+    let _init_guard = zebra_test::init();
+    let network = Network::new_wcash_testnet();
+    let height = Height(1);
+    let input = transparent::Input::PrevOut {
+        outpoint: transparent::OutPoint {
+            hash: Hash([0x22; 32]),
+            index: 0,
+        },
+        unlock_script: transparent::Script::new(&[0x51]),
+        sequence: u32::MAX,
+    };
+    let output = transparent::Output {
+        value: Amount::try_from(1).expect("one zatoshi is valid"),
+        lock_script: transparent::Script::new(&[0x51]),
+    };
+    let base_transaction = Transaction::test_v6_for_network(
+        &network,
+        height,
+        vec![input],
+        vec![output],
+        LockTime::unlocked(),
+        Height::MAX_EXPIRY_HEIGHT,
+    );
+
+    let sapling_source = test_transactions(&Network::Mainnet)
+        .find_map(|(_, transaction)| {
+            transaction
+                .has_sapling_shielded_data()
+                .then_some(transaction)
+        })
+        .expect("the Zcash block test vectors contain a Sapling bundle");
+    let sapling_bundle = sapling_source
+        .sapling_bundle()
+        .cloned()
+        .expect("the selected transaction contains a Sapling bundle");
+    let sapling_transaction = base_transaction
+        .clone()
+        .with_sapling_bundle(Some(sapling_bundle));
+
+    let sprout_transaction = test_transactions(&Network::Mainnet)
+        .find_map(|(_, transaction)| {
+            (!transaction.is_coinbase() && transaction.has_sprout_joinsplit_data())
+                .then_some(transaction)
+        })
+        .expect("the Zcash block test vectors contain a non-coinbase Sprout transaction");
+
+    let orchard_bundle = fake_bundle_for_branch(
+        zcash_protocol::consensus::BranchId::WcashTestnetV1,
+        ::orchard::ValuePool::Orchard,
+        1,
+        0x0057_4341_5348,
+    )
+    .expect("the Wcash V6 format can represent an inherited Orchard bundle");
+    let orchard_transaction = base_transaction
+        .clone()
+        .with_orchard_bundle(Some(orchard_bundle));
+
+    let ironwood_bundle = fake_bundle_for_branch(
+        zcash_protocol::consensus::BranchId::WcashTestnetV1,
+        ::orchard::ValuePool::Ironwood,
+        1,
+        0x4952_4f4e_574f_4f44,
+    )
+    .expect("the Wcash V6 format supports Ironwood");
+    let ironwood_transaction = base_transaction.with_ironwood_bundle(Some(ironwood_bundle));
+    assert_eq!(
+        check_common_consensus_rules(&ironwood_transaction, height, &network),
+        Ok(()),
+        "Wcash must retain its selected private pool",
+    );
+
+    let cases = [
+        (
+            sprout_transaction.as_ref().clone(),
+            Height::MIN,
+            TransactionError::WcashSproutPoolDisabled,
+        ),
+        (
+            sapling_transaction,
+            height,
+            TransactionError::WcashSaplingPoolDisabled,
+        ),
+        (
+            orchard_transaction,
+            height,
+            TransactionError::WcashOrchardPoolDisabled,
+        ),
+    ];
+
+    for (transaction, verification_height, expected_error) in cases {
+        assert_eq!(
+            check_common_consensus_rules(&transaction, verification_height, &network),
+            Err(expected_error.clone()),
+        );
+
+        let state: MockService<_, _, _, _> = MockService::build().for_unit_tests();
+        let block_result = BlockTxVerifier::new(&network, state.clone())
+            .oneshot(BlockRequest {
+                transaction_hash: transaction.hash(),
+                transaction: Arc::new(transaction.clone()),
+                known_utxos: Arc::new(HashMap::new()),
+                height: verification_height,
+                time: DateTime::<Utc>::MAX_UTC,
+            })
+            .await;
+        assert_eq!(block_result, Err(expected_error.clone()));
+
+        let mempool_result = MempoolTxVerifier::new_for_tests(&network, state)
+            .oneshot(MempoolRequest {
+                transaction: Arc::new(transaction).into(),
+                height: verification_height,
+            })
+            .await;
+        assert_eq!(mempool_result, Err(expected_error));
+    }
 }
 
 #[cfg(feature = "wcash-consensus")]
@@ -308,6 +501,233 @@ async fn wcash_v6_transfer_passes_block_and_mempool_verifiers() {
             .id,
         expected_id
     );
+}
+
+#[cfg(feature = "wcash-consensus")]
+#[tokio::test]
+async fn wcash_v6_mempool_rejects_missing_inputs_and_unpaid_actions() {
+    let _init_guard = zebra_test::init();
+    let height = Height(1);
+
+    for network in [Network::new_wcash_testnet(), Network::new_wcash_regtest()] {
+        let (missing_input, output, _) = mock_transparent_transfer(
+            Height::MIN,
+            true,
+            0,
+            Amount::try_from(10_001).expect("valid test amount"),
+        );
+        let missing_transaction = Transaction::test_v6_for_network(
+            &network,
+            height,
+            vec![missing_input],
+            vec![output],
+            LockTime::unlocked(),
+            Height::MAX_EXPIRY_HEIGHT,
+        );
+        let missing_outpoint = missing_transaction.inputs()[0]
+            .outpoint()
+            .expect("the test transaction spends a previous output");
+        let mut state = MockService::build().for_unit_tests();
+        let verification =
+            MempoolTxVerifier::new_for_tests(&network, state.clone()).oneshot(MempoolRequest {
+                transaction: Arc::new(missing_transaction).into(),
+                height,
+            });
+        let state_request = async {
+            state
+                .expect_request(zebra_state::Request::UnspentBestChainUtxo(missing_outpoint))
+                .await
+                .respond(zebra_state::Response::UnspentBestChainUtxo(None));
+        };
+        let (result, ()) = futures::join!(verification, state_request);
+        assert_eq!(result, Err(TransactionError::TransparentInputNotFound));
+
+        let (low_fee_input, output, known_utxos) = mock_transparent_transfer(
+            Height::MIN,
+            true,
+            1,
+            Amount::try_from(10).expect("valid test amount"),
+        );
+        let low_fee_transaction = Transaction::test_v6_for_network(
+            &network,
+            height,
+            vec![low_fee_input],
+            vec![output],
+            LockTime::unlocked(),
+            Height::MAX_EXPIRY_HEIGHT,
+        );
+        let low_fee_outpoint = low_fee_transaction.inputs()[0]
+            .outpoint()
+            .expect("the test transaction spends a previous output");
+        let mut state = MockService::build().for_unit_tests();
+        let verification =
+            MempoolTxVerifier::new_for_tests(&network, state.clone()).oneshot(MempoolRequest {
+                transaction: Arc::new(low_fee_transaction).into(),
+                height,
+            });
+        let state_request = async {
+            state
+                .expect_request(zebra_state::Request::UnspentBestChainUtxo(low_fee_outpoint))
+                .await
+                .respond(zebra_state::Response::UnspentBestChainUtxo(
+                    known_utxos
+                        .get(&low_fee_outpoint)
+                        .map(|utxo| utxo.utxo.clone()),
+                ));
+        };
+        let (result, ()) = futures::join!(verification, state_request);
+        assert_eq!(
+            result,
+            Err(TransactionError::Zip317(zip317::Error::UnpaidActions))
+        );
+    }
+}
+
+#[cfg(feature = "wcash-consensus")]
+#[tokio::test]
+async fn wcash_v6_rejects_duplicate_transparent_spends_on_both_paths() {
+    let height = Height(1);
+
+    for network in [Network::new_wcash_testnet(), Network::new_wcash_regtest()] {
+        let (input, output, known_utxos) = mock_transparent_transfer(
+            Height::MIN,
+            true,
+            0,
+            Amount::try_from(10_001).expect("valid test amount"),
+        );
+        let outpoint = input
+            .outpoint()
+            .expect("the test transaction spends a previous output");
+        let transaction = Transaction::test_v6_for_network(
+            &network,
+            height,
+            vec![input.clone(), input],
+            vec![output],
+            LockTime::unlocked(),
+            Height::MAX_EXPIRY_HEIGHT,
+        );
+        let state: MockService<_, _, _, _> = MockService::build().for_unit_tests();
+        let block_result = BlockTxVerifier::new(&network, state.clone())
+            .oneshot(BlockRequest {
+                transaction_hash: transaction.hash(),
+                transaction: Arc::new(transaction.clone()),
+                known_utxos: Arc::new(known_utxos),
+                height,
+                time: DateTime::<Utc>::MAX_UTC,
+            })
+            .await;
+        assert_eq!(
+            block_result,
+            Err(TransactionError::DuplicateTransparentSpend(outpoint))
+        );
+
+        let mempool_result = MempoolTxVerifier::new_for_tests(&network, state)
+            .oneshot(MempoolRequest {
+                transaction: Arc::new(transaction).into(),
+                height,
+            })
+            .await;
+        assert_eq!(
+            mempool_result,
+            Err(TransactionError::DuplicateTransparentSpend(outpoint))
+        );
+    }
+}
+
+#[cfg(feature = "wcash-consensus")]
+#[tokio::test]
+async fn wcash_v6_block_verification_rejects_invalid_transparent_scripts() {
+    let height = Height(1);
+
+    for network in [Network::new_wcash_testnet(), Network::new_wcash_regtest()] {
+        let (input, output, known_utxos) = mock_transparent_transfer(
+            Height::MIN,
+            false,
+            0,
+            Amount::try_from(10_001).expect("valid test amount"),
+        );
+        let transaction = Transaction::test_v6_for_network(
+            &network,
+            height,
+            vec![input],
+            vec![output],
+            LockTime::unlocked(),
+            Height::MAX_EXPIRY_HEIGHT,
+        );
+        let state = service_fn(|_| async { unreachable!("all UTXOs are supplied by the block") });
+        let result = BlockTxVerifier::new(&network, state)
+            .oneshot(BlockRequest {
+                transaction_hash: transaction.hash(),
+                transaction: Arc::new(transaction),
+                known_utxos: Arc::new(known_utxos),
+                height,
+                time: DateTime::<Utc>::MAX_UTC,
+            })
+            .await;
+
+        assert_eq!(
+            result,
+            Err(TransactionError::InternalDowncastError(
+                "downcast to known transaction error type failed, original error: ScriptInvalid"
+                    .to_string(),
+            ))
+        );
+    }
+}
+
+#[cfg(feature = "wcash-consensus")]
+#[tokio::test]
+async fn wcash_testnet_and_regtest_reject_each_others_transactions() {
+    let _init_guard = zebra_test::init();
+    let height = Height(1);
+    let (input, output, _) = mock_transparent_transfer(
+        Height::MIN,
+        true,
+        0,
+        Amount::try_from(10_001).expect("valid test amount"),
+    );
+
+    for (source, destination) in [
+        (Network::new_wcash_testnet(), Network::new_wcash_regtest()),
+        (Network::new_wcash_regtest(), Network::new_wcash_testnet()),
+    ] {
+        let transaction = Transaction::test_v6_for_network(
+            &source,
+            height,
+            vec![input.clone()],
+            vec![output.clone()],
+            LockTime::unlocked(),
+            Height::MAX_EXPIRY_HEIGHT,
+        );
+        let state: MockService<_, _, _, _> = MockService::build().for_unit_tests();
+
+        let block_result = BlockTxVerifier::new(&destination, state.clone())
+            .oneshot(BlockRequest {
+                transaction_hash: transaction.hash(),
+                transaction: Arc::new(transaction.clone()),
+                known_utxos: Arc::new(HashMap::new()),
+                height,
+                time: DateTime::<Utc>::MAX_UTC,
+            })
+            .await;
+        assert_eq!(
+            block_result,
+            Err(TransactionError::WrongConsensusBranchId),
+            "a {source} transaction must fail block verification on {destination}",
+        );
+
+        let mempool_result = MempoolTxVerifier::new_for_tests(&destination, state)
+            .oneshot(MempoolRequest {
+                transaction: Arc::new(transaction).into(),
+                height,
+            })
+            .await;
+        assert_eq!(
+            mempool_result,
+            Err(TransactionError::WrongConsensusBranchId),
+            "a {source} transaction must fail mempool verification on {destination}",
+        );
+    }
 }
 
 #[cfg(feature = "wcash-consensus")]
@@ -781,6 +1201,7 @@ fn v5_transaction_with_no_outputs_fails_verification() {
     }
 }
 
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn mempool_request_with_missing_input_is_rejected() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_unit_tests();
@@ -817,6 +1238,7 @@ async fn mempool_request_with_missing_input_is_rejected() {
     }
 }
 
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn mempool_request_with_present_input_is_accepted() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -877,6 +1299,7 @@ async fn mempool_request_with_present_input_is_accepted() {
     );
 }
 
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn mempool_request_with_invalid_lock_time_is_rejected() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -954,6 +1377,7 @@ async fn mempool_request_with_invalid_lock_time_is_rejected() {
     );
 }
 
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn mempool_request_with_unlocked_lock_time_is_accepted() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -1014,6 +1438,7 @@ async fn mempool_request_with_unlocked_lock_time_is_accepted() {
     );
 }
 
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn mempool_request_with_lock_time_max_sequence_number_is_accepted() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -1082,6 +1507,7 @@ async fn mempool_request_with_lock_time_max_sequence_number_is_accepted() {
     );
 }
 
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn mempool_request_with_past_lock_time_is_accepted() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -1155,6 +1581,7 @@ async fn mempool_request_with_past_lock_time_is_accepted() {
     );
 }
 
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn mempool_request_with_unmined_output_spends_is_accepted() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -1271,6 +1698,7 @@ async fn mempool_request_with_unmined_output_spends_is_accepted() {
 /// verifier. `BlockTxVerifier` has no dependency on any mempool service, so
 /// this is now also enforced structurally; this test additionally checks the
 /// runtime behavior when both verifiers share a state backend.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn block_verification_does_not_use_mempool_verified_state() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -1439,6 +1867,7 @@ async fn block_verification_does_not_use_mempool_verified_state() {
 
 /// Tests that calls to the transaction verifier with a mempool request that spends
 /// immature coinbase outputs will return an error.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn mempool_request_with_immature_spend_is_rejected() {
     let _init_guard = zebra_test::init();
@@ -1540,6 +1969,7 @@ async fn mempool_request_with_immature_spend_is_rejected() {
 
 /// Tests that calls to the transaction verifier with a mempool request that spends
 /// mature coinbase outputs to transparent outputs will return Ok() on Regtest.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn mempool_request_with_transparent_coinbase_spend_is_accepted_on_regtest() {
     let _init_guard = zebra_test::init();
@@ -1640,6 +2070,7 @@ async fn mempool_request_with_transparent_coinbase_spend_is_accepted_on_regtest(
 
 /// Tests that errors from the read state service are correctly converted into
 /// transaction verifier errors.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn state_error_converted_correctly() {
     use zebra_state::DuplicateNullifierError;
@@ -1764,6 +2195,7 @@ fn v5_coinbase_transaction_with_enable_spends_flag_fails_validation() {
     }
 }
 
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_transaction_is_rejected_before_nu5_activation() {
     let sapling = NetworkUpgrade::Sapling;
@@ -1791,6 +2223,7 @@ async fn v5_transaction_is_rejected_before_nu5_activation() {
     }
 }
 
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_transaction_is_accepted_after_nu5_activation() {
     let _init_guard = zebra_test::init();
@@ -1818,6 +2251,7 @@ async fn v5_transaction_is_accepted_after_nu5_activation() {
 }
 
 /// Test if V4 transaction with transparent funds is accepted.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v4_transaction_with_transparent_transfer_is_accepted() {
     let network = Network::Mainnet;
@@ -1872,6 +2306,7 @@ async fn v4_transaction_with_transparent_transfer_is_accepted() {
 
 /// Tests if a non-coinbase V4 transaction with the last valid expiry height is
 /// accepted.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v4_transaction_with_last_valid_expiry_height() {
     let state_service =
@@ -1918,6 +2353,7 @@ async fn v4_transaction_with_last_valid_expiry_height() {
 ///
 /// Note that an expiry height lower than the block height is considered
 /// *expired* for *non-coinbase* transactions.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v4_coinbase_transaction_with_low_expiry_height() {
     let state_service =
@@ -1958,6 +2394,7 @@ async fn v4_coinbase_transaction_with_low_expiry_height() {
 }
 
 /// Tests if an expired non-coinbase V4 transaction is rejected.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v4_transaction_with_too_low_expiry_height() {
     let state_service =
@@ -2009,6 +2446,7 @@ async fn v4_transaction_with_too_low_expiry_height() {
 
 /// Tests if a non-coinbase V4 transaction with an expiry height exceeding the
 /// maximum is rejected.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v4_transaction_with_exceeding_expiry_height() {
     let state_service =
@@ -2059,6 +2497,7 @@ async fn v4_transaction_with_exceeding_expiry_height() {
 
 /// Tests if a coinbase V4 transaction with an expiry height exceeding the
 /// maximum is rejected.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v4_coinbase_transaction_with_exceeding_expiry_height() {
     let state_service =
@@ -2112,6 +2551,7 @@ async fn v4_coinbase_transaction_with_exceeding_expiry_height() {
 /// A non-coinbase V4/V5/V6 transaction with an expiry height in the out-of-range wire band
 /// [2^31, 2^32 - 1] is rejected. `expiry_height()` preserves the raw wire value so the
 /// verifier can apply the maximum-height rule instead of treating it as "no expiry".
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn transaction_with_out_of_range_expiry_height() {
     let network = Network::Mainnet;
@@ -2222,6 +2662,7 @@ async fn transaction_with_out_of_range_expiry_height() {
 
 /// A coinbase transaction with an expiry height in the out-of-range wire band is rejected:
 /// pre-NU5 by the expiry maximum, NU5 onward by the must-equal-block-height rule.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn coinbase_with_out_of_range_expiry_height() {
     let network = Network::Mainnet;
@@ -2282,6 +2723,7 @@ async fn coinbase_with_out_of_range_expiry_height() {
 }
 
 /// Test if V4 coinbase transaction is accepted.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v4_coinbase_transaction_is_accepted() {
     let network = Network::Mainnet;
@@ -2330,6 +2772,7 @@ async fn v4_coinbase_transaction_is_accepted() {
 ///
 /// This test simulates the case where the script verifier rejects the transaction because the
 /// script prevents spending the source UTXO.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v4_transaction_with_transparent_transfer_is_rejected_by_the_script() {
     let network = Network::Mainnet;
@@ -2384,6 +2827,7 @@ async fn v4_transaction_with_transparent_transfer_is_rejected_by_the_script() {
 }
 
 /// Test if V4 transaction with an internal double spend of transparent funds is rejected.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v4_transaction_with_conflicting_transparent_spend_is_rejected() {
     let network = Network::Mainnet;
@@ -2439,6 +2883,7 @@ async fn v4_transaction_with_conflicting_transparent_spend_is_rejected() {
 }
 
 /// Test if V4 transaction with a joinsplit that has duplicate nullifiers is rejected.
+#[cfg(not(feature = "wcash-consensus"))]
 #[test]
 fn v4_transaction_with_conflicting_sprout_nullifier_inside_joinsplit_is_rejected() {
     let _init_guard = zebra_test::init();
@@ -2492,6 +2937,7 @@ fn v4_transaction_with_conflicting_sprout_nullifier_inside_joinsplit_is_rejected
 }
 
 /// Test if V4 transaction with duplicate nullifiers across joinsplits is rejected.
+#[cfg(not(feature = "wcash-consensus"))]
 #[test]
 fn v4_transaction_with_conflicting_sprout_nullifier_across_joinsplits_is_rejected() {
     let _init_guard = zebra_test::init();
@@ -2551,6 +2997,7 @@ fn v4_transaction_with_conflicting_sprout_nullifier_across_joinsplits_is_rejecte
 }
 
 /// Test if V5 transaction with transparent funds is accepted.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_transaction_with_transparent_transfer_is_accepted() {
     let network = Network::new_default_testnet();
@@ -2607,6 +3054,7 @@ async fn v5_transaction_with_transparent_transfer_is_accepted() {
 
 /// Tests if a non-coinbase V5 transaction with the last valid expiry height is
 /// accepted.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_transaction_with_last_valid_expiry_height() {
     let network = Network::new_default_testnet();
@@ -2652,6 +3100,7 @@ async fn v5_transaction_with_last_valid_expiry_height() {
 
 /// Tests that a coinbase V5 transaction is accepted only if its expiry height
 /// is equal to the height of the block the transaction belongs to.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_coinbase_transaction_expiry_height() {
     let network = Network::new_default_testnet();
@@ -2784,6 +3233,7 @@ async fn v5_coinbase_transaction_expiry_height() {
 }
 
 /// Tests if an expired non-coinbase V5 transaction is rejected.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_transaction_with_too_low_expiry_height() {
     let network = Network::new_default_testnet();
@@ -2836,6 +3286,7 @@ async fn v5_transaction_with_too_low_expiry_height() {
 }
 
 /// Tests if a non-coinbase V5 transaction with an expiry height exceeding the maximum is rejected.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_transaction_with_exceeding_expiry_height() {
     let state = service_fn(|_| async { unreachable!("State service should not be called") });
@@ -2886,6 +3337,7 @@ async fn v5_transaction_with_exceeding_expiry_height() {
 }
 
 /// Test if V5 coinbase transaction is accepted.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_coinbase_transaction_is_accepted() {
     let network = Network::new_default_testnet();
@@ -2937,6 +3389,7 @@ async fn v5_coinbase_transaction_is_accepted() {
 ///
 /// This test simulates the case where the script verifier rejects the transaction because the
 /// script prevents spending the source UTXO.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_transaction_with_transparent_transfer_is_rejected_by_the_script() {
     let network = Network::new_default_testnet();
@@ -2993,6 +3446,7 @@ async fn v5_transaction_with_transparent_transfer_is_rejected_by_the_script() {
 }
 
 /// Test if V5 transaction with an internal double spend of transparent funds is rejected.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_transaction_with_conflicting_transparent_spend_is_rejected() {
     for network in Network::iter() {
@@ -3042,6 +3496,7 @@ async fn v5_transaction_with_conflicting_transparent_spend_is_rejected() {
 /// Test if signed V4 transaction with a dummy [`sprout::JoinSplit`] is accepted.
 ///
 /// This test verifies if the transaction verifier correctly accepts a signed transaction.
+#[cfg(not(feature = "wcash-consensus"))]
 #[test]
 fn v4_with_signed_sprout_transfer_is_accepted() {
     let _init_guard = zebra_test::init();
@@ -3085,6 +3540,7 @@ fn v4_with_signed_sprout_transfer_is_accepted() {
 ///
 /// This test verifies if the transaction verifier correctly rejects the transaction because of the
 /// invalid JoinSplit.
+#[cfg(not(feature = "wcash-consensus"))]
 #[test]
 fn v4_with_modified_joinsplit_is_rejected() {
     let _init_guard = zebra_test::init();
@@ -3109,6 +3565,7 @@ fn v4_with_modified_joinsplit_is_rejected() {
     })
 }
 
+#[cfg(not(feature = "wcash-consensus"))]
 async fn v4_with_joinsplit_is_rejected_for_modification(
     modification: JoinSplitModification,
     expected_error: TransactionError,
@@ -3163,6 +3620,7 @@ async fn v4_with_joinsplit_is_rejected_for_modification(
 }
 
 /// Test if a V4 transaction with Sapling spends is accepted by the verifier.
+#[cfg(not(feature = "wcash-consensus"))]
 #[test]
 fn v4_with_sapling_spends() {
     let _init_guard = zebra_test::init();
@@ -3206,6 +3664,7 @@ fn v4_with_sapling_spends() {
 }
 
 /// Test if a V4 transaction with a duplicate Sapling spend is rejected by the verifier.
+#[cfg(not(feature = "wcash-consensus"))]
 #[test]
 fn v4_with_duplicate_sapling_spends() {
     let _init_guard = zebra_test::init();
@@ -3251,6 +3710,7 @@ fn v4_with_duplicate_sapling_spends() {
 }
 
 /// Test if a V4 transaction with Sapling outputs but no spends is accepted by the verifier.
+#[cfg(not(feature = "wcash-consensus"))]
 #[test]
 fn v4_with_sapling_outputs_and_no_spends() {
     let _init_guard = zebra_test::init();
@@ -3296,6 +3756,7 @@ fn v4_with_sapling_outputs_and_no_spends() {
 /// Test that a V4 transaction with a small-order Sapling spend `rk` parses but fails verification.
 /// Rejected at parse time before the `zcash_primitives` refactor, now by `sapling-crypto`'s
 /// `check_spend` — pinned here at its new layer.
+#[cfg(not(feature = "wcash-consensus"))]
 #[test]
 fn v4_with_small_order_rk_sapling_spend() {
     let _init_guard = zebra_test::init();
@@ -3339,6 +3800,7 @@ fn v4_with_small_order_rk_sapling_spend() {
 /// Test that a V4 transaction with a small-order Sapling output `epk` parses but fails verification.
 /// Rejected at parse time before the `zcash_primitives` refactor, now by `sapling-crypto`'s
 /// `check_output` — pinned here at its new layer.
+#[cfg(not(feature = "wcash-consensus"))]
 #[test]
 fn v4_with_small_order_epk_sapling_output() {
     let _init_guard = zebra_test::init();
@@ -3380,6 +3842,7 @@ fn v4_with_small_order_epk_sapling_output() {
 }
 
 /// Test if a V5 transaction with Sapling spends is accepted by the verifier.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_with_sapling_spends() {
     let _init_guard = zebra_test::init();
@@ -3423,6 +3886,7 @@ async fn v5_with_sapling_spends() {
 }
 
 /// Test if a V5 transaction with a duplicate Sapling spend is rejected by the verifier.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_with_duplicate_sapling_spends() {
     let _init_guard = zebra_test::init();
@@ -3463,6 +3927,7 @@ async fn v5_with_duplicate_sapling_spends() {
 /// Test that a V5 transaction with a small-order Sapling spend `rk` parses but fails verification.
 /// Rejected at parse time before the `zcash_primitives` refactor, now by `sapling-crypto`'s
 /// `check_spend` — pinned here at its new layer.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_with_small_order_rk_sapling_spend() {
     let _init_guard = zebra_test::init();
@@ -3501,6 +3966,7 @@ async fn v5_with_small_order_rk_sapling_spend() {
 /// Test that a V5 transaction with a small-order Sapling output `epk` parses but fails verification.
 /// Rejected at parse time before the `zcash_primitives` refactor, now by `sapling-crypto`'s
 /// `check_output` — pinned here at its new layer.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_with_small_order_epk_sapling_output() {
     let _init_guard = zebra_test::init();
@@ -3538,6 +4004,7 @@ async fn v5_with_small_order_epk_sapling_output() {
 }
 
 /// Test if a V5 transaction with a duplicate Orchard action is rejected by the verifier.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_with_duplicate_orchard_action() {
     use ::orchard::bundle::{Bundle as OrchardBundle, Flags as OrchardFlags};
@@ -3614,6 +4081,7 @@ async fn v5_with_duplicate_orchard_action() {
 /// Checks the activation boundary of the temporary Orchard-disabling soft fork:
 /// it is inactive below the configured height and active at and above it, can be
 /// disabled entirely, and Mainnet uses its fixed activation height.
+#[cfg(not(feature = "wcash-consensus"))]
 #[test]
 fn orchard_disabling_soft_fork_activation_boundary() {
     let _init_guard = zebra_test::init();
@@ -3664,6 +4132,7 @@ fn orchard_disabling_soft_fork_activation_boundary() {
 /// The temporary Orchard-disabling soft fork must reject transactions that
 /// contain Orchard actions once it is active, in both block and mempool
 /// verification contexts.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn orchard_disabling_soft_fork_rejects_orchard_actions_in_blocks_and_mempool() {
     let _init_guard = zebra_test::init();
@@ -3748,6 +4217,7 @@ async fn orchard_disabling_soft_fork_rejects_orchard_actions_in_blocks_and_mempo
 /// Negative control mirroring the zcashd test: a transaction without Orchard
 /// actions is unaffected by the soft fork and is still accepted while it is
 /// active.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn orchard_disabling_soft_fork_accepts_non_orchard_transactions() {
     let _init_guard = zebra_test::init();
@@ -3837,6 +4307,7 @@ async fn orchard_disabling_soft_fork_accepts_non_orchard_transactions() {
 /// Mirrors the zcashd boundary test: the soft fork must accept an Orchard
 /// transaction one block below its activation height but reject the same
 /// transaction at the activation height.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn orchard_disabling_soft_fork_accepts_orchard_actions_below_activation_height() {
     let _init_guard = zebra_test::init();
@@ -3940,6 +4411,7 @@ async fn orchard_disabling_soft_fork_accepts_orchard_actions_below_activation_he
 }
 
 /// Checks that the tx verifier handles consensus branch ids in V5 txs correctly.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn v5_consensus_branch_ids() {
     let mut state = MockService::build().for_unit_tests();
@@ -4203,6 +4675,7 @@ fn mock_transparent_transfer(
 /// Then create UTXO with a [`transparent::Output`] spending some coinbase funds.
 ///
 /// Returns the generated coinbase input and transparent output.
+#[cfg(not(feature = "wcash-consensus"))]
 fn mock_coinbase_transparent_output(
     coinbase_height: block::Height,
 ) -> (transparent::Input, transparent::Output) {
@@ -4229,6 +4702,7 @@ fn mock_coinbase_transparent_output(
 ///
 /// Creates a minimal Sapling V4 transaction (no transparent inputs/outputs, no sapling data)
 /// containing the given joinsplit data.
+#[cfg(not(feature = "wcash-consensus"))]
 fn build_v4_tx_with_joinsplit_data(
     joinsplit_data: Option<JoinSplitData<Groth16Proof>>,
     expiry_height: block::Height,
@@ -4242,6 +4716,7 @@ fn build_v4_tx_with_joinsplit_data(
 ///
 /// Constructs the transaction, computes the sighash, signs it, and patches the signature
 /// into the serialized bytes before re-deserializing.
+#[cfg(not(feature = "wcash-consensus"))]
 fn build_signed_v4_tx_with_joinsplit_data(
     joinsplit_data: JoinSplitData<Groth16Proof>,
     signing_key: &ed25519::SigningKey,
@@ -4279,6 +4754,7 @@ fn build_signed_v4_tx_with_joinsplit_data(
 /// The [`transaction::JoinSplitData`] with the dummy [`sprout::JoinSplit`] is returned together
 /// with the [`ed25519::SigningKey`] that can be used to create a signature to later add to the
 /// returned join split data.
+#[cfg(not(feature = "wcash-consensus"))]
 fn mock_sprout_join_split_data() -> (JoinSplitData<Groth16Proof>, ed25519::SigningKey) {
     // Prepare dummy inputs for the join split
     let zero_amount = 0_i32
@@ -4327,6 +4803,7 @@ fn mock_sprout_join_split_data() -> (JoinSplitData<Groth16Proof>, ed25519::Signi
 
 /// A type of JoinSplit modification to test.
 #[derive(Clone, Copy)]
+#[cfg(not(feature = "wcash-consensus"))]
 enum JoinSplitModification {
     // Corrupt a signature, making it invalid.
     CorruptSignature,
@@ -4348,6 +4825,7 @@ enum JoinSplitModification {
 /// signature over an *invalid* proof, so only the proof check fails. Conversely,
 /// [`JoinSplitModification::CorruptSignature`] leaves the proof (and its signature) valid and then
 /// invalidates only the signature.
+#[cfg(not(feature = "wcash-consensus"))]
 fn modify_joinsplit_bytes_and_resign(
     tx_bytes: &mut Vec<u8>,
     network: &Network,
@@ -4409,6 +4887,7 @@ fn modify_joinsplit_bytes_and_resign(
 ///
 /// Parses past the V4 header, transparent data, lock time, expiry height, sapling data,
 /// and the first joinsplit fields to reach the 192-byte proof field.
+#[cfg(not(feature = "wcash-consensus"))]
 fn find_first_joinsplit_proof_offset(tx_bytes: &[u8]) -> usize {
     // Parse past V4 header
     let mut pos = 8usize; // nVersion(4) + nVersionGroupId(4)
@@ -4510,6 +4989,7 @@ fn parse_compact_size(bytes: &[u8], pos: &mut usize) -> u64 {
 /// # Panics
 ///
 /// Will panic if the transaction does not have Sapling spends.
+#[cfg(not(feature = "wcash-consensus"))]
 fn duplicate_sapling_spend(transaction: &mut Transaction) -> sapling::Nullifier {
     let tx_bytes = transaction
         .zcash_serialize_to_vec()
@@ -4685,6 +5165,7 @@ fn duplicate_sapling_spend(transaction: &mut Transaction) -> sapling::Nullifier 
 }
 
 /// Returns the encoding of the jubjub identity point, a small-order point.
+#[cfg(not(feature = "wcash-consensus"))]
 fn small_order_point_bytes() -> [u8; 32] {
     let bytes = jubjub::AffinePoint::identity().to_bytes();
     let point = jubjub::AffinePoint::from_bytes(bytes).unwrap();
@@ -4693,6 +5174,7 @@ fn small_order_point_bytes() -> [u8; 32] {
 }
 
 /// Skip past the V4 header and transparent sections, returning the position of nLockTime.
+#[cfg(not(feature = "wcash-consensus"))]
 fn skip_v4_header_and_transparent(tx_bytes: &[u8]) -> usize {
     let mut pos = 8usize; // nVersion(4) + nVersionGroupId(4)
 
@@ -4721,6 +5203,7 @@ fn skip_v4_header_and_transparent(tx_bytes: &[u8]) -> usize {
 ///
 /// Serializes the transaction, overwrites the rk bytes in place, and re-deserializes;
 /// panics if the mutated transaction fails to parse.
+#[cfg(not(feature = "wcash-consensus"))]
 fn set_first_sapling_spend_rk(transaction: &mut Transaction, rk_bytes: [u8; 32]) {
     let mut tx_bytes = transaction
         .zcash_serialize_to_vec()
@@ -4761,6 +5244,7 @@ fn set_first_sapling_spend_rk(transaction: &mut Transaction, rk_bytes: [u8; 32])
 ///
 /// Serializes the transaction, overwrites the epk bytes in place, and re-deserializes;
 /// panics if the mutated transaction fails to parse.
+#[cfg(not(feature = "wcash-consensus"))]
 fn set_first_sapling_output_epk(transaction: &mut Transaction, epk_bytes: [u8; 32]) {
     let mut tx_bytes = transaction
         .zcash_serialize_to_vec()
@@ -4926,6 +5410,7 @@ fn find_v5_orchard_flags_offset(tx_bytes: &[u8]) -> usize {
 }
 
 /// Write a CompactSize integer to `bytes`.
+#[cfg(not(feature = "wcash-consensus"))]
 fn write_compact_size(bytes: &mut Vec<u8>, value: u64) {
     if value < 0xfd {
         bytes.push(value as u8);
@@ -5188,6 +5673,7 @@ fn shielded_outputs_are_not_decryptable_for_fake_v5_blocks() {
     }
 }
 
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn mempool_zip317_error() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -5250,6 +5736,7 @@ async fn mempool_zip317_error() {
     );
 }
 
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn mempool_zip317_ok() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -5328,6 +5815,7 @@ async fn mempool_zip317_ok() {
 /// [`BlockTxVerifier`] has no mempool handle, so it cannot consult mempool state at all. That
 /// makes the bypass structurally impossible rather than merely untaken, which is why this test
 /// only needs to check that the garbage proofs are rejected on their own merits.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn block_with_garbage_orchard_proofs_is_rejected() {
     let _init_guard = zebra_test::init();
@@ -5406,6 +5894,7 @@ async fn block_with_garbage_orchard_proofs_is_rejected() {
 /// bypass can no longer be reconstructed from a block request. What remains testable, and what
 /// this test pins, is the rule the bypass evaded: block verification rejects a transaction whose
 /// `nExpiryHeight` is below the block height.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mempool_cached_result_bypasses_expiry_check_for_block_at_next_height() {
     let _init_guard = zebra_test::init();
@@ -5776,6 +6265,7 @@ fn script_sig_args_expected_values() {
 /// A V5 transaction with a pre-NU5 branch ID and a V6 with a pre-NU6.3 branch ID are rejected
 /// on both the block and mempool paths. Rejected at parse time before the `zcash_primitives`
 /// refactor, now by `check::consensus_branch_id` — pinned so a dependency bump can't drop it.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn tx_with_pre_activation_branch_id_is_rejected() {
     let network = Network::Mainnet;
@@ -5854,6 +6344,7 @@ async fn tx_with_pre_activation_branch_id_is_rejected() {
 /// input: it parses as a regular `PrevOut` input, is rejected in the coinbase position of a
 /// block, and is a spend of a nonexistent UTXO otherwise. Rejected at parse time before the
 /// `zcash_primitives` refactor ("Wrong index in coinbase") — pinned here at its new layer.
+#[cfg(not(feature = "wcash-consensus"))]
 #[tokio::test]
 async fn null_prevout_hash_with_other_index_is_not_coinbase() {
     let network = Network::Mainnet;
@@ -5932,6 +6423,165 @@ fn non_coinbase_expiry_height_accepts_zero_and_spec_max() {
         assert_eq!(
             check::non_coinbase_expiry_height(&block_height, &tx),
             Ok(())
+        );
+    }
+}
+
+/// Returns a raw v1 transaction with two inputs: a null prevout carrying a valid height-1
+/// coinbase script, and a regular spend of a nonexistent UTXO.
+#[cfg(not(feature = "wcash-consensus"))]
+fn non_coinbase_tx_with_null_prevout_input() -> Transaction {
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&1_u32.to_le_bytes()); // version 1
+    raw.push(2); // input count
+    raw.extend_from_slice(&[0; 32]); // null prevout hash
+    raw.extend_from_slice(&0xFFFF_FFFF_u32.to_le_bytes()); // null prevout index
+    raw.push(2); // coinbase script: height 1, one data byte
+    raw.extend_from_slice(&[0x51, 0x00]);
+    raw.extend_from_slice(&0xFFFF_FFFF_u32.to_le_bytes()); // sequence
+    raw.extend_from_slice(&[1; 32]); // regular prevout hash
+    raw.extend_from_slice(&0_u32.to_le_bytes()); // regular prevout index
+    raw.push(0); // empty unlock script
+    raw.extend_from_slice(&0xFFFF_FFFF_u32.to_le_bytes()); // sequence
+    raw.push(1); // output count
+    raw.extend_from_slice(&1_u64.to_le_bytes()); // value
+    raw.push(0); // empty lock script
+    raw.extend_from_slice(&0_u32.to_le_bytes()); // lock time
+
+    raw.zcash_deserialize_into()
+        .expect("a null-prevout input with a valid height script parses")
+}
+
+/// A non-coinbase transaction with a null-prevout input is rejected by the transaction
+/// verifier before any UTXO lookup, and as a later block transaction by `coinbase_is_first`.
+///
+/// # Consensus
+///
+/// > A transparent input in a non-coinbase transaction MUST NOT have a null prevout.
+///
+/// <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
+///
+/// This rule was silently disabled when `Transaction::is_valid_non_coinbase` became
+/// `!is_coinbase()` in the `zcash_primitives` newtype refactor.
+#[cfg(not(feature = "wcash-consensus"))]
+#[tokio::test]
+async fn non_coinbase_with_null_prevout_input_is_rejected() {
+    let network = Network::Mainnet;
+    let tx = non_coinbase_tx_with_null_prevout_input();
+
+    assert!(!tx.is_coinbase(), "two inputs is never a coinbase");
+    assert!(
+        matches!(tx.inputs()[0], transparent::Input::Coinbase { .. }),
+        "the null-prevout input is parsed as a coinbase input"
+    );
+
+    // As the first block transaction, it is rejected by the coinbase position rule.
+    let block = Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_434873_BYTES[..])
+        .expect("block should deserialize");
+    let mut first_block = block.clone();
+    first_block.transactions[0] = Arc::new(tx.clone());
+    assert_eq!(
+        crate::block::check::coinbase_is_first(&first_block)
+            .expect_err("a first transaction that is not a coinbase must be rejected"),
+        crate::error::BlockError::Transaction(TransactionError::CoinbasePosition),
+    );
+
+    // As a later block transaction, it is rejected by the block structure check, which the
+    // block verifier runs before handing any transaction to the transaction verifier.
+    let mut later_block = block;
+    later_block.transactions.push(Arc::new(tx.clone()));
+    assert_eq!(
+        crate::block::check::coinbase_is_first(&later_block)
+            .expect_err("a later transaction with a null-prevout input must be rejected"),
+        crate::error::BlockError::Transaction(TransactionError::CoinbaseAfterFirst),
+    );
+
+    // Both transaction verifiers reject it before any UTXO lookup: the state service is a
+    // mock with no expectations, so a lookup could never be answered.
+    let height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 height must be set");
+
+    let state: MockService<_, _, _, _> = MockService::build().for_unit_tests();
+    let rsp = BlockTxVerifier::new(&network, state)
+        .oneshot(BlockRequest {
+            transaction_hash: tx.hash(),
+            transaction: Arc::new(tx.clone()),
+            known_utxos: Arc::new(HashMap::new()),
+            height,
+            time: DateTime::<Utc>::MAX_UTC,
+        })
+        .await;
+    assert_eq!(rsp, Err(TransactionError::NonCoinbaseHasCoinbaseInput));
+
+    let state: MockService<_, _, _, _> = MockService::build().for_unit_tests();
+    let rsp = MempoolTxVerifier::new_for_tests(&network, state)
+        .oneshot(MempoolRequest {
+            transaction: Arc::new(tx).into(),
+            height,
+        })
+        .await;
+    assert_eq!(rsp, Err(TransactionError::NonCoinbaseHasCoinbaseInput));
+}
+
+/// Wcash V6 rejects a coinbase input in a non-coinbase transaction on both
+/// transaction-verification paths, before consulting the UTXO set.
+#[cfg(feature = "wcash-consensus")]
+#[tokio::test]
+async fn wcash_v6_non_coinbase_with_null_prevout_input_is_rejected() {
+    for network in [Network::new_wcash_testnet(), Network::new_wcash_regtest()] {
+        let height = Height(1);
+        let coinbase_input = transparent::Input::Coinbase {
+            height,
+            data: vec![0],
+            sequence: u32::MAX,
+        };
+        let regular_input = transparent::Input::PrevOut {
+            outpoint: transparent::OutPoint {
+                hash: Hash([1; 32]),
+                index: 0,
+            },
+            unlock_script: transparent::Script::new(&[]),
+            sequence: u32::MAX,
+        };
+        let output = transparent::Output {
+            value: Amount::try_from(1).expect("one zatoshi is valid"),
+            lock_script: transparent::Script::new(&[0x51]),
+        };
+        let tx = Transaction::test_v6_for_network(
+            &network,
+            height,
+            vec![coinbase_input, regular_input],
+            vec![output],
+            LockTime::unlocked(),
+            height,
+        );
+
+        let state: MockService<_, _, _, _> = MockService::build().for_unit_tests();
+        let block_response = BlockTxVerifier::new(&network, state)
+            .oneshot(BlockRequest {
+                transaction_hash: tx.hash(),
+                transaction: Arc::new(tx.clone()),
+                known_utxos: Arc::new(HashMap::new()),
+                height,
+                time: DateTime::<Utc>::MAX_UTC,
+            })
+            .await;
+        assert_eq!(
+            block_response,
+            Err(TransactionError::NonCoinbaseHasCoinbaseInput)
+        );
+
+        let state: MockService<_, _, _, _> = MockService::build().for_unit_tests();
+        let mempool_response = MempoolTxVerifier::new_for_tests(&network, state)
+            .oneshot(MempoolRequest {
+                transaction: Arc::new(tx).into(),
+                height,
+            })
+            .await;
+        assert_eq!(
+            mempool_response,
+            Err(TransactionError::NonCoinbaseHasCoinbaseInput)
         );
     }
 }

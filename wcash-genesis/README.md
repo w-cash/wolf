@@ -4,7 +4,7 @@ This crate defines the minimum identity and Bitcoin-anchor rules needed by the
 Wcash node. It is part of the node workspace so the frozen identity values are
 used directly by consensus and runtime configuration.
 
-The canonical product name is `Wcash`, the ticker is `WCASH`, and each Wcash
+The canonical product name is `Wcash`, the ticker is `WEC`, and each Wcash
 network has P2P magic derived from an explicit Wcash-only domain label. A node
 must also use Wcash-only peer discovery, address encodings, ports, user-agent,
 configuration, and data paths before any public network is enabled.
@@ -28,7 +28,7 @@ genesis commitment is BLAKE2b-256 with the 16-byte personalization
 announcement timestamp, is:
 
 ```text
-06/Sep/2026 Wcash: BTC #<height> <64-character display hash>
+06/Sep/2026 Wcash (WEC) BTC #<height> <64-character display hash>
 ```
 
 Neither consensus validation nor the generator performs HTTP requests.
@@ -62,12 +62,13 @@ the immutable anchor fields, Wcash network discriminator, genesis statement,
 commitment, and complete serialized Wcash genesis block.
 
 The Testnet profile uses Wcash Testnet v1 branch ID `0xb3cfd27e` for NU6.3 /
-Ironwood transactions and rejects the standard Zcash NU6.3 ID. Every
-post-genesis transaction must be V6, so V1-V5 and inherited Zcash-domain
-transactions are invalid in both blocks and the mempool. A controlled local
-Regtest E2E has spent a private coinbase through the Wcash V6 domain, but that
-does not establish public-network wallet or pool-payout readiness. Testnet
-rewards have no value, and mainnet remains disabled.
+Ironwood transactions; local Regtest uses the separate ID `0xc3a6678a`. Both
+reject the standard Zcash NU6.3 ID and each other's Wcash ID. Every post-genesis
+transaction must be V6, so V1-V5 and wrong-domain transactions are invalid in
+both blocks and the mempool. A controlled local Regtest E2E has spent a private
+coinbase through its Wcash V6 domain, but that does not establish public-network
+wallet or pool-payout readiness. Testnet rewards have no value, and mainnet
+remains disabled.
 
 ## Fail-closed mainnet launch
 

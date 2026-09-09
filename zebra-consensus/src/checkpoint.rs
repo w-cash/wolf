@@ -50,7 +50,12 @@ use crate::{
 
 mod types;
 
-#[cfg(test)]
+// These tests replay Zcash checkpoint fixtures. Wcash has no post-genesis
+// checkpoint fixture yet; its frozen genesis and height-one verification are covered by
+// the Wcash block and AuxPoW tests instead of pretending Zcash blocks belong
+// to the fork. Enable these tests once a post-genesis Wcash checkpoint fixture
+// is frozen.
+#[cfg(all(test, not(feature = "wcash-consensus")))]
 mod tests;
 
 pub use zebra_node_services::constants::{MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};

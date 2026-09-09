@@ -273,6 +273,15 @@ pub enum TransactionError {
     #[error("Wcash post-genesis transactions must use transaction version 6, got version {0}")]
     WcashRequiresV6(u32),
 
+    #[error("Wcash transactions must not contain Sprout JoinSplit data")]
+    WcashSproutPoolDisabled,
+
+    #[error("Wcash transactions must not contain Sapling shielded data")]
+    WcashSaplingPoolDisabled,
+
+    #[error("Wcash transactions must not contain legacy Orchard shielded data")]
+    WcashOrchardPoolDisabled,
+
     #[error("wrong tx format: tx version is ≥ 5, but `nConsensusBranchId` is missing")]
     MissingConsensusBranchId,
 
@@ -434,6 +443,9 @@ impl TransactionError {
             | NotEnoughIronwoodFlags
             | WrongConsensusBranchId
             | WcashRequiresV6(_)
+            | WcashSproutPoolDisabled
+            | WcashSaplingPoolDisabled
+            | WcashOrchardPoolDisabled
             | MissingConsensusBranchId
             | LockedUntilAfterBlockHeight(_)
             | LockedUntilAfterBlockTime(_) => 100,

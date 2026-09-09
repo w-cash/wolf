@@ -13,6 +13,32 @@ use zebra_chain::{
 
 use wcash_zcash_aux::{MAX_PROOF_BYTES, WCASH_AUXILIARY_CHAIN_ID};
 
+/// An unguessable, fixed-size capability for retiring one cached candidate.
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RetireToken(
+    #[serde(with = "hex")]
+    #[schemars(with = "String")]
+    [u8; 32],
+);
+
+impl RetireToken {
+    /// Constructs a retirement capability from cryptographically random bytes.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the capability bytes for constant-time authentication.
+    pub const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl fmt::Debug for RetireToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RetireToken([REDACTED])")
+    }
+}
+
 /// The maximum number of hexadecimal characters accepted by `submitauxblock`.
 pub const MAX_AUX_POW_HEX_CHARS: usize = MAX_PROOF_BYTES * 2;
 
@@ -120,6 +146,15 @@ pub struct CreateAuxBlockResponse {
     #[getter(copy)]
     hash: block::Hash,
 
+    /// Capability required to retire this candidate before its cache TTL.
+    ///
+    /// Pools must keep this value private. It authorizes only this exact
+    /// candidate and cannot retire a job after an AuxPoW submission begins.
+    #[serde(rename = "retiretoken")]
+    #[schemars(with = "String")]
+    #[getter(copy)]
+    retire_token: RetireToken,
+
     /// Canonical serialized proof-free Wcash candidate.
     ///
     /// Its Wcash solution carrier is empty. A pool attaches the AuxPoW witness
@@ -167,7 +202,7 @@ pub struct CreateAuxBlockResponse {
 impl CreateAuxBlockResponse {
     /// Constructs a response for one exact cached Wcash candidate.
     pub fn new(
-        hash: block::Hash,
+        candidate_lease: (block::Hash, RetireToken),
         data: Vec<u8>,
         previous_block_hash: block::Hash,
         coinbase_value: i64,
@@ -175,8 +210,10 @@ impl CreateAuxBlockResponse {
         bits: CompactDifficulty,
         height: u32,
     ) -> Self {
+        let (hash, retire_token) = candidate_lease;
         Self {
             hash,
+            retire_token,
             data,
             chain_id: WCASH_AUXILIARY_CHAIN_ID,
             previous_block_hash,
@@ -186,6 +223,18 @@ impl CreateAuxBlockResponse {
             height,
         }
     }
+}
+
+/// Result of an authenticated `retireauxblock` request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RetireAuxBlockResponse {
+    /// The active candidate was removed.
+    Retired,
+    /// The candidate was already absent, including after a retry or restart.
+    AlreadyAbsent,
+    /// A validly encoded AuxPoW submission began, so the candidate was retained.
+    SubmissionStarted,
 }
 
 /// Exact witness-bound state of a submitted Wcash auxiliary block.
@@ -241,6 +290,29 @@ mod tests {
     }
 
     #[test]
+    fn retire_token_is_fixed_size_and_redacted_from_debug_output() {
+        let token = RetireToken::new([0x5a; 32]);
+        let encoded = serde_json::to_string(&token).expect("token serializes");
+        assert_eq!(encoded, format!("\"{}\"", "5a".repeat(32)));
+        assert_eq!(
+            serde_json::from_str::<RetireToken>(&encoded).expect("token deserializes"),
+            token
+        );
+        assert!(serde_json::from_str::<RetireToken>("\"5a\"").is_err());
+        assert!(!format!("{token:?}").contains("5a5a"));
+
+        for response in [
+            RetireAuxBlockResponse::Retired,
+            RetireAuxBlockResponse::AlreadyAbsent,
+            RetireAuxBlockResponse::SubmissionStarted,
+        ] {
+            let encoded = serde_json::to_value(response).expect("response serializes");
+            let decoded = serde_json::from_value(encoded).expect("response deserializes");
+            assert_eq!(response, decoded);
+        }
+    }
+
+    #[test]
     fn create_aux_block_response_uses_pool_compatible_fields() {
         let hash = block::Hash([0x11; 32]);
         let previous = block::Hash([0x22; 32]);
@@ -248,7 +320,7 @@ mod tests {
         let target = bits.to_expanded().expect("valid expanded target");
         let data = vec![0x01, 0x23, 0x45];
         let response = CreateAuxBlockResponse::new(
-            hash,
+            (hash, RetireToken::new([0x33; 32])),
             data.clone(),
             previous,
             1_000_000_000,
@@ -258,6 +330,7 @@ mod tests {
         );
 
         assert_eq!(response.hash(), hash);
+        assert_eq!(response.retire_token().into_bytes(), [0x33; 32]);
         assert_eq!(response.data(), data.as_slice());
         assert_eq!(response.chain_id(), WCASH_AUXILIARY_CHAIN_ID);
         assert_eq!(response.previous_block_hash(), previous);

@@ -48,6 +48,7 @@ impl ZebraDb {
         let sprout_anchors = self.db().cf_handle("sprout_anchors").unwrap();
         let sapling_anchors = self.db().cf_handle("sapling_anchors").unwrap();
         let orchard_anchors = self.db().cf_handle("orchard_anchors").unwrap();
+        let ironwood_anchors = self.db().cf_handle("ironwood_anchors").unwrap();
 
         let sprout_tree = sprout::tree::NoteCommitmentTree::default();
         // Calculate the root so we pass the tree with a cached root to the database. We need to do
@@ -69,6 +70,11 @@ impl ZebraDb {
             // Orchard
             if let Some(anchor) = transaction.orchard_anchor() {
                 batch.zs_insert(&orchard_anchors, anchor, ());
+            }
+
+            // Ironwood
+            if let Some(anchor) = transaction.ironwood_anchor() {
+                batch.zs_insert(&ironwood_anchors, anchor, ());
             }
         }
 

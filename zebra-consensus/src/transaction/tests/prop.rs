@@ -41,7 +41,7 @@ proptest! {
         (network, block_height) in sapling_onwards_strategy(),
         block_time in datetime_full(),
         relative_source_fund_heights in vec(0.0..1.0, 1..=MAX_TRANSPARENT_INPUTS),
-        transaction_version in 4_u8..=5,
+        transaction_version in transaction_version_strategy(),
     ) {
         let _init_guard = zebra_test::init();
 
@@ -73,7 +73,7 @@ proptest! {
         (network, block_height) in sapling_onwards_strategy(),
         block_time in datetime_full(),
         relative_source_fund_heights in vec(0.0..1.0, 1..=MAX_TRANSPARENT_INPUTS),
-        transaction_version in 4_u8..=5,
+        transaction_version in transaction_version_strategy(),
         lock_time in any::<LockTime>(),
     ) {
         let _init_guard = zebra_test::init();
@@ -110,7 +110,7 @@ proptest! {
         (network, block_height) in sapling_onwards_strategy(),
         block_time in datetime_full(),
         relative_source_fund_heights in vec(0.0..1.0, 1..=MAX_TRANSPARENT_INPUTS),
-        transaction_version in 4_u8..=5,
+        transaction_version in transaction_version_strategy(),
         relative_unlock_height in 0.0..1.0,
     ) {
         let _init_guard = zebra_test::init();
@@ -147,7 +147,7 @@ proptest! {
         first_datetime in datetime_u32(),
         second_datetime in datetime_u32(),
         relative_source_fund_heights in vec(0.0..1.0, 1..=MAX_TRANSPARENT_INPUTS),
-        transaction_version in 4_u8..=5,
+        transaction_version in transaction_version_strategy(),
     ) {
         let _init_guard = zebra_test::init();
 
@@ -183,7 +183,7 @@ proptest! {
         (network, block_height) in sapling_onwards_strategy(),
         block_time in datetime_full(),
         relative_source_fund_heights in vec(0.0..1.0, 1..=MAX_TRANSPARENT_INPUTS),
-        transaction_version in 4_u8..=5,
+        transaction_version in transaction_version_strategy(),
         relative_unlock_height in 0.0..1.0,
     ) {
         let _init_guard = zebra_test::init();
@@ -222,7 +222,7 @@ proptest! {
         first_datetime in datetime_u32(),
         second_datetime in datetime_u32(),
         relative_source_fund_heights in vec(0.0..1.0, 1..=MAX_TRANSPARENT_INPUTS),
-        transaction_version in 4_u8..=5,
+        transaction_version in transaction_version_strategy(),
     ) {
         let _init_guard = zebra_test::init();
 
@@ -284,7 +284,7 @@ proptest! {
         (network, block_height) in sapling_onwards_strategy(),
         next_median_time_past in datetime_u32(),
         relative_source_fund_heights in vec(0.0..1.0, 1..=MAX_TRANSPARENT_INPUTS),
-        transaction_version in 4_u8..=5,
+        transaction_version in transaction_version_strategy(),
         lock_time in lock_time_strategy(),
     ) {
         let _init_guard = zebra_test::init();
@@ -350,6 +350,16 @@ fn lock_time_strategy() -> impl Strategy<Value = LockTime> {
     ]
 }
 
+fn transaction_version_strategy() -> impl Strategy<Value = u8> {
+    #[cfg(feature = "wcash-consensus")]
+    let strategy = Just(6_u8).boxed();
+
+    #[cfg(not(feature = "wcash-consensus"))]
+    let strategy = (4_u8..=5).boxed();
+
+    strategy
+}
+
 /// Generates an arbitrary [`block::Height`] after the Sapling activation height
 /// on an arbitrary network.
 ///
@@ -359,7 +369,21 @@ fn lock_time_strategy() -> impl Strategy<Value = LockTime> {
 /// - a block height between the Sapling activation height (inclusive) on that
 ///   network and the maximum transaction expiry height.
 fn sapling_onwards_strategy() -> impl Strategy<Value = (Network, block::Height)> {
-    any::<Network>().prop_flat_map(|network| {
+    #[cfg(feature = "wcash-consensus")]
+    let network = prop_oneof![
+        Just(Network::new_wcash_testnet()),
+        Just(Network::new_wcash_regtest()),
+    ]
+    .boxed();
+
+    #[cfg(not(feature = "wcash-consensus"))]
+    let network = any::<Network>().boxed();
+
+    network.prop_flat_map(|network| {
+        #[cfg(feature = "wcash-consensus")]
+        let start_height_value = 1;
+
+        #[cfg(not(feature = "wcash-consensus"))]
         let start_height_value = NetworkUpgrade::Sapling
             .activation_height(&network)
             .expect("Sapling to have an activation height")
@@ -420,6 +444,14 @@ fn mock_transparent_transaction(
     let transaction = match transaction_version {
         4 => Transaction::test_v4(inputs, outputs, lock_time, expiry_height),
         5 => Transaction::test_v5(network_upgrade, inputs, outputs, lock_time, expiry_height),
+        6 => Transaction::test_v6_for_network(
+            network,
+            block_height,
+            inputs,
+            outputs,
+            lock_time,
+            expiry_height,
+        ),
         invalid_version => unreachable!("invalid transaction version: {}", invalid_version),
     };
 
@@ -437,6 +469,11 @@ fn sanitize_transaction_version(
     block_height: block::Height,
 ) -> (u8, NetworkUpgrade) {
     let network_upgrade = NetworkUpgrade::current(network, block_height);
+
+    #[cfg(feature = "wcash-consensus")]
+    if network.is_wcash_testnet() || network.is_wcash_regtest() {
+        return (6, network_upgrade);
+    }
 
     let max_version = {
         use NetworkUpgrade::*;
@@ -593,7 +630,14 @@ fn mock_funded_transparent_transaction(
     let transaction = match transaction_version {
         4 => Transaction::test_v4(inputs, outputs, lock_time, expiry_height),
         5 => Transaction::test_v5(network_upgrade, inputs, outputs, lock_time, expiry_height),
-        6 => Transaction::test_v6(network_upgrade, inputs, outputs, lock_time, expiry_height),
+        6 => Transaction::test_v6_for_network(
+            network,
+            block_height,
+            inputs,
+            outputs,
+            lock_time,
+            expiry_height,
+        ),
         invalid_version => unreachable!("invalid transaction version: {}", invalid_version),
     };
 

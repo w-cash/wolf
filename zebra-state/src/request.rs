@@ -168,16 +168,19 @@ impl HashOrHeight {
                     .map_err(|_| "could not parse negative height")
                     .and_then(|d: HeightDiff| {
                         if d.is_negative() {
-                            {
-                                Ok(HashOrHeight::Height(
-                                    tip_height
-                                        .ok_or("missing tip height")?
-                                        .add(d)
-                                        .ok_or("underflow when adding negative height to tip")?
-                                        .next()
-                                        .map_err(|_| "height -1 needs to point to tip")?,
-                                ))
-                            }
+                            // RPC negative heights are one-based from the tip: -1 is the tip,
+                            // -2 is its parent, and so on. Apply that +1 adjustment to the signed
+                            // offset before adding it to the unsigned height, so a genesis-only
+                            // tip does not transiently underflow while resolving -1.
+                            let tip_offset = d
+                                .checked_add(1)
+                                .ok_or("overflow adjusting negative height from tip")?;
+                            Ok(HashOrHeight::Height(
+                                tip_height
+                                    .ok_or("missing tip height")?
+                                    .add(tip_offset)
+                                    .ok_or("underflow when adding negative height to tip")?,
+                            ))
                         } else {
                             Err("height was not negative")
                         }
@@ -233,6 +236,33 @@ impl std::str::FromStr for HashOrHeight {
             .map_err(|_| {
                 SerializationError::Parse("could not convert the input string to a hash or height")
             })
+    }
+}
+
+#[cfg(test)]
+mod hash_or_height_tests {
+    use super::HashOrHeight;
+    use zebra_chain::block::Height;
+
+    #[test]
+    fn negative_one_resolves_to_a_genesis_only_tip() {
+        assert_eq!(
+            HashOrHeight::new("-1", Some(Height(0))),
+            Ok(HashOrHeight::Height(Height(0)))
+        );
+    }
+
+    #[test]
+    fn negative_heights_remain_one_based_above_genesis() {
+        assert_eq!(
+            HashOrHeight::new("-1", Some(Height(10))),
+            Ok(HashOrHeight::Height(Height(10)))
+        );
+        assert_eq!(
+            HashOrHeight::new("-2", Some(Height(10))),
+            Ok(HashOrHeight::Height(Height(9)))
+        );
+        assert!(HashOrHeight::new("-12", Some(Height(10))).is_err());
     }
 }
 

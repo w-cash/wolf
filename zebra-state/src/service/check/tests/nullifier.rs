@@ -21,10 +21,13 @@ use crate::{
     service::{
         check::nullifier::tx_no_duplicates_in_chain, read, write::validate_and_commit_non_finalized,
     },
-    tests::setup::{new_state_with_mainnet_genesis, transaction_v4_from_coinbase},
+    tests::setup::{
+        new_state_with_mainnet_genesis, transaction_v4_from_coinbase, uses_wcash_consensus,
+    },
     CheckpointVerifiedBlock,
     ValidateContextError::{
-        DuplicateOrchardNullifier, DuplicateSaplingNullifier, DuplicateSproutNullifier,
+        DuplicateIronwoodNullifier, DuplicateOrchardNullifier, DuplicateSaplingNullifier,
+        DuplicateSproutNullifier,
     },
 };
 
@@ -38,12 +41,133 @@ use crate::{
 
 const DEFAULT_NULLIFIER_PROPTEST_CASES: u32 = 2;
 
+/// Exercise the active Wcash shielded pool through contextual state updates.
+///
+/// The inherited property cases below intentionally cover Zcash's historical
+/// Sprout, Sapling, and Orchard pools. Wcash starts at Ironwood, so its native
+/// case verifies insertion and duplicates across blocks on both built-in
+/// Wcash networks.
+#[test]
+fn wcash_ironwood_nullifiers_are_contextually_enforced() {
+    use proptest::strategy::ValueTree;
+
+    use zebra_chain::{
+        parameters::{Network, NetworkUpgrade},
+        transaction::LockTime,
+        LedgerState,
+    };
+
+    use crate::{
+        service::finalized_state::FinalizedState,
+        tests::setup::{test_genesis, wcash_fake_children_with_transactions},
+        Config, NonFinalizedState,
+    };
+
+    if !uses_wcash_consensus() {
+        return;
+    }
+
+    for network in [Network::new_wcash_testnet(), Network::new_wcash_regtest()] {
+        let mut finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )
+        .expect("opening an ephemeral Wcash database should succeed");
+        let genesis = CheckpointVerifiedBlock::from(test_genesis(&network));
+        finalized_state
+            .commit_finalized_direct(genesis.into(), None, "Wcash Ironwood nullifier test")
+            .expect("the built-in Wcash genesis should commit");
+
+        // Generate a structurally valid Ironwood bundle, then transplant it
+        // into a transaction built with this Wcash network's distinct branch
+        // ID. The generated transaction is only a convenient bundle factory.
+        let transaction_strategy =
+            LedgerState::network_upgrade_strategy(NetworkUpgrade::Nu6_3, 6, true)
+                .prop_flat_map(Transaction::arbitrary_with)
+                .prop_filter("transaction must contain Ironwood", |transaction| {
+                    transaction.has_ironwood_shielded_data()
+                });
+        let mut runner = proptest::test_runner::TestRunner::deterministic();
+        let generated_transaction = transaction_strategy
+            .new_tree(&mut runner)
+            .expect("the Ironwood transaction strategy should generate a case")
+            .current()
+            .with_transparent_inputs(Vec::new())
+            .with_transparent_outputs(Vec::new())
+            .with_orchard_bundle(None);
+        let bundle = generated_transaction
+            .sighasher(NetworkUpgrade::Nu6_3, Arc::new(Vec::new()))
+            .expect("the generated V6 transaction should be sighashable")
+            .ironwood_bundle()
+            .expect("the filtered transaction has an Ironwood bundle")
+            .clone();
+        let transaction = Arc::new(
+            Transaction::test_v6_for_network(
+                &network,
+                Height(1),
+                Vec::new(),
+                Vec::new(),
+                LockTime::min_lock_time_timestamp(),
+                Height(0),
+            )
+            .with_ironwood_bundle(Some(bundle)),
+        );
+        let nullifier = transaction
+            .ironwood_nullifiers()
+            .next()
+            .expect("the test transaction has one Ironwood action");
+
+        // Reusing the same transaction in the next block repeats its nullifier.
+        // The blocks themselves have exact Wcash history and tx-auth commitments.
+        let blocks = wcash_fake_children_with_transactions(
+            &network,
+            vec![vec![transaction.clone()], vec![transaction.clone()]],
+        );
+        finalized_state.populate_with_anchors(&blocks[0]);
+        finalized_state.populate_with_anchors(&blocks[1]);
+        let mut non_finalized_state = NonFinalizedState::new(&network);
+        validate_and_commit_non_finalized(
+            &finalized_state.db,
+            &mut non_finalized_state,
+            blocks[0].clone().prepare(),
+        )
+        .expect("a fresh Ironwood nullifier should commit");
+        assert!(non_finalized_state
+            .best_chain()
+            .expect("the first Wcash child created a chain")
+            .ironwood_nullifiers
+            .contains_key(&nullifier));
+
+        let state_before_rejection = non_finalized_state.clone();
+        assert_eq!(
+            validate_and_commit_non_finalized(
+                &finalized_state.db,
+                &mut non_finalized_state,
+                blocks[1].clone().prepare(),
+            ),
+            Err(DuplicateIronwoodNullifier {
+                nullifier,
+                in_finalized_state: false,
+            }),
+        );
+        assert!(non_finalized_state.eq_internal_state(&state_before_rejection));
+    }
+}
+
 proptest! {
     #![proptest_config(
-        proptest::test_runner::Config::with_cases(env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_NULLIFIER_PROPTEST_CASES))
+        proptest::test_runner::Config::with_cases(if uses_wcash_consensus() {
+            // These fixtures exclusively construct Sprout, Sapling, or legacy
+            // Orchard transactions, none of which are active on Wcash.
+            0
+        } else {
+            env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_NULLIFIER_PROPTEST_CASES)
+        })
     )]
 
     // sprout

@@ -14,7 +14,7 @@ use crate::{
 
 /// Frozen display-order block ID of the public Wcash Testnet genesis block.
 pub const WCASH_TESTNET_GENESIS_HASH: &str =
-    "78b292284bc7b03c6a16b62e29a3ab2015c40d6414cbc27ddcee878225600f10";
+    "d95a9f2f1daf07d48fb3c863ad7334ec630a4a7077da98c8f7e65f8c0e277cf1";
 
 /// Genesis block for Regtest, copied from zcashd via `getblock 0 0` RPC method
 pub fn regtest_genesis_block() -> Arc<Block> {
@@ -155,7 +155,7 @@ mod tests {
             .is_empty());
         assert_eq!(
             block.hash().to_string(),
-            "b0ebe8618354e0563091d10b73ba03842cb3c112a801012616489269e58dbd61",
+            "70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c",
             "the local Wcash genesis ID is a frozen interoperability vector",
         );
 

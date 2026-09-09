@@ -192,6 +192,7 @@ impl With<MinerAddressType> for ZebradConfig {
     fn with(mut self, miner_address_type: MinerAddressType) -> Self {
         self.mining.miner_address = Some(
             default_miner_address_for_network(&self.network.network, &miner_address_type)
+                .expect("the selected miner address type must be supported by the network")
                 .parse()
                 .expect("valid hard-coded address"),
         );

@@ -42,7 +42,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         "status" => {
             reject_extra_arguments(arguments)?;
-            println!("project: Wcash (WCASH)");
+            println!("project: Wcash ({})", wcash_genesis::CURRENCY_TICKER);
             println!(
                 "mainnet: disabled; designated Bitcoin anchor height {}",
                 wcash_genesis::DESIGNATED_MAINNET_BITCOIN_HEIGHT

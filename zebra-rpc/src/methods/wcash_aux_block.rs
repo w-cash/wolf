@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rand::{rngs::OsRng, RngCore};
+use subtle::ConstantTimeEq;
 use zebra_chain::{
     block::{self, Block},
     work::equihash::Solution,
@@ -45,6 +47,57 @@ pub(crate) enum CandidateLookupError {
 pub(crate) enum CandidateInsertError {
     /// Every bounded slot contains an unexpired mining job.
     Full,
+    /// Another request is still publishing the same exact candidate.
+    Publishing,
+}
+
+/// An authenticated lease for one exact candidate-cache entry.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct CandidateLease {
+    id: block::Hash,
+    retire_token: [u8; 32],
+    needs_publication: bool,
+}
+
+impl std::fmt::Debug for CandidateLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CandidateLease")
+            .field("id", &self.id)
+            .field("retire_token", &"[REDACTED]")
+            .field("needs_publication", &self.needs_publication)
+            .finish()
+    }
+}
+
+impl CandidateLease {
+    /// Returns the proof-independent candidate ID.
+    pub(crate) const fn id(&self) -> block::Hash {
+        self.id
+    }
+
+    /// Returns the unguessable capability required to retire this entry.
+    pub(crate) const fn retire_token(&self) -> [u8; 32] {
+        self.retire_token
+    }
+}
+
+/// Result of an authenticated candidate-retirement request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateRetirement {
+    /// The exact published entry was removed.
+    Retired,
+    /// No entry remains, including after an idempotent retry or node restart.
+    AlreadyAbsent,
+    /// A decoded AuxPoW submission already referenced this candidate.
+    SubmissionStarted,
+}
+
+/// A failed authenticated candidate-retirement request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateRetirementError {
+    /// The supplied retirement capability did not match the active entry.
+    Unauthorized,
 }
 
 /// Current state-service location of an exact submitted Wcash candidate.
@@ -174,6 +227,18 @@ struct CacheInner {
 struct CacheEntry {
     candidate: Arc<Block>,
     created_at: Instant,
+    retire_token: [u8; 32],
+    state: CacheEntryState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CacheEntryState {
+    /// Reserved inside `createauxblock`, but not returned to its caller yet.
+    Publishing,
+    /// Published to a pool and eligible for authenticated retirement.
+    Published,
+    /// At least one canonically decoded AuxPoW submission has begun.
+    SubmissionStarted,
 }
 
 impl Default for AuxBlockCandidateCache {
@@ -195,14 +260,14 @@ impl AuxBlockCandidateCache {
         }
     }
 
-    /// Reserves one exact, proof-free candidate and returns its stable ID.
+    /// Reserves one exact, proof-free candidate and returns its stable lease.
     ///
     /// Unexpired issued jobs are never evicted to make room for a later caller:
     /// doing so could discard parent-chain work already committed to their IDs.
     pub(crate) fn insert(
         &self,
         candidate: Arc<Block>,
-    ) -> Result<block::Hash, CandidateInsertError> {
+    ) -> Result<CandidateLease, CandidateInsertError> {
         self.insert_at(candidate, Instant::now())
     }
 
@@ -210,7 +275,7 @@ impl AuxBlockCandidateCache {
         &self,
         candidate: Arc<Block>,
         now: Instant,
-    ) -> Result<block::Hash, CandidateInsertError> {
+    ) -> Result<CandidateLease, CandidateInsertError> {
         let id = candidate.hash();
         let mut inner = self
             .inner
@@ -219,29 +284,97 @@ impl AuxBlockCandidateCache {
 
         Self::purge_expired(&mut inner, now, self.ttl);
 
-        if !inner.entries.contains_key(&id) && inner.entries.len() >= self.capacity {
+        if let Some(existing) = inner.entries.get(&id) {
+            if existing.state == CacheEntryState::Publishing {
+                return Err(CandidateInsertError::Publishing);
+            }
+
+            return Ok(CandidateLease {
+                id,
+                retire_token: existing.retire_token,
+                needs_publication: false,
+            });
+        }
+
+        if inner.entries.len() >= self.capacity {
             return Err(CandidateInsertError::Full);
         }
 
-        // Reissuing the exact candidate refreshes its bounded lifetime without
-        // consuming another slot.
+        let mut retire_token = [0; 32];
+        OsRng.fill_bytes(&mut retire_token);
         inner.entries.insert(
             id,
             CacheEntry {
                 candidate,
                 created_at: now,
+                retire_token,
+                state: CacheEntryState::Publishing,
             },
         );
-        Ok(id)
+        Ok(CandidateLease {
+            id,
+            retire_token,
+            needs_publication: true,
+        })
     }
 
-    /// Returns an exact unexpired candidate.
+    /// Marks a reserved entry as externally visible.
+    ///
+    /// A concurrent reissue can only observe the lease after this transition.
+    pub(crate) fn publish(&self, lease: CandidateLease) {
+        if !lease.needs_publication {
+            return;
+        }
+
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = inner
+            .entries
+            .get_mut(&lease.id)
+            .expect("a candidate reservation must exist until publication");
+        assert!(
+            bool::from(entry.retire_token.ct_eq(&lease.retire_token)),
+            "a candidate reservation token must not change"
+        );
+        assert_eq!(
+            entry.state,
+            CacheEntryState::Publishing,
+            "a candidate cannot be submitted before publication"
+        );
+        entry.state = CacheEntryState::Published;
+    }
+
+    /// Discards a reservation that was never returned to its caller.
+    pub(crate) fn discard_unpublished(&self, lease: CandidateLease) {
+        if !lease.needs_publication {
+            return;
+        }
+
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let should_remove = inner.entries.get(&lease.id).is_some_and(|entry| {
+            entry.state == CacheEntryState::Publishing
+                && bool::from(entry.retire_token.ct_eq(&lease.retire_token))
+        });
+        if should_remove {
+            inner.entries.remove(&lease.id);
+        }
+    }
+
+    /// Protects and returns an exact unexpired candidate for submission.
     ///
     /// The caller validates the candidate's parent against any committed chain
     /// before consensus submission. Keeping this cache tip-independent lets a
     /// late solution be committed to a shallow side chain and survive a reorg.
-    pub(crate) fn get(&self, id: block::Hash) -> Result<Arc<Block>, CandidateLookupError> {
-        self.get_at(id, Instant::now())
+    pub(crate) fn begin_submission(
+        &self,
+        id: block::Hash,
+    ) -> Result<Arc<Block>, CandidateLookupError> {
+        self.begin_submission_at(id, Instant::now())
     }
 
     /// Releases an issued job after its exact witness is confirmed on the best
@@ -254,13 +387,48 @@ impl AuxBlockCandidateCache {
             .remove(&id);
     }
 
-    fn get_at(&self, id: block::Hash, now: Instant) -> Result<Arc<Block>, CandidateLookupError> {
+    /// Retires one published entry only for its unguessable capability.
+    ///
+    /// Once any decoded submission begins, explicit retirement is refused so
+    /// a concurrent valid share remains retryable. The normal TTL still bounds
+    /// retention if that submission never reaches a definitive result.
+    pub(crate) fn retire(
+        &self,
+        id: block::Hash,
+        retire_token: [u8; 32],
+    ) -> Result<CandidateRetirement, CandidateRetirementError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::purge_expired(&mut inner, Instant::now(), self.ttl);
+        let Some(entry) = inner.entries.get(&id) else {
+            return Ok(CandidateRetirement::AlreadyAbsent);
+        };
+        if !bool::from(entry.retire_token.ct_eq(&retire_token)) {
+            return Err(CandidateRetirementError::Unauthorized);
+        }
+        match entry.state {
+            CacheEntryState::Publishing => Err(CandidateRetirementError::Unauthorized),
+            CacheEntryState::Published => {
+                inner.entries.remove(&id);
+                Ok(CandidateRetirement::Retired)
+            }
+            CacheEntryState::SubmissionStarted => Ok(CandidateRetirement::SubmissionStarted),
+        }
+    }
+
+    fn begin_submission_at(
+        &self,
+        id: block::Hash,
+        now: Instant,
+    ) -> Result<Arc<Block>, CandidateLookupError> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let Some(entry) = inner.entries.get(&id) else {
+        let Some(entry) = inner.entries.get_mut(&id) else {
             return Err(CandidateLookupError::Unknown);
         };
 
@@ -273,6 +441,10 @@ impl AuxBlockCandidateCache {
             return Err(CandidateLookupError::Expired);
         }
 
+        if entry.state == CacheEntryState::Publishing {
+            return Err(CandidateLookupError::Unknown);
+        }
+        entry.state = CacheEntryState::SubmissionStarted;
         Ok(Arc::clone(&entry.candidate))
     }
 
@@ -304,12 +476,13 @@ mod tests {
         let now = Instant::now();
         let tip = block::Hash([0x11; 32]);
         let candidate = candidate(1, tip);
-        let id = cache
+        let lease = cache
             .insert_at(Arc::clone(&candidate), now)
             .expect("cache has room");
+        cache.publish(lease);
 
         let cached = cache
-            .get_at(id, now)
+            .begin_submission_at(lease.id(), now)
             .expect("unexpired candidate is cached");
         assert!(Arc::ptr_eq(&candidate, &cached));
     }
@@ -320,23 +493,25 @@ mod tests {
         let now = Instant::now();
         let tip = block::Hash([0x11; 32]);
 
-        let expired_id = cache
+        let expired = cache
             .insert_at(candidate(1, tip), now)
             .expect("cache has room");
+        cache.publish(expired);
         assert_eq!(
-            cache.get_at(expired_id, now + Duration::from_secs(10)),
+            cache.begin_submission_at(expired.id(), now + Duration::from_secs(10)),
             Err(CandidateLookupError::Expired)
         );
         assert_eq!(
-            cache.get_at(expired_id, now + Duration::from_secs(10)),
+            cache.begin_submission_at(expired.id(), now + Duration::from_secs(10)),
             Err(CandidateLookupError::Unknown)
         );
 
-        let reorg_candidate_id = cache
+        let reorg_candidate = cache
             .insert_at(candidate(2, tip), now)
             .expect("expired slot was purged");
+        cache.publish(reorg_candidate);
         assert!(
-            cache.get_at(reorg_candidate_id, now).is_ok(),
+            cache.begin_submission_at(reorg_candidate.id(), now).is_ok(),
             "a bounded candidate remains available while its parent changes chain status"
         );
     }
@@ -350,27 +525,129 @@ mod tests {
         let first = cache
             .insert_at(candidate(1, tip), now)
             .expect("first slot is free");
+        cache.publish(first);
         let second = cache
             .insert_at(candidate(2, tip), now + Duration::from_secs(1))
             .expect("second slot is free");
+        cache.publish(second);
         assert_eq!(
             cache.insert_at(candidate(3, tip), now + Duration::from_secs(2)),
             Err(CandidateInsertError::Full),
             "a later caller must not evict a job that may already have parent work"
         );
 
-        assert!(cache.get_at(first, now + Duration::from_secs(2)).is_ok());
-        assert!(cache.get_at(second, now + Duration::from_secs(2)).is_ok());
-
-        cache.remove(first);
         assert!(cache
-            .insert_at(candidate(3, tip), now + Duration::from_secs(3))
+            .begin_submission_at(first.id(), now + Duration::from_secs(2))
             .is_ok());
+        assert!(cache
+            .begin_submission_at(second.id(), now + Duration::from_secs(2))
+            .is_ok());
+
+        cache.remove(first.id());
+        let third = cache
+            .insert_at(candidate(3, tip), now + Duration::from_secs(3))
+            .expect("explicit removal releases capacity");
+        cache.publish(third);
 
         // An expired reservation is purged atomically by the next insertion.
         assert!(cache
             .insert_at(candidate(4, tip), now + Duration::from_secs(11))
             .is_ok());
+    }
+
+    #[test]
+    fn authenticated_retirement_soaks_more_than_sixteen_unsolved_rotations() {
+        let cache = AuxBlockCandidateCache::new(2, Duration::from_secs(600));
+        let now = Instant::now();
+        let tip = block::Hash([0x31; 32]);
+
+        for generation in 0..64u8 {
+            let lease = cache
+                .insert_at(candidate(generation, tip), now)
+                .expect("a retired unsolved generation must release its slot");
+            cache.publish(lease);
+            assert_eq!(
+                cache
+                    .retire(lease.id(), lease.retire_token())
+                    .expect("the exact capability authorizes retirement"),
+                CandidateRetirement::Retired
+            );
+            assert_eq!(
+                cache
+                    .retire(lease.id(), lease.retire_token())
+                    .expect("retirement retries are idempotent"),
+                CandidateRetirement::AlreadyAbsent
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_lease_debug_redacts_the_retirement_capability() {
+        let cache = AuxBlockCandidateCache::new(1, Duration::from_secs(600));
+        let lease = cache
+            .insert_at(candidate(1, block::Hash([0x61; 32])), Instant::now())
+            .expect("cache has room");
+        let debug = format!("{lease:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(&hex::encode(lease.retire_token())));
+    }
+
+    #[test]
+    fn retirement_never_discards_a_started_submission() {
+        let cache = AuxBlockCandidateCache::new(2, Duration::from_secs(600));
+        let now = Instant::now();
+        let tip = block::Hash([0x41; 32]);
+        let lease = cache
+            .insert_at(candidate(1, tip), now)
+            .expect("cache has room");
+
+        assert_eq!(
+            cache
+                .retire(lease.id(), lease.retire_token())
+                .expect_err("an unpublished reservation has no external retirement authority"),
+            CandidateRetirementError::Unauthorized
+        );
+        cache.publish(lease);
+        assert_eq!(
+            cache.retire(lease.id(), [0xff; 32]),
+            Err(CandidateRetirementError::Unauthorized)
+        );
+        let submitted = cache
+            .begin_submission_at(lease.id(), now)
+            .expect("published candidate begins submission");
+        assert_eq!(submitted.hash(), lease.id());
+        assert_eq!(
+            cache
+                .retire(lease.id(), lease.retire_token())
+                .expect("the correct capability is recognized"),
+            CandidateRetirement::SubmissionStarted
+        );
+        assert!(
+            cache.begin_submission_at(lease.id(), now).is_ok(),
+            "the exact candidate remains retryable"
+        );
+    }
+
+    #[test]
+    fn unpublished_tip_race_cleanup_does_not_leak_capacity() {
+        let cache = AuxBlockCandidateCache::new(1, Duration::from_secs(600));
+        let now = Instant::now();
+        let tip = block::Hash([0x51; 32]);
+        let abandoned = cache
+            .insert_at(candidate(1, tip), now)
+            .expect("reserve unpublished candidate");
+        cache.discard_unpublished(abandoned);
+
+        let replacement = cache
+            .insert_at(candidate(2, tip), now)
+            .expect("unpublished cleanup must release capacity immediately");
+        cache.publish(replacement);
+        assert_eq!(
+            cache
+                .retire(replacement.id(), replacement.retire_token())
+                .expect("published candidate retires"),
+            CandidateRetirement::Retired
+        );
     }
 
     #[test]

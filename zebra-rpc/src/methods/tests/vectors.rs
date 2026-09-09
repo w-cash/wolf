@@ -17,11 +17,7 @@ use zebra_chain::{
     chain_sync_status::MockSyncStatus,
     chain_tip::{mock::MockChainTip, NoChainTip},
     history_tree::HistoryTree,
-    parameters::{
-        testnet::{self, Parameters},
-        Network::*,
-        NetworkKind,
-    },
+    parameters::{testnet::Parameters, Network::*, NetworkKind},
     serialization::{DateTime32, ZcashDeserializeInto, ZcashSerialize},
     transaction::{zip317, UnminedTxId, VerifiedUnminedTx},
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, U256},
@@ -39,7 +35,10 @@ use zebra_test::mock_service::MockService;
 
 use crate::methods::{
     hex_data::HexData,
-    tests::utils::fake_history_tree,
+    tests::utils::{
+        consensus_profile_blocks, consensus_profile_network, consensus_profile_regtest_network,
+        fake_history_tree, zcash_historical_fixtures_are_compatible,
+    },
     types::get_block_template::{
         constants::{CAPABILITIES_FIELD, MUTABLE_FIELD, NONCE_RANGE_FIELD},
         GetBlockTemplateRequestMode,
@@ -302,6 +301,7 @@ async fn rpc_getdeprecationinfo_estimated_time_is_never_negative() {
 // Helper function that returns the nonce, final sapling root and
 // block commitments of a given Block.
 async fn get_block_data(
+    network: &Network,
     read_state: &ReadStateService,
     block: Arc<Block>,
     height: usize,
@@ -336,7 +336,7 @@ async fn get_block_data(
     };
 
     let expected_block_commitments = match block
-        .commitment(&Mainnet)
+        .commitment(network)
         .expect("Unexpected failure while parsing the blockcommitments field in get_block_data")
     {
         Commitment::PreSaplingReserved(bytes) => bytes,
@@ -378,21 +378,18 @@ async fn get_block_data(
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblock() {
     let _init_guard = zebra_test::init();
+    let network = consensus_profile_network();
 
-    // Create a continuous chain of mainnet blocks from genesis
-    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
-        .values()
-        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
-        .collect();
+    let blocks = consensus_profile_blocks(&network);
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     // Create a populated state service
-    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &Mainnet).await;
+    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &network).await;
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue) = RpcImpl::new(
-        Mainnet,
+        network.clone(),
         Default::default(),
         Default::default(),
         "0.0.1",
@@ -446,10 +443,14 @@ async fn rpc_getblock() {
         assert_eq!(get_block, expected_result);
     }
 
-    // Test negative heights: -1 should return block 10, -2 block 9, etc.
-    for neg_height in (-10..=-1).rev() {
+    // Test negative heights, where -1 is the current tip.
+    let oldest_relative_height = -i32::try_from(blocks.len()).expect("fixture length fits in i32");
+    for neg_height in (oldest_relative_height..=-1).rev() {
         // Convert negative height to corresponding index
-        let index = (neg_height + (blocks.len() as i32)) as usize;
+        let index = usize::try_from(
+            neg_height + i32::try_from(blocks.len()).expect("fixture length fits in i32"),
+        )
+        .expect("the relative fixture height is non-negative");
 
         let expected_result = GetBlockResponse::Raw(blocks[index].clone().into());
 
@@ -485,7 +486,7 @@ async fn rpc_getblock() {
             expected_block_commitments,
             block_info,
             delta,
-        ) = get_block_data(&read_state, block.clone(), i, prev_block_info).await;
+        ) = get_block_data(&network, &read_state, block.clone(), i, prev_block_info).await;
         prev_block_info = block_info.clone();
 
         assert_eq!(
@@ -514,7 +515,7 @@ async fn rpc_getblock() {
                     block
                         .header
                         .difficulty_threshold
-                        .relative_to_network(&Mainnet)
+                        .relative_to_network(&network)
                 ),
                 previous_block_hash: Some(block.header.previous_block_hash),
                 next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
@@ -543,7 +544,7 @@ async fn rpc_getblock() {
             expected_block_commitments,
             block_info,
             delta,
-        ) = get_block_data(&read_state, block.clone(), i, prev_block_info).await;
+        ) = get_block_data(&network, &read_state, block.clone(), i, prev_block_info).await;
         prev_block_info = block_info.clone();
 
         assert_eq!(
@@ -572,7 +573,7 @@ async fn rpc_getblock() {
                     block
                         .header
                         .difficulty_threshold
-                        .relative_to_network(&Mainnet)
+                        .relative_to_network(&network)
                 ),
                 previous_block_hash: Some(block.header.previous_block_hash),
                 next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
@@ -600,7 +601,7 @@ async fn rpc_getblock() {
             expected_block_commitments,
             block_info,
             delta,
-        ) = get_block_data(&read_state, block.clone(), i, prev_block_info).await;
+        ) = get_block_data(&network, &read_state, block.clone(), i, prev_block_info).await;
         prev_block_info = block_info.clone();
 
         // partially compare the expected and actual GetBlock structs
@@ -648,7 +649,7 @@ async fn rpc_getblock() {
                     block
                         .header
                         .difficulty_threshold
-                        .relative_to_network(&Mainnet)
+                        .relative_to_network(&network)
                 )
             );
             assert_eq!(previous_block_hash, &Some(block.header.previous_block_hash));
@@ -700,7 +701,7 @@ async fn rpc_getblock() {
             expected_block_commitments,
             block_info,
             delta,
-        ) = get_block_data(&read_state, block.clone(), i, prev_block_info).await;
+        ) = get_block_data(&network, &read_state, block.clone(), i, prev_block_info).await;
         prev_block_info = block_info.clone();
 
         // partially compare the expected and actual GetBlock structs
@@ -748,7 +749,7 @@ async fn rpc_getblock() {
                     block
                         .header
                         .difficulty_threshold
-                        .relative_to_network(&Mainnet)
+                        .relative_to_network(&network)
                 )
             );
             assert_eq!(previous_block_hash, &Some(block.header.previous_block_hash));
@@ -800,7 +801,7 @@ async fn rpc_getblock() {
             expected_block_commitments,
             block_info,
             delta,
-        ) = get_block_data(&read_state, block.clone(), i, prev_block_info).await;
+        ) = get_block_data(&network, &read_state, block.clone(), i, prev_block_info).await;
         prev_block_info = block_info.clone();
 
         assert_eq!(
@@ -829,7 +830,7 @@ async fn rpc_getblock() {
                     block
                         .header
                         .difficulty_threshold
-                        .relative_to_network(&Mainnet)
+                        .relative_to_network(&network)
                 ),
                 previous_block_hash: Some(block.header.previous_block_hash),
                 next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
@@ -857,7 +858,7 @@ async fn rpc_getblock() {
             expected_block_commitments,
             block_info,
             delta,
-        ) = get_block_data(&read_state, block.clone(), i, prev_block_info).await;
+        ) = get_block_data(&network, &read_state, block.clone(), i, prev_block_info).await;
         prev_block_info = block_info.clone();
 
         assert_eq!(
@@ -886,7 +887,7 @@ async fn rpc_getblock() {
                     block
                         .header
                         .difficulty_threshold
-                        .relative_to_network(&Mainnet)
+                        .relative_to_network(&network)
                 ),
                 previous_block_hash: Some(block.header.previous_block_hash),
                 next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
@@ -1139,20 +1140,17 @@ async fn rpc_getblock_side_chain_verbosity2_does_not_panic() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblockheader() {
     let _init_guard = zebra_test::init();
+    let network = consensus_profile_network();
 
-    // Create a continuous chain of mainnet blocks from genesis
-    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
-        .values()
-        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
-        .collect();
+    let blocks = consensus_profile_blocks(&network);
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &Mainnet).await;
+    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &network).await;
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue) = RpcImpl::new(
-        Mainnet,
+        network.clone(),
         Default::default(),
         Default::default(),
         "0.0.1",
@@ -1211,9 +1209,9 @@ async fn rpc_getblockheader() {
 
         let expected_result = GetBlockHeaderResponse::Object(Box::new(BlockHeaderObject {
             hash,
-            confirmations: 11 - i as i64,
+            confirmations: i64::try_from(blocks.len() - i).expect("fixture length fits in i64"),
             height,
-            version: 4,
+            version: block.header.version,
             merkle_root: block.header.merkle_root,
             block_commitments: block.header.commitment_bytes.0,
             final_sapling_root: expected_final_sapling_root,
@@ -1225,7 +1223,7 @@ async fn rpc_getblockheader() {
             difficulty: block
                 .header
                 .difficulty_threshold
-                .relative_to_network(&Mainnet),
+                .relative_to_network(&network),
             previous_block_hash: block.header.previous_block_hash,
             next_block_hash: blocks.get(i + 1).map(|b| b.hash()),
         }));
@@ -1239,10 +1237,12 @@ async fn rpc_getblockheader() {
         }
     }
 
-    // Test negative heights: -1 should return a header for block 10, -2 block header 9, etc.
-    for neg_height in (-10..=-1).rev() {
-        // Convert negative height to corresponding index
-        let index = (neg_height + (blocks.len() as i32)) as usize;
+    let oldest_relative_height = -i32::try_from(blocks.len()).expect("fixture length fits in i32");
+    for neg_height in (oldest_relative_height..=-1).rev() {
+        let index = usize::try_from(
+            neg_height + i32::try_from(blocks.len()).expect("fixture length fits in i32"),
+        )
+        .expect("the relative fixture height is non-negative");
 
         let expected_result =
             GetBlockHeaderResponse::Raw(HexData(blocks[index].header.clone().as_bytes()));
@@ -1265,12 +1265,9 @@ async fn rpc_getblockheader() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getbestblockhash() {
     let _init_guard = zebra_test::init();
+    let network = consensus_profile_network();
 
-    // Create a continuous chain of mainnet blocks from genesis
-    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
-        .values()
-        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
-        .collect();
+    let blocks = consensus_profile_blocks(&network);
 
     // Get the hash of the block at the tip using hardcoded block tip bytes.
     // We want to test the RPC response is equal to this hash
@@ -1280,12 +1277,12 @@ async fn rpc_getbestblockhash() {
     // Get a mempool handle
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     // Create a populated state service, the tip will be in `NUMBER_OF_BLOCKS`.
-    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &Mainnet).await;
+    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &network).await;
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue) = RpcImpl::new(
-        Mainnet,
+        network,
         Default::default(),
         Default::default(),
         "0.0.1",
@@ -1320,6 +1317,9 @@ async fn rpc_getbestblockhash() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getrawtransaction() {
     let _init_guard = zebra_test::init();
+    if !zcash_historical_fixtures_are_compatible() {
+        return;
+    }
 
     // Create a continuous chain of mainnet blocks from genesis
     let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
@@ -1509,21 +1509,17 @@ async fn rpc_getrawtransaction() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getaddresstxids_invalid_arguments() {
     let _init_guard = zebra_test::init();
+    let network = consensus_profile_network();
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-
-    // Create a continuous chain of mainnet blocks from genesis
-    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
-        .values()
-        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
-        .collect();
-
-    // Create a populated state service
-    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &Mainnet).await;
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(Height(10));
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, rpc_tx_queue) = RpcImpl::new(
-        Mainnet,
+        network.clone(),
         Default::default(),
         Default::default(),
         "0.0.1",
@@ -1554,7 +1550,9 @@ async fn rpc_getaddresstxids_invalid_arguments() {
     mempool.expect_no_requests().await;
 
     // create a valid address
-    let address = "t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd".to_string();
+    let address =
+        mining::default_miner_address_for_network(&network, &mining::MinerAddressType::Transparent)
+            .expect("both consensus profiles support transparent addresses");
     let addresses = vec![address.clone()];
 
     // call the method with start greater than end
@@ -1574,6 +1572,8 @@ async fn rpc_getaddresstxids_invalid_arguments() {
     );
 
     mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
 
     // The queue task should continue without errors or panics
     let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
@@ -1583,6 +1583,9 @@ async fn rpc_getaddresstxids_invalid_arguments() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getaddresstxids_response() {
     let _init_guard = zebra_test::init();
+    if !zcash_historical_fixtures_are_compatible() {
+        return;
+    }
 
     for network in Network::iter() {
         let blocks: Vec<Arc<Block>> = network
@@ -1766,19 +1769,11 @@ async fn rpc_getaddresstxids_response_with(
 #[tokio::test(flavor = "multi_thread")]
 async fn getaddresstxids_single_equals_object_full_range() {
     let _init_guard = zebra_test::init();
-
-    let network = Network::Mainnet;
-
-    let blocks: Vec<Arc<Block>> = network
-        .blockchain_map()
-        .values()
-        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
-        .collect();
-
-    let first_block_first_tx = &blocks[1].transactions[0];
-    let address = first_block_first_tx.outputs()[1]
-        .address(&network)
-        .expect("should get address from coinbase output");
+    let network = consensus_profile_network();
+    let blocks = consensus_profile_blocks(&network);
+    let addr_str =
+        mining::default_miner_address_for_network(&network, &mining::MinerAddressType::Transparent)
+            .expect("both consensus profiles support transparent addresses");
 
     let (_, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &network).await;
 
@@ -1803,8 +1798,6 @@ async fn getaddresstxids_single_equals_object_full_range() {
         rx,
         None,
     );
-
-    let addr_str = address.to_string();
 
     let object_response = rpc
         .get_address_tx_ids(GetAddressTxIdsRequest {
@@ -1875,6 +1868,9 @@ async fn rpc_getaddressutxos_invalid_arguments() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getaddressutxos_response() {
     let _init_guard = zebra_test::init();
+    if !zcash_historical_fixtures_are_compatible() {
+        return;
+    }
 
     let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
         .values()
@@ -1968,6 +1964,9 @@ async fn rpc_getaddressutxos_response() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getaddressutxos_limits() {
     let _init_guard = zebra_test::init();
+    if !zcash_historical_fixtures_are_compatible() {
+        return;
+    }
 
     let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
         .values()
@@ -2055,12 +2054,9 @@ async fn rpc_getaddressutxos_limits() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblockcount() {
     let _init_guard = zebra_test::init();
+    let network = consensus_profile_network();
 
-    // Create a continuous chain of mainnet blocks from genesis
-    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
-        .values()
-        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
-        .collect();
+    let blocks = consensus_profile_blocks(&network);
 
     // Get the height of the block at the tip using hardcoded block tip bytes.
     // We want to test the RPC response is equal to this hash
@@ -2070,11 +2066,11 @@ async fn rpc_getblockcount() {
     // Get a mempool handle
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     // Create a populated state service, the tip will be in `NUMBER_OF_BLOCKS`.
-    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &Mainnet).await;
+    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &network).await;
 
     let (block_verifier_router, _, _, _) = zebra_consensus::router::init_test(
         zebra_consensus::Config::default(),
-        &Mainnet,
+        &network,
         state.clone(),
     )
     .await;
@@ -2082,7 +2078,7 @@ async fn rpc_getblockcount() {
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _) = RpcImpl::new(
-        Mainnet,
+        network,
         Default::default(),
         Default::default(),
         "0.0.1",
@@ -2110,15 +2106,16 @@ async fn rpc_getblockcount() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblockcount_empty_state() {
     let _init_guard = zebra_test::init();
+    let network = consensus_profile_network();
 
     // Get a mempool handle
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     // Create an empty state
-    let (state, read_state, tip, _) = zebra_state::init_test_services(&Mainnet).await;
+    let (state, read_state, tip, _) = zebra_state::init_test_services(&network).await;
 
     let (block_verifier_router, _, _, _) = zebra_consensus::router::init_test(
         zebra_consensus::Config::default(),
-        &Mainnet,
+        &network,
         state.clone(),
     )
     .await;
@@ -2126,7 +2123,7 @@ async fn rpc_getblockcount_empty_state() {
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _) = RpcImpl::new(
-        Mainnet,
+        network,
         Default::default(),
         Default::default(),
         "0.0.1",
@@ -2160,10 +2157,10 @@ async fn rpc_getblockcount_empty_state() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getpeerinfo() {
     let _init_guard = zebra_test::init();
-    let network = Mainnet;
+    let network = consensus_profile_network();
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let (state, read_state, tip, _) = zebra_state::init_test_services(&Mainnet).await;
+    let (state, read_state, tip, _) = zebra_state::init_test_services(&network).await;
 
     let (block_verifier_router, _, _, _) = zebra_consensus::router::init_test(
         zebra_consensus::Config::default(),
@@ -2276,19 +2273,16 @@ async fn rpc_getpeerinfo() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblockhash() {
     let _init_guard = zebra_test::init();
+    let network = consensus_profile_network();
 
-    // Create a continuous chain of mainnet blocks from genesis
-    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
-        .values()
-        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
-        .collect();
+    let blocks = consensus_profile_blocks(&network);
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &Mainnet).await;
+    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &network).await;
 
     let (block_verifier_router, _, _, _) = zebra_consensus::router::init_test(
         zebra_consensus::Config::default(),
-        &Mainnet,
+        &network,
         state.clone(),
     )
     .await;
@@ -2296,7 +2290,7 @@ async fn rpc_getblockhash() {
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _) = RpcImpl::new(
-        Mainnet,
+        network,
         Default::default(),
         Default::default(),
         "0.0.1",
@@ -2323,16 +2317,17 @@ async fn rpc_getblockhash() {
     }
 
     // Query the hashes using negative indexes
-    for i in (-10..=-1).rev() {
+    let fixture_len = i32::try_from(blocks.len()).expect("fixture length fits in i32");
+    let oldest_relative_height = -fixture_len;
+    for i in (oldest_relative_height..=-1).rev() {
         let get_block_hash = rpc
             .get_block_hash(i)
             .await
             .expect("We should have a GetBlockHash struct");
 
-        assert_eq!(
-            get_block_hash,
-            GetBlockHashResponse(blocks[(10 + (i + 1)) as usize].hash())
-        );
+        let index =
+            usize::try_from(fixture_len + i).expect("the relative fixture height is non-negative");
+        assert_eq!(get_block_hash, GetBlockHashResponse(blocks[index].hash()));
     }
 
     mempool.expect_no_requests().await;
@@ -2341,20 +2336,17 @@ async fn rpc_getblockhash() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getmininginfo() {
     let _init_guard = zebra_test::init();
+    let network = consensus_profile_network();
 
-    // Create a continuous chain of mainnet blocks from genesis
-    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
-        .values()
-        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
-        .collect();
+    let blocks = consensus_profile_blocks(&network);
 
     // Create a populated state service
-    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &Mainnet).await;
+    let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), &network).await;
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _) = RpcImpl::new(
-        Mainnet,
+        network,
         Default::default(),
         Default::default(),
         "0.0.1",
@@ -2378,6 +2370,9 @@ async fn rpc_getmininginfo() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getnetworksolps() {
     let _init_guard = zebra_test::init();
+    if !zcash_historical_fixtures_are_compatible() {
+        return;
+    }
 
     // Create a continuous chain of mainnet blocks from genesis
     let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
@@ -2764,6 +2759,9 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_submitblock_errors() {
     let _init_guard = zebra_test::init();
+    if !zcash_historical_fixtures_are_compatible() {
+        return;
+    }
 
     // Create a continuous chain of mainnet blocks from genesis
     let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
@@ -3368,18 +3366,16 @@ async fn rpc_z_listunifiedreceivers() {
 async fn rpc_z_listunifiedreceivers_uses_wcash_namespace() {
     let _init_guard = zebra_test::init();
 
-    for (network, ua_prefix, sapling_prefix, p2pkh_prefix, p2sh_prefix) in [
+    for (network, ua_prefix, p2pkh_prefix, p2sh_prefix) in [
         (
             zebra_chain::parameters::Network::new_wcash_testnet(),
             "wutest1",
-            "wtestsapling1",
             "WT",
             "WU",
         ),
         (
             zebra_chain::parameters::Network::new_wcash_regtest(),
             concat!("w", "u", "regtest", "1"),
-            "wregtestsapling1",
             "WR",
             "WS",
         ),
@@ -3403,7 +3399,8 @@ async fn rpc_z_listunifiedreceivers_uses_wcash_namespace() {
         );
 
         let wcash_address =
-            mining::default_miner_address_for_network(&network, &mining::MinerAddressType::Unified);
+            mining::default_miner_address_for_network(&network, &mining::MinerAddressType::Unified)
+                .expect("Wcash supports Ironwood Unified Addresses");
         assert!(wcash_address.starts_with(ua_prefix));
 
         let response = rpc
@@ -3415,9 +3412,7 @@ async fn rpc_z_listunifiedreceivers_uses_wcash_namespace() {
             .orchard()
             .as_deref()
             .is_some_and(|address| address.starts_with(ua_prefix)));
-        if let Some(address) = response.sapling() {
-            assert!(address.starts_with(sapling_prefix));
-        }
+        assert_eq!(*response.sapling(), None);
         if let Some(address) = response.p2pkh() {
             assert!(address.starts_with(p2pkh_prefix));
         }
@@ -3440,7 +3435,8 @@ async fn rpc_z_listunifiedreceivers_uses_wcash_namespace() {
         let other_wcash_address = mining::default_miner_address_for_network(
             &other_wcash_network,
             &mining::MinerAddressType::Unified,
-        );
+        )
+        .expect("Wcash supports Ironwood Unified Addresses");
         assert!(rpc
             .z_list_unified_receivers(other_wcash_address)
             .await
@@ -3551,33 +3547,9 @@ async fn rpc_z_listunifiedreceivers_rejects_bad_sapling_receiver() {
          got {result:?}",
     );
 
-    let wcash_encoded =
-        zebra_chain::primitives::WcashAddress::from_unified(NetworkType::Regtest, unified.clone())
-            .encode();
-    let wcash_network = zebra_chain::parameters::Network::new_wcash_regtest();
-    let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (wcash_rpc, _) = RpcImpl::new(
-        wcash_network,
-        Default::default(),
-        Default::default(),
-        "0.0.1",
-        "RPC test",
-        MockService::build().for_unit_tests(),
-        MockService::build().for_unit_tests(),
-        MockService::build().for_unit_tests(),
-        MockService::build().for_unit_tests(),
-        MockSyncStatus::default(),
-        NoChainTip,
-        MockAddressBookPeers::default(),
-        rx,
-        None,
-    );
-
-    let wcash_result = wcash_rpc.z_list_unified_receivers(wcash_encoded).await;
     assert!(
-        wcash_result.is_err(),
-        "z_listunifiedreceivers must reject a malformed Wcash Sapling receiver, \
-         got {wcash_result:?}",
+        zebra_chain::primitives::WcashAddress::from_unified(NetworkType::Regtest, unified).is_err(),
+        "the Wcash codec must reject every Sapling receiver before RPC handling",
     );
 }
 
@@ -3620,7 +3592,9 @@ async fn rpc_z_listunifiedreceivers_rejects_bad_orchard_receiver() {
     );
 
     let wcash_encoded =
-        zebra_chain::primitives::WcashAddress::from_unified(NetworkType::Regtest, unified).encode();
+        zebra_chain::primitives::WcashAddress::from_unified(NetworkType::Regtest, unified)
+            .expect("the Wcash codec accepts the structurally valid Orchard container")
+            .encode();
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (wcash_rpc, _) = RpcImpl::new(
         zebra_chain::parameters::Network::new_wcash_regtest(),
@@ -3649,13 +3623,10 @@ async fn rpc_z_listunifiedreceivers_rejects_bad_orchard_receiver() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_addnode() {
     let _init_guard = zebra_test::init();
-    let network = Network::Testnet(Arc::new(
-        testnet::Parameters::new_regtest(Default::default())
-            .expect("failed to build regtest parameters"),
-    ));
+    let network = consensus_profile_regtest_network();
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let (state, read_state, tip, _) = zebra_state::init_test_services(&Mainnet).await;
+    let (state, read_state, tip, _) = zebra_state::init_test_services(&network).await;
 
     let (block_verifier_router, _, _, _) = zebra_consensus::router::init_test(
         zebra_consensus::Config::default(),
@@ -3723,6 +3694,9 @@ async fn rpc_addnode() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_gettxout() {
     let _init_guard = zebra_test::init();
+    if !zcash_historical_fixtures_are_compatible() {
+        return;
+    }
 
     // Create a continuous chain of mainnet blocks from genesis
     let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS

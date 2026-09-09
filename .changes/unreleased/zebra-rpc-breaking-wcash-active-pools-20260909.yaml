@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: breaking
+body: "Make Wcash miner-address defaults fallible, expose only transparent or Ironwood-capable Unified destinations, and add capability-authenticated retirement for bounded AuxPoW candidate leases; standalone Sapling payout addresses are no longer accepted."
+time: 2026-09-09T12:00:00.000000004Z

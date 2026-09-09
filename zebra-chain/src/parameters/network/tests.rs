@@ -16,7 +16,7 @@ use crate::{
             height_for_halving, miner_subsidy, ParameterSubsidy as _, WCASH_FIRST_HALVING_HEIGHT,
             WCASH_HALVING_INTERVAL, WCASH_INITIAL_BLOCK_SUBSIDY,
         },
-        ConsensusBranchId, NetworkUpgrade, WCASH_TESTNET_V1_BRANCH_ID,
+        ConsensusBranchId, NetworkUpgrade, WCASH_REGTEST_V1_BRANCH_ID, WCASH_TESTNET_V1_BRANCH_ID,
     },
     serialization::DateTime32,
     work::difficulty::ParameterDifficulty as _,
@@ -119,7 +119,15 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
     );
     assert_eq!(
         ConsensusBranchId::current(&regtest, Height(1)),
-        Some(WCASH_TESTNET_V1_BRANCH_ID)
+        Some(WCASH_REGTEST_V1_BRANCH_ID)
+    );
+    assert_eq!(
+        NetworkUpgrade::try_from(u32::from(WCASH_TESTNET_V1_BRANCH_ID)),
+        Ok(NetworkUpgrade::Nu6_3)
+    );
+    assert_eq!(
+        NetworkUpgrade::try_from(u32::from(WCASH_REGTEST_V1_BRANCH_ID)),
+        Ok(NetworkUpgrade::Nu6_3)
     );
     assert_eq!(
         zcash_protocol::consensus::BranchId::for_height(
@@ -128,6 +136,14 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
         ),
         zcash_protocol::consensus::BranchId::WcashTestnetV1
     );
+    assert_eq!(
+        zcash_protocol::consensus::BranchId::for_height(
+            &regtest,
+            zcash_protocol::consensus::BlockHeight::from_u32(1),
+        ),
+        zcash_protocol::consensus::BranchId::WcashRegtestV1
+    );
+    assert_ne!(WCASH_TESTNET_V1_BRANCH_ID, WCASH_REGTEST_V1_BRANCH_ID);
 
     for zcash in zcash_networks {
         assert!(!zcash.uses_wcash_consensus());
@@ -251,7 +267,7 @@ fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
     assert_eq!(
         WCASH_INITIAL_BLOCK_SUBSIDY,
         u64::try_from(6 * COIN + COIN / 4).unwrap(),
-        "the initial subsidy must be exactly 6.25000000 WCASH"
+        "the initial subsidy must be exactly 6.25000000 WEC"
     );
     assert_eq!(WCASH_HALVING_INTERVAL, 1_680_000);
     assert_eq!(
@@ -294,8 +310,8 @@ fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
 
     // Integer truncation leaves 1,249,999,989 zatoshi of per-block subsidy across all eras.
     // Each era contains exactly 1,680,000 blocks, so the scheduled total is
-    // 20,999,999.81520000 WCASH (2,099,999,981,520,000 zatoshi). Integer-zatoshi
-    // truncation leaves the schedule 0.1848 WCASH below the 21 million hard cap.
+    // 20,999,999.81520000 WEC (2,099,999,981,520,000 zatoshi). Integer-zatoshi
+    // truncation leaves the schedule 0.1848 WEC below the 21 million hard cap.
     let per_block_era_sum: u64 = (0..64)
         .map(|era| WCASH_INITIAL_BLOCK_SUBSIDY.checked_shr(era).unwrap_or(0))
         .sum();

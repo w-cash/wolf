@@ -26,7 +26,10 @@ use crate::{
     arbitrary::Prepare,
     init_test,
     service::{arbitrary::populated_state, chain_tip::TipAction, StateService},
-    tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
+    tests::setup::{
+        partial_nu5_chain_strategy, test_network, transaction_v4_from_coinbase,
+        uses_wcash_consensus,
+    },
     BoxError, CheckpointVerifiedBlock, Config, Request, Response, SemanticallyVerifiedBlock,
 };
 
@@ -256,7 +259,7 @@ async fn empty_state_still_responds_to_requests() -> Result<()> {
     .into_iter();
     let transcript = Transcript::from(iter);
 
-    let network = Network::Mainnet;
+    let network = test_network();
     let state = init_test(&network).await;
 
     transcript.check(state).await?;
@@ -267,6 +270,11 @@ async fn empty_state_still_responds_to_requests() -> Result<()> {
 #[test]
 fn state_behaves_when_blocks_are_committed_in_order() -> Result<()> {
     let _init_guard = zebra_test::init();
+    if uses_wcash_consensus() {
+        // These are frozen Zcash mainnet blocks. Wcash has a native state
+        // lifecycle test based on its own genesis and activation schedule.
+        return Ok(());
+    }
 
     let blocks = zebra_test::vectors::MAINNET_BLOCKS
         .range(0..=LAST_BLOCK_HEIGHT)
@@ -301,6 +309,10 @@ proptest! {
     #[test]
     fn state_behaves_when_blocks_are_committed_out_of_order(blocks in out_of_order_committing_strategy()) {
         let _init_guard = zebra_test::init();
+
+        if uses_wcash_consensus() {
+            return Ok(());
+        }
 
         populate_and_check(blocks).unwrap();
     }
@@ -403,6 +415,10 @@ proptest! {
             in continuous_empty_blocks_from_test_vectors(),
     ) {
         let _init_guard = zebra_test::init();
+        if uses_wcash_consensus() {
+            // This strategy is backed by frozen Zcash slow-start blocks.
+            return Ok(());
+        }
         let (mut state_service, _, _, _) = Runtime::new().unwrap().block_on(async {
             // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
             StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await
@@ -480,7 +496,7 @@ proptest! {
 // This test sleeps for every block, so we only ever want to run it once
 proptest! {
     #![proptest_config(
-        proptest::test_runner::Config::with_cases(1)
+        proptest::test_runner::Config::with_cases(if uses_wcash_consensus() { 0 } else { 1 })
     )]
 
     /// Test that the best tip height is updated accordingly.
@@ -496,6 +512,10 @@ proptest! {
             in continuous_empty_blocks_from_test_vectors(),
     ) {
         let _init_guard = zebra_test::init();
+
+        if uses_wcash_consensus() {
+            return Ok(());
+        }
 
         let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change) = Runtime::new().unwrap().block_on(async {
             // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
@@ -615,7 +635,7 @@ fn continuous_empty_blocks_from_test_vectors() -> impl Strategy<
 /// creating a new, empty database.
 #[test]
 fn read_only_open_with_no_database_returns_error() {
-    let network = Network::Mainnet;
+    let network = test_network();
 
     // An existing, readable, but empty cache directory: it contains no database.
     let cache_dir =
@@ -638,7 +658,7 @@ fn read_only_open_with_no_database_returns_error() {
 /// on-disk format version.
 #[test]
 fn read_only_open_with_unreadable_cache_dir_returns_error() {
-    let network = Network::Mainnet;
+    let network = test_network();
 
     // A cache directory that does not exist. `read_dir` fails for a missing directory the same way
     // it does for an unreadable one, without depending on filesystem permissions (which `root`
@@ -665,7 +685,7 @@ fn read_only_open_with_unreadable_cache_dir_returns_error() {
 /// (which would delete the primary's files on drop).
 #[test]
 fn read_only_open_with_ephemeral_config_returns_error() {
-    let network = Network::Mainnet;
+    let network = test_network();
 
     // While `ephemeral: true` should make `cache_dir` irrelevant, we had
     // instances where a bug would try to read the `cache_dir` before checking

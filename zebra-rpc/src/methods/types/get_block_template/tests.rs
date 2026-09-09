@@ -141,7 +141,8 @@ fn wcash_template_includes_v6_transfer_fees_and_private_coinbase() {
         .expect("the transaction pays its ZIP-317 conventional fee");
     assert!(verified.pays_conventional_fee());
 
-    let miner_address = default_miner_address_for_network(&network, &MinerAddressType::Unified);
+    let miner_address = default_miner_address_for_network(&network, &MinerAddressType::Unified)
+        .expect("Wcash supports Ironwood Unified Addresses");
     let miner_params = MinerParams::new(
         &network,
         Config {
@@ -914,8 +915,10 @@ fn wcash_miner_payout_addresses_are_bound_to_the_selected_network() {
     };
 
     for address_type in [MinerAddressType::Transparent, MinerAddressType::Unified] {
-        let testnet_address = default_miner_address_for_network(&testnet, &address_type);
-        let regtest_address = default_miner_address_for_network(&regtest, &address_type);
+        let testnet_address = default_miner_address_for_network(&testnet, &address_type)
+            .expect("the selected payout type is supported by Wcash");
+        let regtest_address = default_miner_address_for_network(&regtest, &address_type)
+            .expect("the selected payout type is supported by Wcash");
 
         for (network, matching_address, other_network_address) in [
             (&testnet, testnet_address.as_str(), regtest_address.as_str()),
@@ -943,8 +946,10 @@ fn wcash_coinbase_supports_transparent_and_private_payouts() {
     let net = Network::new_wcash_regtest();
     let height = Height(1);
     let transparent_address =
-        default_miner_address_for_network(&net, &MinerAddressType::Transparent);
-    let unified_address = default_miner_address_for_network(&net, &MinerAddressType::Unified);
+        default_miner_address_for_network(&net, &MinerAddressType::Transparent)
+            .expect("Wcash supports transparent payouts");
+    let unified_address = default_miner_address_for_network(&net, &MinerAddressType::Unified)
+        .expect("Wcash supports Ironwood Unified Addresses");
     let config_for = |address: &str| Config {
         miner_address: Some(address.parse().expect("hard-coded address parses")),
         ..Default::default()
@@ -1063,18 +1068,10 @@ fn wcash_coinbase_supports_transparent_and_private_payouts() {
         Err(super::MinerParamsError::WcashAddressNamespaceRequired)
     ));
 
-    let sapling_address = default_miner_address_for_network(&net, &MinerAddressType::Sapling);
-    assert!(matches!(
-        MinerParams::new(&net, config_for(&sapling_address)),
-        Err(super::MinerParamsError::WcashUnsupportedPayoutAddress)
-    ));
-
-    let invalid_params = MinerParams::new(&net, config_for(&sapling_address))
-        .expect_err("the Wcash coinbase policy rejects legacy shielded miner addresses");
-    assert!(matches!(
-        invalid_params,
-        super::MinerParamsError::WcashUnsupportedPayoutAddress
-    ));
+    assert!(
+        default_miner_address_for_network(&net, &MinerAddressType::Sapling).is_none(),
+        "Wcash must not expose a default address for the disabled Sapling pool",
+    );
 
     let tex_address = WcashAddress::from_tex(NetworkType::Regtest, [0x42; 20]).encode();
     assert!(matches!(
@@ -1098,7 +1095,8 @@ fn wcash_zero_subsidy_tail_supports_both_payout_modes() {
     let net = Network::new_wcash_regtest();
     let height = Height(50_400_001);
     for address_type in [MinerAddressType::Transparent, MinerAddressType::Unified] {
-        let address = default_miner_address_for_network(&net, &address_type);
+        let address = default_miner_address_for_network(&net, &address_type)
+            .expect("the selected payout type is supported by Wcash");
         let miner_params = MinerParams::new(
             &net,
             Config {

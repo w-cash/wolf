@@ -1,7 +1,7 @@
 //! Wcash wallet network selection.
 
 use serde::{Deserialize, Serialize};
-use zcash_protocol::consensus::NetworkType;
+use zcash_protocol::consensus::{BranchId, NetworkType};
 use zebra_chain::parameters::Network;
 
 /// A public Wcash network supported by the testnet wallet.
@@ -34,6 +34,19 @@ impl WalletNetwork {
         }
     }
 
+    /// Returns this network's transaction signature and transaction-ID domain.
+    pub const fn branch_id(self) -> BranchId {
+        match self {
+            Self::Testnet => BranchId::WcashTestnetV1,
+            Self::Regtest => BranchId::WcashRegtestV1,
+        }
+    }
+
+    /// Returns this network's consensus branch ID in display byte order.
+    pub fn branch_id_hex(self) -> String {
+        format!("{:08x}", u32::from(self.branch_id()))
+    }
+
     /// Returns the frozen genesis block identifier in internal/serialized byte order.
     pub fn genesis_hash(self) -> [u8; 32] {
         self.parameters().genesis_hash().0
@@ -63,6 +76,10 @@ mod tests {
             WalletNetwork::Testnet.address_network(),
             WalletNetwork::Regtest.address_network()
         );
+        assert_ne!(
+            WalletNetwork::Testnet.branch_id(),
+            WalletNetwork::Regtest.branch_id()
+        );
     }
 
     #[test]
@@ -78,7 +95,7 @@ mod tests {
             assert_eq!(parameters.activation_height(NetworkUpgrade::Nu6_3), launch);
             assert_eq!(
                 parameters.branch_id_for_upgrade(NetworkUpgrade::Nu6_3),
-                zcash_protocol::consensus::BranchId::WcashTestnetV1,
+                network.branch_id(),
             );
         }
     }

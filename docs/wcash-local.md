@@ -53,7 +53,7 @@ its V6 coinbase has the authorization commitment required by AuxPoW v2.
 The current local identities are pinned explicitly:
 
 ```sh
-export WCASH_EXPECTED_GENESIS_HASH=b0ebe8618354e0563091d10b73ba03842cb3c112a801012616489269e58dbd61
+export WCASH_EXPECTED_GENESIS_HASH=70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c
 export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327
 WCASH_JOURNAL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wcash-native-e2e.XXXXXX")"
 chmod 700 "$WCASH_JOURNAL_DIR"
@@ -143,7 +143,7 @@ The two Zcash nodes should report the same tip because a parent winner is
 broadcast to the template node and proposal validator independently.
 
 `getblockchaininfo` on the Wcash node exposes deterministic chain supply and
-public value-pool totals. With the normal example address, a mined 6.25-WCASH
+public value-pool totals. With the normal example address, a mined 6.25-WEC
 child block increases the transparent pool by 6.25 while the shielded pools
 remain zero. Supplying a controlled Wcash Unified Address instead moves that
 reward into private Ironwood. Gross protocol issuance remains auditable in
@@ -284,12 +284,12 @@ submit exact blocks to both chains, and accept a canonical ZIP-301 share bound
 to an exact authenticated worker.
 
 The mandatory `scripts/wcash-testnet-e2e.sh` run adds two controlled Regtest
-wallet phases. The private phase mines and scans three private 6.25-WCASH
-coinbases, signs and broadcasts a one-WCASH Wcash V6 transfer, matches its exact
+wallet phases. The private phase mines and scans three private 6.25-WEC
+coinbases, signs and broadcasts a one-WEC Wcash V6 transfer, matches its exact
 bytes and fee in the mempool and block template, verifies duplicate-broadcast
 handling and rejection by two standard Zcash Regtest nodes, mines the
 transaction in a fourth real AuxPoW block, and rescans the recipient and private
-change. Its final supply check is exactly 25 WCASH, entirely in Ironwood. This
+change. Its final supply check is exactly 25 WEC, entirely in Ironwood. This
 phase uses the explicit Regtest-only unsafe one-confirmation override.
 
 The transparent phase mines 101 AuxPoW blocks to a seed-derived Wcash address.
@@ -299,7 +299,7 @@ A second wallet initialized with birthday 100 recovers all 100 existing
 coinbase UTXOs through the separate current-UTXO scan. The primary wallet then
 persists and broadcasts an exact V6 transaction that shields one mature
 coinbase, matches it in the mempool and block template, and mines it in block
-101. The final chain and wallet checks conserve exactly 631.25 WCASH across the
+101. The final chain and wallet checks conserve exactly 631.25 WEC across the
 transparent and Ironwood pools. Rotating and accepting 101 distinct child jobs
 also exercises candidate release far beyond the coordinator's 16-entry active
 cache bound. Transparent maturity is not overridden, and the public Testnet
@@ -322,7 +322,8 @@ Testnet, public pool, payout, or settlement service is deployed. No physical
 ASIC model or firmware is certified, and Wcash mainnet remains disabled. Those
 remain community-pool and network release gates.
 
-Wcash payment namespaces are disjoint from Zcash: Unified `wu...`, Sapling
-`ws...`, TEX `wtex...`, and transparent `W...`, with separate testnet and
-regtest forms. Never create a Wcash address by editing a Zcash prefix; checksums
-and Unified Address jumbling bind the namespace.
+Wcash payment namespaces are disjoint from Zcash: Unified `wu...`, transparent
+`W...`, and transparent-source-only TEX `wtex...`, with separate testnet and
+regtest forms. Sapling namespaces are reserved and rejected. Never create a
+Wcash address by editing a Zcash prefix; checksums and Unified Address jumbling
+bind the namespace.

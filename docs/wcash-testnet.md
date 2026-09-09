@@ -8,7 +8,8 @@ testnet coins must have no monetary value.
 
 > **Transaction-domain test boundary:** Wcash Testnet accepts only post-genesis V6
 > transactions carrying its chain-specific branch ID `0xb3cfd27e`. Zcash
-> domains and V1-V5 are rejected. The controlled private-transfer and
+> domains, the distinct Wcash Regtest domain `0xc3a6678a`, and V1-V5 are
+> rejected. The controlled private-transfer and
 > transparent-coinbase shielding lifecycles have passed on isolated Regtest, but
 > no coin has monetary value and those local tests do not
 > make the wallet, a public Testnet, a mining pool, or payout/settlement system
@@ -22,8 +23,9 @@ The built-in `WcashTestnet` network commits to Bitcoin mainnet block 965,900:
 Bitcoin block:       965900
 Bitcoin block hash:  0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851
 Anchor audit height: 966011 (112 confirmations counting the anchor)
-Wcash genesis hash:  78b292284bc7b03c6a16b62e29a3ab2015c40d6414cbc27ddcee878225600f10
-P2P magic:           8ee56b56
+Wcash genesis hash:  d95a9f2f1daf07d48fb3c863ad7334ec630a4a7077da98c8f7e65f8c0e277cf1
+P2P identity:        Wcash/testnet/v4
+P2P magic:           2f229b8c
 P2P port:            38233
 Suggested RPC port:  38232 (loopback only)
 ```
@@ -32,10 +34,11 @@ The exact Bitcoin header, proof of work, confirmation audit height, complete
 Wcash genesis bytes, and derived hash are frozen test vectors in the source.
 Consensus never fetches or replaces an anchor at runtime. Testnet, regtest, and
 Zcash use different genesis hashes, P2P magic, ports, and peer-cache paths.
-Wcash configuration also rejects inherited Zcash DNS seeds. Any local state
-created by the earlier mining-only prototype must be deleted and resynchronized;
-post-genesis blocks from that prototype are not compatible with the frozen
-Wcash Testnet v1 transaction domain.
+Wcash configuration also rejects inherited Zcash DNS seeds. The corrected
+Testnet identity stores state under `wcashtestnet-v4` and peers under its
+matching cache namespace, so earlier profile data is not loaded. Operators must
+start from the new empty paths and must not copy or rename older Wcash state
+into them.
 
 ## Anchor verification record
 
@@ -143,9 +146,9 @@ the pool trusts the loopback child node to construct the requested recipient.
 
 This script is a mandatory local release check. It is intentionally not run by
 GitHub Actions because it performs real proof-of-work solving. The checked-in
-hosted workflows are configured to use fixed Equihash and AuxPoW vectors and
-exercise the non-solving validation paths, but repository Actions are currently
-disabled and therefore provide no result for this branch.
+hosted workflow uses fixed Equihash and AuxPoW vectors and exercises every
+non-solving validation path; its result is a separate required release signal,
+not a substitute for the local solver run.
 It uses ephemeral, loopback-only profiles with no peers and no cookie
 authentication. The first Wcash Testnet-profile phase does not use a
 `debug_force_finished_sync` override; the isolated Regtest wallet and parent
@@ -178,12 +181,12 @@ scripts/wcash-testnet-e2e.sh
 The passing run proved that the frozen Testnet profile boots cleanly and that a
 proposal-validated ZIP-301 job survives the parent coinbase and block-commitment
 paths into Wcash and both Zcash validators. In its controlled Regtest phase, the
-script mined and scanned three private 6.25-WCASH coinbases, signed a one-WCASH
-V6 transfer under branch ID `0xb3cfd27e`, observed the exact transaction bytes
-and fee in the mempool and `getblocktemplate`, checked duplicate-broadcast
+script mined and scanned three private 6.25-WEC coinbases, signed a one-WEC
+V6 transfer under the Regtest branch ID `0xc3a6678a`, observed the exact
+transaction bytes and fee in the mempool and `getblocktemplate`, checked duplicate-broadcast
 behavior, and required both standard Zcash Regtest nodes to reject those Wcash
 bytes. It then mined the transfer in a fourth real AuxPoW block, rescanned the
-recipient and private change, and verified that all 25 WCASH remained in
+recipient and private change, and verified that all 25 WEC remained in
 Ironwood while the other pools remained zero.
 
 The transparent phase reported all 99 rewards pending at tip 99 and rejected
@@ -193,7 +196,7 @@ all 100 current coinbase UTXOs, proving that transparent recovery does not depen
 on the shielded birthday. The primary wallet persisted and broadcast the exact
 V6 transaction that shielded one mature coinbase, matched it in the mempool and
 block template, and mined it through AuxPoW at height 101. Final wallet and node
-checks conserved exactly 631.25 WCASH across the transparent and Ironwood pools.
+checks conserved exactly 631.25 WEC across the transparent and Ironwood pools.
 Processing 101 distinct child jobs also exercised confirmed-candidate release
 beyond the coordinator's 16-entry active cache.
 
@@ -225,10 +228,10 @@ The passing automated run established this controlled local path:
 
 1. It derived separate miner and recipient addresses in the Wcash Regtest
    namespace, mined three real AuxPoW child blocks to the controlled miner, and
-   scanned all three private 6.25-WCASH coinbases.
-2. It constructed a balanced one-WCASH V6 Ironwood transfer under branch ID
-   `0xb3cfd27e`, including verified private change, fee, and expiry height. It
-   used the explicit Regtest-only unsafe one-confirmation override; the public
+   scanned all three private 6.25-WEC coinbases.
+2. It constructed a balanced one-WEC V6 Ironwood transfer under the Regtest
+   branch ID `0xc3a6678a`, including verified private change, fee, and expiry
+   height. It used the explicit Regtest-only unsafe one-confirmation override; the public
    Testnet wallet policy remains 100 confirmations.
 3. It submitted the exact signed bytes, observed the transaction in the Wcash
    mempool, checked duplicate-broadcast behavior, and matched its exact bytes and
@@ -240,8 +243,8 @@ The passing automated run established this controlled local path:
 5. It mined and accepted the transfer in a fourth real AuxPoW child block,
    observed its mined status, and independently rescanned the sender and
    recipient wallets.
-6. The recipient held exactly one WCASH, the sender retained 24 WCASH, and the
-   chain reported exactly 25 WCASH entirely in Ironwood, with transparent,
+6. The recipient held exactly one WEC, the sender retained 24 WEC, and the
+   chain reported exactly 25 WEC entirely in Ironwood, with transparent,
    Sapling, and Orchard balances remaining zero.
 7. A fresh wallet and chain mined 101 transparent coinbases through AuxPoW,
    rotating well beyond the coordinator's 16-entry active-candidate cache.
@@ -254,7 +257,7 @@ The passing automated run established this controlled local path:
     outputs, and two-action Ironwood bundle, and the template contained those
     same bytes and fee.
 11. AuxPoW block 101 mined the transaction. The wallet and chain independently
-    reported 631.25 WCASH total across transparent and Ironwood, with zero value
+    reported 631.25 WEC total across transparent and Ironwood, with zero value
     in Sapling and Orchard.
 
 This local pass goes beyond transaction serialization and wallet unit tests. It

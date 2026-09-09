@@ -25,9 +25,70 @@ use crate::{
         non_finalized_state::{Chain, NonFinalizedState, MIN_DURATION_BETWEEN_BACKUP_UPDATES},
         ReconsiderError,
     },
-    tests::FakeChainHelper,
+    tests::{
+        setup::{uses_wcash_consensus, zcash_test_networks},
+        FakeChainHelper,
+    },
     Config, SemanticallyVerifiedBlock,
 };
+
+/// Exercise finalized persistence, non-finalized growth, rejection rollback,
+/// and tip reads on both built-in Wcash networks without importing any legacy
+/// Zcash history or shielded-pool fixture.
+#[test]
+fn wcash_native_state_lifecycle() -> Result<()> {
+    use crate::{
+        service::read,
+        tests::setup::{test_genesis, wcash_fake_children},
+    };
+
+    if !uses_wcash_consensus() {
+        return Ok(());
+    }
+
+    for network in [Network::new_wcash_testnet(), Network::new_wcash_regtest()] {
+        let mut finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )?;
+        let genesis = test_genesis(&network);
+        let genesis_hash = genesis.hash();
+        finalized_state.commit_finalized_direct(
+            genesis.into(),
+            None,
+            "Wcash native state lifecycle",
+        )?;
+
+        let non_finalized_state = NonFinalizedState::new(&network);
+        assert_eq!(
+            read::best_tip(&non_finalized_state, &finalized_state.db),
+            Some((Height(0), genesis_hash)),
+        );
+
+        let children = wcash_fake_children(&network, 3);
+        let mut non_finalized_state = non_finalized_state;
+        non_finalized_state.commit_new_chain(children[0].clone().prepare(), &finalized_state)?;
+        non_finalized_state.commit_block(children[1].clone().prepare(), &finalized_state)?;
+
+        let state_before_rejection = non_finalized_state.clone();
+        let invalid = children[2].clone().set_block_commitment([0x42; 32]);
+        assert!(non_finalized_state
+            .commit_block(invalid.prepare(), &finalized_state)
+            .is_err());
+        assert!(non_finalized_state.eq_internal_state(&state_before_rejection));
+
+        non_finalized_state.commit_block(children[2].clone().prepare(), &finalized_state)?;
+        assert_eq!(
+            read::best_tip(&non_finalized_state, &finalized_state.db),
+            Some((Height(3), children[2].hash())),
+        );
+        assert_eq!(non_finalized_state.best_chain_len(), Some(3));
+    }
+
+    Ok(())
+}
 
 #[test]
 fn construct_empty() {
@@ -131,7 +192,7 @@ fn ord_matches_work() -> Result<()> {
 fn best_chain_wins() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    for network in Network::iter() {
+    for network in zcash_test_networks() {
         best_chain_wins_for_network(network)?;
     }
 
@@ -171,7 +232,7 @@ fn best_chain_wins_for_network(network: Network) -> Result<()> {
 fn finalize_pops_from_best_chain() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    for network in Network::iter() {
+    for network in zcash_test_networks() {
         finalize_pops_from_best_chain_for_network(network)?;
     }
 
@@ -219,7 +280,7 @@ fn finalize_pops_from_best_chain_for_network(network: Network) -> Result<()> {
 fn invalidate_block_removes_block_and_descendants_from_chain() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    for network in Network::iter() {
+    for network in zcash_test_networks() {
         invalidate_block_removes_block_and_descendants_from_chain_for_network(network)?;
     }
 
@@ -341,6 +402,10 @@ fn new_invalidate_test_state(network: &Network) -> (NonFinalizedState, Finalized
 fn invalidating_non_finalized_root_does_not_panic() {
     let _init_guard = zebra_test::init();
 
+    if uses_wcash_consensus() {
+        return;
+    }
+
     let network = Network::Mainnet;
     let block1: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
     let block2 = block1.make_fake_child().set_work(10);
@@ -375,6 +440,10 @@ fn invalidating_non_finalized_root_does_not_panic() {
 #[test]
 fn invalidating_same_height_fork_tips_is_idempotent() {
     let _init_guard = zebra_test::init();
+
+    if uses_wcash_consensus() {
+        return;
+    }
 
     let network = Network::Mainnet;
     let block1: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
@@ -419,6 +488,10 @@ fn invalidating_same_height_fork_tips_is_idempotent() {
 #[test]
 fn reconsider_block_removes_live_entry_and_second_call_returns_missing() {
     let _init_guard = zebra_test::init();
+
+    if uses_wcash_consensus() {
+        return;
+    }
 
     let network = Network::Mainnet;
     let block1: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
@@ -475,6 +548,10 @@ fn reconsider_block_removes_live_entry_and_second_call_returns_missing() {
 fn reconsider_block_preserves_record_when_parent_chain_missing() {
     let _init_guard = zebra_test::init();
 
+    if uses_wcash_consensus() {
+        return;
+    }
+
     let network = Network::Mainnet;
     let block1: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
     let block2 = block1.make_fake_child().set_work(10);
@@ -524,7 +601,7 @@ fn reconsider_block_and_reconsider_chain_correctly_reconsiders_blocks_and_descen
 {
     let _init_guard = zebra_test::init();
 
-    for network in Network::iter() {
+    for network in zcash_test_networks() {
         reconsider_block_inserts_block_and_descendants_into_chain_for_network(network.clone())?;
     }
 
@@ -608,7 +685,7 @@ fn reconsider_block_inserts_block_and_descendants_into_chain_for_network(
 fn commit_block_extending_best_chain_doesnt_drop_worst_chains() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    for network in Network::iter() {
+    for network in zcash_test_networks() {
         commit_block_extending_best_chain_doesnt_drop_worst_chains_for_network(network)?;
     }
 
@@ -655,7 +732,7 @@ fn commit_block_extending_best_chain_doesnt_drop_worst_chains_for_network(
 #[test]
 fn shorter_chain_can_be_best_chain() -> Result<()> {
     let _init_guard = zebra_test::init();
-    for network in Network::iter() {
+    for network in zcash_test_networks() {
         shorter_chain_can_be_best_chain_for_network(network)?;
     }
     Ok(())
@@ -698,7 +775,7 @@ fn shorter_chain_can_be_best_chain_for_network(network: Network) -> Result<()> {
 #[test]
 fn longer_chain_with_more_work_wins() -> Result<()> {
     let _init_guard = zebra_test::init();
-    for network in Network::iter() {
+    for network in zcash_test_networks() {
         longer_chain_with_more_work_wins_for_network(network)?;
     }
 
@@ -747,7 +824,7 @@ fn longer_chain_with_more_work_wins_for_network(network: Network) -> Result<()> 
 fn equal_length_goes_to_more_work() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    for network in Network::iter() {
+    for network in zcash_test_networks() {
         equal_length_goes_to_more_work_for_network(network)?;
     }
 
@@ -788,7 +865,7 @@ fn equal_length_goes_to_more_work_for_network(network: Network) -> Result<()> {
 
 #[test]
 fn history_tree_is_updated() -> Result<()> {
-    for network in Network::iter() {
+    for network in zcash_test_networks() {
         history_tree_is_updated_for_network_upgrade(network, NetworkUpgrade::Heartwood)?;
     }
     // TODO: we can't test other upgrades until we have a method for creating a FinalizedState
@@ -896,7 +973,7 @@ fn history_tree_is_updated_for_network_upgrade(
 
 #[test]
 fn commitment_is_validated() {
-    for network in Network::iter() {
+    for network in zcash_test_networks() {
         commitment_is_validated_for_network_upgrade(network, NetworkUpgrade::Heartwood);
     }
     // TODO: we can't test other upgrades until we have a method for creating a FinalizedState
@@ -983,6 +1060,10 @@ fn commitment_is_validated_for_network_upgrade(network: Network, network_upgrade
 
 #[tokio::test]
 async fn non_finalized_state_writes_blocks_to_and_restores_blocks_from_backup_cache() {
+    if uses_wcash_consensus() {
+        return;
+    }
+
     let network = Network::Mainnet;
 
     let finalized_state = FinalizedState::new(
@@ -1148,6 +1229,9 @@ fn with_block_and_spent_utxos_preserves_deferred_pool_balance_change() -> Result
 #[test]
 fn commit_new_chain_sets_chain_value_pools_deferred_amount() -> Result<()> {
     let _init_guard = zebra_test::init();
+    if uses_wcash_consensus() {
+        return Ok(());
+    }
     let network = Network::Mainnet;
 
     let block: Arc<Block> = Arc::new(network.test_block(653_599, 583_999).unwrap());

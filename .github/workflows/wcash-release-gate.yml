@@ -68,14 +68,16 @@ jobs:
       - name: Test Wcash consensus-specific paths
         run: |
           cargo test --locked -p zebra-chain --lib --features wcash-consensus
-          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash
-          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash_requires_v6_and_exact_branch_domain
-          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash_v6_transfer_passes_block_and_mempool_verifiers
-          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash_v6_out_of_range_expiry_is_rejected_by_block_and_mempool_verifiers
-          cargo test --locked -p zebra-rpc --lib wcash
-          cargo test --locked -p zebra-rpc --lib --features zebra-chain/wcash-consensus wcash
-          cargo test --locked -p zebra-rpc --lib --features zebra-chain/wcash-consensus all_network_templates_query_and_propagate_mempool_errors
-          cargo test --locked -p zebra-rpc --lib --features zebra-chain/wcash-consensus wcash_template_includes_v6_transfer_fees_and_private_coinbase
+          cargo test --locked -p zebra-consensus --lib --features wcash-consensus
+          cargo test --locked -p zebra-rpc --lib --features zebra-chain/wcash-consensus
+          cargo test --locked -p zebra-state --lib --features zebra-chain/wcash-consensus -- --test-threads=1
+
+      - name: Lint the complete Wcash consensus boundary
+        run: |
+          cargo clippy --locked -p zebra-chain --features wcash-consensus --all-targets -- -D warnings
+          cargo clippy --locked -p zebra-consensus --features wcash-consensus --all-targets -- -D warnings
+          cargo clippy --locked -p zebra-rpc --features zebra-chain/wcash-consensus --all-targets -- -D warnings
+          cargo clippy --locked -p zebra-state --lib --tests --features zebra-chain/wcash-consensus -- -D warnings
 
       - name: Test parent RPC payout attestation and serialization
         run: |
@@ -96,9 +98,10 @@ jobs:
 
       - name: Test frozen Wcash Testnet identity and isolation
         run: |
-          cargo test --locked -p wcash-genesis public_testnet
+          cargo test --locked -p wcash-genesis
           cargo test --locked -p zebra-chain --lib --features wcash-consensus wcash_testnet
           cargo test --locked -p zebra-network --lib --features wcash-consensus wcash_
+          cargo test --locked -p zebra-state --lib --features zebra-chain/wcash-consensus wcash_state_paths_are_isolated_by_network_identity
           cargo test --locked -p zebra-state --lib --features zebra-chain/wcash-consensus wcash_height_one_uses_candidate_height
           cargo test --locked -p zebra-state --lib --features zebra-chain/wcash-consensus zcash_activation_boundary_uses_candidate_height
           cargo test --locked -p zebrad --lib --features wcash-consensus local_genesis_bootstrap_selects_exact_built_in_chain
@@ -115,11 +118,11 @@ jobs:
 
       - name: Preserve standard Zcash branch, history, privacy, and RPC behavior
         run: |
-          cargo test --locked -p zebra-chain --lib branch_id
-          cargo test --locked -p zebra-chain --lib history
-          cargo test --locked -p zebra-chain --lib zip244
-          cargo test --locked -p zebra-consensus --lib coinbase_outputs_are_decryptable
-          cargo test --locked -p zebra-rpc --lib get_blockchain_info
+          cargo test --locked -p zebra-chain --lib
+          cargo test --locked -p zebra-consensus --lib
+          cargo test --locked -p zebra-rpc --lib
+          cargo test --locked -p zebra-state --lib -- --test-threads=1
+          cargo clippy --locked -p zebra-state --lib --tests -- -D warnings
 
       - name: Preserve upstream Zcash parser and verifier boundaries
         run: |

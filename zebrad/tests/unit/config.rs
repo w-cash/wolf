@@ -1183,7 +1183,8 @@ fn config_wcash_regtest_miner_address_uses_wcash_namespace() {
     let miner_address = zebra_rpc::config::mining::default_miner_address_for_network(
         &network,
         &zebra_rpc::config::mining::MinerAddressType::Transparent,
-    );
+    )
+    .expect("transparent mining is supported by Wcash");
     let toml_string = format!(
         r#"[network]
         network = "WcashRegtest"

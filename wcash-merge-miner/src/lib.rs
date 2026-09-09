@@ -27,8 +27,8 @@ pub mod zip301_client;
 
 pub use coinbase::{build_parent_coinbase, ParentOutput};
 pub use coordinator::{
-    CoordinatorConfig, NativeMiningCoordinator, NativeMiningSupervisor, WinnerOutboxStatus,
-    NATIVE_JOB_MAX_AGE_SECONDS,
+    CoordinatorConfig, GenerationRetirement, NativeMiningCoordinator, NativeMiningSupervisor,
+    WinnerOutboxStatus, NATIVE_JOB_MAX_AGE_SECONDS,
 };
 pub use error::MinerError;
 pub use job::{JobConfig, PreparedJob, SolvedAuxPow, EQUIHASH_SOLUTION_BYTES};

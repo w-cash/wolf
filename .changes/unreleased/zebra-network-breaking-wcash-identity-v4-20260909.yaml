@@ -1,0 +1,4 @@
+project: zebra-network
+kind: breaking
+body: "Rotate the pre-launch Wcash Testnet and Regtest P2P identities and peer-cache namespaces after consensus-domain corrections; older Wcash peers are intentionally incompatible."
+time: 2026-09-09T12:00:00.000000003Z

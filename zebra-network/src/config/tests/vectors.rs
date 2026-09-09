@@ -186,8 +186,8 @@ fn wcash_peer_cache_paths_are_network_isolated() {
 
     assert_ne!(testnet, regtest);
     assert_ne!(testnet, zcash);
-    assert!(testnet.ends_with("wcashtestnet.peers"));
-    assert!(regtest.ends_with("wcashregtest.peers"));
+    assert!(testnet.ends_with("wcashtestnet-v4.peers"));
+    assert!(regtest.ends_with("wcashregtest-v5.peers"));
 }
 
 #[test]

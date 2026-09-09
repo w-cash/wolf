@@ -1,0 +1,4 @@
+project: zebra-state
+kind: breaking
+body: "Move corrected pre-launch Wcash Testnet and Regtest chains into versioned state directories so incompatible prototype state cannot be reused; nodes must resynchronize."
+time: 2026-09-09T12:00:00.000000005Z

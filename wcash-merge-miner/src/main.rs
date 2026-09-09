@@ -22,9 +22,9 @@ use wcash_merge_miner::{
         DEFAULT_ZIP301_AUTHENTICATION_LIMIT, DEFAULT_ZIP301_CLIENT_LIMIT,
         DEFAULT_ZIP301_VALIDATION_LIMIT,
     },
-    CoordinatorConfig, JobConfig, MinerError, NativeMiningCoordinator, NativeMiningSupervisor,
-    NativeZcashConfig, PreparedJob, ShareProcessor, Zip301ClientConfig, Zip301Config,
-    Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
+    CoordinatorConfig, GenerationRetirement, JobConfig, MinerError, NativeMiningCoordinator,
+    NativeMiningSupervisor, NativeZcashConfig, PreparedJob, ShareProcessor, Zip301ClientConfig,
+    Zip301Config, Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
 };
 use wcash_zcash_aux::Target;
 use zcash_address::ZcashAddress;
@@ -277,17 +277,25 @@ fn run_native_job(arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn
     let arguments = parse_native_job_arguments(arguments)?;
     let journal = share_journal_path()?;
     let configured = configure_native(&arguments.connection)?;
-    let coordinator = NativeMiningCoordinator::prepare(configured.config, &journal)?;
-
-    print_json(&native_preflight(
+    let mut coordinator = NativeMiningCoordinator::prepare(configured.config, &journal)?;
+    let preflight = native_preflight(
         "native-job",
         &arguments.connection,
         &configured.summary,
         &journal,
         &coordinator,
         None,
-    )?)?;
-    Ok(())
+    );
+    let retirement = coordinator.retire_generation();
+    match (preflight, retirement) {
+        (Ok(preflight), Ok(_)) => print_json(&preflight),
+        (Err(error), Ok(_)) => Err(error.into()),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Err(error), Err(retirement)) => {
+            eprintln!("native-job also failed to retire its child candidate: {retirement}");
+            Err(error.into())
+        }
+    }
 }
 
 fn run_native_mine(arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
@@ -295,35 +303,47 @@ fn run_native_mine(arguments: impl Iterator<Item = String>) -> Result<(), Box<dy
 
     let journal = share_journal_path()?;
     let configured = configure_native(&arguments.connection)?;
-    let coordinator = NativeMiningCoordinator::prepare(configured.config, &journal)?;
-    let native_job = coordinator.job();
-    let solved = native_job
-        .job()
-        .solve(arguments.start_nonce, arguments.maximum_runs)?;
-    let share = native_job.validate_share(&solved.nonce(), solved.solution(), Target::MAX)?;
-    let wcash_candidate = share.wcash_candidate().is_some();
-    let zcash_candidate = share.parent_block().is_some();
-    coordinator.process("local.native-mine", &share)?;
-    // Unlike the ZIP-301 server, this one-shot command has no background
-    // health monitor. Flush its newly durable winner outbox before exiting.
-    coordinator.flush_winner_outbox()?;
-    let outbox = coordinator.outbox_status()?;
+    let mut coordinator = NativeMiningCoordinator::prepare(configured.config, &journal)?;
+    let result = (|| -> Result<Value, MinerError> {
+        let native_job = coordinator.job();
+        let solved = native_job
+            .job()
+            .solve(arguments.start_nonce, arguments.maximum_runs)?;
+        let share = native_job.validate_share(&solved.nonce(), solved.solution(), Target::MAX)?;
+        let wcash_candidate = share.wcash_candidate().is_some();
+        let zcash_candidate = share.parent_block().is_some();
+        let job_id = native_job.job().job_id().to_string();
+        coordinator.process("local.native-mine", &share)?;
+        // Unlike the ZIP-301 server, this one-shot command has no background
+        // health monitor. Flush its newly durable winner outbox before exiting.
+        coordinator.flush_winner_outbox()?;
+        let outbox = coordinator.outbox_status()?;
 
-    print_json(&json!({
-        "command": "native-mine",
-        "result": "processed",
-        "job_id": native_job.job().job_id(),
-        "parent_block_hash": display_hex(solved.parent_block_hash_le()),
-        "wcash_candidate": wcash_candidate,
-        "zcash_candidate": zcash_candidate,
-        "durable_outbox": {
-            "pending_wcash_winners": outbox.pending_wcash,
-            "pending_zcash_winners": outbox.pending_zcash,
-            "observed_best_chain_winners": outbox.observed,
-            "retention_confirmations": outbox.retention_confirmations,
-        },
-    }))?;
-    Ok(())
+        Ok(json!({
+            "command": "native-mine",
+            "result": "processed",
+            "job_id": job_id,
+            "parent_block_hash": display_hex(solved.parent_block_hash_le()),
+            "wcash_candidate": wcash_candidate,
+            "zcash_candidate": zcash_candidate,
+            "durable_outbox": {
+                "pending_wcash_winners": outbox.pending_wcash,
+                "pending_zcash_winners": outbox.pending_zcash,
+                "observed_best_chain_winners": outbox.observed,
+                "retention_confirmations": outbox.retention_confirmations,
+            },
+        }))
+    })();
+    let retirement = coordinator.retire_generation();
+    match (result, retirement) {
+        (Ok(result), Ok(_)) => print_json(&result),
+        (Err(error), Ok(_)) => Err(error.into()),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Err(error), Err(retirement)) => {
+            eprintln!("native-mine also failed to retire its child candidate: {retirement}");
+            Err(error.into())
+        }
+    }
 }
 
 fn run_native_serve_once(arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
@@ -374,7 +394,7 @@ fn run_native_server(
     let mut preparation_backoff = Duration::from_secs(1);
 
     loop {
-        let coordinator = match supervisor.prepare_generation() {
+        let mut coordinator = match supervisor.prepare_generation() {
             Ok(coordinator) => {
                 preparation_backoff = Duration::from_secs(1);
                 coordinator
@@ -385,10 +405,6 @@ fn run_native_server(
                     preparation_backoff.as_secs()
                 );
                 thread::sleep(preparation_backoff);
-                // At a 60-second ceiling, one supervisor cannot consume all
-                // 16 child-candidate cache slots within their 10-minute TTL
-                // when parent preparation repeatedly fails after
-                // `createauxblock` succeeds.
                 preparation_backoff = (preparation_backoff * 2).min(Duration::from_secs(60));
                 continue;
             }
@@ -396,7 +412,7 @@ fn run_native_server(
         };
         let job = coordinator.job().clone();
 
-        print_json(&native_preflight(
+        let preflight = match native_preflight(
             command,
             &arguments.connection,
             &configured.summary,
@@ -411,15 +427,67 @@ fn run_native_server(
                 worker_count,
                 automatic_rotation,
             }),
-        )?)?;
+        ) {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                if let Err(retirement) =
+                    retire_native_generation(&mut coordinator, automatic_rotation)
+                {
+                    eprintln!(
+                        "native preflight also failed to retire its child candidate: {retirement}"
+                    );
+                }
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = print_json(&preflight) {
+            if let Err(retirement) = retire_native_generation(&mut coordinator, automatic_rotation)
+            {
+                eprintln!(
+                    "native preflight output also failed to retire its child candidate: {retirement}"
+                );
+            }
+            return Err(error);
+        }
 
-        let processor: Arc<dyn ShareProcessor> = Arc::new(coordinator);
-        match listener.serve(job, zip301.clone(), processor) {
+        let coordinator = Arc::new(coordinator);
+        let processor: Arc<dyn ShareProcessor> = coordinator.clone();
+        let serve_result = listener.serve(job, zip301.clone(), processor);
+        let mut coordinator = Arc::try_unwrap(coordinator).map_err(|_| {
+            MinerError::InvalidRequest(
+                "native generation retained a share processor after every handler joined"
+                    .to_string(),
+            )
+        })?;
+        retire_native_generation(&mut coordinator, automatic_rotation)?;
+
+        match serve_result {
             Err(error) if automatic_rotation && is_retryable_native_preparation_error(&error) => {
                 eprintln!("rotating/retrying native job after a transient failure: {error}");
             }
             Err(error) => return Err(error.into()),
             Ok(()) => return Ok(()),
+        }
+    }
+}
+
+fn retire_native_generation(
+    coordinator: &mut NativeMiningCoordinator,
+    retry_transient: bool,
+) -> Result<GenerationRetirement, MinerError> {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match coordinator.retire_generation() {
+            Ok(retirement) => return Ok(retirement),
+            Err(error) if retry_transient && is_retryable_native_preparation_error(&error) => {
+                eprintln!(
+                    "transient native candidate-retirement failure: {error}; retrying in {} second(s) before creating new work",
+                    backoff.as_secs()
+                );
+                thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+            }
+            Err(error) => return Err(error),
         }
     }
 }
