@@ -52,13 +52,15 @@ non-palindromic vector are documented in
 The Wcash child node exposes two Namecoin-shaped methods:
 
 ```text
-createauxblock("<Wcash Unified Address>")
+createauxblock("<Wcash payout address>")
 submitauxblock("<candidate hash in display order>", "<AuxPoW v2 hex>")
 getauxblockstatus("<candidate hash in display order>", "<AuxPoW v2 hex>")
 ```
 
-`createauxblock` accepts only a Wcash Unified Address with the receiver needed
-for a private Ironwood coinbase. It proposal-validates the proof-free child,
+`createauxblock` accepts an exact Wcash address in the selected network's
+namespace. A transparent address selects the normal pool-integration path; a
+Unified Address with an Orchard receiver explicitly selects a private Ironwood
+coinbase. It proposal-validates the proof-free child,
 rechecks the tip, and caches the exact block. The response includes `hash`, the
 canonical proof-free block `data`, `chainid`, `previousblockhash`,
 `coinbasevalue`, `target`, `bits`, and `height`. The coordinator independently
@@ -92,7 +94,7 @@ The Zcash parent template node accepts one private GBT extension:
 
 The extension is valid only on a Zcash network, only in template mode, and not
 with long polling. Zebra reserves the exact 44-byte carrier cost while selecting
-transactions, creates the normal shielded parent coinbase, then performs a
+transactions, creates the normal configured parent coinbase, then performs a
 V5/V6-specific canonical wire splice into miner data. It proves the mined
 transaction ID and shielded signature hash are unchanged, recomputes the
 authorization digest, authorization-data root, and block-commitments hash, and
@@ -116,21 +118,24 @@ The native adapter enforces these rules before a job reaches an ASIC:
 - Parent templates are decoded into a local JSON projection rather than shared
   node implementation types.
 - The template node returns a domain-separated commitment to its canonical
-  payout configuration. The coordinator independently recovers every shielded
-  recipient from the exact `coinbasetxn` with Zcash's consensus-public zero
-  outgoing viewing key and requires all of them to match the configured
-  shielded address.
+  payout configuration. The coordinator verifies the exact `coinbasetxn`
+  according to the configured Zcash address type: transparent scripts are
+  matched directly, while shielded recipients are recovered with Zcash's
+  consensus-public zero outgoing viewing key.
 - Every proposal validator also supplies an ordinary, child-independent
-  template on the same predecessor. Its shielded payout must match the same
-  address, and its complete transparent-output vector must equal the candidate
-  template. This prevents an extra transparent diversion while allowing the
-  validator to remain unmodified.
-- Wcash recipient verification has a different boundary: its coinbase is
-  intentionally not publicly recoverable, so the coordinator cannot prove the
-  recipient from a payment address alone. It validates the exact candidate,
-  target, and private-only coinbase shape, then trusts the loopback child node's
+  template on the same predecessor. Its payout must match the same configured
+  address. Configured miner outputs are removed before the remaining
+  funding-stream and lockbox outputs are compared exactly, so honest mempool
+  fee differences do not stall work. Exact proposal validation independently
+  enforces the candidate's subsidy-plus-fee total and prevents an extra
+  diversion while allowing the validator to remain unmodified.
+- For a transparent Wcash address, the coordinator checks the exact public
+  recipient and value in the serialized child candidate. A private Ironwood
+  coinbase is intentionally not publicly recoverable; the coordinator verifies
+  its private-only shape and value, then trusts the loopback child node's
   reviewed `createauxblock` implementation for recipient correctness. The child
-  binary, configuration, RPC socket, and host are payout-critical.
+  binary, configuration, RPC socket, and host are payout-critical in either
+  mode.
 - Transaction bytes, transaction IDs, authorization digests, both Merkle
   roots, `hashBlockCommitments`, compact difficulty, expanded target, child
   commitment, and auxiliary nonce are independently recomputed or compared.
@@ -200,24 +205,24 @@ change. The present code intentionally contains no credentialed F2Pool proxy.
 
 ## Privacy boundary
 
-The Wcash coinbase reward goes directly to Ironwood using ordinary private note
-encryption, not the inherited publicly recoverable coinbase outgoing-viewing
-key. This prevents protocol-wide public recovery of its recipient and note
-contents, while deterministic subsidy, fees, and public value-pool balance
-changes keep aggregate supply auditable. As with any shielded payment, the
-recipient or miner can still disclose their own viewing data out of band.
+The normal pool configuration pays both Wcash and Zcash coinbases to explicit
+transparent addresses. Those recipients and values are public, which matches
+the operational assumptions of existing pool software. Transparent Wcash
+coinbase outputs mature after 100 blocks and must be shielded before ordinary
+settlement. Aggregate issuance is auditable in every payout mode.
 
-This does not hide the independent Zcash parent payout: standard Zcash
-coinbases are publicly recoverable by design. Both parent nodes must use the
-same shielded address supplied through `ZCASH_PAYOUT_ADDRESS`; the coordinator
-checks the actual serialized outputs before releasing work. Pool share logs or
-payout systems can still create off-chain metadata.
+An operator can opt into a private Wcash reward by supplying a Unified Address
+with an Orchard receiver through `WCASH_PAYOUT_ADDRESS`. That reward goes to
+Ironwood using ordinary private note encryption rather than Zcash's publicly
+recoverable coinbase outgoing-viewing key. The recipient or miner can still
+disclose their own viewing data out of band, and pool logs can create off-chain
+metadata.
 
-Operators should pass `-` for the Wcash address argument and provide the
-shielded receiver through `WCASH_PAYOUT_ADDRESS`. Preflight output then exposes
-only that a receiver was configured and its environment-variable source. Raw
-RPC-body logging is disabled, avoiding plaintext receiver disclosure in
-ordinary process listings and logs.
+Operators should pass `-` for the Wcash address command-line argument and put
+the selected address in `WCASH_PAYOUT_ADDRESS`. Preflight output exposes only
+that an address was configured and its environment-variable source. Raw
+RPC-body logging is disabled, avoiding plaintext payout material in ordinary
+process listings and logs.
 
 The current payout policy deliberately fails closed if a future Zcash upgrade
 adds shielded funding-stream outputs or a new shielded pool. Supporting such an
@@ -238,11 +243,26 @@ with the full 25-WCASH supply remaining in Ironwood. That transfer uses the
 explicit Regtest-only unsafe one-confirmation override; the public Testnet wallet
 policy remains 100 confirmations.
 
+A third phase mines 101 transparent Wcash coinbases through the real AuxPoW
+path. It rejects shielding at tip 99, enforces the 100-block maturity boundary at
+tip 100, recovers every current UTXO from a deliberately late wallet birthday,
+persists and broadcasts the exact shielding transaction, matches it in the
+mempool and block template, and mines it at height 101. Final wallet and chain
+checks conserve exactly 631.25 WCASH across transparent and Ironwood pools.
+Rotating more than 16 accepted child candidates also covers release of confirmed
+winners beyond the coordinator's bounded active-candidate cache. Transparent
+maturity is not overridden.
+
 No public Wcash Testnet or community pool is deployed. A community-facing pool
 still needs project-operated seeds, an independently reviewed consensus
 specification, multi-node soak and reorg tests, vendor ASIC interoperability,
 and an operated TLS/variable-difficulty edge with durable accounting, payouts,
 and reorg-safe shielded settlement. The experimental one-shot wallet in this
-workspace is not that operated payout system. Wcash mainnet remains disabled.
+workspace can derive a transparent coinbase address and construct a bounded
+mature-coinbase shielding transaction, but it requires one exclusive writer per
+database and is not that operated payout system. After an ambiguous post-sign
+outcome, operators must recover the paginated persisted record and rebroadcast
+the exact signed bytes rather than create a replacement. Wcash mainnet remains
+disabled.
 Do not call this engineering profile production-ready or use it with funds of
 real value.

@@ -58,10 +58,14 @@ magic or address prefixes for replay protection. A controlled local Regtest E2E
 has mined three private coinbases, scanned them into the experimental wallet,
 signed and broadcast a one-WCASH Wcash-domain transfer, observed its exact bytes
 and fee in the mempool and block template, mined it through AuxPoW, and rescanned
-the recipient and private change. The test uses the explicit Regtest-only
-one-confirmation override; the public Testnet wallet policy remains 100
-confirmations. Testnet coins remain test-only, and this local result is not a
-public-network or production-wallet claim.
+the recipient and private change. A second isolated Regtest lifecycle mined 101
+transparent coinbases, rejected shielding before maturity, made the height-1
+reward spendable only for the height-101 transaction, and mined that exact
+shielding transaction through AuxPoW. Only the private-transfer phase uses the
+explicit Regtest-only one-confirmation override; transparent coinbase maturity
+remains 100 blocks. The public Testnet wallet policy remains 100 confirmations.
+Testnet coins remain test-only, and these local results are not a public-network
+or production-wallet claim.
 
 ## Monetary policy
 
@@ -94,7 +98,7 @@ are transfers of existing value and do not increase supply.
 
 Wcash has no slow start, founders reward, funding stream, deferred pool,
 lockbox disbursement, premine, or developer tax. The complete subsidy plus fees
-belongs to the miner coinbase and is subject to the shielded-output rules below.
+belongs to the miner coinbase and is subject to the coinbase payout-mode rules below.
 
 ## Block timing and difficulty
 
@@ -114,30 +118,38 @@ The compact difficulty field in the Wcash header is authoritative for Wcash.
 The Zcash parent header's `nBits` is retained only as diagnostic data and cannot
 allow a miner to choose an easier Wcash target.
 
-## Mandatory private coinbase
+## Coinbase payout modes
 
-For every height above genesis, consensus requires the coinbase transaction to:
+For every height above genesis, a Wcash coinbase can use either of two explicit
+payout modes:
 
-- contain no transparent outputs;
-- contain no Sapling component;
-- contain no Orchard component;
-- contain at least one Ironwood action;
-- move every positive subsidy-plus-fee value into Ironwood; and
-- make every Ironwood output unrecoverable with Zcash's conventional all-zero
-  outgoing viewing key.
+- a transparent Wcash address, which is the recommended default for existing
+  pool integration; or
+- a Wcash Unified Address containing an Orchard receiver, which routes the
+  reward into Ironwood with private note encryption.
 
-The block-template builder accepts only a Unified Address containing an Orchard
-receiver, then routes that receiver to an Ironwood output. It passes no outgoing
-viewing key to note encryption. These rules are consensus-checked again when a
-block is validated; they are not merely wallet or pool defaults.
+The template builder selects the mode from the address supplied by the pool.
+It never inserts a hard-coded runtime payout address, and it rejects inherited
+Zcash addresses and wrong-network Wcash addresses. Standalone Sapling and TEX
+destinations, and direct Sapling or Orchard transaction components, are not
+coinbase payout modes. Transparent and Ironwood miner payouts cannot be mixed
+in one Wcash coinbase.
 
-This policy prevents the standard public recovery of the reward recipient and
-note plaintext. It cannot stop a miner from publishing their own viewing data,
-and the parent Zcash coinbase may expose pool-identifying tags. The public
-Ironwood value balance and the deterministic subsidy/fee equations reveal the
-net amount entering the shielded pool. Therefore Wcash provides recipient
-privacy, not secrecy of aggregate issuance or necessarily of the gross reward
-for an individual block.
+Transparent coinbase outputs retain Zcash's public-network spend policy: they
+mature after 100 blocks, and a transaction spending them must not create any
+transparent outputs. A pool therefore shields matured coinbase value before
+ordinary settlement. The included experimental wallet exposes a seed-derived
+transparent P2PKH coinbase address and can build a bounded, one-shot transaction
+that shields only mature, fully classified coinbase outputs into the same
+wallet's Ironwood receiver. It is not an automatic pool-shielding, payout, or
+settlement service.
+
+For the optional Ironwood mode, the builder passes no outgoing viewing key to
+note encryption and consensus rejects outputs recoverable with Zcash's
+conventional all-zero outgoing viewing key. This hides the reward recipient and
+note plaintext. A transparent reward is intentionally public. Neither mode
+hides the deterministic gross subsidy or transaction fees, and parent-pool
+metadata can create additional off-chain correlation.
 
 ## Payment-address domains
 
@@ -158,29 +170,45 @@ jumbling construction and the Bech32m checksum. Replacing the visible prefix of
 a Zcash address does not produce a valid Wcash address.
 
 Wcash RPC and mining interfaces require the Wcash namespace when Wcash
-consensus is active. A mining destination must be a Wcash Unified Address with
-an Orchard receiver; the template builder uses that receiver payload to create
-the mandatory Ironwood reward output. Standalone Sapling, TEX, and transparent
-addresses are never valid coinbase destinations.
+consensus is active. A transparent Wcash address selects the normal public
+coinbase path. A Wcash Unified Address with an Orchard receiver explicitly
+selects a private Ironwood reward. Standalone Sapling, TEX, and inherited Zcash
+addresses are not valid Wcash coinbase destinations.
 
 The node implements payment-address parsing and encoding. The workspace also
 contains an experimental one-shot wallet for controlled Testnet and regtest
-transfers. It derives Wcash-domain keys and receivers, scans a local SQLite
-wallet from an attested loopback node, signs Wcash-domain V6 Ironwood transfers,
-and broadcasts the exact signed bytes. It deliberately does not implement batch
-payouts, pool accounting, durable settlement, or idempotent payout requests.
-The controlled-key private-coinbase spend gate has passed for one deterministic,
-isolated Regtest path. That result does not establish general wallet
-interoperability, public Testnet operation, or production payout safety. Key
-control must never be inferred from a syntactically valid payment address.
+operations. Its `derive-address` command reports both the private Unified
+Address and the related transparent P2PKH coinbase address. After synchronization
+has classified a coinbase and enforced its 100-block maturity, `shield-coinbase`
+can build and persist one Wcash-domain V6 transaction that sends the selected
+transparent inputs into the wallet's Ironwood receiver. The wallet also signs
+Ironwood transfers and broadcasts exact signed bytes. `list-pending` returns
+bounded, paginated recovery records containing the persisted transaction ID and
+exact signed bytes. After any ambiguous post-sign outcome, an operator must
+enumerate those pages, inspect transaction status, and rebroadcast the same bytes
+rather than construct a replacement. The wallet is restricted operationally to
+one exclusive writer per database. It deliberately does not implement automatic
+shielding, batch payouts, pool accounting, durable settlement, or idempotent
+payout requests.
+
+The controlled-key private-transfer and transparent-coinbase shielding gates
+have passed in isolated Regtest. The transparent phase recovered all current
+UTXOs from a wallet initialized with a deliberately late birthday, exercised the
+100-block maturity boundary across 101 AuxPoW-mined blocks, and conserved exactly
+631.25 WCASH across the transparent and Ironwood pools after shielding one
+coinbase. These deterministic local results do not establish general wallet
+interoperability, public Testnet operation, public reorg safety, or production
+payout safety. Key control must never be inferred from a syntactically valid
+payment address.
 
 ## Supply auditability
 
 Validators independently check the subsidy for the height, sum transaction
-fees, forbid all other coinbase value destinations, and require the post-NU6
-coinbase output value to equal its input value exactly. Ironwood's value balance
-is part of the public transaction data. An auditor can reproduce cumulative
-scheduled issuance and pool balance changes without decrypting reward notes.
+fees, validate the selected payout mode, and require the post-NU6 coinbase
+output value to equal its input value exactly. Transparent outputs and
+Ironwood's value balance are both public transaction data. An auditor can
+reproduce cumulative scheduled issuance and pool balance changes without
+decrypting private reward notes.
 
 ## Inherited code and review boundary
 
@@ -200,9 +228,10 @@ library tests.
 
 Wcash Testnet has a frozen identity for future public engineering
 interoperability, but no public Wcash Testnet is deployed. The controlled local
-Regtest wallet-spend lifecycle has passed; the wallet remains experimental and
-is not a production or pool-settlement service. Project-operated seeds, a
-separately implemented pool-payout system, multi-node and pool soak testing,
-physical ASIC runs, and an external security/consensus audit remain required
-before any mainnet or community payout service. Mainnet remains disabled. See
+Regtest private-transfer and transparent-shielding lifecycles have passed; the
+single-writer wallet remains experimental and is not a production or
+pool-settlement service. Project-operated seeds, a separately implemented
+pool-payout system, multi-node and pool soak and reorg testing, physical ASIC
+runs, and an external security/consensus audit remain required before any
+mainnet or community payout service. Mainnet remains disabled. See
 [`wcash-testnet.md`](wcash-testnet.md).

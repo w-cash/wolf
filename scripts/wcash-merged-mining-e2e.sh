@@ -149,7 +149,10 @@ fi
 
 export WCASH_EXPECTED_GENESIS_HASH=b0ebe8618354e0563091d10b73ba03842cb3c112a801012616489269e58dbd61
 export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327
-export WCASH_SHARE_JOURNAL="$runtime_dir/journal.jsonl"
+# `native-job` durably activates its job identifier. Keep its inspection-only
+# activation in a separate journal so the following `native-mine` invocation
+# cannot silently reuse one accounting identity on the unchanged tip.
+export WCASH_SHARE_JOURNAL="$runtime_dir/native-job-journal.jsonl"
 export WCASH_PAYOUT_ADDRESS="$wcash_payout_address"
 export ZCASH_PAYOUT_ADDRESS="$zcash_payout_address"
 
@@ -163,7 +166,7 @@ native_args=(
 "$repo_root/target/release/wcash-merge-miner" native-job \
   "${native_args[@]}" >"$runtime_dir/native-job.json"
 
-if ZCASH_PAYOUT_ADDRESS=tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV \
+if ZCASH_PAYOUT_ADDRESS=tmWbBGi7TjExNmLZyMcFpxVh3ZPbGrpbX3H \
   "$repo_root/target/release/wcash-merge-miner" native-job \
   "${native_args[@]}" >"$runtime_dir/rejected-job.log" 2>&1; then
   echo "mismatched parent payout address was accepted" >&2
@@ -171,6 +174,7 @@ if ZCASH_PAYOUT_ADDRESS=tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV \
 fi
 grep --quiet 'payout commitment differs' "$runtime_dir/rejected-job.log"
 
+export WCASH_SHARE_JOURNAL="$runtime_dir/journal.jsonl"
 "$repo_root/target/release/wcash-merge-miner" native-mine \
   "${native_args[@]}" 256 0 \
   >"$runtime_dir/native-mine.json" 2>"$runtime_dir/native-mine.log"
@@ -202,9 +206,9 @@ result=json.load(sys.stdin)["result"]
 assert result["chainSupply"]["chainValue"] == 6.25
 assert result["chainSupply"]["chainValueZat"] == 625_000_000
 pools={pool["id"]: pool for pool in result["valuePools"]}
-assert pools["ironwood"]["chainValue"] == 6.25
-assert pools["ironwood"]["chainValueZat"] == 625_000_000
-assert all(pool["chainValueZat"] == 0 for name,pool in pools.items() if name != "ironwood")
+assert pools["transparent"]["chainValue"] == 6.25
+assert pools["transparent"]["chainValueZat"] == 625_000_000
+assert all(pool["chainValueZat"] == 0 for name,pool in pools.items() if name != "transparent")
 '
 
 export WCASH_STRATUM_PASSWORD=local-test-password-change-me
@@ -362,9 +366,9 @@ result=json.load(sys.stdin)["result"]
 assert result["chainSupply"]["chainValue"] == 18.75
 assert result["chainSupply"]["chainValueZat"] == 1_875_000_000
 pools={pool["id"]: pool for pool in result["valuePools"]}
-assert pools["ironwood"]["chainValue"] == 18.75
-assert pools["ironwood"]["chainValueZat"] == 1_875_000_000
-assert all(pool["chainValueZat"] == 0 for name,pool in pools.items() if name != "ironwood")
+assert pools["transparent"]["chainValue"] == 18.75
+assert pools["transparent"]["chainValueZat"] == 1_875_000_000
+assert all(pool["chainValueZat"] == 0 for name,pool in pools.items() if name != "transparent")
 '
 
 if ! kill -0 "$pool_pid" 2>/dev/null; then
