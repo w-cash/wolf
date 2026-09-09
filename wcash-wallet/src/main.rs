@@ -129,7 +129,7 @@ enum Command {
         /// Canonical Wcash Unified Address.
         #[arg(long)]
         recipient: String,
-        /// Recipient value in zatoshis (100,000,000 zatoshis = 1 WEC).
+        /// Recipient value in zatoshis (100,000,000 zatoshis = 1 TWC).
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         amount_zat: u64,
         /// Optional raw memo bytes as hexadecimal (maximum 512 bytes).

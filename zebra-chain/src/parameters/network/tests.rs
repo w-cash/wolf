@@ -267,7 +267,7 @@ fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
     assert_eq!(
         WCASH_INITIAL_BLOCK_SUBSIDY,
         u64::try_from(6 * COIN + COIN / 4).unwrap(),
-        "the initial subsidy must be exactly 6.25000000 WEC"
+        "the initial subsidy must be exactly 6.25000000 WEC or TWC, according to network"
     );
     assert_eq!(WCASH_HALVING_INTERVAL, 1_680_000);
     assert_eq!(
@@ -310,8 +310,9 @@ fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
 
     // Integer truncation leaves 1,249,999,989 zatoshi of per-block subsidy across all eras.
     // Each era contains exactly 1,680,000 blocks, so the scheduled total is
-    // 20,999,999.81520000 WEC (2,099,999,981,520,000 zatoshi). Integer-zatoshi
-    // truncation leaves the schedule 0.1848 WEC below the 21 million hard cap.
+    // 20,999,999.81520000 WEC or TWC (2,099,999,981,520,000 zatoshi), according
+    // to network. Integer-zatoshi truncation leaves the schedule 0.1848 whole
+    // units below the 21 million hard cap.
     let per_block_era_sum: u64 = (0..64)
         .map(|era| WCASH_INITIAL_BLOCK_SUBSIDY.checked_shr(era).unwrap_or(0))
         .sum();

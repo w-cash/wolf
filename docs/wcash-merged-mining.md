@@ -3,6 +3,10 @@
 Wcash uses one parent proof-of-work profile: Zcash Equihash `(200, 9)`. Other
 algorithms and parent chains are deliberately outside this branch.
 
+Testing-chain Wcash rewards are displayed as valueless `TWC` (Test Wcash).
+`WEC` remains the mainnet ticker; the label does not change integer-zatoshi
+amount serialization or any mining target.
+
 The implementation has three separate trust boundaries:
 
 1. A Wcash child node creates and caches an exact proof-independent candidate
@@ -252,9 +256,9 @@ height-zero node without the debug sync override, obtains a child candidate,
 mines through the ZIP-301 listener, and requires Wcash plus two Zcash processes
 to accept the resulting work. The same release script also passes a separate
 controlled Regtest wallet lifecycle: three private coinbases are scanned, a
-one-WEC V6 transfer is matched in the mempool and block template, rejected by
+one-TWC V6 transfer is matched in the mempool and block template, rejected by
 both standard Zcash Regtest nodes, mined in a fourth AuxPoW block, and rescanned
-with the full 25-WEC supply remaining in Ironwood. That transfer uses the
+with the full 25-TWC supply remaining in Ironwood. That transfer uses the
 explicit Regtest-only unsafe one-confirmation override; the public Testnet wallet
 policy remains 100 confirmations.
 
@@ -263,7 +267,7 @@ path. It rejects shielding at tip 99, enforces the 100-block maturity boundary a
 tip 100, recovers every current UTXO from a deliberately late wallet birthday,
 persists and broadcasts the exact shielding transaction, matches it in the
 mempool and block template, and mines it at height 101. Final wallet and chain
-checks conserve exactly 631.25 WEC across transparent and Ironwood pools.
+checks conserve exactly 631.25 TWC across transparent and Ironwood pools.
 Rotating more than 16 accepted child candidates also covers release of confirmed
 winners beyond the coordinator's bounded active-candidate cache. Transparent
 maturity is not overridden.

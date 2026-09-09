@@ -29,13 +29,13 @@ use constants::{
     POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
 };
 
-/// Wcash starts at 6.25 WEC per mined block.
+/// Wcash starts at 6.25 whole units per mined block: WEC on Mainnet and TWC on testing networks.
 pub(crate) const WCASH_INITIAL_BLOCK_SUBSIDY: u64 = 625_000_000;
 
 /// Wcash halves every 1,680,000 blocks, approximately four years at 75 seconds per block.
 ///
-/// Together with the 6.25 WEC initial subsidy, this interval keeps total
-/// scheduled issuance below the 21 million WEC monetary-base hard cap.
+/// Together with the 6.25-unit initial subsidy, this interval keeps total
+/// scheduled issuance below the 21 million WEC Mainnet monetary-base hard cap.
 pub(crate) const WCASH_HALVING_INTERVAL: HeightDiff = 1_680_000;
 
 /// The first Wcash block paid at half the initial subsidy.

@@ -1,4 +1,4 @@
 project: zebra-chain
 kind: breaking
-body: "Finalize the pre-launch Wcash/WEC identity and regenerated genesis blocks, restrict payment addresses to transparent and Ironwood-capable Unified receivers, remove the standalone Sapling address API, and assign separate transaction domains to Testnet and Regtest."
+body: "Finalize the pre-launch Wcash testing identity under TWC and regenerated genesis blocks, restrict payment addresses to transparent and Ironwood-capable Unified receivers, remove the standalone Sapling address API, and assign separate transaction domains to Testnet and Regtest."
 time: 2026-09-09T12:00:00.000000001Z

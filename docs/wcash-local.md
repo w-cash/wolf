@@ -7,6 +7,10 @@ mining-only; the mandatory automated E2E described below adds separate
 controlled private-transfer and transparent-coinbase wallet phases. Neither is
 a public Testnet deployment.
 
+All Wcash balances in this local testing procedure use the valueless `TWC`
+(Test Wcash) display ticker. Mainnet keeps `WEC`; both labels represent the same
+eight-decimal integer-zatoshi precision and do not affect serialized amounts.
+
 ## 1. Build separate consensus binaries
 
 Install Rust 1.91 or newer and Zebra's native build dependencies. Build the
@@ -143,7 +147,7 @@ The two Zcash nodes should report the same tip because a parent winner is
 broadcast to the template node and proposal validator independently.
 
 `getblockchaininfo` on the Wcash node exposes deterministic chain supply and
-public value-pool totals. With the normal example address, a mined 6.25-WEC
+public value-pool totals. With the normal example address, a mined 6.25-TWC
 child block increases the transparent pool by 6.25 while the shielded pools
 remain zero. Supplying a controlled Wcash Unified Address instead moves that
 reward into private Ironwood. Gross protocol issuance remains auditable in
@@ -284,12 +288,12 @@ submit exact blocks to both chains, and accept a canonical ZIP-301 share bound
 to an exact authenticated worker.
 
 The mandatory `scripts/wcash-testnet-e2e.sh` run adds two controlled Regtest
-wallet phases. The private phase mines and scans three private 6.25-WEC
-coinbases, signs and broadcasts a one-WEC Wcash V6 transfer, matches its exact
+wallet phases. The private phase mines and scans three private 6.25-TWC
+coinbases, signs and broadcasts a one-TWC Wcash V6 transfer, matches its exact
 bytes and fee in the mempool and block template, verifies duplicate-broadcast
 handling and rejection by two standard Zcash Regtest nodes, mines the
 transaction in a fourth real AuxPoW block, and rescans the recipient and private
-change. Its final supply check is exactly 25 WEC, entirely in Ironwood. This
+change. Its final supply check is exactly 25 TWC, entirely in Ironwood. This
 phase uses the explicit Regtest-only unsafe one-confirmation override.
 
 The transparent phase mines 101 AuxPoW blocks to a seed-derived Wcash address.
@@ -299,7 +303,7 @@ A second wallet initialized with birthday 100 recovers all 100 existing
 coinbase UTXOs through the separate current-UTXO scan. The primary wallet then
 persists and broadcasts an exact V6 transaction that shields one mature
 coinbase, matches it in the mempool and block template, and mines it in block
-101. The final chain and wallet checks conserve exactly 631.25 WEC across the
+101. The final chain and wallet checks conserve exactly 631.25 TWC across the
 transparent and Ironwood pools. Rotating and accepting 101 distinct child jobs
 also exercises candidate release far beyond the coordinator's 16-entry active
 cache bound. Transparent maturity is not overridden, and the public Testnet

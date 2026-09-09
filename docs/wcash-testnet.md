@@ -6,6 +6,11 @@ block. No public Wcash Testnet node, DNS seed, or community pool is deployed.
 This is not a production-readiness claim: Wcash mainnet remains disabled and
 testnet coins must have no monetary value.
 
+User-facing Testnet balances use `TWC` (Test Wcash) rather than mainnet `WEC`.
+This label does not alter the eight-decimal integer-zatoshi encoding.
+The frozen genesis statement retains its historical `WEC` text, so the genesis
+bytes and hash listed below remain unchanged.
+
 > **Transaction-domain test boundary:** Wcash Testnet accepts only post-genesis V6
 > transactions carrying its chain-specific branch ID `0xb3cfd27e`. Zcash
 > domains, the distinct Wcash Regtest domain `0xc3a6678a`, and V1-V5 are
@@ -181,12 +186,12 @@ scripts/wcash-testnet-e2e.sh
 The passing run proved that the frozen Testnet profile boots cleanly and that a
 proposal-validated ZIP-301 job survives the parent coinbase and block-commitment
 paths into Wcash and both Zcash validators. In its controlled Regtest phase, the
-script mined and scanned three private 6.25-WEC coinbases, signed a one-WEC
+script mined and scanned three private 6.25-TWC coinbases, signed a one-TWC
 V6 transfer under the Regtest branch ID `0xc3a6678a`, observed the exact
 transaction bytes and fee in the mempool and `getblocktemplate`, checked duplicate-broadcast
 behavior, and required both standard Zcash Regtest nodes to reject those Wcash
 bytes. It then mined the transfer in a fourth real AuxPoW block, rescanned the
-recipient and private change, and verified that all 25 WEC remained in
+recipient and private change, and verified that all 25 TWC remained in
 Ironwood while the other pools remained zero.
 
 The transparent phase reported all 99 rewards pending at tip 99 and rejected
@@ -196,7 +201,7 @@ all 100 current coinbase UTXOs, proving that transparent recovery does not depen
 on the shielded birthday. The primary wallet persisted and broadcast the exact
 V6 transaction that shielded one mature coinbase, matched it in the mempool and
 block template, and mined it through AuxPoW at height 101. Final wallet and node
-checks conserved exactly 631.25 WEC across the transparent and Ironwood pools.
+checks conserved exactly 631.25 TWC across the transparent and Ironwood pools.
 Processing 101 distinct child jobs also exercised confirmed-candidate release
 beyond the coordinator's 16-entry active cache.
 
@@ -228,8 +233,8 @@ The passing automated run established this controlled local path:
 
 1. It derived separate miner and recipient addresses in the Wcash Regtest
    namespace, mined three real AuxPoW child blocks to the controlled miner, and
-   scanned all three private 6.25-WEC coinbases.
-2. It constructed a balanced one-WEC V6 Ironwood transfer under the Regtest
+   scanned all three private 6.25-TWC coinbases.
+2. It constructed a balanced one-TWC V6 Ironwood transfer under the Regtest
    branch ID `0xc3a6678a`, including verified private change, fee, and expiry
    height. It used the explicit Regtest-only unsafe one-confirmation override; the public
    Testnet wallet policy remains 100 confirmations.
@@ -243,8 +248,8 @@ The passing automated run established this controlled local path:
 5. It mined and accepted the transfer in a fourth real AuxPoW child block,
    observed its mined status, and independently rescanned the sender and
    recipient wallets.
-6. The recipient held exactly one WEC, the sender retained 24 WEC, and the
-   chain reported exactly 25 WEC entirely in Ironwood, with transparent,
+6. The recipient held exactly one TWC, the sender retained 24 TWC, and the
+   chain reported exactly 25 TWC entirely in Ironwood, with transparent,
    Sapling, and Orchard balances remaining zero.
 7. A fresh wallet and chain mined 101 transparent coinbases through AuxPoW,
    rotating well beyond the coordinator's 16-entry active-candidate cache.
@@ -257,7 +262,7 @@ The passing automated run established this controlled local path:
     outputs, and two-action Ironwood bundle, and the template contained those
     same bytes and fee.
 11. AuxPoW block 101 mined the transaction. The wallet and chain independently
-    reported 631.25 WEC total across transparent and Ironwood, with zero value
+    reported 631.25 TWC total across transparent and Ironwood, with zero value
     in Sapling and Orchard.
 
 This local pass goes beyond transaction serialization and wallet unit tests. It

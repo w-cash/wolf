@@ -4,6 +4,11 @@ This document describes the rules currently implemented on the built-in Wcash
 Testnet and regtest networks. It is an implementation snapshot for review, not
 a claim that mainnet or community-pool infrastructure is production ready.
 
+`WEC` denotes the future mainnet currency. Testnet and regtest balances use the
+valueless display ticker `TWC` (Test Wcash). The ticker is not serialized by
+consensus: amounts remain integer zatoshi, and the frozen testing genesis
+statements and hashes are unchanged.
+
 ## Activation status
 
 `Network::new_wcash_testnet()` and `Network::new_wcash_regtest()` activate Wcash
@@ -60,7 +65,7 @@ block and mempool verifier paths enforce the same checks.
 This makes value-transfer testing possible without relying on P2P
 magic or address prefixes for replay protection. A controlled local Regtest E2E
 has mined three private coinbases, scanned them into the experimental wallet,
-signed and broadcast a one-WEC Wcash-domain transfer, observed its exact bytes
+signed and broadcast a one-TWC Wcash-domain transfer, observed its exact bytes
 and fee in the mempool and block template, mined it through AuxPoW, and rescanned
 the recipient and private change. A second isolated Regtest lifecycle mined 101
 transparent coinbases, rejected shielding before maturity, made the height-1
@@ -73,16 +78,17 @@ or production-wallet claim.
 
 ## Monetary policy
 
-Wcash uses Zcash's monetary precision without modification: one WEC is exactly
-100,000,000 zatoshi, so the smallest consensus amount is 0.00000001 WEC.
-Amounts are encoded and validated as integer zatoshi; consensus never uses
-floating-point coin values.
+Wcash uses Zcash's monetary precision without modification: one WEC on mainnet,
+or one TWC on Testnet and regtest, is exactly 100,000,000 zatoshi. The smallest
+consensus amount is therefore 0.00000001 WEC or TWC. Amounts are encoded and
+validated as integer zatoshi; consensus never uses floating-point coin values.
 
 Genesis at height 0 has no subsidy. Heights 1 through 1,680,000 inclusive each
-create 6.25 WEC. The first halved block is height 1,680,001, and every later
-era contains exactly 1,680,000 blocks. At the 75-second target, each era is
-approximately four years. Subsidies are integer zatoshi values and each era
-uses a right shift, so fractional zatoshi are discarded.
+create 6.25 TWC on the testing networks; the future mainnet amount is 6.25 WEC.
+The first halved block is height 1,680,001, and every later era contains exactly
+1,680,000 blocks. At the 75-second target, each era is approximately four
+years. Subsidies are integer zatoshi values and each era uses a right shift, so
+fractional zatoshi are discarded.
 
 The inherited genesis transaction contains one zero-valued transparent output.
 It creates no spendable coins, and the chain supply at height 0 is exactly zero.
@@ -92,12 +98,13 @@ from height 50,400,001 onward. Summing every era gives exactly:
 
 ```text
 2,099,999,981,520,000 zatoshi
-= 20,999,999.81520000 WEC
+= 20,999,999.81520000 WEC or TWC, according to network
 ```
 
-Wcash enforces a 21,000,000-WEC monetary-base hard cap
-(2,100,000,000,000,000 zatoshi). Integer-zatoshi halving truncation makes exact
-scheduled subsidy issuance 0.18480000 WEC lower than the cap. Transaction fees
+Wcash enforces a 21,000,000-WEC mainnet monetary-base hard cap and the same
+2,100,000,000,000,000-zatoshi ceiling on testing networks, where it is displayed
+as 21,000,000 TWC. Integer-zatoshi halving truncation makes exact scheduled
+subsidy issuance 0.18480000 WEC or TWC lower than the ceiling. Transaction fees
 are transfers of existing value and do not increase supply.
 
 Wcash has no slow start, founders reward, funding stream, deferred pool,
@@ -203,7 +210,7 @@ The controlled-key private-transfer and transparent-coinbase shielding gates
 have passed in isolated Regtest. The transparent phase recovered all current
 UTXOs from a wallet initialized with a deliberately late birthday, exercised the
 100-block maturity boundary across 101 AuxPoW-mined blocks, and conserved exactly
-631.25 WEC across the transparent and Ironwood pools after shielding one
+631.25 TWC across the transparent and Ironwood pools after shielding one
 coinbase. These deterministic local results do not establish general wallet
 interoperability, public Testnet operation, public reorg safety, or production
 payout safety. Key control must never be inferred from a syntactically valid

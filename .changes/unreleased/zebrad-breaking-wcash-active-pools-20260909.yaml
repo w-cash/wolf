@@ -1,4 +1,4 @@
 project: zebrad
 kind: breaking
-body: "Launch corrected Wcash/WEC test profiles with regenerated genesis blocks, separate replay and storage domains, transparent mining payouts by default, and optional Ironwood payouts without inherited shielded pools."
+body: "Launch corrected Wcash Testnet and regtest profiles under TWC with regenerated genesis blocks, separate replay and storage domains, transparent mining payouts by default, and optional Ironwood payouts without inherited shielded pools."
 time: 2026-09-09T12:00:00.000000006Z

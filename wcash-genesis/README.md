@@ -4,8 +4,11 @@ This crate defines the minimum identity and Bitcoin-anchor rules needed by the
 Wcash node. It is part of the node workspace so the frozen identity values are
 used directly by consensus and runtime configuration.
 
-The canonical product name is `Wcash`, the ticker is `WEC`, and each Wcash
-network has P2P magic derived from an explicit Wcash-only domain label. A node
+The canonical product name is `Wcash`; mainnet uses the ticker `WEC`, while
+Testnet and local regtest use the valueless display ticker `TWC` (Test Wcash).
+Ticker selection is presentation metadata and does not change integer-zatoshi
+amount serialization. Each Wcash network has P2P magic derived from an explicit
+Wcash-only domain label. A node
 must also use Wcash-only peer discovery, address encodings, ports, user-agent,
 configuration, and data paths before any public network is enabled.
 
@@ -30,6 +33,11 @@ announcement timestamp, is:
 ```text
 06/Sep/2026 Wcash (WEC) BTC #<height> <64-character display hash>
 ```
+
+The `WEC` token in this string is historical consensus-committed genesis text,
+not the Testnet balance ticker. It remains unchanged so the frozen Testnet and
+regtest genesis bytes and hashes do not rotate when user interfaces adopt
+`TWC`.
 
 Neither consensus validation nor the generator performs HTTP requests.
 

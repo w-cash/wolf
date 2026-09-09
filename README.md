@@ -15,6 +15,12 @@ own blocks, difficulty target, transactions, and shielded value pool.
 > Wcash mainnet remains disabled, and it must not be used with funds of real
 > value.
 
+`WEC` is the mainnet ticker. The valueless Testnet and local regtest display
+ticker is `TWC` (Test Wcash). This is presentation metadata only: all networks
+continue to encode amounts as integer zatoshi with eight decimal places. The
+already-frozen Testnet and regtest genesis statements retain their historical
+`WEC` text, so this naming clarification does not change either genesis hash.
+
 The built-in Testnet and regtest profiles have separate Wcash-specific NU6.3
 transaction domains. Every post-genesis transaction must use version 6 and
 embed the exact branch ID selected by its Wcash network; inherited Zcash branch
@@ -28,10 +34,11 @@ itself make either engineering profile or its wallet production ready.
 | --- | --- |
 | Parent proof of work | Zcash Equihash `(200, 9)` AuxPoW only |
 | Target block spacing | 75 seconds |
-| Monetary precision | 8 decimal places, identical to Zcash; 1 WEC = 100,000,000 zatoshi |
-| Initial subsidy | 6.25 WEC at heights 1 through 1,680,000 |
+| Currency ticker | Mainnet `WEC`; Testnet and regtest `TWC` |
+| Monetary precision | 8 decimal places, identical to Zcash; 1 WEC or 1 TWC = 100,000,000 zatoshi |
+| Initial subsidy | 6.25 WEC on mainnet, displayed as 6.25 TWC on testing networks, at heights 1 through 1,680,000 |
 | Halving | Every 1,680,000 blocks (about four years); first halved block is 1,680,001 |
-| Monetary cap | 21,000,000 WEC; exact scheduled issuance is 20,999,999.81520000 WEC after zatoshi truncation |
+| Monetary cap | 21,000,000 WEC on mainnet; testing networks use the same schedule under the valueless TWC label |
 | Development allocation | None: no founders reward, funding stream, lockbox, or developer tax |
 | Coinbase destination | Explicit transparent Wcash address is the normal mode; private Ironwood payout is optional |
 | Active value pools | Transparent and Ironwood only; Sprout, Sapling, and legacy Orchard are rejected |
@@ -69,7 +76,7 @@ bounded transaction that shields only mature, fully classified coinbase outputs
 into its own Ironwood receiver. It also signs Wcash-domain V6 Ironwood transfers
 and broadcasts exact signed bytes. It is a controlled, single-writer tool, not a
 pool payout or durable settlement system. Its current full local Regtest gate
-has mined three private coinbases, scanned and spent one WEC under the Wcash
+has mined three private coinbases, scanned and spent one TWC under the Wcash
 V6 domain, included the exact transaction in the mempool and block template,
 mined it through AuxPoW, and rescanned the recipient and private change. A
 separate phase mined 101 transparent coinbases through the same AuxPoW path,
@@ -77,7 +84,7 @@ proved the 100-block maturity boundary and pre-maturity rejection, recovered all
 current UTXOs from a deliberately late wallet birthday, shielded one mature
 coinbase with its exact signed bytes in the mempool and template, and mined the
 shielding transaction at height 101. The run conserved the complete
-631.25-WEC supply across transparent and Ironwood pools and rotated far beyond
+631.25-TWC supply across transparent and Ironwood pools and rotated far beyond
 the coordinator's 16-candidate cache bound. Only the private-transfer phase used
 the explicit Regtest-only one-confirmation override; transparent coinbase
 maturity was not shortened. The public Testnet wallet policy remains 100

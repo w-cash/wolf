@@ -14,8 +14,17 @@ use sha2::{Digest, Sha256};
 /// Human-readable project name.
 pub const PROJECT_NAME: &str = "Wcash";
 
-/// Currency ticker used by Wcash software.
-pub const CURRENCY_TICKER: &str = "WEC";
+/// Currency ticker used for monetary-value Wcash on Mainnet.
+pub const MAINNET_CURRENCY_TICKER: &str = "WEC";
+
+/// Currency ticker used for valueless Wcash Testnet and Regtest funds.
+pub const TESTNET_CURRENCY_TICKER: &str = "TWC";
+
+/// Compatibility alias for the canonical Wcash Mainnet ticker.
+///
+/// New network-aware presentation code should use
+/// [`WcashNetwork::currency_ticker`] instead.
+pub const CURRENCY_TICKER: &str = MAINNET_CURRENCY_TICKER;
 
 /// Canonical configuration-file name.
 pub const CONFIG_FILE_NAME: &str = "wcash.toml";
@@ -28,9 +37,10 @@ pub const USER_AGENT_PREFIX: &str = "/Wcash:";
 
 /// Human-readable timestamp prefix embedded in every Wcash genesis statement.
 ///
-/// The project name and currency ticker are both consensus-committed here so
-/// a genesis block cannot be mistaken for an earlier prelaunch build that used
-/// a different ticker.
+/// The project name and Mainnet currency ticker are consensus-committed here
+/// so a genesis block cannot be mistaken for an earlier prelaunch build that
+/// used a different project identity. Testnet's `TWC` ticker is presentation
+/// metadata and deliberately does not rotate a frozen genesis block.
 pub const GENESIS_TIMESTAMP_TEXT: &str = "06/Sep/2026 Wcash (WEC)";
 
 /// Bitcoin mainnet height designated for a possible Wcash mainnet anchor.
@@ -114,6 +124,18 @@ impl WcashNetwork {
             Self::Mainnet => "mainnet",
             Self::Testnet => "testnet",
             Self::Regtest => "regtest",
+        }
+    }
+
+    /// Returns the display ticker for funds on this network.
+    ///
+    /// Testnet and Regtest funds use `TWC` so they cannot be mistaken for
+    /// monetary-value Mainnet `WEC`.
+    #[must_use]
+    pub const fn currency_ticker(self) -> &'static str {
+        match self {
+            Self::Mainnet => MAINNET_CURRENCY_TICKER,
+            Self::Testnet | Self::Regtest => TESTNET_CURRENCY_TICKER,
         }
     }
 }
@@ -795,9 +817,19 @@ mod tests {
     #[test]
     fn identity_values_are_domain_derived_and_not_zcash_magic() {
         assert_eq!(PROJECT_NAME, "Wcash");
-        assert_eq!(CURRENCY_TICKER, "WEC");
+        assert_eq!(MAINNET_CURRENCY_TICKER, "WEC");
+        assert_eq!(TESTNET_CURRENCY_TICKER, "TWC");
+        assert_eq!(CURRENCY_TICKER, MAINNET_CURRENCY_TICKER);
+        assert_eq!(WcashNetwork::Mainnet.currency_ticker(), "WEC");
+        assert_eq!(WcashNetwork::Testnet.currency_ticker(), "TWC");
+        assert_eq!(WcashNetwork::Regtest.currency_ticker(), "TWC");
+        for ticker in [MAINNET_CURRENCY_TICKER, TESTNET_CURRENCY_TICKER] {
+            assert_eq!(ticker.len(), 3);
+            assert!(ticker.bytes().all(|byte| byte.is_ascii_uppercase()));
+        }
         assert!(GENESIS_TIMESTAMP_TEXT.contains(PROJECT_NAME));
-        assert!(GENESIS_TIMESTAMP_TEXT.contains(CURRENCY_TICKER));
+        assert!(GENESIS_TIMESTAMP_TEXT.contains(MAINNET_CURRENCY_TICKER));
+        assert!(!GENESIS_TIMESTAMP_TEXT.contains(TESTNET_CURRENCY_TICKER));
 
         let zcash_magics = [
             [0x24, 0xe9, 0x27, 0x64],

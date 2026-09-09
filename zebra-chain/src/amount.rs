@@ -603,7 +603,7 @@ impl Constraint for NegativeOrZero {
     }
 }
 
-/// Number of zatoshis in 1 ZEC or WEC.
+/// Number of zatoshis in one whole Zcash or Wcash unit (ZEC, WEC, or TWC).
 pub const COIN: i64 = 100_000_000;
 
 /// The maximum Zcash amount, in zatoshis.

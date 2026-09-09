@@ -42,18 +42,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         "status" => {
             reject_extra_arguments(arguments)?;
-            println!("project: Wcash ({})", wcash_genesis::CURRENCY_TICKER);
+            println!("project: Wcash");
             println!(
-                "mainnet: disabled; designated Bitcoin anchor height {}",
+                "mainnet: {} (disabled); designated Bitcoin anchor height {}",
+                wcash_genesis::WcashNetwork::Mainnet.currency_ticker(),
                 wcash_genesis::DESIGNATED_MAINNET_BITCOIN_HEIGHT
             );
             println!(
-                "testnet: enabled for mining interoperability; Bitcoin block {} anchor (verified at Bitcoin height {})",
+                "testnet: {} (valueless); enabled for mining interoperability; Bitcoin block {} anchor (verified at Bitcoin height {})",
+                wcash_genesis::WcashNetwork::Testnet.currency_ticker(),
                 wcash_genesis::PUBLIC_TESTNET_BITCOIN_HEIGHT,
                 wcash_genesis::PUBLIC_TESTNET_VERIFICATION_HEIGHT,
             );
             println!(
-                "regtest: enabled; frozen Bitcoin block {} anchor",
+                "regtest: {} (valueless); enabled; frozen Bitcoin block {} anchor",
+                wcash_genesis::WcashNetwork::Regtest.currency_ticker(),
                 wcash_genesis::LOCAL_REGTEST_BITCOIN_HEIGHT
             );
         }
@@ -73,6 +76,10 @@ fn reject_extra_arguments(mut arguments: impl Iterator<Item = String>) -> Result
 
 fn print_anchor(anchor: wcash_genesis::BitcoinAnchor) {
     println!("network: {}", anchor.wcash_network());
+    println!(
+        "currency_ticker: {}",
+        anchor.wcash_network().currency_ticker()
+    );
     println!("bitcoin_height: {}", anchor.bitcoin_height());
     println!("bitcoin_hash: {}", anchor.bitcoin_block_hash());
     println!("statement: {}", anchor.genesis_statement());
