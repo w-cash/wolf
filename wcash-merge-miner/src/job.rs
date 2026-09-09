@@ -66,6 +66,7 @@ impl Default for JobConfig {
 pub struct PreparedJob {
     child_block_hash: [u8; 32],
     required_target: Target,
+    job_id_bytes: [u8; 32],
     job_id: String,
     coinbase_bytes: Vec<u8>,
     coinbase_transaction_id: [u8; 32],
@@ -130,7 +131,7 @@ impl PreparedJob {
         parent_header_input[100..104].copy_from_slice(&config.timestamp.to_le_bytes());
         parent_header_input[104..108].copy_from_slice(&config.advertised_n_bits.to_le_bytes());
 
-        let job_id = job_id(
+        let job_id_bytes = job_id(
             child_block_hash,
             required_target,
             &parent_header_input,
@@ -139,10 +140,12 @@ impl PreparedJob {
             &[],
             config.chain_history_root,
         );
+        let job_id = hex::encode(job_id_bytes);
 
         Ok(Self {
             child_block_hash,
             required_target,
+            job_id_bytes,
             job_id,
             coinbase_bytes,
             coinbase_transaction_id: coinbase.transaction_id,
@@ -176,7 +179,7 @@ impl PreparedJob {
             ));
         }
         let coinbase = canonical_parent_coinbase(&coinbase_bytes)?;
-        let job_id = job_id(
+        let job_id_bytes = job_id(
             child_block_hash,
             required_target,
             &parent_header_input,
@@ -185,10 +188,12 @@ impl PreparedJob {
             &auth_data_merkle_branch,
             chain_history_root,
         );
+        let job_id = hex::encode(job_id_bytes);
 
         Ok(Self {
             child_block_hash,
             required_target,
+            job_id_bytes,
             job_id,
             coinbase_bytes,
             coinbase_transaction_id: coinbase.transaction_id,
@@ -203,6 +208,11 @@ impl PreparedJob {
     /// Returns the stable identifier for this exact local job.
     pub fn job_id(&self) -> &str {
         &self.job_id
+    }
+
+    /// Returns the stable identifier as the exact 32 bytes hashed for this job.
+    pub const fn job_id_bytes(&self) -> [u8; 32] {
+        self.job_id_bytes
     }
 
     /// Returns the exact Wcash child block ID bytes committed by this job.
@@ -437,7 +447,7 @@ fn job_id(
     parent_merkle_branch: &[[u8; 32]],
     auth_data_merkle_branch: &[[u8; 32]],
     chain_history_root: [u8; 32],
-) -> String {
+) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"Wcash/ZcashAuxPoW/job/v2\0");
     hash.update(child_block_hash);
@@ -451,7 +461,7 @@ fn job_id(
         hash.update(node);
     }
     hash.update(chain_history_root);
-    hex::encode(hash.finalize())
+    hash.finalize().into()
 }
 
 #[cfg(test)]
@@ -470,6 +480,7 @@ mod tests {
 
         assert_eq!(first, same);
         assert_ne!(first.job_id(), different.job_id());
+        assert_eq!(hex::encode(first.job_id_bytes()), first.job_id());
         assert_eq!(
             &first.parent_header_input()[36..68],
             &first.coinbase_transaction_id()
