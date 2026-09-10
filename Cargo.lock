@@ -3122,6 +3122,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "memuse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3237,6 +3246,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -6797,6 +6807,7 @@ dependencies = [
  "equihash",
  "fs2",
  "hex",
+ "nix",
  "orchard",
  "rand_core 0.6.4",
  "reqwest 0.12.28",
@@ -6805,10 +6816,25 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "uuid",
+ "wcash-pool-protocol",
  "wcash-zcash-aux",
  "zcash_address",
  "zcash_protocol",
  "zebra-chain",
+]
+
+[[package]]
+name = "wcash-pool-protocol"
+version = "0.1.0-alpha.1"
+source = "git+https://github.com/w-cash/pool.git?rev=3b23f184a58da199c326d77c5486f8c9f54c32fc#3b23f184a58da199c326d77c5486f8c9f54c32fc"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]

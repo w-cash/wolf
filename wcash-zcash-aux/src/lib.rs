@@ -69,6 +69,11 @@ pub const MERGED_MINING_MARKER: [u8; 4] = [0xfa, 0xbe, 0x6d, 0x6d];
 /// This commitment is an operator safety check, not part of Wcash consensus.
 pub const PARENT_PAYOUT_COMMITMENT_DOMAIN: &[u8] = b"Wcash/Zcash parent payout address/v1\0";
 
+/// Domain separator for the Wcash child-template payout-address commitment.
+///
+/// This commitment is an operator safety check, not part of Wcash consensus.
+pub const CHILD_PAYOUT_COMMITMENT_DOMAIN: &[u8] = b"Wcash/Wcash child payout address/v1\0";
+
 /// Commits to the canonical encoded Zcash address configured on a parent
 /// template node.
 ///
@@ -79,6 +84,15 @@ pub const PARENT_PAYOUT_COMMITMENT_DOMAIN: &[u8] = b"Wcash/Zcash parent payout a
 pub fn parent_payout_address_commitment(encoded_address: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(PARENT_PAYOUT_COMMITMENT_DOMAIN);
+    hasher.update(encoded_address.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Commits to the canonical encoded Wcash address configured on the child
+/// template node without exposing that address across the pool boundary.
+pub fn child_payout_address_commitment(encoded_address: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(CHILD_PAYOUT_COMMITMENT_DOMAIN);
     hasher.update(encoded_address.as_bytes());
     hasher.finalize().into()
 }
@@ -103,7 +117,7 @@ pub const PARENT_HEADER_BYTES: usize = 4 + 32 * 3 + 4 * 2 + 32 + 3 + 1_344;
 
 #[cfg(test)]
 mod payout_tests {
-    use super::parent_payout_address_commitment;
+    use super::{child_payout_address_commitment, parent_payout_address_commitment};
 
     #[test]
     fn parent_payout_commitment_is_domain_separated_and_stable() {
@@ -115,6 +129,19 @@ mod payout_tests {
         assert_ne!(
             commitment,
             parent_payout_address_commitment("u1test-address-2")
+        );
+    }
+
+    #[test]
+    fn child_payout_commitment_is_stable_and_separate_from_parent_authority() {
+        let commitment = child_payout_address_commitment("wtestsapling1test-address");
+        assert_eq!(
+            hex::encode(commitment),
+            "e5120497f36b3d1fca6c21a4ef6dd8bf060a2d86ca6ba67e0c418eb4fa537559"
+        );
+        assert_ne!(
+            commitment,
+            parent_payout_address_commitment("wtestsapling1test-address")
         );
     }
 }
