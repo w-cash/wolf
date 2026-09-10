@@ -157,6 +157,50 @@ edge must select a meaningful share target and implement variable difficulty.
 It proves share submission, not block discovery: for a deterministic local
 dual-winner test, use the equal child and parent network target printed by
 `native-job`, as the automated E2E gate does.
+
+### Zcash Testnet bootstrap parent sampling
+
+By default, `WCASH_SHARE_TARGET` must include both the Wcash child target and
+the Zcash parent target. This guarantees that miners submit every possible
+winner on either chain. Keep that default everywhere except the narrow public
+Testnet bootstrap case described here.
+
+Live Zcash Testnet can temporarily advertise a parent target that is much
+easier than the ASIC-rate Wcash Testnet target. Advertising that parent target
+as the share target would make an initial Z15 submit at an unsafe rate. For the
+initial deployment, copy the exact Wcash `child_target` reported by
+`native-job` into `WCASH_SHARE_TARGET` (approximately one Wcash-target share per
+75 seconds at the calibrated launch rate), then explicitly enable sampling:
+
+```sh
+export ZCASH_NETWORK=testnet
+export WCASH_SHARE_TARGET='<exact child_target from native-job>'
+export WCASH_TESTNET_PARENT_TARGET_SAMPLING=1
+```
+
+The opt-in value must be exactly `1`. The coordinator rejects it on Mainnet,
+Regtest, with any child genesis other than the built-in Wcash Testnet, or when
+the listener allows more than one client. An unset variable preserves full
+dual-target coverage. Sampling
+still requires the advertised share target to include every Wcash winner; it
+only omits Zcash winners whose hashes meet the easier parent target but not the
+harder advertised share target. Preflight reports the configured policy,
+per-chain winner coverage, and `degraded_parent_coverage`, and emits a warning
+when parent coverage is sampled.
+
+While the live parent target remains easier, every submitted share in this
+configuration also meets it. After the first such share is validated and
+synchronously appended to the durable winner outbox, the listener requests
+generation rotation and then returns the ASIC success response. It stops
+admitting new work promptly, joins
+already accepted handlers, and explicitly flushes the outbox before retiring
+the generation or preparing replacement work; restart replay remains the
+fallback for interruption or unavailable nodes. This does not weaken winner
+validation, durable accounting, authentication, independent chain submission,
+or Wcash winner capture. Do not raise the existing
+64-submission-per-second connection cap to compensate for the parent target.
+Remove this bootstrap opt-in once full parent coverage is operationally safe.
+
 The `-` address argument reads `WCASH_PAYOUT_ADDRESS` without exposing it in a
 process listing or plaintext diagnostic field. Raw JSON-RPC body logging is
 disabled so the loopback `createauxblock` request does not reintroduce that

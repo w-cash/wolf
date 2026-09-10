@@ -28,6 +28,7 @@ use wcash_merge_miner::{
 };
 use wcash_zcash_aux::Target;
 use zcash_address::ZcashAddress;
+use zebra_chain::block::genesis::WCASH_TESTNET_GENESIS_HASH;
 
 const DEFAULT_BIND: &str = "127.0.0.1:28237";
 const DEFAULT_SHARE_JOURNAL: &str = ".wcash-share-journal-v2.jsonl";
@@ -49,6 +50,7 @@ const WCASH_AUTHENTICATION_LIMIT: &str = "WCASH_AUTHENTICATION_LIMIT";
 const WCASH_EXPECTED_GENESIS_HASH: &str = "WCASH_EXPECTED_GENESIS_HASH";
 const ZCASH_EXPECTED_GENESIS_HASH: &str = "ZCASH_EXPECTED_GENESIS_HASH";
 const ZCASH_NETWORK: &str = "ZCASH_NETWORK";
+const WCASH_TESTNET_PARENT_TARGET_SAMPLING: &str = "WCASH_TESTNET_PARENT_TARGET_SAMPLING";
 
 const USAGE: &str = r#"Wcash/Zcash merged-mining operator CLI
 
@@ -110,6 +112,12 @@ native preflight prints the exact Zcash coinbase.
 WCASH_VALIDATION_LIMIT optionally sets the global concurrent share-validation
 limit (default 4, maximum 1024). WCASH_AUTHENTICATION_LIMIT optionally sets the
 global concurrent Argon2id verification limit (default 4, maximum 256).
+WCASH_TESTNET_PARENT_TARGET_SAMPLING may be set to exactly `1` only with
+ZCASH_NETWORK=testnet, the built-in Wcash Testnet genesis, and a one-client
+listener. It permits the advertised share target to sample the abnormally easy
+parent target, but never to exclude a Wcash network winner. Without this explicit
+bootstrap mode, the share target must include both network targets. Sampling mode
+rotates immediately after durably recording a network winner.
 WCASH_SHARE_JOURNAL optionally selects the durable JSON-lines share journal; the
 default is .wcash-share-journal-v2.jsonl in the current directory (created 0600
 on Unix). The default listener is 127.0.0.1:28237 and the default client limit is
@@ -382,14 +390,23 @@ fn run_native_server(
         DEFAULT_ZIP301_AUTHENTICATION_LIMIT,
         WCASH_AUTHENTICATION_LIMIT,
     )?;
-    let zip301 = Zip301Config::new_with_worker_authenticator(share_target, Arc::new(credentials))
-        .with_maximum_clients(arguments.maximum_clients)?
-        .with_maximum_parallel_authentications(maximum_parallel_authentications)?
-        .with_maximum_parallel_validations(maximum_parallel_validations)?;
+    let configured = configure_native(&arguments.connection)?;
+    let testnet_parent_target_sampling = parse_testnet_parent_target_sampling(
+        optional_env(WCASH_TESTNET_PARENT_TARGET_SAMPLING)?,
+        configured.zcash_network,
+        &configured.config.expected_wcash_genesis_hash,
+    )?;
+    let mut zip301 =
+        Zip301Config::new_with_worker_authenticator(share_target, Arc::new(credentials))
+            .with_maximum_clients(arguments.maximum_clients)?
+            .with_maximum_parallel_authentications(maximum_parallel_authentications)?
+            .with_maximum_parallel_validations(maximum_parallel_validations)?;
+    if testnet_parent_target_sampling {
+        zip301 = zip301.with_testnet_parent_target_sampling(configured.zcash_network)?;
+    }
     let listener = Zip301LoopbackListener::bind(arguments.bind)?;
 
     let journal = share_journal_path()?;
-    let configured = configure_native(&arguments.connection)?;
     let supervisor = NativeMiningSupervisor::open(configured.config.clone(), &journal)?;
     let command = if automatic_rotation {
         "native-serve"
@@ -429,6 +446,7 @@ fn run_native_server(
                 maximum_parallel_authentications,
                 maximum_parallel_validations,
                 share_target,
+                testnet_parent_target_sampling,
                 worker_count,
                 automatic_rotation,
             }),
@@ -464,7 +482,10 @@ fn run_native_server(
                     .to_string(),
             )
         })?;
-        retire_native_generation(&mut coordinator, automatic_rotation)?;
+        let outbox_flush = coordinator.flush_winner_outbox();
+        retire_after_outbox_flush(outbox_flush, || {
+            retire_native_generation(&mut coordinator, automatic_rotation)
+        })?;
 
         match serve_result {
             Err(error) if automatic_rotation && is_retryable_native_preparation_error(&error) => {
@@ -474,6 +495,14 @@ fn run_native_server(
             Ok(()) => return Ok(()),
         }
     }
+}
+
+fn retire_after_outbox_flush<T>(
+    outbox_flush: Result<(), MinerError>,
+    retire: impl FnOnce() -> Result<T, MinerError>,
+) -> Result<T, MinerError> {
+    outbox_flush?;
+    retire()
 }
 
 fn retire_native_generation(
@@ -681,6 +710,7 @@ fn parse_native_connection(
 struct ConfiguredNative {
     config: CoordinatorConfig,
     summary: EndpointSummary,
+    zcash_network: NativeZcashNetwork,
 }
 
 struct EndpointSummary {
@@ -751,6 +781,7 @@ fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredN
             auxiliary_nonce: arguments.auxiliary_nonce,
         },
         summary,
+        zcash_network: expected_zcash_network,
     })
 }
 
@@ -779,6 +810,32 @@ fn required_zcash_network_env() -> Result<NativeZcashNetwork, MinerError> {
             "environment variable {ZCASH_NETWORK} must be exactly `mainnet`, `testnet`, or `regtest`"
         ))),
     }
+}
+
+fn parse_testnet_parent_target_sampling(
+    configured: Option<String>,
+    zcash_network: NativeZcashNetwork,
+    expected_wcash_genesis_hash: &str,
+) -> Result<bool, MinerError> {
+    let Some(configured) = configured else {
+        return Ok(false);
+    };
+    if configured != "1" {
+        return Err(MinerError::InvalidRequest(format!(
+            "environment variable {WCASH_TESTNET_PARENT_TARGET_SAMPLING} must be exactly `1` when set"
+        )));
+    }
+    if zcash_network != NativeZcashNetwork::Testnet {
+        return Err(MinerError::InvalidRequest(format!(
+            "environment variable {WCASH_TESTNET_PARENT_TARGET_SAMPLING} is allowed only when {ZCASH_NETWORK}=testnet"
+        )));
+    }
+    if !expected_wcash_genesis_hash.eq_ignore_ascii_case(WCASH_TESTNET_GENESIS_HASH) {
+        return Err(MinerError::InvalidRequest(format!(
+            "environment variable {WCASH_TESTNET_PARENT_TARGET_SAMPLING} is allowed only with the built-in Wcash Testnet genesis"
+        )));
+    }
+    Ok(true)
 }
 
 fn endpoint_from_env(
@@ -840,8 +897,55 @@ struct ServeSummary {
     maximum_parallel_authentications: usize,
     maximum_parallel_validations: usize,
     share_target: Target,
+    testnet_parent_target_sampling: bool,
     worker_count: usize,
     automatic_rotation: bool,
+}
+
+fn share_target_policy_preflight(
+    share_target: Target,
+    child_target: Target,
+    parent_target: Target,
+    parent_network: NativeZcashNetwork,
+    testnet_parent_target_sampling: bool,
+) -> Result<Value, MinerError> {
+    if testnet_parent_target_sampling && parent_network != NativeZcashNetwork::Testnet {
+        return Err(MinerError::InvalidRequest(
+            "parent-target sampling is allowed only on Zcash Testnet".to_string(),
+        ));
+    }
+    let captures_all_wcash_winners = share_target.includes(child_target);
+    let captures_all_zcash_winners = share_target.includes(parent_target);
+    if !captures_all_wcash_winners
+        || (!testnet_parent_target_sampling && !captures_all_zcash_winners)
+    {
+        return Err(MinerError::InvalidRequest(
+            if testnet_parent_target_sampling {
+                "ZIP-301 Testnet sampling target must include the Wcash child network target"
+                    .to_string()
+            } else {
+                "ZIP-301 share target must be at least as easy as both network targets".to_string()
+            },
+        ));
+    }
+
+    Ok(json!({
+        "mode": if testnet_parent_target_sampling {
+            "testnet_parent_target_sampling"
+        } else {
+            "full_network_winner_coverage"
+        },
+        "opt_in_source": if testnet_parent_target_sampling {
+            Value::String(WCASH_TESTNET_PARENT_TARGET_SAMPLING.to_string())
+        } else {
+            Value::Null
+        },
+        "captures_all_wcash_winners": captures_all_wcash_winners,
+        "captures_all_zcash_winners": captures_all_zcash_winners,
+        "degraded_parent_coverage": testnet_parent_target_sampling
+            && !captures_all_zcash_winners,
+        "rotation_after_first_durable_network_winner": testnet_parent_target_sampling,
+    }))
 }
 
 fn native_preflight(
@@ -855,8 +959,14 @@ fn native_preflight(
     let native_job = coordinator.job();
     let job = native_job.job();
     let outbox = coordinator.outbox_status()?;
-    let lifecycle_message = if serve.is_some_and(|serve| serve.automatic_rotation) {
+    let lifecycle_message = if serve
+        .is_some_and(|serve| serve.automatic_rotation && serve.testnet_parent_target_sampling)
+    {
+        "one exact proposal-validated generation is active; the process retires it and prepares fresh work after the first durably recorded network winner, whenever either chain tip changes, or when the Wcash candidate expires"
+    } else if serve.is_some_and(|serve| serve.automatic_rotation) {
         "one exact proposal-validated generation is active; the process retires it and prepares fresh work whenever either chain tip changes or the Wcash candidate expires"
+    } else if serve.is_some_and(|serve| serve.testnet_parent_target_sampling) {
+        "ONE FROZEN JOB ONLY: this process stops after the first durably recorded network winner, when either chain tip changes, or when the Wcash candidate expires"
     } else if serve.is_some() {
         "ONE FROZEN JOB ONLY: this process keeps serving this exact job until stopped and exits when either chain tip changes or the Wcash candidate expires"
     } else {
@@ -933,6 +1043,15 @@ fn native_preflight(
     });
 
     if let Some(serve) = serve {
+        let share_target_policy = share_target_policy_preflight(
+            serve.share_target,
+            job.required_target(),
+            native_job.parent_target(),
+            native_job.parent_network(),
+            serve.testnet_parent_target_sampling,
+        )?;
+        let degraded_parent_coverage =
+            share_target_policy["degraded_parent_coverage"] == Value::Bool(true);
         output["listener"] = json!({
             "bind": serve.bind.to_string(),
             "loopback_only": true,
@@ -940,10 +1059,16 @@ fn native_preflight(
             "maximum_parallel_authentications": serve.maximum_parallel_authentications,
             "maximum_parallel_validations": serve.maximum_parallel_validations,
             "share_target": display_target(serve.share_target),
+            "share_target_policy": share_target_policy,
             "authentication": "exact-worker-argon2id",
             "worker_count": serve.worker_count,
             "worker_credentials_source": WCASH_WORKER_CREDENTIALS,
         });
+        if degraded_parent_coverage {
+            eprintln!(
+                "WARNING: {WCASH_TESTNET_PARENT_TARGET_SAMPLING}=1 is sampling Zcash Testnet parent winners; Wcash winner coverage remains complete and the generation rotates after its first durably recorded network winner"
+            );
+        }
     }
     Ok(output)
 }
@@ -1161,6 +1286,119 @@ mod tests {
         );
         assert_eq!(display_target(target), display);
         assert!(parse_display_target(&"00".repeat(32), "target").is_err());
+    }
+
+    #[test]
+    fn parent_target_sampling_requires_exact_testnet_opt_in() {
+        let wcash_testnet_genesis = WCASH_TESTNET_GENESIS_HASH;
+        for network in [
+            NativeZcashNetwork::Mainnet,
+            NativeZcashNetwork::Testnet,
+            NativeZcashNetwork::Regtest,
+        ] {
+            assert!(
+                !parse_testnet_parent_target_sampling(None, network, wcash_testnet_genesis)
+                    .expect("an absent opt-in preserves full coverage")
+            );
+        }
+        assert!(parse_testnet_parent_target_sampling(
+            Some("1".to_string()),
+            NativeZcashNetwork::Testnet,
+            wcash_testnet_genesis,
+        )
+        .expect("exact Testnet opt-in is accepted"));
+        for network in [NativeZcashNetwork::Mainnet, NativeZcashNetwork::Regtest] {
+            assert!(parse_testnet_parent_target_sampling(
+                Some("1".to_string()),
+                network,
+                wcash_testnet_genesis,
+            )
+            .is_err());
+        }
+        for value in ["", "0", "true", "yes", " 1"] {
+            assert!(parse_testnet_parent_target_sampling(
+                Some(value.to_string()),
+                NativeZcashNetwork::Testnet,
+                wcash_testnet_genesis,
+            )
+            .is_err());
+        }
+        assert!(parse_testnet_parent_target_sampling(
+            Some("1".to_string()),
+            NativeZcashNetwork::Testnet,
+            &"00".repeat(32),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn preflight_exposes_degraded_parent_coverage_without_weakening_child_coverage() {
+        let target = |most_significant| {
+            let mut bytes = [0; 32];
+            bytes[31] = most_significant;
+            Target::from_le_bytes(bytes).expect("fixture target is nonzero")
+        };
+        let child = target(0x20);
+        let easier_parent = target(0x30);
+
+        assert!(share_target_policy_preflight(
+            child,
+            child,
+            easier_parent,
+            NativeZcashNetwork::Testnet,
+            false,
+        )
+        .is_err());
+        let sampled = share_target_policy_preflight(
+            child,
+            child,
+            easier_parent,
+            NativeZcashNetwork::Testnet,
+            true,
+        )
+        .expect("explicit sampling keeps complete child coverage");
+        assert_eq!(sampled["mode"], "testnet_parent_target_sampling");
+        assert_eq!(sampled["captures_all_wcash_winners"], true);
+        assert_eq!(sampled["captures_all_zcash_winners"], false);
+        assert_eq!(sampled["degraded_parent_coverage"], true);
+        assert_eq!(sampled["rotation_after_first_durable_network_winner"], true);
+        assert!(share_target_policy_preflight(
+            target(0x1f),
+            child,
+            easier_parent,
+            NativeZcashNetwork::Testnet,
+            true,
+        )
+        .is_err());
+        for network in [NativeZcashNetwork::Mainnet, NativeZcashNetwork::Regtest] {
+            assert!(
+                share_target_policy_preflight(child, child, easier_parent, network, true).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn generation_retirement_requires_a_successful_outbox_flush() {
+        let retirement_called = std::cell::Cell::new(false);
+        let result = retire_after_outbox_flush(
+            Err(MinerError::InvalidRequest(
+                "fixture durable outbox failure".to_string(),
+            )),
+            || {
+                retirement_called.set(true);
+                Ok(GenerationRetirement::Retired)
+            },
+        );
+        assert!(result.is_err());
+        assert!(!retirement_called.get());
+
+        let result = retire_after_outbox_flush(Ok(()), || {
+            retirement_called.set(true);
+            Ok(GenerationRetirement::RetainedForWcashWinner)
+        })
+        .expect("a successful flush permits safe retirement");
+        assert!(retirement_called.get());
+        assert_eq!(result, GenerationRetirement::RetainedForWcashWinner);
     }
 
     #[test]

@@ -264,6 +264,7 @@ impl NativeZcashConfig {
 pub struct NativeZcashProvider {
     template_node: ZebraRpcClient,
     proposal_validators: Vec<ZebraRpcClient>,
+    parent_network: NativeZcashNetwork,
     expected_parent_network: Network,
     expected_parent_payout_commitment: [u8; 32],
     expected_parent_payout_address: ZcashAddress,
@@ -283,6 +284,7 @@ impl NativeZcashProvider {
     /// other chain is temporarily unavailable.
     pub(crate) fn connect(config: NativeZcashConfig) -> Result<Self, MinerError> {
         config.validate()?;
+        let parent_network = config.expected_parent_network;
         let expected_parent_network = config.expected_parent_network.consensus_parameters();
         let expected_parent_payout_commitment = config.expected_parent_payout_commitment;
         let expected_parent_payout_address = config.expected_parent_payout_address;
@@ -295,6 +297,7 @@ impl NativeZcashProvider {
         Ok(Self {
             template_node,
             proposal_validators,
+            parent_network,
             expected_parent_network,
             expected_parent_payout_commitment,
             expected_parent_payout_address,
@@ -344,6 +347,7 @@ impl NativeZcashProvider {
             auxiliary_nonce,
             template,
             &self.expected_parent_payout_address,
+            self.parent_network,
             &self.expected_parent_network,
         )?;
 
@@ -594,6 +598,7 @@ pub struct NativePreparedJob {
     job: PreparedJob,
     parent_proposal: Block,
     proposal_bytes: Vec<u8>,
+    parent_network: NativeZcashNetwork,
     parent_target: Target,
     parent_tip_display: String,
     parent_height: u32,
@@ -771,6 +776,7 @@ impl NativePreparedJob {
         auxiliary_nonce: u32,
         template: BlockTemplateResponse,
         expected_parent_payout_address: &ZcashAddress,
+        parent_network: NativeZcashNetwork,
         expected_parent_network: &Network,
     ) -> Result<Self, MinerError> {
         if template.version != 4 {
@@ -990,6 +996,7 @@ impl NativePreparedJob {
             job,
             parent_proposal,
             proposal_bytes,
+            parent_network,
             parent_target,
             parent_tip_display,
             parent_height,
@@ -1005,6 +1012,11 @@ impl NativePreparedJob {
     /// Returns the exact proposal bytes accepted before this job was issued.
     pub fn proposal_bytes(&self) -> &[u8] {
         &self.proposal_bytes
+    }
+
+    /// Returns the standard Zcash network profile bound to this prepared job.
+    pub const fn parent_network(&self) -> NativeZcashNetwork {
+        self.parent_network
     }
 
     /// Returns the Zcash network target authenticated by the parent template.
@@ -1961,6 +1973,7 @@ mod tests {
                 .as_ref()
                 .clone(),
             proposal_bytes: Vec::new(),
+            parent_network: NativeZcashNetwork::Regtest,
             parent_target: Target::MAX,
             parent_tip_display: "00".repeat(32),
             parent_height: 1,
