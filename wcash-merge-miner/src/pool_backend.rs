@@ -11,8 +11,10 @@ pub use crate::{
     pool_backend_connection::BackendRequestKind,
     pool_backend_identity::{PoolBackendIdentity, PoolBackendIdentityError},
     pool_backend_journal::{
-        JournalEventPage, PoolBackendJournal, PoolBackendJournalError, JOURNAL_FORMAT_VERSION,
-        MAX_JOURNAL_BYTES, MAX_JOURNAL_EVENTS, MAX_JOURNAL_RECORD_BYTES,
+        JournalEventPage, JournalShareCommit, JournalWinnerBlocks, JournalWinnerLifecycle,
+        JournalWinnerState, JournalWinnerSummary, PoolBackendJournal, PoolBackendJournalError,
+        JOURNAL_FORMAT_VERSION, MAX_JOURNAL_BYTES, MAX_JOURNAL_EVENTS, MAX_JOURNAL_RECORD_BYTES,
+        MAX_WINNER_BLOCK_BYTES,
     },
     pool_backend_listener::{
         PoolBackendAuthority, PoolBackendConnectionOutcome, PoolBackendHandlerError,
