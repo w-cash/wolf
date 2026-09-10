@@ -16,16 +16,19 @@ use std::{
 use thiserror::Error;
 use wcash_pool_protocol::{
     canonical_attribution_id, canonical_parent_header_hash_le, canonical_share_id, AcceptableJob,
-    BackendErrorCode, BackendEvent, BackendMessage, BackendRequest, CanonicalUuid, Hex1344, Hex32,
-    Hex4, JobDescriptor, JobInvalidationReason, MergedChain, ProtocolError, ShareReceipt, TargetLe,
-    WinnerDescriptor, WorkerIdentity, BACKEND_PROTOCOL_VERSION, MAX_EVENT_PAGE_ITEMS,
-    REQUIRED_BACKEND_CAPABILITIES,
+    BackendErrorCode, BackendEvent, BackendMessage, BackendRequest, CanonicalUuid, ChainTip,
+    Hex1344, Hex32, Hex4, JobDescriptor, JobInvalidationReason, MergedChain, ProtocolError,
+    ShareReceipt, TargetLe, WinnerDescriptor, WorkerIdentity, BACKEND_PROTOCOL_VERSION,
+    MAX_EVENT_PAGE_ITEMS, REQUIRED_BACKEND_CAPABILITIES,
 };
 
 use crate::{
     pool_backend::{PoolShareTargetPolicy, PoolShareTargetPolicyError},
     pool_backend_connection::BackendRequestKind,
-    pool_backend_journal::{JournalWinnerBlocks, PoolBackendJournal, PoolBackendJournalError},
+    pool_backend_journal::{
+        JournalWinnerBlocks, JournalWinnerLifecycle, JournalWinnerState, JournalWinnerTransition,
+        PoolBackendJournal, PoolBackendJournalError,
+    },
     pool_backend_listener::{
         PoolBackendAuthority, PoolBackendHandlerError, PoolBackendListenerError,
         PoolBackendRequestContext, PoolBackendRequestHandler,
@@ -144,6 +147,157 @@ impl fmt::Debug for PoolBackendValidatedShare {
     }
 }
 
+/// Authority-bound key for one independently reconciled chain winner.
+///
+/// Keys are created from actor snapshots rather than arbitrary caller bytes,
+/// preventing a pagination cursor or point lookup from crossing journal
+/// sequence namespaces accidentally.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolBackendWinnerKey {
+    journal_stream: CanonicalUuid,
+    winner_ordinal: usize,
+    share_id: Hex32,
+    chain: MergedChain,
+}
+
+impl PoolBackendWinnerKey {
+    /// Returns the stable accepted-share identity that created this winner.
+    pub const fn share_id(&self) -> &Hex32 {
+        &self.share_id
+    }
+
+    /// Returns the independently reconciled merged-mining chain.
+    pub const fn chain(&self) -> MergedChain {
+        self.chain
+    }
+}
+
+/// One exact, bounded winner snapshot returned by the serialized actor.
+///
+/// The snapshot is also the compare-and-swap token for an external
+/// reconciliation attempt. Its exact block is capped by
+/// `MAX_WINNER_BLOCK_BYTES`; `Debug` reports only its length.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PoolBackendWinnerSnapshot {
+    journal_stream: CanonicalUuid,
+    winner_ordinal: usize,
+    state: JournalWinnerState,
+}
+
+impl PoolBackendWinnerSnapshot {
+    /// Returns an authority-bound key suitable for point lookup or pagination.
+    pub fn key(&self) -> PoolBackendWinnerKey {
+        PoolBackendWinnerKey {
+            journal_stream: self.journal_stream,
+            winner_ordinal: self.winner_ordinal,
+            share_id: self.state.share_id.clone(),
+            chain: self.state.winner.chain,
+        }
+    }
+
+    /// Returns the stable accepted-share identity that created this winner.
+    pub const fn share_id(&self) -> &Hex32 {
+        &self.state.share_id
+    }
+
+    /// Returns the exact backend generation that created this winner.
+    pub const fn job_id(&self) -> &Hex32 {
+        &self.state.job_id
+    }
+
+    /// Returns the immutable chain, reward, height, and block identity facts.
+    pub const fn winner(&self) -> &WinnerDescriptor {
+        &self.state.winner
+    }
+
+    /// Returns the exact validated parent-header hash shared by both chains.
+    pub const fn parent_hash_le(&self) -> &Hex32 {
+        &self.state.parent_hash_le
+    }
+
+    /// Returns the exact canonical block retained for submission or checking.
+    pub fn block_bytes(&self) -> &[u8] {
+        &self.state.block_bytes
+    }
+
+    /// Returns the latest durable lifecycle state.
+    pub const fn lifecycle(&self) -> &JournalWinnerLifecycle {
+        &self.state.lifecycle
+    }
+
+    /// Returns the per-winner event revision used by compare-and-swap.
+    pub const fn revision_event_seq(&self) -> u64 {
+        self.state.revision_event_seq
+    }
+}
+
+impl fmt::Debug for PoolBackendWinnerSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PoolBackendWinnerSnapshot")
+            .field("journal_stream", &self.journal_stream)
+            .field("winner_ordinal", &self.winner_ordinal)
+            .field("share_id", &self.state.share_id)
+            .field("job_id", &self.state.job_id)
+            .field("winner", &self.state.winner)
+            .field("parent_hash_le", &self.state.parent_hash_le)
+            .field("block_bytes_len", &self.state.block_bytes.len())
+            .field("lifecycle", &self.state.lifecycle)
+            .field("revision_event_seq", &self.state.revision_event_seq)
+            .finish()
+    }
+}
+
+/// Exact best-chain result to append for one authority-bound winner snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PoolBackendWinnerTransition {
+    /// The exact retained block is on the sampled best chain.
+    Observed {
+        /// Exact best-chain tip used for this observation.
+        tip: ChainTip,
+        /// Confirmations computed from the same chain snapshot as `tip`.
+        confirmations: u32,
+    },
+    /// A previously observed or matured block left the sampled best chain.
+    Orphaned {
+        /// Exact replacement best-chain tip.
+        tip: ChainTip,
+    },
+    /// A conflicting Wcash AuxPoW witness occupies the same child block ID.
+    Quarantined {
+        /// Exact best-chain tip sampled with the witness conflict.
+        tip: ChainTip,
+    },
+    /// A quarantined Wcash winner is absent and eligible for resubmission.
+    Requeued {
+        /// Exact best-chain tip sampled before releasing quarantine.
+        tip: ChainTip,
+    },
+    /// An observed reward reached its immutable maturity threshold.
+    Matured {
+        /// Exact best-chain tip used for this maturity decision.
+        tip: ChainTip,
+        /// Confirmations computed from the same chain snapshot as `tip`.
+        confirmations: u32,
+    },
+}
+
+impl From<PoolBackendWinnerTransition> for JournalWinnerTransition {
+    fn from(transition: PoolBackendWinnerTransition) -> Self {
+        match transition {
+            PoolBackendWinnerTransition::Observed { tip, confirmations } => {
+                Self::Observed { tip, confirmations }
+            }
+            PoolBackendWinnerTransition::Orphaned { tip } => Self::Orphaned { tip },
+            PoolBackendWinnerTransition::Quarantined { tip } => Self::Quarantined { tip },
+            PoolBackendWinnerTransition::Requeued { tip } => Self::Requeued { tip },
+            PoolBackendWinnerTransition::Matured { tip, confirmations } => {
+                Self::Matured { tip, confirmations }
+            }
+        }
+    }
+}
+
 /// Stable failure classes returned by a retained consensus validator.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum PoolBackendShareValidationError {
@@ -230,6 +384,18 @@ pub enum PoolBackendActorError {
     /// An unhealthy retained validator cannot be advertised to miners.
     #[error("retained pool job is not healthy")]
     RetainedJobUnhealthy,
+
+    /// A winner key or snapshot belongs to another journal sequence namespace.
+    #[error("winner reconciliation authority does not match this backend journal")]
+    WinnerAuthorityMismatch,
+
+    /// A winner snapshot no longer names retained private block material.
+    #[error("winner reconciliation snapshot is not retained")]
+    WinnerNotRetained,
+
+    /// Another transition changed this winner after the observation began.
+    #[error("winner reconciliation snapshot is stale")]
+    WinnerRevisionConflict,
 
     /// Replayed events contradicted the actor projection.
     #[error("durable backend events contain an invalid actor projection: {0}")]
@@ -535,6 +701,83 @@ impl PoolBackendActor {
             return Err(PoolBackendActorError::InvalidJobPhase);
         }
         close_retained_job(&mut state, job_id)
+    }
+
+    /// Returns the next retained winner in durable journal order while cloning
+    /// only that winner's bounded exact block.
+    ///
+    /// Pass the prior snapshot's [`PoolBackendWinnerSnapshot::key`] to advance
+    /// a pass. `None` begins a new pass. Matured winners remain visible because
+    /// a deep reorganization can still orphan them.
+    pub fn next_winner_snapshot(
+        &self,
+        after: Option<&PoolBackendWinnerKey>,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        if after.is_some_and(|key| key.journal_stream != self.authority_fields.journal_stream) {
+            return Err(PoolBackendActorError::WinnerAuthorityMismatch);
+        }
+        let state = self.lock_state()?;
+        let after_ordinal = after.map(|key| key.winner_ordinal);
+        state
+            .journal
+            .next_winner_state(after_ordinal)
+            .map(|winner| {
+                winner.map(|(winner_ordinal, state)| PoolBackendWinnerSnapshot {
+                    journal_stream: self.authority_fields.journal_stream,
+                    winner_ordinal,
+                    state,
+                })
+            })
+            .map_err(PoolBackendActorError::Journal)
+    }
+
+    /// Returns the latest snapshot for one authority-bound retained winner.
+    pub fn winner_snapshot(
+        &self,
+        key: &PoolBackendWinnerKey,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        if key.journal_stream != self.authority_fields.journal_stream {
+            return Err(PoolBackendActorError::WinnerAuthorityMismatch);
+        }
+        let state = self.lock_state()?;
+        state
+            .journal
+            .winner_state(&key.share_id, key.chain)
+            .map(|winner| {
+                winner.map(|state| PoolBackendWinnerSnapshot {
+                    journal_stream: self.authority_fields.journal_stream,
+                    winner_ordinal: key.winner_ordinal,
+                    state,
+                })
+            })
+            .map_err(PoolBackendActorError::Journal)
+    }
+
+    /// Durably applies one winner lifecycle result if `expected` is still the
+    /// latest snapshot for that exact winner.
+    ///
+    /// A worker must obtain the snapshot before starting its external node
+    /// observation and submit the result through this method afterwards. A
+    /// transition committed by another worker changes the per-winner revision,
+    /// so this method rejects the stale result without appending an event.
+    pub fn compare_and_apply_winner_transition(
+        &self,
+        expected: &PoolBackendWinnerSnapshot,
+        transition: PoolBackendWinnerTransition,
+    ) -> Result<BackendEvent, PoolBackendActorError> {
+        if expected.journal_stream != self.authority_fields.journal_stream {
+            return Err(PoolBackendActorError::WinnerAuthorityMismatch);
+        }
+        let state = self.lock_state()?;
+        state
+            .journal
+            .compare_and_transition_winner(
+                &expected.state.share_id,
+                expected.state.winner.chain,
+                expected.state.revision_event_seq,
+                transition.into(),
+            )
+            .map_err(winner_transition_error)
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, ActorState>, PoolBackendActorError> {
@@ -1384,6 +1627,16 @@ fn journal_handler_error(error: PoolBackendJournalError) -> PoolBackendHandlerEr
     }
 }
 
+fn winner_transition_error(error: PoolBackendJournalError) -> PoolBackendActorError {
+    match error {
+        PoolBackendJournalError::WinnerNotFound { .. } => PoolBackendActorError::WinnerNotRetained,
+        PoolBackendJournalError::WinnerRevisionConflict { .. } => {
+            PoolBackendActorError::WinnerRevisionConflict
+        }
+        error => PoolBackendActorError::Journal(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1395,8 +1648,10 @@ mod tests {
 
     use tempfile::TempDir;
     use wcash_pool_protocol::{Hex108, BACKEND_PROTOCOL_VERSION};
+    use zebra_chain::{block::Block, serialization::ZcashDeserializeInto, work::difficulty::U256};
 
     use super::*;
+    use crate::coordinator::{validate_persisted_winner_block, PersistedWinnerBlockKind};
 
     const TEST_CHAIN_ID: u32 = 0x5743_4153;
 
@@ -1573,6 +1828,149 @@ mod tests {
     fn actor(path: &Path, config: &TestJournalConfig, clock: Arc<TestClock>) -> PoolBackendActor {
         PoolBackendActor::new_with_clock(create_journal(path, config), target_policy(), clock)
             .expect("construct actor")
+    }
+
+    fn actor_from_journal(journal: PoolBackendJournal, clock: Arc<TestClock>) -> PoolBackendActor {
+        PoolBackendActor::new_with_clock(journal, target_policy(), clock)
+            .expect("construct actor from retained winner journal")
+    }
+
+    fn wcash_winner_journal(
+        path: &Path,
+        config: &TestJournalConfig,
+    ) -> (PoolBackendJournal, WinnerDescriptor, Vec<u8>) {
+        let journal = create_journal(path, config);
+        let block_bytes =
+            hex::decode(include_str!("vectors/wcash-valid-auxpow-block-nonzero-prev.txt").trim())
+                .expect("valid Wcash AuxPoW fixture is hex");
+        let block: Block = block_bytes
+            .as_slice()
+            .zcash_deserialize_into()
+            .expect("valid Wcash AuxPoW fixture decodes");
+        let block_hash = block.hash().0;
+        let coinbase_txid = block.transactions[0].hash().0;
+        let expanded_target: U256 = block
+            .header
+            .difficulty_threshold
+            .to_expanded()
+            .expect("Wcash fixture compact target is valid")
+            .into();
+        let mut display_hash = block_hash;
+        display_hash.reverse();
+        let parent_hash = validate_persisted_winner_block(
+            &block_bytes,
+            &hex::encode(display_hash),
+            1,
+            PersistedWinnerBlockKind::Wcash,
+        )
+        .expect("Wcash fixture carries a valid exact AuxPoW parent");
+
+        let mut descriptor = job(9);
+        descriptor.wcash_candidate_hash_le = Hex32::new(block_hash);
+        descriptor.wcash_previous_hash_le = Hex32::new(block.header.previous_block_hash.0);
+        descriptor.wcash_coinbase_txid_le = Hex32::new(coinbase_txid);
+        descriptor.wcash_target_le = TargetLe::new(expanded_target.to_little_endian());
+        descriptor.wcash_height = 1;
+        descriptor.wcash_maturity_confirmations = 2;
+        journal
+            .append_event(BackendEvent::JobActivated {
+                event_seq: 0,
+                job: descriptor.clone(),
+            })
+            .expect("activate exact Wcash fixture job");
+        let winner = WinnerDescriptor {
+            chain: MergedChain::Wcash,
+            block_hash_le: Hex32::new(block_hash),
+            height: 1,
+            coinbase_txid_le: Hex32::new(coinbase_txid),
+            reward_zat: descriptor.wcash_reward_zat,
+            maturity_confirmations: 2,
+        };
+        journal
+            .append_share_committed(
+                descriptor.job_id,
+                Hex32::new([0x81; 32]),
+                Hex32::new(parent_hash),
+                vec![winner.clone()],
+                identity(),
+                TargetLe::new([0xff; 32]),
+                JournalWinnerBlocks {
+                    wcash: Some(block_bytes.clone()),
+                    zcash: None,
+                },
+            )
+            .expect("commit exact Wcash fixture winner");
+        (journal, winner, block_bytes)
+    }
+
+    fn zcash_winner_journal(
+        path: &Path,
+        config: &TestJournalConfig,
+    ) -> (PoolBackendJournal, WinnerDescriptor, Vec<u8>) {
+        let journal = create_journal(path, config);
+        let (winner, block_bytes) = append_zcash_winner(&journal, Hex32::new([0x82; 32]));
+        (journal, winner, block_bytes)
+    }
+
+    fn append_zcash_winner(
+        journal: &PoolBackendJournal,
+        share_id: Hex32,
+    ) -> (WinnerDescriptor, Vec<u8>) {
+        let block_bytes = hex::decode(
+            include_str!("../../zebra-test/src/vectors/block-main-0-000-001.txt").trim(),
+        )
+        .expect("valid Zcash block-one fixture is hex");
+        let block: Block = block_bytes
+            .as_slice()
+            .zcash_deserialize_into()
+            .expect("valid Zcash block-one fixture decodes");
+        let block_hash = block.hash().0;
+        let coinbase_txid = block.transactions[0].hash().0;
+        let expanded_target: U256 = block
+            .header
+            .difficulty_threshold
+            .to_expanded()
+            .expect("Zcash fixture compact target is valid")
+            .into();
+
+        let mut descriptor = job(10);
+        descriptor.zcash_previous_hash_le = Hex32::new(block.header.previous_block_hash.0);
+        descriptor.zcash_coinbase_txid_le = Hex32::new(coinbase_txid);
+        descriptor.zcash_target_le = TargetLe::new(expanded_target.to_little_endian());
+        descriptor.zcash_height = 1;
+        descriptor.zcash_maturity_confirmations = 2;
+        let mut header_input = descriptor.header_input.into_bytes();
+        header_input[4..36].copy_from_slice(&block.header.previous_block_hash.0);
+        descriptor.header_input = Hex108::new(header_input);
+        journal
+            .append_event(BackendEvent::JobActivated {
+                event_seq: 0,
+                job: descriptor.clone(),
+            })
+            .expect("activate exact Zcash fixture job");
+        let winner = WinnerDescriptor {
+            chain: MergedChain::Zcash,
+            block_hash_le: Hex32::new(block_hash),
+            height: 1,
+            coinbase_txid_le: Hex32::new(coinbase_txid),
+            reward_zat: descriptor.zcash_reward_zat,
+            maturity_confirmations: 2,
+        };
+        journal
+            .append_share_committed(
+                descriptor.job_id,
+                share_id,
+                Hex32::new(block_hash),
+                vec![winner.clone()],
+                identity(),
+                TargetLe::new([0xff; 32]),
+                JournalWinnerBlocks {
+                    wcash: None,
+                    zcash: Some(block_bytes.clone()),
+                },
+            )
+            .expect("commit exact Zcash fixture winner");
+        (winner, block_bytes)
     }
 
     fn identity() -> WorkerIdentity {
@@ -2176,5 +2574,354 @@ mod tests {
                 .expect("journal watermark"),
             2
         );
+    }
+
+    #[test]
+    fn wcash_winner_cas_covers_quarantine_requeue_maturity_and_restart() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let (journal, winner, block_bytes) = wcash_winner_journal(&path, &config);
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+
+        let pending = actor
+            .next_winner_snapshot(None)
+            .expect("enumerate winner")
+            .expect("Wcash winner is retained");
+        assert_eq!(pending.winner(), &winner);
+        assert_eq!(pending.block_bytes(), block_bytes);
+        assert_eq!(pending.revision_event_seq(), 2);
+        assert!(matches!(
+            pending.lifecycle(),
+            JournalWinnerLifecycle::Pending
+        ));
+        let key = pending.key();
+        assert!(actor
+            .next_winner_snapshot(Some(&key))
+            .expect("advance bounded winner pass")
+            .is_none());
+        let debug = format!("{pending:?}");
+        assert!(debug.contains(&format!("block_bytes_len: {}", block_bytes.len())));
+        assert!(!debug.contains(&hex::encode(&block_bytes[..16])));
+
+        let winner_tip = ChainTip {
+            block_hash_le: winner.block_hash_le.clone(),
+            height: winner.height,
+        };
+        let quarantined_event = actor
+            .compare_and_apply_winner_transition(
+                &pending,
+                PoolBackendWinnerTransition::Quarantined {
+                    tip: winner_tip.clone(),
+                },
+            )
+            .expect("quarantine exact conflicting Wcash witness");
+        assert!(matches!(
+            quarantined_event,
+            BackendEvent::WinnerQuarantined { event_seq: 5, .. }
+        ));
+
+        assert!(matches!(
+            actor.compare_and_apply_winner_transition(
+                &pending,
+                PoolBackendWinnerTransition::Observed {
+                    tip: winner_tip.clone(),
+                    confirmations: 1,
+                },
+            ),
+            Err(PoolBackendActorError::WinnerRevisionConflict)
+        ));
+
+        let quarantined = actor
+            .winner_snapshot(&key)
+            .expect("refresh quarantined winner")
+            .expect("winner remains retained");
+        assert_eq!(quarantined.revision_event_seq(), 5);
+        assert!(matches!(
+            quarantined.lifecycle(),
+            JournalWinnerLifecycle::Quarantined { tip } if tip == &winner_tip
+        ));
+
+        let replacement_tip = ChainTip {
+            block_hash_le: Hex32::new([0xa1; 32]),
+            height: winner.height + 1,
+        };
+        actor
+            .compare_and_apply_winner_transition(
+                &quarantined,
+                PoolBackendWinnerTransition::Requeued {
+                    tip: replacement_tip.clone(),
+                },
+            )
+            .expect("release exact Wcash block for resubmission");
+        let requeued = actor
+            .winner_snapshot(&key)
+            .expect("refresh requeued winner")
+            .expect("winner remains retained");
+        assert!(matches!(
+            requeued.lifecycle(),
+            JournalWinnerLifecycle::Requeued { tip } if tip == &replacement_tip
+        ));
+
+        actor
+            .compare_and_apply_winner_transition(
+                &requeued,
+                PoolBackendWinnerTransition::Observed {
+                    tip: winner_tip,
+                    confirmations: 1,
+                },
+            )
+            .expect("observe exact Wcash winner");
+        let observed = actor
+            .winner_snapshot(&key)
+            .expect("refresh observed winner")
+            .expect("winner remains retained");
+        actor
+            .compare_and_apply_winner_transition(
+                &observed,
+                PoolBackendWinnerTransition::Matured {
+                    tip: replacement_tip.clone(),
+                    confirmations: 2,
+                },
+            )
+            .expect("mature observed Wcash reward");
+        drop(actor);
+
+        let recovered =
+            actor_from_journal(open_journal(&path, &config), Arc::new(TestClock::new()));
+        let matured = recovered
+            .winner_snapshot(&key)
+            .expect("read winner after restart")
+            .expect("matured winner remains retained");
+        assert_eq!(matured.block_bytes(), block_bytes);
+        assert_eq!(matured.revision_event_seq(), 8);
+        assert!(matches!(
+            matured.lifecycle(),
+            JournalWinnerLifecycle::Matured {
+                tip,
+                confirmations: 2,
+            } if tip == &replacement_tip
+        ));
+        let orphan_tip = ChainTip {
+            block_hash_le: Hex32::new([0xa2; 32]),
+            height: winner.height + 2,
+        };
+        recovered
+            .compare_and_apply_winner_transition(
+                &matured,
+                PoolBackendWinnerTransition::Orphaned {
+                    tip: orphan_tip.clone(),
+                },
+            )
+            .expect("deep reorganization can orphan matured Wcash reward");
+        let orphaned = recovered
+            .winner_snapshot(&key)
+            .expect("refresh orphaned winner")
+            .expect("orphaned winner remains retained");
+        assert_eq!(orphaned.revision_event_seq(), 9);
+        assert!(matches!(
+            orphaned.lifecycle(),
+            JournalWinnerLifecycle::Orphaned { tip } if tip == &orphan_tip
+        ));
+    }
+
+    #[test]
+    fn mixed_winner_journal_order_cursor_is_exact_and_replay_stable() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let (journal, wcash_winner, wcash_block) = wcash_winner_journal(&path, &config);
+        let (zcash_winner, zcash_block) = append_zcash_winner(&journal, Hex32::new([0x01; 32]));
+
+        let (first_ordinal, first) = journal
+            .next_winner_state(None)
+            .expect("begin mixed winner pass")
+            .expect("Wcash winner is first in journal order");
+        let (second_ordinal, second) = journal
+            .next_winner_state(Some(first_ordinal))
+            .expect("advance mixed winner pass")
+            .expect("Zcash winner is second in journal order");
+        assert_eq!((first_ordinal, second_ordinal), (0, 1));
+        assert_eq!(first.winner, wcash_winner);
+        assert_eq!(first.block_bytes, wcash_block);
+        assert_eq!(second.winner, zcash_winner);
+        assert_eq!(second.block_bytes, zcash_block);
+        assert!(first.share_id.as_bytes() > second.share_id.as_bytes());
+        assert!(journal
+            .next_winner_state(Some(second_ordinal))
+            .expect("finish mixed winner pass")
+            .is_none());
+        drop(journal);
+
+        let reopened = open_journal(&path, &config);
+        let (replayed_first_ordinal, replayed_first) = reopened
+            .next_winner_state(None)
+            .expect("begin replayed mixed winner pass")
+            .expect("replayed Wcash winner is retained");
+        let (replayed_second_ordinal, replayed_second) = reopened
+            .next_winner_state(Some(replayed_first_ordinal))
+            .expect("advance replayed mixed winner pass")
+            .expect("replayed Zcash winner is retained");
+        assert_eq!(
+            (replayed_first_ordinal, replayed_second_ordinal),
+            (first_ordinal, second_ordinal)
+        );
+        assert_eq!(replayed_first, first);
+        assert_eq!(replayed_second, second);
+        assert!(reopened
+            .next_winner_state(Some(replayed_second_ordinal))
+            .expect("finish replayed mixed winner pass")
+            .is_none());
+    }
+
+    #[test]
+    fn zcash_winner_rejects_invalid_and_concurrent_stale_cas_transitions() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let (journal, winner, _) = zcash_winner_journal(&path, &config);
+        let actor = Arc::new(actor_from_journal(journal, Arc::new(TestClock::new())));
+        let pending = actor
+            .next_winner_snapshot(None)
+            .expect("enumerate winner")
+            .expect("Zcash winner is retained");
+        let other_directory = private_temp_dir();
+        let other = actor_from_journal(
+            create_journal(&other_directory.path().join("other-actor.journal"), &config),
+            Arc::new(TestClock::new()),
+        );
+        assert!(matches!(
+            other.next_winner_snapshot(Some(&pending.key())),
+            Err(PoolBackendActorError::WinnerAuthorityMismatch)
+        ));
+        assert!(matches!(
+            other.winner_snapshot(&pending.key()),
+            Err(PoolBackendActorError::WinnerAuthorityMismatch)
+        ));
+        assert!(matches!(
+            other.compare_and_apply_winner_transition(
+                &pending,
+                PoolBackendWinnerTransition::Observed {
+                    tip: ChainTip {
+                        block_hash_le: winner.block_hash_le.clone(),
+                        height: winner.height,
+                    },
+                    confirmations: 1,
+                },
+            ),
+            Err(PoolBackendActorError::WinnerAuthorityMismatch)
+        ));
+        let winner_tip = ChainTip {
+            block_hash_le: winner.block_hash_le.clone(),
+            height: winner.height,
+        };
+
+        assert!(matches!(
+            actor.compare_and_apply_winner_transition(
+                &pending,
+                PoolBackendWinnerTransition::Quarantined {
+                    tip: winner_tip.clone(),
+                },
+            ),
+            Err(PoolBackendActorError::Journal(
+                PoolBackendJournalError::InvalidEvent { .. }
+            ))
+        ));
+        assert!(matches!(
+            actor.compare_and_apply_winner_transition(
+                &pending,
+                PoolBackendWinnerTransition::Observed {
+                    tip: winner_tip.clone(),
+                    confirmations: 2,
+                },
+            ),
+            Err(PoolBackendActorError::Journal(
+                PoolBackendJournalError::InvalidEvent { .. }
+            ))
+        ));
+        assert_eq!(
+            actor
+                .winner_snapshot(&pending.key())
+                .expect("refresh after rejected transitions")
+                .expect("winner remains retained")
+                .revision_event_seq(),
+            2
+        );
+
+        let expected = Arc::new(pending);
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let actor = Arc::clone(&actor);
+            let expected = Arc::clone(&expected);
+            let tip = winner_tip.clone();
+            threads.push(thread::spawn(move || {
+                actor.compare_and_apply_winner_transition(
+                    &expected,
+                    PoolBackendWinnerTransition::Observed {
+                        tip,
+                        confirmations: 1,
+                    },
+                )
+            }));
+        }
+        let mut committed = 0usize;
+        let mut stale = 0usize;
+        for thread in threads {
+            match thread.join().expect("CAS thread does not panic") {
+                Ok(BackendEvent::WinnerObserved { event_seq: 5, .. }) => committed += 1,
+                Err(PoolBackendActorError::WinnerRevisionConflict) => stale += 1,
+                result => panic!("unexpected concurrent CAS result: {result:?}"),
+            }
+        }
+        assert_eq!((committed, stale), (1, 1));
+
+        let key = expected.key();
+        let observed = actor
+            .winner_snapshot(&key)
+            .expect("refresh observed Zcash winner")
+            .expect("winner remains retained");
+        assert!(matches!(
+            observed.lifecycle(),
+            JournalWinnerLifecycle::Observed {
+                tip,
+                confirmations: 1,
+            } if tip == &winner_tip
+        ));
+        let mature_tip = ChainTip {
+            block_hash_le: Hex32::new([0xb1; 32]),
+            height: winner.height + 1,
+        };
+        actor
+            .compare_and_apply_winner_transition(
+                &observed,
+                PoolBackendWinnerTransition::Matured {
+                    tip: mature_tip.clone(),
+                    confirmations: 2,
+                },
+            )
+            .expect("mature observed Zcash reward");
+        let matured = actor
+            .winner_snapshot(&key)
+            .expect("refresh matured Zcash winner")
+            .expect("winner remains retained");
+        actor
+            .compare_and_apply_winner_transition(
+                &matured,
+                PoolBackendWinnerTransition::Orphaned {
+                    tip: ChainTip {
+                        block_hash_le: Hex32::new([0xb2; 32]),
+                        height: winner.height + 2,
+                    },
+                },
+            )
+            .expect("deep reorganization can orphan matured Zcash reward");
+        assert!(matches!(
+            actor
+                .winner_snapshot(&key)
+                .expect("refresh orphaned Zcash winner")
+                .expect("winner remains retained")
+                .lifecycle(),
+            JournalWinnerLifecycle::Orphaned { .. }
+        ));
     }
 }
