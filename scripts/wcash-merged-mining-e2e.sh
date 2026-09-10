@@ -356,6 +356,12 @@ wait_for_height http://127.0.0.1:28232 Wcash 3
 wait_for_height http://127.0.0.1:18232 Zcash-template 3
 wait_for_height http://127.0.0.1:18242 Zcash-validator 3
 
+# The second accepted share advances both tips before the long-running server
+# has necessarily finished proposal-validating and durably activating its
+# replacement generation. Wait for that bounded post-winner rotation before
+# stopping the server and auditing every activation in the journal.
+wait_for_preflight_count "$runtime_dir/native-serve.json" 3
+
 template_tip="$(rpc_result http://127.0.0.1:18232 getbestblockhash)"
 validator_tip="$(rpc_result http://127.0.0.1:18242 getbestblockhash)"
 [[ "$template_tip" == "$validator_tip" ]]
