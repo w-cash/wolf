@@ -377,7 +377,7 @@ impl Network {
             // Version Wcash cache roots whenever pre-launch consensus changes,
             // so an updated binary cannot silently trust state accepted by an
             // incompatible prototype.
-            Some(wcash_genesis::WcashNetwork::Testnet) => "wcashtestnet-v4".to_owned(),
+            Some(wcash_genesis::WcashNetwork::Testnet) => "wcashtestnet-v5".to_owned(),
             Some(wcash_genesis::WcashNetwork::Regtest) => "wcashregtest-v5".to_owned(),
             _ => self.to_string().to_ascii_lowercase(),
         }

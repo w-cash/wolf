@@ -28,9 +28,9 @@ The built-in `WcashTestnet` network commits to Bitcoin mainnet block 965,900:
 Bitcoin block:       965900
 Bitcoin block hash:  0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851
 Anchor audit height: 966011 (112 confirmations counting the anchor)
-Wcash genesis hash:  d95a9f2f1daf07d48fb3c863ad7334ec630a4a7077da98c8f7e65f8c0e277cf1
-P2P identity:        Wcash/testnet/v4
-P2P magic:           2f229b8c
+Wcash genesis hash:  0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a
+P2P identity:        Wcash/testnet/v5
+P2P magic:           95d14004
 P2P port:            38233
 Suggested RPC port:  38232 (loopback only)
 ```
@@ -40,7 +40,7 @@ Wcash genesis bytes, and derived hash are frozen test vectors in the source.
 Consensus never fetches or replaces an anchor at runtime. Testnet, regtest, and
 Zcash use different genesis hashes, P2P magic, ports, and peer-cache paths.
 Wcash configuration also rejects inherited Zcash DNS seeds. The corrected
-Testnet identity stores state under `wcashtestnet-v4` and peers under its
+Testnet identity stores state under `wcashtestnet-v5` and peers under its
 matching cache namespace, so earlier profile data is not loaded. Operators must
 start from the new empty paths and must not copy or rename older Wcash state
 into them.
@@ -105,10 +105,13 @@ external audit snapshot only. Nodes do not trust explorers: runtime consensus
 uses only the immutable header and derived values compiled into this release.
 
 Testnet activates NU6.3 at height 1, uses a 75-second target spacing, starts at
-the compact proof-of-work limit `0x2007ffff` (`2^251 - 1`), and enables normal
-damped retargeting from launch. A block more than 450 seconds after its
-predecessor may use the testnet minimum difficulty. The boundary is strict:
-exactly 450 seconds is not enough.
+the compact proof-of-work limit `0x1e008859` (expanded target
+`00000088590000…`), calibrated to approximately 75 seconds at 420,000 Equihash
+solutions per second, and enables normal damped retargeting from launch. A block
+more than 450 seconds after its predecessor may use the testnet minimum
+difficulty. The boundary is strict: exactly 450 seconds is not enough. That
+minimum is the same ASIC-calibrated launch limit, not a CPU-easy recovery target.
+Comparable launch hash rate is therefore a Testnet liveness prerequisite.
 
 ## Start a node
 
@@ -162,17 +165,18 @@ mempool at genesis and exposes loopback lightwalletd gRPC so the controlled
 spend path is deterministic without public peers. None of those Regtest settings
 may be copied into pool operations.
 
-The first phase boots the frozen Testnet profile, asserts its identity and zero
-initial supply, uses explicit transparent Wcash and Zcash test-only payout
-fixtures, serves a real ZIP-301 job, solves Equihash `(200, 9)`, and requires
-consensus acceptance by the Wcash Testnet-profile node and two isolated Zcash
-Regtest parent nodes. The coordinator and Wcash AuxPoW verifier independently
-check the real Equihash solution. The isolated Zcash Regtest profiles disable
-their native proof-of-work check, so their role in this gate is exact parent
-block structure, target, proposal, and chain acceptance rather than a second
-Equihash verification. The second phase boots a separate Wcash Regtest node,
-explicitly selects private Ironwood payout, and exercises the controlled wallet
-lifecycle against the same parent validators. The third phase boots a fresh
+The first phase boots the frozen Testnet profile, asserts its identity, zero
+initial supply, hardened target, AuxPoW candidate lifecycle, and proposal gate,
+then verifies an authenticated ZIP-301 job transcript without attempting to
+CPU-mine the ASIC-calibrated public target. The second phase boots a separate
+Wcash Regtest node, uses the bundled reference miner to solve real Equihash
+`(200, 9)`, requires consensus acceptance by Wcash and both isolated Zcash
+Regtest parent nodes, explicitly selects private Ironwood payout, and exercises
+the controlled wallet lifecycle. The coordinator and Wcash AuxPoW verifier
+independently check every real solution. The isolated Zcash Regtest profiles
+disable their native proof-of-work check, so their role in this gate is exact
+parent block structure, target, proposal, and chain acceptance rather than a
+second Equihash verification. The third phase boots a fresh
 Wcash Regtest node, mines 101 transparent coinbases, and exercises the inherited
 100-block maturity and mandatory-shielding path without reducing confirmations.
 Bounded template retries cover asynchronous RPC, state, mempool, and
@@ -184,9 +188,11 @@ scripts/wcash-testnet-e2e.sh
 ```
 
 The passing run proved that the frozen Testnet profile boots cleanly and that a
-proposal-validated ZIP-301 job survives the parent coinbase and block-commitment
-paths into Wcash and both Zcash validators. In its controlled Regtest phase, the
-script mined and scanned three private 6.25-TWC coinbases, signed a one-TWC
+proposal-validated ZIP-301 job with the hardened launch target survives exact
+construction and authenticated delivery without submitting synthetic public
+Testnet work. In its controlled Regtest phase, the script carried real
+Equihash/AuxPoW solutions through Wcash and both Zcash validators, mined and
+scanned three private 6.25-TWC coinbases, signed a one-TWC
 V6 transfer under the Regtest branch ID `0xc3a6678a`, observed the exact
 transaction bytes and fee in the mempool and `getblocktemplate`, checked duplicate-broadcast
 behavior, and required both standard Zcash Regtest nodes to reject those Wcash

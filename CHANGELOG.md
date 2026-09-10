@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Hardened the prelaunch Wcash Testnet proof-of-work limit for a 420 KSol/s
+  Equihash ASIC, targeting approximately 75 seconds per block instead of
+  allowing a production miner to flood one child candidate with valid proofs.
+  The genesis hash, P2P identity, and state/peer cache namespaces were rotated
+  before any public Testnet block was mined.
 - Kept proof-of-work solving outside every GitHub Actions workflow while
   retaining compilation, linting, deterministic Equihash and AuxPoW vectors,
   consensus validation, RPC tests, and network-isolation tests in hosted CI.

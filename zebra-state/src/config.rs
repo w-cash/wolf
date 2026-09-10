@@ -620,7 +620,7 @@ mod tests {
         let regtest_path = config.db_path("state", 1, &regtest);
         let zcash_path = config.db_path("state", 1, &zcash_testnet);
 
-        assert!(testnet_path.ends_with("state/v1/wcashtestnet-v4"));
+        assert!(testnet_path.ends_with("state/v1/wcashtestnet-v5"));
         assert!(regtest_path.ends_with("state/v1/wcashregtest-v5"));
         assert_ne!(testnet_path, regtest_path);
         assert_ne!(testnet_path, zcash_path);

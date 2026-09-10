@@ -90,6 +90,16 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
         testnet.target_difficulty_limit().to_compact()
     );
     assert_eq!(
+        genesis
+            .header
+            .difficulty_threshold
+            .to_work()
+            .expect("the Wcash Testnet launch target has non-zero work")
+            .as_u128(),
+        31_500_118,
+        "the frozen launch target must retain its independently checked work value"
+    );
+    assert_eq!(
         genesis.header.difficulty_threshold.to_string(),
         format!("{:08x}", wcash_genesis::PUBLIC_TESTNET_POW_LIMIT_BITS)
     );
