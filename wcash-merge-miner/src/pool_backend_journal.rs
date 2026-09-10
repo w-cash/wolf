@@ -29,7 +29,7 @@ use wcash_pool_protocol::{
     ProtocolError, ShareReceipt, TargetLe, WinnerDescriptor, WorkerIdentity,
     BACKEND_PROTOCOL_VERSION, MAX_BACKEND_PAYLOAD_BYTES, MAX_EVENT_PAGE_ITEMS,
 };
-use zebra_chain::{block::Block, serialization::ZcashDeserializeInto};
+use zebra_chain::{block::Block, serialization::ZcashDeserializeInto, work::difficulty::U256};
 
 use crate::coordinator::{validate_persisted_winner_block, PersistedWinnerBlockKind};
 
@@ -1436,10 +1436,18 @@ impl JournalSemanticState {
                     .jobs
                     .get_mut(job_id)
                     .ok_or_else(|| semantic(event_seq, "closure references an unknown job"))?;
-                if job.lifecycle == JobLifecycle::Closed {
-                    return Err(semantic(event_seq, "job was closed more than once"));
+                match job.lifecycle {
+                    JobLifecycle::Invalidated => job.lifecycle = JobLifecycle::Closed,
+                    JobLifecycle::Active => {
+                        return Err(semantic(
+                            event_seq,
+                            "active job must be invalidated before closure",
+                        ));
+                    }
+                    JobLifecycle::Closed => {
+                        return Err(semantic(event_seq, "job was closed more than once"));
+                    }
                 }
-                job.lifecycle = JobLifecycle::Closed;
             }
             BackendEvent::ShareCommitted {
                 receipt,
@@ -1830,6 +1838,27 @@ fn validate_exact_winner_block(
             event_seq,
             chain,
             reason: "block predecessor does not match its activated job".to_string(),
+        });
+    }
+    let expanded_target = block
+        .header
+        .difficulty_threshold
+        .to_expanded()
+        .ok_or_else(|| PoolBackendJournalError::InvalidWinnerBlock {
+            event_seq,
+            chain,
+            reason: "block has an invalid compact target".to_string(),
+        })?;
+    let expanded_target: U256 = expanded_target.into();
+    let expected_target = match winner.chain {
+        MergedChain::Wcash => &job.wcash_target_le,
+        MergedChain::Zcash => &job.zcash_target_le,
+    };
+    if expanded_target.to_little_endian() != *expected_target.as_bytes() {
+        return Err(PoolBackendJournalError::InvalidWinnerBlock {
+            event_seq,
+            chain,
+            reason: "block target does not match its activated job".to_string(),
         });
     }
     let coinbase_txid = block
@@ -2897,6 +2926,13 @@ mod tests {
             .expect("journal allocates the first sequence");
         assert_eq!(assigned.event_seq(), 1);
         assert!(matches!(
+            journal.append_event(BackendEvent::GenerationClosed {
+                event_seq: 0,
+                job_id: job(2).job_id,
+            }),
+            Err(PoolBackendJournalError::SemanticViolation { .. })
+        ));
+        assert!(matches!(
             journal.append_event(event(0, 2)),
             Err(PoolBackendJournalError::SemanticViolation { .. })
         ));
@@ -3023,9 +3059,48 @@ mod tests {
         descriptor.zcash_coinbase_txid_le = Hex32::new(coinbase_txid);
         descriptor.zcash_height = 1;
         descriptor.zcash_maturity_confirmations = 1;
+        let expanded_target: U256 = block
+            .header
+            .difficulty_threshold
+            .to_expanded()
+            .expect("fixture compact target is valid")
+            .into();
+        descriptor.zcash_target_le = TargetLe::new(expanded_target.to_little_endian());
         let mut header_input = descriptor.header_input.clone().into_bytes();
         header_input[4..36].copy_from_slice(&block.header.previous_block_hash.0);
         descriptor.header_input = Hex108::new(header_input);
+        let mut wrong_target_job = descriptor.clone();
+        wrong_target_job.job_id = Hex32::new([0x0a; 32]);
+        wrong_target_job.zcash_target_le = TargetLe::new([0xff; 32]);
+        journal
+            .append_event(BackendEvent::JobActivated {
+                event_seq: 0,
+                job: wrong_target_job.clone(),
+            })
+            .expect("activate target-mismatch fixture job");
+        let wrong_target_winner = WinnerDescriptor {
+            chain: MergedChain::Zcash,
+            block_hash_le: Hex32::new(block_hash),
+            height: 1,
+            coinbase_txid_le: Hex32::new(coinbase_txid),
+            reward_zat: wrong_target_job.zcash_reward_zat,
+            maturity_confirmations: 1,
+        };
+        assert!(matches!(
+            journal.append_share_committed(
+                wrong_target_job.job_id,
+                Hex32::new([0x80; 32]),
+                Hex32::new(block_hash),
+                vec![wrong_target_winner],
+                identity(3),
+                TargetLe::new([0xff; 32]),
+                JournalWinnerBlocks {
+                    wcash: None,
+                    zcash: Some(block_bytes.clone()),
+                },
+            ),
+            Err(PoolBackendJournalError::InvalidWinnerBlock { .. })
+        ));
         journal
             .append_event(BackendEvent::JobActivated {
                 event_seq: 0,
