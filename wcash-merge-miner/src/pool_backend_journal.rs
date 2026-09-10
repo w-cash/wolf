@@ -572,6 +572,20 @@ pub struct JournalWinnerState {
     pub lifecycle: JournalWinnerLifecycle,
 }
 
+/// Lightweight winner-outbox counts for backend health reporting.
+///
+/// This summary deliberately excludes retained block bytes so a heartbeat can
+/// never allocate in proportion to winner payload size.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JournalWinnerSummary {
+    /// Non-mature Wcash winners retained for submission or reconciliation.
+    pub pending_wcash: u32,
+    /// Pending Wcash winners blocked by conflicting-witness quarantine.
+    pub quarantined_wcash: u32,
+    /// Non-mature Zcash winners retained for submission or reconciliation.
+    pub pending_zcash: u32,
+}
+
 impl std::fmt::Debug for JournalWinnerState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1113,6 +1127,34 @@ impl PoolBackendJournal {
         let state = self.lock_state()?;
         ensure_usable(&state)?;
         Ok(state.semantic.winners.values().cloned().collect())
+    }
+
+    /// Returns winner-outbox counts without cloning any retained block bytes.
+    pub fn winner_summary(&self) -> Result<JournalWinnerSummary, PoolBackendJournalError> {
+        let state = self.lock_state()?;
+        ensure_usable(&state)?;
+        let mut summary = JournalWinnerSummary::default();
+        for winner in state.semantic.winners.values() {
+            if matches!(winner.lifecycle, JournalWinnerLifecycle::Matured { .. }) {
+                continue;
+            }
+            let count = match winner.winner.chain {
+                MergedChain::Wcash => {
+                    if matches!(winner.lifecycle, JournalWinnerLifecycle::Quarantined { .. }) {
+                        summary.quarantined_wcash = summary
+                            .quarantined_wcash
+                            .checked_add(1)
+                            .ok_or(PoolBackendJournalError::Overflow)?;
+                    }
+                    &mut summary.pending_wcash
+                }
+                MergedChain::Zcash => &mut summary.pending_zcash,
+            };
+            *count = count
+                .checked_add(1)
+                .ok_or(PoolBackendJournalError::Overflow)?;
+        }
+        Ok(summary)
     }
 
     /// Returns every unique historical job descriptor and whether share
@@ -3129,6 +3171,14 @@ mod tests {
                 },
             )
             .expect("commit consensus-valid exact Zcash block");
+        assert_eq!(
+            journal.winner_summary().expect("pending summary"),
+            JournalWinnerSummary {
+                pending_wcash: 0,
+                quarantined_wcash: 0,
+                pending_zcash: 1,
+            }
+        );
         let tip = ChainTip {
             block_hash_le: Hex32::new(block_hash),
             height: 1,
@@ -3160,6 +3210,10 @@ mod tests {
             retained[0].lifecycle,
             JournalWinnerLifecycle::Matured { .. }
         ));
+        assert_eq!(
+            journal.winner_summary().expect("matured summary"),
+            JournalWinnerSummary::default()
+        );
         drop(journal);
 
         let reopened = open(&path, &config);
@@ -3188,6 +3242,14 @@ mod tests {
             retained[0].lifecycle,
             JournalWinnerLifecycle::Orphaned { .. }
         ));
+        assert_eq!(
+            reopened.winner_summary().expect("orphaned summary"),
+            JournalWinnerSummary {
+                pending_wcash: 0,
+                quarantined_wcash: 0,
+                pending_zcash: 1,
+            }
+        );
     }
 
     #[test]

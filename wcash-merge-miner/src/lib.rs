@@ -21,6 +21,7 @@ mod error;
 mod job;
 pub mod native;
 pub mod pool_backend;
+mod pool_backend_actor;
 mod pool_backend_connection;
 mod pool_backend_identity;
 mod pool_backend_journal;
@@ -52,6 +53,10 @@ pub use native::{
     NativeGenerationDescriptor, NativePreparedJob, NativeWcashPayoutVerification,
     NativeZcashConfig, NativeZcashNetwork, NativeZcashProvider, ParentNodeOutcome,
     ParentSubmissionReport, ValidatedNativeShare,
+};
+pub use pool_backend_actor::{
+    PoolBackendActor, PoolBackendActorError, PoolBackendRetainedJob, PoolBackendShareRequest,
+    PoolBackendShareValidationError, PoolBackendValidatedShare,
 };
 pub use zip301::{serve_zip301_loopback, ShareProcessor, Zip301Config, Zip301LoopbackListener};
 pub use zip301_client::{mine_zip301_once, Zip301AcceptedShare, Zip301ClientConfig};
