@@ -48,12 +48,20 @@ the network pins and an isolated journal:
 ```sh
 export WCASH_EXPECTED_GENESIS_HASH=70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c
 export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327
+export ZCASH_NETWORK=regtest
 WCASH_JOURNAL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wcash-native.XXXXXX")"
 chmod 700 "$WCASH_JOURNAL_DIR"
 export WCASH_SHARE_JOURNAL="$WCASH_JOURNAL_DIR/journal.jsonl"
 export WCASH_PAYOUT_ADDRESS='replace-with-an-operator-owned-Wcash-address'
 export ZCASH_PAYOUT_ADDRESS='replace-with-the-parent-nodes-Zcash-address'
 ```
+
+`ZCASH_NETWORK` is a fail-closed selection of the canonical parent subsidy and
+upgrade schedule. It must agree with the pinned genesis, payout-address
+namespace, and coinbase branch ID. The native coordinator exposes only the
+three documented profiles and refuses parent work before NU6.3; a separately
+configured node is detected when its active branch diverges from the selected
+profile.
 
 Use operator-owned transparent addresses for the normal pool-integration path.
 No fallback payout address is compiled into the coordinator. A transparent

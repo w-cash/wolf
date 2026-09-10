@@ -44,8 +44,8 @@ pub use error::MinerError;
 pub use job::{JobConfig, PreparedJob, SolvedAuxPow, EQUIHASH_SOLUTION_BYTES};
 pub use native::{
     NativeGenerationDescriptor, NativePreparedJob, NativeWcashPayoutVerification,
-    NativeZcashConfig, NativeZcashProvider, ParentNodeOutcome, ParentSubmissionReport,
-    ValidatedNativeShare,
+    NativeZcashConfig, NativeZcashNetwork, NativeZcashProvider, ParentNodeOutcome,
+    ParentSubmissionReport, ValidatedNativeShare,
 };
 pub use zip301::{serve_zip301_loopback, ShareProcessor, Zip301Config, Zip301LoopbackListener};
 pub use zip301_client::{mine_zip301_once, Zip301AcceptedShare, Zip301ClientConfig};

@@ -266,6 +266,7 @@ fi
 
 export WCASH_EXPECTED_GENESIS_HASH="$wcash_genesis"
 export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327
+export ZCASH_NETWORK=regtest
 export WCASH_SHARE_JOURNAL="$runtime_dir/native-job-journal.jsonl"
 export WCASH_PAYOUT_ADDRESS="$wcash_payout_address"
 export ZCASH_PAYOUT_ADDRESS="$zcash_payout_address"
@@ -434,7 +435,7 @@ recipient_db="$runtime_dir/recipient.sqlite"
 # loader inspects. Clear the completed Testnet mining phase before starting a
 # second node, otherwise coordinator-only keys are rejected as unknown Zebra
 # configuration fields.
-unset WCASH_EXPECTED_GENESIS_HASH ZCASH_EXPECTED_GENESIS_HASH \
+unset WCASH_EXPECTED_GENESIS_HASH ZCASH_EXPECTED_GENESIS_HASH ZCASH_NETWORK \
   WCASH_SHARE_JOURNAL WCASH_PAYOUT_ADDRESS ZCASH_PAYOUT_ADDRESS \
   WCASH_SHARE_TARGET WCASH_VALIDATION_LIMIT WCASH_AUTHENTICATION_LIMIT \
   WCASH_WORKER_CREDENTIALS WCASH_STRATUM_PASSWORD
@@ -492,6 +493,7 @@ PY
 
 export WCASH_EXPECTED_GENESIS_HASH="$wcash_regtest_genesis"
 export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327
+export ZCASH_NETWORK=regtest
 export WCASH_SHARE_JOURNAL="$runtime_dir/wallet-spend-journal.jsonl"
 export WCASH_PAYOUT_ADDRESS="$sender_address"
 export ZCASH_PAYOUT_ADDRESS="$zcash_payout_address"
@@ -797,7 +799,7 @@ if kill -0 "$private_wallet_node_pid" 2>/dev/null; then
 fi
 wait "$private_wallet_node_pid" 2>/dev/null || true
 
-unset WCASH_EXPECTED_GENESIS_HASH ZCASH_EXPECTED_GENESIS_HASH \
+unset WCASH_EXPECTED_GENESIS_HASH ZCASH_EXPECTED_GENESIS_HASH ZCASH_NETWORK \
   WCASH_SHARE_JOURNAL WCASH_PAYOUT_ADDRESS ZCASH_PAYOUT_ADDRESS
 
 transparent_sender_db="$runtime_dir/transparent-sender.sqlite"
@@ -837,6 +839,7 @@ PY
 
 export WCASH_EXPECTED_GENESIS_HASH="$wcash_regtest_genesis"
 export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327
+export ZCASH_NETWORK=regtest
 export WCASH_SHARE_JOURNAL="$runtime_dir/transparent-coinbase-journal.jsonl"
 export WCASH_PAYOUT_ADDRESS="$sender_transparent_address"
 export ZCASH_PAYOUT_ADDRESS="$zcash_payout_address"

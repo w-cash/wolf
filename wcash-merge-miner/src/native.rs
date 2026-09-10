@@ -15,13 +15,18 @@ use wcash_zcash_aux::{
     ParentBlockHash, Target, MAX_COINBASE_BYTES,
 };
 use zcash_address::{unified::Receiver, ZcashAddress};
+use zcash_protocol::consensus::NetworkType;
 use zebra_chain::{
     block::{
         self,
         merkle::{AuthDataRoot, AUTH_DIGEST_PLACEHOLDER},
-        Block, ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Header,
+        Block, ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Header, Height,
     },
-    parameters::Network,
+    parameters::{
+        subsidy::{block_subsidy, miner_subsidy},
+        testnet::{ConfiguredActivationHeights, RegtestParameters},
+        Network, NetworkUpgrade,
+    },
     serialization::{BytesInDisplayOrder, DateTime32, ZcashDeserializeInto, ZcashSerialize},
     transaction::{AuthDigest, Hash as TransactionHash, Transaction},
     transparent,
@@ -97,6 +102,46 @@ struct ParentBlockHeaderStatus {
     height: u32,
 }
 
+/// Standard Zcash parent-network profiles supported by native merged mining.
+///
+/// Restricting this selection prevents a custom Testnet schedule from being used to calculate a
+/// weaker miner-subsidy floor than the parent nodes actually enforce.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeZcashNetwork {
+    /// Zcash Mainnet.
+    Mainnet,
+    /// The public Zcash Testnet.
+    Testnet,
+    /// The repository's local Zcash Regtest profile, with NU6.3 active from height 1.
+    Regtest,
+}
+
+impl NativeZcashNetwork {
+    fn consensus_parameters(self) -> Network {
+        match self {
+            Self::Mainnet => Network::Mainnet,
+            Self::Testnet => Network::new_default_testnet(),
+            Self::Regtest => Network::new_regtest(RegtestParameters {
+                activation_heights: ConfiguredActivationHeights {
+                    nu6_3: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+impl fmt::Display for NativeZcashNetwork {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Mainnet => "mainnet",
+            Self::Testnet => "testnet",
+            Self::Regtest => "regtest",
+        })
+    }
+}
+
 /// Configuration for the independent native-Zcash work source.
 #[derive(Clone)]
 pub struct NativeZcashConfig {
@@ -104,6 +149,8 @@ pub struct NativeZcashConfig {
     template_node: RpcEndpoint,
     /// Independent nodes that must all accept the exact proposal.
     proposal_validators: Vec<RpcEndpoint>,
+    /// Exact standard Zcash network whose subsidy schedule is enforced locally.
+    expected_parent_network: NativeZcashNetwork,
     /// Expected parent genesis hash in conventional RPC display order.
     expected_genesis_hash: String,
     /// Domain-separated commitment to the expected parent payout address.
@@ -120,6 +167,7 @@ impl fmt::Debug for NativeZcashConfig {
             .debug_struct("NativeZcashConfig")
             .field("template_node", &self.template_node)
             .field("proposal_validators", &self.proposal_validators)
+            .field("expected_parent_network", &self.expected_parent_network)
             .field("expected_genesis_hash", &self.expected_genesis_hash)
             .field("expected_parent_payout_commitment", &"[REDACTED]")
             .field("expected_parent_payout_address", &"[REDACTED]")
@@ -133,6 +181,7 @@ impl NativeZcashConfig {
     pub fn new(
         template_node: RpcEndpoint,
         proposal_validators: Vec<RpcEndpoint>,
+        expected_parent_network: NativeZcashNetwork,
         expected_genesis_hash: String,
         expected_parent_payout_address: ZcashAddress,
     ) -> Result<Self, MinerError> {
@@ -141,6 +190,7 @@ impl NativeZcashConfig {
         let config = Self {
             template_node,
             proposal_validators,
+            expected_parent_network,
             expected_genesis_hash,
             expected_parent_payout_commitment,
             expected_parent_payout_address,
@@ -172,7 +222,29 @@ impl NativeZcashConfig {
                 )));
             }
         }
-        validate_display_hash(&self.expected_genesis_hash, "expected Zcash genesis hash")
+        validate_display_hash(&self.expected_genesis_hash, "expected Zcash genesis hash")?;
+        let expected_parent_network = self.expected_parent_network.consensus_parameters();
+        let network_genesis = expected_parent_network.genesis_hash().to_string();
+        if !self
+            .expected_genesis_hash
+            .eq_ignore_ascii_case(&network_genesis)
+        {
+            return Err(MinerError::RpcConfiguration(format!(
+                "the expected Zcash genesis hash does not match the configured {} network",
+                self.expected_parent_network
+            )));
+        }
+        let expected_address_network = NetworkType::from(expected_parent_network.kind());
+        self.expected_parent_payout_address
+            .clone()
+            .convert_if_network::<zebra_chain::primitives::Address>(expected_address_network)
+            .map_err(|_| {
+                MinerError::RpcConfiguration(format!(
+                    "the configured Zcash payout address does not belong to the {} network",
+                    self.expected_parent_network
+                ))
+            })?;
+        Ok(())
     }
 
     /// Returns the operator-pinned parent genesis hash.
@@ -186,6 +258,7 @@ impl NativeZcashConfig {
 pub struct NativeZcashProvider {
     template_node: ZebraRpcClient,
     proposal_validators: Vec<ZebraRpcClient>,
+    expected_parent_network: Network,
     expected_parent_payout_commitment: [u8; 32],
     expected_parent_payout_address: ZcashAddress,
 }
@@ -204,6 +277,7 @@ impl NativeZcashProvider {
     /// other chain is temporarily unavailable.
     pub(crate) fn connect(config: NativeZcashConfig) -> Result<Self, MinerError> {
         config.validate()?;
+        let expected_parent_network = config.expected_parent_network.consensus_parameters();
         let expected_parent_payout_commitment = config.expected_parent_payout_commitment;
         let expected_parent_payout_address = config.expected_parent_payout_address;
         let template_node = ZebraRpcClient::new(config.template_node, config.rpc_timeout)?;
@@ -215,6 +289,7 @@ impl NativeZcashProvider {
         Ok(Self {
             template_node,
             proposal_validators,
+            expected_parent_network,
             expected_parent_payout_commitment,
             expected_parent_payout_address,
         })
@@ -263,6 +338,7 @@ impl NativeZcashProvider {
             auxiliary_nonce,
             template,
             &self.expected_parent_payout_address,
+            &self.expected_parent_network,
         )?;
 
         // Check the same predecessor on every node before proposal validation.
@@ -280,6 +356,7 @@ impl NativeZcashProvider {
                 &prepared,
                 &payout_template,
                 &self.expected_parent_payout_address,
+                &self.expected_parent_network,
                 validator.label(),
             )?;
             let result = validator.call_value(
@@ -520,10 +597,8 @@ pub struct NativePreparedJob {
 /// Strength of the Wcash coinbase-recipient check performed for one generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeWcashPayoutVerification {
-    /// Every positive output was matched to the configured transparent recipient.
+    /// Every output was matched to the configured transparent recipient.
     ExactTransparentRecipient,
-    /// The coinbase creates no value, so there is no recipient to authenticate.
-    NoReward,
     /// The encrypted value and privacy shape were checked, but the recipient is trusted to the
     /// private loopback template node because a payment address cannot decrypt its ciphertext.
     TrustedPrivateTemplateNode,
@@ -690,6 +765,7 @@ impl NativePreparedJob {
         auxiliary_nonce: u32,
         template: BlockTemplateResponse,
         expected_parent_payout_address: &ZcashAddress,
+        expected_parent_network: &Network,
     ) -> Result<Self, MinerError> {
         if template.version != 4 {
             return Err(MinerError::InvalidParentTemplate(format!(
@@ -734,9 +810,15 @@ impl NativePreparedJob {
 
         let mut transactions = Vec::with_capacity(template.transactions.len() + 1);
         let coinbase = decode_template_coinbase(&template.coinbase_txn)?;
+        validate_parent_coinbase_network_upgrade(
+            &coinbase,
+            template.height,
+            expected_parent_network,
+            "parent template coinbase",
+        )?;
         let coinbase_bytes = coinbase.zcash_serialize_to_vec()?;
-        let recovered_parent_payout =
-            zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_value_to(
+        let (recovered_parent_payout, matching_parent_outputs) =
+            zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_value_and_output_count_to(
                 &coinbase,
                 expected_parent_payout_address,
             )
@@ -746,6 +828,13 @@ impl NativePreparedJob {
                         .to_string(),
                 )
             })?;
+        validate_parent_miner_payout(
+            recovered_parent_payout,
+            matching_parent_outputs,
+            template.height,
+            expected_parent_network,
+            "parent template coinbase",
+        )?;
         let coinbase_inputs = coinbase.inputs();
         let miner_data = coinbase_inputs
             .first()
@@ -1386,6 +1475,7 @@ fn validate_independent_parent_payout_template(
     prepared: &NativePreparedJob,
     validator_template: &BlockTemplateResponse,
     expected_address: &ZcashAddress,
+    expected_parent_network: &Network,
     endpoint: &str,
 ) -> Result<(), MinerError> {
     if validator_template.version != 4 || validator_template.height != prepared.parent_height {
@@ -1404,8 +1494,14 @@ fn validate_independent_parent_payout_template(
     }
 
     let validator_coinbase = decode_template_coinbase(&validator_template.coinbase_txn)?;
-    let validator_payout =
-        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_value_to(
+    validate_parent_coinbase_network_upgrade(
+        &validator_coinbase,
+        validator_template.height,
+        expected_parent_network,
+        &format!("independent payout template from {endpoint}"),
+    )?;
+    let (validator_payout, matching_validator_outputs) =
+        zebra_chain::primitives::zcash_note_encryption::publicly_recoverable_coinbase_value_and_output_count_to(
             &validator_coinbase,
             expected_address,
         )
@@ -1414,10 +1510,12 @@ fn validate_independent_parent_payout_template(
                 "independent payout template from {endpoint} has outputs that do not match the configured payout address"
             ))
         })?;
-    validate_matching_parent_payout_presence(
-        prepared.parent_reward_zatoshis,
+    validate_parent_miner_payout(
         validator_payout,
-        endpoint,
+        matching_validator_outputs,
+        validator_template.height,
+        expected_parent_network,
+        &format!("independent payout template from {endpoint}"),
     )?;
     let prepared_coinbase = prepared
         .parent_proposal
@@ -1438,14 +1536,66 @@ fn validate_independent_parent_payout_template(
     Ok(())
 }
 
-fn validate_matching_parent_payout_presence(
-    prepared_payout: u64,
-    validator_payout: u64,
-    endpoint: &str,
+fn validate_parent_coinbase_network_upgrade(
+    coinbase: &Transaction,
+    height: u32,
+    network: &Network,
+    source: &str,
 ) -> Result<(), MinerError> {
-    if (validator_payout == 0) != (prepared_payout == 0) {
+    let height = Height(height);
+    let expected_upgrade = NetworkUpgrade::current(network, height);
+    if expected_upgrade < NetworkUpgrade::Nu6_3 {
         return Err(MinerError::InvalidParentTemplate(format!(
-            "independent payout template from {endpoint} disagrees on whether the configured payout is zero"
+            "{source} is on {expected_upgrade:?}; native merged mining requires NU6.3 or later"
+        )));
+    }
+    if coinbase.network_upgrade() != Some(expected_upgrade) {
+        return Err(MinerError::InvalidParentTemplate(format!(
+            "{source} does not use the {expected_upgrade:?} consensus branch required at height {}",
+            height.0
+        )));
+    }
+    Ok(())
+}
+
+fn validate_parent_miner_payout(
+    payout: u64,
+    matching_output_count: usize,
+    height: u32,
+    network: &Network,
+    source: &str,
+) -> Result<(), MinerError> {
+    if matching_output_count == 0 {
+        return Err(MinerError::InvalidParentTemplate(format!(
+            "{source} has no output for the configured ZCASH_PAYOUT_ADDRESS"
+        )));
+    }
+
+    let height = Height(height);
+    let expected_block_subsidy = block_subsidy(height, network).map_err(|error| {
+        MinerError::InvalidParentTemplate(format!(
+            "cannot calculate the Zcash block subsidy for {source} at height {}: {error}",
+            height.0
+        ))
+    })?;
+    let minimum_miner_payout = miner_subsidy(height, network, expected_block_subsidy)
+        .map_err(|error| {
+            MinerError::InvalidParentTemplate(format!(
+                "cannot calculate the Zcash miner subsidy for {source} at height {}: {error}",
+                height.0
+            ))
+        })?
+        .zatoshis();
+    let minimum_miner_payout = u64::try_from(minimum_miner_payout).map_err(|_| {
+        MinerError::InvalidParentTemplate(format!(
+            "calculated a negative Zcash miner subsidy for {source} at height {}",
+            height.0
+        ))
+    })?;
+    if payout < minimum_miner_payout {
+        return Err(MinerError::InvalidParentTemplate(format!(
+            "{source} pays {payout} zatoshis to the configured miner, below the Zcash miner subsidy {minimum_miner_payout} at height {}",
+            height.0
         )));
     }
     Ok(())
@@ -1743,13 +1893,15 @@ mod tests {
     fn native_config_requires_an_independent_proposal_gate() {
         let endpoint =
             RpcEndpoint::new("http://127.0.0.1:8232", None, None).expect("loopback endpoint");
-        let genesis = "00".repeat(32);
+        let network = NativeZcashNetwork::Regtest;
+        let genesis = network.consensus_parameters().genesis_hash().to_string();
         let payout_address: ZcashAddress = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
             .parse()
             .expect("valid Zcash testnet address");
         assert!(NativeZcashConfig::new(
             endpoint.clone(),
             Vec::new(),
+            network,
             genesis.clone(),
             payout_address.clone(),
         )
@@ -1757,6 +1909,7 @@ mod tests {
         assert!(NativeZcashConfig::new(
             endpoint.clone(),
             vec![endpoint],
+            network,
             genesis.clone(),
             payout_address.clone(),
         )
@@ -1766,7 +1919,8 @@ mod tests {
         assert!(NativeZcashConfig::new(
             RpcEndpoint::new("http://127.0.0.1:8232", None, None).expect("template endpoint"),
             vec![validator],
-            genesis,
+            network,
+            genesis.to_ascii_uppercase(),
             payout_address.clone(),
         )
         .is_ok());
@@ -1777,6 +1931,7 @@ mod tests {
         assert!(NativeZcashConfig::new(
             remote_template,
             vec![remote_validator],
+            network,
             "00".repeat(32),
             payout_address.clone(),
         )
@@ -1786,7 +1941,8 @@ mod tests {
             template_node: RpcEndpoint::new("http://127.0.0.1:8232", None, None)
                 .expect("loopback endpoint"),
             proposal_validators: Vec::new(),
-            expected_genesis_hash: "00".repeat(32),
+            expected_parent_network: network,
+            expected_genesis_hash: genesis,
             expected_parent_payout_commitment: parent_payout_address_commitment(
                 &payout_address.to_string(),
             ),
@@ -1797,6 +1953,55 @@ mod tests {
             NativeZcashProvider::connect(bypass_attempt).is_err(),
             "the provider must revalidate configs even when an in-crate caller bypasses new()"
         );
+    }
+
+    #[test]
+    fn native_config_binds_parent_genesis_and_payout_network() {
+        let template =
+            || RpcEndpoint::new("http://127.0.0.1:8232", None, None).expect("template endpoint");
+        let validator =
+            || RpcEndpoint::new("http://127.0.0.1:8233", None, None).expect("validator endpoint");
+        let testnet_payout: ZcashAddress = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
+            .parse()
+            .expect("valid Zcash testnet address");
+
+        assert!(NativeZcashConfig::new(
+            template(),
+            vec![validator()],
+            NativeZcashNetwork::Regtest,
+            NativeZcashNetwork::Mainnet
+                .consensus_parameters()
+                .genesis_hash()
+                .to_string(),
+            testnet_payout.clone(),
+        )
+        .is_err());
+        assert!(NativeZcashConfig::new(
+            template(),
+            vec![validator()],
+            NativeZcashNetwork::Mainnet,
+            NativeZcashNetwork::Mainnet
+                .consensus_parameters()
+                .genesis_hash()
+                .to_string(),
+            testnet_payout,
+        )
+        .is_err());
+
+        let testnet_unified: ZcashAddress = "utest10zg6frxk32ma8980kdv9473e4aclw7clq9hydzcj6l349pkqzxk2mmj3cn7j5x38w6l4wyryv50whnlrw0k9agzpdf5fxyj7kq96ukcp"
+            .parse()
+            .expect("valid Zcash Testnet Unified Address");
+        assert!(NativeZcashConfig::new(
+            template(),
+            vec![validator()],
+            NativeZcashNetwork::Regtest,
+            NativeZcashNetwork::Regtest
+                .consensus_parameters()
+                .genesis_hash()
+                .to_string(),
+            testnet_unified,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1878,13 +2083,118 @@ mod tests {
     }
 
     #[test]
-    fn independent_parent_templates_must_agree_on_zero_reward_tail() {
-        validate_matching_parent_payout_presence(0, 0, "validator")
-            .expect("two zero-reward templates agree");
-        validate_matching_parent_payout_presence(625_000_000, 625_010_000, "validator")
-            .expect("honest fee divergence keeps both rewards positive");
-        assert!(validate_matching_parent_payout_presence(0, 1, "validator").is_err());
-        assert!(validate_matching_parent_payout_presence(1, 0, "validator").is_err());
+    fn parent_payout_floor_authenticates_subsidy_and_zero_tail_recipient() {
+        let network = NativeZcashNetwork::Regtest.consensus_parameters();
+        let height = Height(1);
+        let block = block_subsidy(height, &network).expect("regtest subsidy is defined");
+        let minimum = u64::try_from(
+            miner_subsidy(height, &network, block)
+                .expect("regtest miner subsidy is defined")
+                .zatoshis(),
+        )
+        .expect("miner subsidy is non-negative");
+        assert!(minimum > 0, "height one must have a positive subsidy");
+
+        validate_parent_miner_payout(minimum, 1, height.0, &network, "template")
+            .expect("the exact subsidy is sufficient");
+        validate_parent_miner_payout(minimum + 10_000, 1, height.0, &network, "template")
+            .expect("transaction fees may increase the miner payout");
+        assert!(
+            validate_parent_miner_payout(minimum - 1, 1, height.0, &network, "template").is_err()
+        );
+        assert!(validate_parent_miner_payout(minimum, 0, height.0, &network, "template").is_err());
+
+        let zero_height = Height(10_000);
+        assert_eq!(
+            block_subsidy(zero_height, &network)
+                .expect("tail subsidy is defined")
+                .zatoshis(),
+            0
+        );
+        validate_parent_miner_payout(0, 1, zero_height.0, &network, "tail template")
+            .expect("an authenticated zero-valued tail output is valid");
+        assert!(
+            validate_parent_miner_payout(0, 0, zero_height.0, &network, "tail template").is_err()
+        );
+    }
+
+    #[test]
+    fn parent_payout_floor_uses_miner_subsidy_during_funding_streams() {
+        let network = NativeZcashNetwork::Mainnet.consensus_parameters();
+        let height = Height(2_000_000);
+        let block = block_subsidy(height, &network).expect("mainnet subsidy is defined");
+        let miner =
+            miner_subsidy(height, &network, block).expect("mainnet miner subsidy is defined");
+        assert!(
+            miner < block,
+            "the fixture height must have active non-miner funding"
+        );
+        let miner = u64::try_from(miner.zatoshis()).expect("miner subsidy is non-negative");
+
+        validate_parent_miner_payout(miner, 1, height.0, &network, "mainnet template")
+            .expect("the miner share, rather than the total subsidy, is the payout floor");
+    }
+
+    #[test]
+    fn parent_coinbase_branch_must_match_the_pinned_schedule() {
+        use zebra_chain::transaction::LockTime;
+
+        let network = NativeZcashNetwork::Regtest.consensus_parameters();
+        let height = Height(1);
+        assert_eq!(
+            NetworkUpgrade::current(&network, height),
+            NetworkUpgrade::Nu6_3
+        );
+        let inputs = || {
+            vec![transparent::Input::Coinbase {
+                height,
+                data: vec![0x51],
+                sequence: u32::MAX,
+            }]
+        };
+        let matching = Transaction::test_v6(
+            NetworkUpgrade::Nu6_3,
+            inputs(),
+            Vec::new(),
+            LockTime::unlocked(),
+            Height(0),
+        );
+        validate_parent_coinbase_network_upgrade(
+            &matching,
+            height.0,
+            &network,
+            "matching template",
+        )
+        .expect("the configured branch is accepted");
+
+        let wrong = Transaction::test_v6(
+            NetworkUpgrade::Nu6_2,
+            inputs(),
+            Vec::new(),
+            LockTime::unlocked(),
+            Height(0),
+        );
+        assert!(validate_parent_coinbase_network_upgrade(
+            &wrong,
+            height.0,
+            &network,
+            "wrong template",
+        )
+        .is_err());
+        let pre_ironwood = Transaction::test_v1(inputs(), Vec::new(), LockTime::unlocked());
+        let pre_ironwood_error = validate_parent_coinbase_network_upgrade(
+            &pre_ironwood,
+            1,
+            &Network::Mainnet,
+            "pre-Ironwood template",
+        )
+        .expect_err("a correctly encoded pre-Ironwood coinbase must be rejected");
+        assert!(
+            pre_ironwood_error
+                .to_string()
+                .contains("requires NU6.3 or later"),
+            "the minimum-upgrade gate must reject pre-Ironwood work: {pre_ironwood_error}"
+        );
     }
 
     #[test]
