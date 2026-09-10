@@ -71,14 +71,19 @@ for binary in zcash-zebrad wcash-zebrad wcash-merge-miner wcash-wallet; do
   fi
 done
 
-rpc_call() {
-  local url=$1
-  local method=$2
-  local params=${3:-[]}
-  curl --fail --silent --show-error --max-time 5 --noproxy '*' \
+rpc_call_with_timeout() {
+  local timeout_seconds=$1
+  local url=$2
+  local method=$3
+  local params=${4:-[]}
+  curl --fail --silent --show-error --max-time "$timeout_seconds" --noproxy '*' \
     --header 'content-type: application/json' \
     --data-binary "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}" \
     "$url"
+}
+
+rpc_call() {
+  rpc_call_with_timeout 5 "$@"
 }
 
 rpc_result() {
@@ -629,7 +634,10 @@ PY
 
 rpc_call "$wcash_wallet_rpc" getrawmempool \
   >"$runtime_dir/wcash-mempool-before.json"
-rpc_call "$wcash_wallet_rpc" getblocktemplate \
+# Ironwood coinbase proving is intentionally more expensive than ordinary RPC
+# service, especially on the two-core deployment target. Keep it bounded
+# without weakening the five-second timeout used by all other test calls.
+rpc_call_with_timeout 30 "$wcash_wallet_rpc" getblocktemplate \
   '[{"mode":"template","capabilities":["coinbasetxn"]}]' \
   >"$runtime_dir/wcash-template-before.json"
 python3 - "$runtime_dir/wcash-mempool-before.json" \
@@ -1053,7 +1061,7 @@ assert len(transaction["ironwood"]["actions"]) == 2, transaction
 assert transaction["ironwood"]["valueBalanceZat"] == -(625_000_000 - int(fee)), transaction
 PY
 
-rpc_call "$wcash_wallet_rpc" getblocktemplate \
+rpc_call_with_timeout 30 "$wcash_wallet_rpc" getblocktemplate \
   '[{"mode":"template","capabilities":["coinbasetxn"]}]' \
   >"$runtime_dir/transparent-template-with-shielding.json"
 python3 - "$runtime_dir/transparent-template-with-shielding.json" \
