@@ -148,6 +148,8 @@ pub struct WinnerOutboxStatus {
     pub pending_zcash: usize,
     /// Retained blocks currently observed on a pinned node's best chain.
     pub observed: usize,
+    /// Wcash blocks quarantined behind a conflicting AuxPoW witness.
+    pub quarantined: usize,
     /// Confirmation depth required before an outbox entry is retired.
     pub retention_confirmations: u32,
 }
@@ -803,7 +805,9 @@ fn retry_pending_winners_with(
                 .map(|winner| {
                     (
                         winner,
-                        scope.spawn(move || submit_pending_winner_with(wcash_node, zcash, winner)),
+                        scope.spawn(move || {
+                            reconcile_pending_winner_with(wcash_node, zcash, journal, winner)
+                        }),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -811,12 +815,13 @@ fn retry_pending_winners_with(
                 .map(|(winner, worker)| {
                     (
                         winner,
-                        worker.join().unwrap_or(WinnerObservation::Unavailable),
+                        worker.join().unwrap_or(Ok(WinnerObservation::Unavailable)),
                     )
                 })
                 .collect::<Vec<_>>()
         });
         for (winner, observation) in results {
+            let observation = observation?;
             match observation {
                 WinnerObservation::Present { confirmations } => {
                     journal.mark_status(winner, WinnerStatus::Observed)?;
@@ -842,9 +847,7 @@ fn retry_pending_winners_with(
                     );
                 }
                 WinnerObservation::ConflictingWitness => {
-                    if winner.observed_on_best_chain {
-                        journal.mark_status(winner, WinnerStatus::Orphaned)?;
-                    }
+                    journal.mark_status(winner, WinnerStatus::Conflicting)?;
                     eprintln!(
                         "wcash winner {} at height {} conflicts with a different AuxPoW witness for the same block ID; exact bytes remain queued and operator intervention is required",
                         winner.block_hash_display,
@@ -865,6 +868,31 @@ fn retry_pending_winners_with(
     Ok(())
 }
 
+fn reconcile_pending_winner_with(
+    wcash_node: &ZebraRpcClient,
+    zcash: &NativeZcashProvider,
+    journal: &ShareJournal,
+    winner: &PendingWinner,
+) -> Result<WinnerObservation, MinerError> {
+    if winner.observed_on_best_chain || winner.conflicting_witness {
+        let observation =
+            observe_pending_winner_with(wcash_node, zcash, winner, winner.conflicting_witness);
+        match observation {
+            observation @ (WinnerObservation::Present { .. }
+            | WinnerObservation::Unavailable
+            | WinnerObservation::ConflictingWitness) => return Ok(observation),
+            WinnerObservation::Absent => {
+                // Persist the authoritative reorg observation before making a
+                // new external submission. A crash after this point leaves a
+                // truthful unobserved outbox entry that the next retry submits.
+                journal.mark_status(winner, WinnerStatus::Orphaned)?;
+            }
+        }
+    }
+
+    Ok(submit_pending_winner_with(wcash_node, zcash, winner))
+}
+
 fn submit_pending_winner_with(
     wcash_node: &ZebraRpcClient,
     zcash: &NativeZcashProvider,
@@ -879,6 +907,7 @@ fn submit_pending_winner_with(
                 winner.height,
                 &winner.block_hash_display,
                 &winner.block_bytes,
+                true,
             )
         }
         WinnerChain::Zcash => {
@@ -887,6 +916,30 @@ fn submit_pending_winner_with(
                 winner.height,
                 &winner.block_hash_display,
             );
+            match zcash.parent_confirmation_depth(winner.height, &winner.block_hash_display) {
+                Ok(Some(confirmations)) => WinnerObservation::Present { confirmations },
+                Ok(None) => WinnerObservation::Absent,
+                Err(_) => WinnerObservation::Unavailable,
+            }
+        }
+    }
+}
+
+fn observe_pending_winner_with(
+    wcash_node: &ZebraRpcClient,
+    zcash: &NativeZcashProvider,
+    winner: &PendingWinner,
+    release_wcash_candidate: bool,
+) -> WinnerObservation {
+    match winner.key.chain {
+        WinnerChain::Wcash => wcash_confirmation_depth(
+            wcash_node,
+            winner.height,
+            &winner.block_hash_display,
+            &winner.block_bytes,
+            release_wcash_candidate,
+        ),
+        WinnerChain::Zcash => {
             match zcash.parent_confirmation_depth(winner.height, &winner.block_hash_display) {
                 Ok(Some(confirmations)) => WinnerObservation::Present { confirmations },
                 Ok(None) => WinnerObservation::Absent,
@@ -927,6 +980,7 @@ fn wcash_confirmation_depth(
     height: u32,
     expected_hash: &str,
     expected_block_bytes: &[u8],
+    release_candidate: bool,
 ) -> WinnerObservation {
     let expected_block: Block = match expected_block_bytes.zcash_deserialize_into() {
         Ok(block) => block,
@@ -958,14 +1012,16 @@ fn wcash_confirmation_depth(
             // Durable outbox replay uses `submitblock` so it remains valid after
             // the node's proof-free candidate cache expires or the node
             // restarts. Once authoritative status proves the exact witness is
-            // on the best chain, repeat the same witness through
-            // `submitauxblock`. Its idempotent best-chain path releases the
-            // now-obsolete active candidate; otherwise long maturity runs can
-            // fill the bounded cache even though every issued job won.
-            let _release = node.call_value(
-                "submitauxblock",
-                json!([expected_hash, hex::encode(witness.as_bytes())]),
-            );
+            // on the best chain for the first time, repeat the same witness
+            // through `submitauxblock`. Its idempotent best-chain path releases
+            // the now-obsolete active candidate; status-only maturity polling
+            // must not keep replaying the submission.
+            if release_candidate {
+                let _release = node.call_value(
+                    "submitauxblock",
+                    json!([expected_hash, hex::encode(witness.as_bytes())]),
+                );
+            }
             WinnerObservation::Present { confirmations }
         }
         WcashAuxBlockStatus::SideChain | WcashAuxBlockStatus::Unknown => WinnerObservation::Absent,
@@ -1196,6 +1252,7 @@ struct PendingWinner {
     height: u32,
     block_bytes: Vec<u8>,
     observed_on_best_chain: bool,
+    conflicting_witness: bool,
 }
 
 const MAX_SHARES_PER_JOB: usize = 100_000;
@@ -1364,7 +1421,8 @@ impl ShareJournal {
                         }
                     }
                 }
-                "winner_observed" | "winner_orphaned" | "winner_matured" | "winner_confirmed" => {
+                "winner_observed" | "winner_orphaned" | "winner_conflicting" | "winner_matured"
+                | "winner_confirmed" => {
                     let share_id = required_share_id(&record)?;
                     let chain = WinnerChain::parse(record.chain.as_deref().ok_or_else(|| {
                         MinerError::InvalidRequest("winner status record has no chain".to_string())
@@ -1404,18 +1462,36 @@ impl ShareJournal {
                                 ));
                             }
                             pending.observed_on_best_chain = true;
+                            pending.conflicting_witness = false;
                         }
                         "winner_orphaned" => {
-                            if !pending.observed_on_best_chain {
+                            if !pending.observed_on_best_chain && !pending.conflicting_witness {
                                 return Err(MinerError::InvalidRequest(
-                                    "share journal orphans a winner that was not observed"
+                                    "share journal orphans a winner that was neither observed nor quarantined"
                                         .to_string(),
                                 ));
                             }
                             pending.observed_on_best_chain = false;
+                            pending.conflicting_witness = false;
+                        }
+                        "winner_conflicting" => {
+                            if chain != WinnerChain::Wcash {
+                                return Err(MinerError::InvalidRequest(
+                                    "only a Wcash winner can enter conflicting-witness quarantine"
+                                        .to_string(),
+                                ));
+                            }
+                            if pending.conflicting_witness {
+                                return Err(MinerError::InvalidRequest(
+                                    "share journal quarantines the same conflicting witness twice without exact best-chain observation"
+                                        .to_string(),
+                                ));
+                            }
+                            pending.observed_on_best_chain = false;
+                            pending.conflicting_witness = true;
                         }
                         "winner_matured" => {
-                            if !pending.observed_on_best_chain {
+                            if !pending.observed_on_best_chain || pending.conflicting_witness {
                                 return Err(MinerError::InvalidRequest(
                                     "share journal matures a winner before best-chain observation"
                                         .to_string(),
@@ -1571,6 +1647,7 @@ impl ShareJournal {
                         height: active_job.child_height,
                         block_bytes,
                         observed_on_best_chain: false,
+                        conflicting_witness: false,
                     },
                 );
             }
@@ -1588,6 +1665,7 @@ impl ShareJournal {
                         height: active_job.parent_height,
                         block_bytes,
                         observed_on_best_chain: false,
+                        conflicting_witness: false,
                     },
                 );
             }
@@ -1626,6 +1704,7 @@ impl ShareJournal {
                 WinnerChain::Zcash => status.pending_zcash += 1,
             }
             status.observed += usize::from(winner.observed_on_best_chain);
+            status.quarantined += usize::from(winner.conflicting_witness);
         }
         Ok(status)
     }
@@ -1645,9 +1724,25 @@ impl ShareJournal {
             ));
         }
         match status {
-            WinnerStatus::Observed if current.observed_on_best_chain => return Ok(()),
-            WinnerStatus::Orphaned if !current.observed_on_best_chain => return Ok(()),
-            WinnerStatus::Matured if !current.observed_on_best_chain => {
+            WinnerStatus::Observed
+                if current.observed_on_best_chain && !current.conflicting_witness =>
+            {
+                return Ok(())
+            }
+            WinnerStatus::Orphaned
+                if !current.observed_on_best_chain && !current.conflicting_witness =>
+            {
+                return Ok(())
+            }
+            WinnerStatus::Conflicting if current.key.chain != WinnerChain::Wcash => {
+                return Err(MinerError::InvalidRequest(
+                    "only a Wcash winner can enter conflicting-witness quarantine".to_string(),
+                ))
+            }
+            WinnerStatus::Conflicting if current.conflicting_witness => return Ok(()),
+            WinnerStatus::Matured
+                if !current.observed_on_best_chain || current.conflicting_witness =>
+            {
                 return Err(MinerError::InvalidRequest(
                     "cannot mature a winner before best-chain observation".to_string(),
                 ))
@@ -1670,18 +1765,28 @@ impl ShareJournal {
         append_synced_journal_record(&mut state, &self.path, &encoded)?;
         match status {
             WinnerStatus::Observed => {
-                state
+                let current = state
                     .pending_winners
                     .get_mut(&winner.key)
-                    .expect("winner existence was checked while holding the journal lock")
-                    .observed_on_best_chain = true;
+                    .expect("winner existence was checked while holding the journal lock");
+                current.observed_on_best_chain = true;
+                current.conflicting_witness = false;
             }
             WinnerStatus::Orphaned => {
-                state
+                let current = state
                     .pending_winners
                     .get_mut(&winner.key)
-                    .expect("winner existence was checked while holding the journal lock")
-                    .observed_on_best_chain = false;
+                    .expect("winner existence was checked while holding the journal lock");
+                current.observed_on_best_chain = false;
+                current.conflicting_witness = false;
+            }
+            WinnerStatus::Conflicting => {
+                let current = state
+                    .pending_winners
+                    .get_mut(&winner.key)
+                    .expect("winner existence was checked while holding the journal lock");
+                current.observed_on_best_chain = false;
+                current.conflicting_witness = true;
             }
             WinnerStatus::Matured => {
                 state.pending_winners.remove(&winner.key);
@@ -1699,6 +1804,7 @@ impl ShareJournal {
 enum WinnerStatus {
     Observed,
     Orphaned,
+    Conflicting,
     Matured,
 }
 
@@ -1707,6 +1813,7 @@ impl WinnerStatus {
         match self {
             Self::Observed => "winner_observed",
             Self::Orphaned => "winner_orphaned",
+            Self::Conflicting => "winner_conflicting",
             Self::Matured => "winner_matured",
         }
     }
@@ -1979,6 +2086,7 @@ fn persisted_winners(
             height,
             block_bytes,
             observed_on_best_chain: false,
+            conflicting_witness: false,
         });
     }
     if record.zcash_candidate {
@@ -2013,6 +2121,7 @@ fn persisted_winners(
             height,
             block_bytes,
             observed_on_best_chain: false,
+            conflicting_witness: false,
         });
     }
     Ok(winners)
@@ -2615,64 +2724,19 @@ mod tests {
             .expect("test RPC body is JSON")
     }
 
-    fn spawn_wcash_status_server() -> (RpcEndpoint, thread::JoinHandle<Vec<serde_json::Value>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test RPC server");
-        listener
-            .set_nonblocking(true)
-            .expect("make test RPC listener nonblocking");
-        let endpoint = RpcEndpoint::new(
-            format!(
-                "http://{}/",
-                listener.local_addr().expect("test RPC address")
-            ),
-            None,
-            None,
-        )
-        .expect("loopback test RPC endpoint");
-        let server = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut requests = Vec::new();
-            while requests.len() < 2 && Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let request = read_test_rpc_request(&mut stream);
-                        let id = request["id"].clone();
-                        let result = if requests.is_empty() {
-                            json!({"state": "best_chain", "confirmations": 1})
-                        } else {
-                            json!(true)
-                        };
-                        let response = serde_json::to_vec(&json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": result,
-                        }))
-                        .expect("serialize test RPC response");
-                        write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            response.len()
-                        )
-                        .expect("write test RPC headers");
-                        stream
-                            .write_all(&response)
-                            .expect("write test RPC response");
-                        requests.push(request);
-                    }
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("test RPC accept failed: {error}"),
-                }
-            }
-            requests
-        });
-        (endpoint, server)
-    }
-
-    fn spawn_retirement_server(
+    fn spawn_scripted_rpc_server(
         results: Vec<serde_json::Value>,
     ) -> (RpcEndpoint, thread::JoinHandle<Vec<serde_json::Value>>) {
+        spawn_scripted_rpc_server_with_request_hook(results, |_, _| {})
+    }
+
+    fn spawn_scripted_rpc_server_with_request_hook<F>(
+        results: Vec<serde_json::Value>,
+        request_hook: F,
+    ) -> (RpcEndpoint, thread::JoinHandle<Vec<serde_json::Value>>)
+    where
+        F: Fn(usize, &serde_json::Value) + Send + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test RPC server");
         listener
             .set_nonblocking(true)
@@ -2689,14 +2753,14 @@ mod tests {
         let server = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut requests = Vec::new();
-            for result in results {
+            for (request_index, result) in results.into_iter().enumerate() {
                 let mut stream = loop {
                     match listener.accept() {
                         Ok((stream, _)) => break stream,
                         Err(error) if error.kind() == ErrorKind::WouldBlock => {
                             assert!(
                                 Instant::now() < deadline,
-                                "test retirement RPC request timed out"
+                                "scripted test RPC request timed out"
                             );
                             thread::sleep(Duration::from_millis(5));
                         }
@@ -2704,6 +2768,7 @@ mod tests {
                     }
                 };
                 let request = read_test_rpc_request(&mut stream);
+                request_hook(request_index, &request);
                 let response = serde_json::to_vec(&json!({
                     "jsonrpc": "2.0",
                     "id": request["id"],
@@ -2720,6 +2785,34 @@ mod tests {
                     .write_all(&response)
                     .expect("write test RPC response");
                 requests.push(request);
+            }
+            let quiet_deadline = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < quiet_deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_test_rpc_request(&mut stream);
+                        let response = serde_json::to_vec(&json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": null,
+                        }))
+                        .expect("serialize unexpected test RPC response");
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            response.len()
+                        )
+                        .expect("write unexpected test RPC headers");
+                        stream
+                            .write_all(&response)
+                            .expect("write unexpected test RPC response");
+                        requests.push(request);
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("test RPC accept failed: {error}"),
+                }
             }
             requests
         });
@@ -2766,6 +2859,57 @@ mod tests {
         record
     }
 
+    fn valid_wcash_winner_outbox_fixture() -> serde_json::Value {
+        let block_bytes =
+            Vec::from_hex(include_str!("vectors/wcash-valid-auxpow-block-1.txt").trim())
+                .expect("valid Wcash winner fixture is hex");
+        let block: Block = block_bytes
+            .zcash_deserialize_into()
+            .expect("valid Wcash winner fixture is a block");
+        let block_hash = display_hash(block.hash().0);
+        let parent_hash_le = validate_persisted_winner_block(
+            &block_bytes,
+            &block_hash,
+            1,
+            PersistedWinnerBlockKind::Wcash,
+        )
+        .expect("Wcash winner fixture has valid AuxPoW");
+        let job_id = "73".repeat(32);
+        json!({
+            "version": JOURNAL_VERSION,
+            "record": "winner_outbox",
+            "accepted_at": 1,
+            "job_id": job_id,
+            "share_id": journal_share_id(&job_id, parent_hash_le),
+            "worker": "account.rig-01",
+            "worker_authentication": "exact_credential",
+            "parent_hash_le": hex::encode(parent_hash_le),
+            "share_target": "ff".repeat(32),
+            "wcash_candidate": true,
+            "zcash_candidate": false,
+            "wcash_block_hash": block_hash,
+            "wcash_height": 1,
+            "zcash_height": 1,
+            "wcash_block": hex::encode(block_bytes),
+        })
+    }
+
+    fn wcash_winner_status_fixture(
+        outbox: &serde_json::Value,
+        record: &'static str,
+    ) -> serde_json::Value {
+        json!({
+            "version": JOURNAL_VERSION,
+            "record": record,
+            "recorded_at": 2,
+            "job_id": outbox["job_id"].clone(),
+            "share_id": outbox["share_id"].clone(),
+            "chain": "wcash",
+            "block_hash": outbox["wcash_block_hash"].clone(),
+            "height": outbox["wcash_height"].clone(),
+        })
+    }
+
     fn active_job_fixture(byte: u8) -> ActiveJournalJob {
         ActiveJournalJob {
             job_id: format!("{byte:02x}").repeat(32),
@@ -2773,6 +2917,51 @@ mod tests {
             child_height: 1,
             parent_height: 1,
             child_candidate_bytes: Arc::from([]),
+        }
+    }
+
+    fn test_zcash_provider(
+        template_node: RpcEndpoint,
+        proposal_validator: RpcEndpoint,
+    ) -> NativeZcashProvider {
+        let config = NativeZcashConfig::new(
+            template_node,
+            vec![proposal_validator],
+            "00".repeat(32),
+            "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
+                .parse()
+                .expect("valid Zcash testnet address"),
+        )
+        .expect("valid test parent-node configuration");
+        NativeZcashProvider::connect(config).expect("construct test parent clients")
+    }
+
+    fn unused_zcash_provider() -> NativeZcashProvider {
+        test_zcash_provider(
+            RpcEndpoint::new("http://127.0.0.1:1/", None, None)
+                .expect("valid unused template endpoint"),
+            RpcEndpoint::new("http://127.0.0.1:2/", None, None)
+                .expect("valid unused validator endpoint"),
+        )
+    }
+
+    fn wcash_winner(observed_on_best_chain: bool) -> PendingWinner {
+        let mut block = wcash_regtest_genesis_block().as_ref().clone();
+        Arc::make_mut(&mut block.header).solution =
+            Solution::for_wcash(vec![0x51, 0x52, 0x53]).expect("test witness is bounded");
+        PendingWinner {
+            key: WinnerKey {
+                share_id: [0x41; 32],
+                chain: WinnerChain::Wcash,
+            },
+            job_id: "42".repeat(32),
+            block_hash_display: display_hash(block.hash().0),
+            height: 0,
+            block_bytes: block
+                .zcash_serialize_to_vec()
+                .expect("test Wcash block serializes"),
+            observed_on_best_chain,
+            conflicting_witness: false,
         }
     }
 
@@ -2794,7 +2983,7 @@ mod tests {
             json!({"state": "already_absent"}),
             json!({"state": "submission_started"}),
         ];
-        let (endpoint, server) = spawn_retirement_server(results);
+        let (endpoint, server) = spawn_scripted_rpc_server(results);
         let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
             .expect("construct test RPC client");
         let lease = ChildCandidateLease {
@@ -2829,7 +3018,10 @@ mod tests {
 
     #[test]
     fn confirmed_wcash_winner_releases_the_exact_active_candidate() {
-        let (endpoint, server) = spawn_wcash_status_server();
+        let (endpoint, server) = spawn_scripted_rpc_server(vec![
+            json!({"state": "best_chain", "confirmations": 1}),
+            json!(true),
+        ]);
         let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
             .expect("construct test RPC client");
         let mut block = wcash_regtest_genesis_block().as_ref().clone();
@@ -2842,7 +3034,7 @@ mod tests {
         let block_hash = display_hash(block.hash().0);
 
         assert_eq!(
-            wcash_confirmation_depth(&client, 0, &block_hash, &block_bytes),
+            wcash_confirmation_depth(&client, 0, &block_hash, &block_bytes, true),
             WinnerObservation::Present { confirmations: 1 }
         );
 
@@ -2857,6 +3049,326 @@ mod tests {
         let expected_params = json!([block_hash, hex::encode(witness)]);
         assert_eq!(requests[0]["params"], expected_params);
         assert_eq!(requests[1]["params"], expected_params);
+    }
+
+    #[test]
+    fn observed_wcash_winner_checks_status_without_replaying_submissions() {
+        let (endpoint, server) = spawn_scripted_rpc_server(vec![json!({
+            "state": "best_chain",
+            "confirmations": 7,
+        })]);
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+        let directory = tempdir().expect("temporary directory");
+        let journal =
+            ShareJournal::open(directory.path().join("shares.jsonl")).expect("open test journal");
+        let winner = wcash_winner(true);
+
+        assert_eq!(
+            reconcile_pending_winner_with(&client, &unused_zcash_provider(), &journal, &winner,)
+                .expect("observed winner reconciliation succeeds"),
+            WinnerObservation::Present { confirmations: 7 },
+        );
+
+        let requests = server.join().expect("test RPC server exits");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "getauxblockstatus");
+    }
+
+    #[test]
+    fn observed_zcash_winner_checks_all_nodes_without_replaying_submissions() {
+        let block_hash = "53".repeat(32);
+        let height = 7;
+        let (template, template_server) = spawn_scripted_rpc_server(vec![json!({
+            "hash": block_hash,
+            "confirmations": 9,
+            "height": height,
+        })]);
+        let (validator, validator_server) = spawn_scripted_rpc_server(vec![json!({
+            "hash": block_hash,
+            "confirmations": 7,
+            "height": height,
+        })]);
+        let zcash = test_zcash_provider(template, validator);
+        let wcash = ZebraRpcClient::new(
+            RpcEndpoint::new("http://127.0.0.1:3/", None, None)
+                .expect("valid unused Wcash endpoint"),
+            Duration::from_secs(3),
+        )
+        .expect("construct unused Wcash client");
+        let directory = tempdir().expect("temporary directory");
+        let journal =
+            ShareJournal::open(directory.path().join("shares.jsonl")).expect("open test journal");
+        let winner = PendingWinner {
+            key: WinnerKey {
+                share_id: [0x52; 32],
+                chain: WinnerChain::Zcash,
+            },
+            job_id: "54".repeat(32),
+            block_hash_display: block_hash,
+            height,
+            block_bytes: Vec::new(),
+            observed_on_best_chain: true,
+            conflicting_witness: false,
+        };
+
+        assert_eq!(
+            reconcile_pending_winner_with(&wcash, &zcash, &journal, &winner)
+                .expect("observed parent winner reconciliation succeeds"),
+            WinnerObservation::Present { confirmations: 7 },
+        );
+
+        for server in [template_server, validator_server] {
+            let requests = server.join().expect("test RPC server exits");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["method"], "getblockheader");
+        }
+    }
+
+    #[test]
+    fn unobserved_wcash_winner_submits_once_and_releases_its_candidate() {
+        let (endpoint, server) = spawn_scripted_rpc_server(vec![
+            json!(null),
+            json!({"state": "best_chain", "confirmations": 1}),
+            json!(true),
+        ]);
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+        let directory = tempdir().expect("temporary directory");
+        let journal =
+            ShareJournal::open(directory.path().join("shares.jsonl")).expect("open test journal");
+        let winner = wcash_winner(false);
+
+        assert_eq!(
+            reconcile_pending_winner_with(&client, &unused_zcash_provider(), &journal, &winner,)
+                .expect("new winner reconciliation succeeds"),
+            WinnerObservation::Present { confirmations: 1 },
+        );
+
+        let requests = server.join().expect("test RPC server exits");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["method"], "submitblock");
+        assert_eq!(requests[1]["method"], "getauxblockstatus");
+        assert_eq!(requests[2]["method"], "submitauxblock");
+    }
+
+    #[test]
+    fn ambiguous_or_conflicting_observed_wcash_winner_is_not_resubmitted() {
+        for (state, expected) in [
+            ("pending", WinnerObservation::Unavailable),
+            ("conflicting_witness", WinnerObservation::ConflictingWitness),
+        ] {
+            let (endpoint, server) = spawn_scripted_rpc_server(vec![json!({"state": state})]);
+            let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+                .expect("construct test RPC client");
+            let directory = tempdir().expect("temporary directory");
+            let journal = ShareJournal::open(directory.path().join("shares.jsonl"))
+                .expect("open test journal");
+            let winner = wcash_winner(true);
+
+            assert_eq!(
+                reconcile_pending_winner_with(
+                    &client,
+                    &unused_zcash_provider(),
+                    &journal,
+                    &winner,
+                )
+                .expect("status-only reconciliation succeeds"),
+                expected,
+            );
+
+            let requests = server.join().expect("test RPC server exits");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["method"], "getauxblockstatus");
+        }
+    }
+
+    #[test]
+    fn conflicting_wcash_winner_stays_quarantined_across_retries_and_reopen() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("shares.jsonl");
+        let outbox = valid_wcash_winner_outbox_fixture();
+        write_journal_records(&path, std::slice::from_ref(&outbox));
+        let journal = ShareJournal::open(&path).expect("open valid Wcash winner journal");
+
+        let (endpoint, first_server) =
+            spawn_scripted_rpc_server(vec![json!(null), json!({"state": "conflicting_witness"})]);
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+        retry_pending_winners_with(
+            &client,
+            &unused_zcash_provider(),
+            &journal,
+            journal.all_pending().expect("load first retry snapshot"),
+        )
+        .expect("first retry durably quarantines the conflict");
+        let first_requests = first_server.join().expect("first RPC server exits");
+        assert_eq!(
+            first_requests
+                .iter()
+                .map(|request| request["method"].as_str().expect("RPC method"))
+                .collect::<Vec<_>>(),
+            ["submitblock", "getauxblockstatus"],
+        );
+        assert_eq!(journal.status().expect("journal status").quarantined, 1);
+
+        let (endpoint, second_server) = spawn_scripted_rpc_server(vec![json!({
+            "state": "conflicting_witness",
+        })]);
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+        retry_pending_winners_with(
+            &client,
+            &unused_zcash_provider(),
+            &journal,
+            journal.all_pending().expect("load second retry snapshot"),
+        )
+        .expect("quarantined retry remains status-only");
+        let second_requests = second_server.join().expect("second RPC server exits");
+        assert_eq!(second_requests.len(), 1);
+        assert_eq!(second_requests[0]["method"], "getauxblockstatus");
+        drop(journal);
+
+        let reopened = ShareJournal::open(&path).expect("reopen quarantined journal");
+        let reopened_status = reopened.status().expect("reopened journal status");
+        assert_eq!(reopened_status.pending_wcash, 1);
+        assert_eq!(reopened_status.observed, 0);
+        assert_eq!(reopened_status.quarantined, 1);
+        let (endpoint, reopened_server) = spawn_scripted_rpc_server(vec![json!({
+            "state": "conflicting_witness",
+        })]);
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+        retry_pending_winners_with(
+            &client,
+            &unused_zcash_provider(),
+            &reopened,
+            reopened
+                .all_pending()
+                .expect("load reopened retry snapshot"),
+        )
+        .expect("reopened quarantine remains status-only");
+        let reopened_requests = reopened_server.join().expect("reopened RPC server exits");
+        assert_eq!(reopened_requests.len(), 1);
+        assert_eq!(reopened_requests[0]["method"], "getauxblockstatus");
+
+        let records = fs::read_to_string(&path).expect("read quarantined journal");
+        assert_eq!(
+            records.matches("\"record\":\"winner_conflicting\"").count(),
+            1
+        );
+        assert!(!records.contains("\"record\":\"winner_orphaned\""));
+    }
+
+    #[test]
+    fn quarantined_wcash_absence_is_durable_before_exact_replay() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("shares.jsonl");
+        let outbox = valid_wcash_winner_outbox_fixture();
+        let conflicting = wcash_winner_status_fixture(&outbox, "winner_conflicting");
+        write_journal_records(&path, &[outbox, conflicting]);
+        let journal = ShareJournal::open(&path).expect("open quarantined Wcash journal");
+        assert_eq!(journal.status().expect("initial status").quarantined, 1);
+
+        let journal_path = path.clone();
+        let (endpoint, server) = spawn_scripted_rpc_server_with_request_hook(
+            vec![
+                json!({"state": "unknown"}),
+                json!(null),
+                json!({"state": "best_chain", "confirmations": 1}),
+                json!(true),
+            ],
+            move |request_index, request| {
+                if request_index == 1 {
+                    assert_eq!(request["method"], "submitblock");
+                    let durable = fs::read_to_string(&journal_path)
+                        .expect("read journal before external replay");
+                    let last: serde_json::Value =
+                        serde_json::from_str(durable.lines().last().expect("durable status line"))
+                            .expect("durable status is JSON");
+                    assert_eq!(last["record"], "winner_orphaned");
+                }
+            },
+        );
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+        retry_pending_winners_with(
+            &client,
+            &unused_zcash_provider(),
+            &journal,
+            journal
+                .all_pending()
+                .expect("load quarantined retry snapshot"),
+        )
+        .expect("authoritative absence clears quarantine and replays exact bytes");
+        let requests = server.join().expect("RPC server exits");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().expect("RPC method"))
+                .collect::<Vec<_>>(),
+            [
+                "getauxblockstatus",
+                "submitblock",
+                "getauxblockstatus",
+                "submitauxblock",
+            ],
+        );
+        let status = journal.status().expect("recovered journal status");
+        assert_eq!(status.quarantined, 0);
+        assert_eq!(status.observed, 1);
+        drop(journal);
+
+        let reopened = ShareJournal::open(&path).expect("reopen recovered winner journal");
+        let status = reopened.status().expect("reopened recovery status");
+        assert_eq!(status.pending_wcash, 1);
+        assert_eq!(status.quarantined, 0);
+        assert_eq!(status.observed, 1);
+        let records = fs::read_to_string(&path).expect("read recovery journal");
+        let records = records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("journal JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(records[2]["record"], "winner_orphaned");
+        assert_eq!(records[3]["record"], "winner_observed");
+    }
+
+    #[test]
+    fn exact_wcash_winner_clears_quarantine_without_generic_resubmission() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("shares.jsonl");
+        let outbox = valid_wcash_winner_outbox_fixture();
+        let conflicting = wcash_winner_status_fixture(&outbox, "winner_conflicting");
+        write_journal_records(&path, &[outbox, conflicting]);
+        let journal = ShareJournal::open(&path).expect("open quarantined Wcash journal");
+        let (endpoint, server) = spawn_scripted_rpc_server(vec![
+            json!({"state": "best_chain", "confirmations": 2}),
+            json!(true),
+        ]);
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+        retry_pending_winners_with(
+            &client,
+            &unused_zcash_provider(),
+            &journal,
+            journal
+                .all_pending()
+                .expect("load quarantined retry snapshot"),
+        )
+        .expect("exact status resolves quarantine");
+        let requests = server.join().expect("test RPC server exits");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["method"], "getauxblockstatus");
+        assert_eq!(requests[1]["method"], "submitauxblock");
+        let status = journal.status().expect("resolved journal status");
+        assert_eq!(status.quarantined, 0);
+        assert_eq!(status.observed, 1);
+        drop(journal);
+
+        let reopened = ShareJournal::open(path).expect("reopen resolved journal");
+        let status = reopened.status().expect("reopened resolved status");
+        assert_eq!(status.quarantined, 0);
+        assert_eq!(status.observed, 1);
     }
 
     fn orchard_unified_wcash_address(network: NetworkType) -> WcashAddress {
@@ -3575,6 +4087,7 @@ mod tests {
             height: 1,
             block_bytes: Vec::new(),
             observed_on_best_chain: false,
+            conflicting_witness: false,
         };
         assert!(journal
             .mark_status(&winner, WinnerStatus::Observed)

@@ -330,6 +330,7 @@ fn run_native_mine(arguments: impl Iterator<Item = String>) -> Result<(), Box<dy
                 "pending_wcash_winners": outbox.pending_wcash,
                 "pending_zcash_winners": outbox.pending_zcash,
                 "observed_best_chain_winners": outbox.observed,
+                "quarantined_conflicting_winners": outbox.quarantined,
                 "retention_confirmations": outbox.retention_confirmations,
             },
         }))
@@ -905,6 +906,7 @@ fn native_preflight(
             "pending_wcash_winners": outbox.pending_wcash,
             "pending_zcash_winners": outbox.pending_zcash,
             "observed_best_chain_winners": outbox.observed,
+            "quarantined_conflicting_winners": outbox.quarantined,
             "retention_confirmations": outbox.retention_confirmations,
         },
     });

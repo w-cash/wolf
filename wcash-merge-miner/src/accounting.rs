@@ -387,7 +387,8 @@ pub(crate) fn read_accounting_snapshot_from_reader(
                     }
                 }
             }
-            "winner_observed" | "winner_orphaned" | "winner_matured" | "winner_confirmed" => {
+            "winner_observed" | "winner_orphaned" | "winner_conflicting" | "winner_matured"
+            | "winner_confirmed" => {
                 apply_winner_status(&record, &mut pending_winners)?;
             }
             _ => {
@@ -537,6 +538,7 @@ struct PendingWinnerStatus {
     block_hash: String,
     height: u32,
     observed: bool,
+    conflicting_witness: bool,
 }
 
 struct ValidatedWinnerBlocks {
@@ -701,6 +703,7 @@ fn validate_winner_blocks(
                 block_hash: block_hash.to_string(),
                 height,
                 observed: false,
+                conflicting_witness: false,
             },
         ));
     } else if record.wcash_block.is_some() {
@@ -747,6 +750,7 @@ fn validate_winner_blocks(
                 block_hash,
                 height,
                 observed: false,
+                conflicting_witness: false,
             },
         ));
     } else if record.zcash_block.is_some() {
@@ -816,19 +820,37 @@ fn apply_winner_status(
     match record.record.as_str() {
         "winner_observed" | "winner_confirmed" if !pending.observed => {
             pending.observed = true;
+            pending.conflicting_witness = false;
         }
         "winner_observed" | "winner_confirmed" => {
             return Err(invalid(
                 "winner is observed twice without an intervening orphan transition",
             ));
         }
-        "winner_orphaned" if pending.observed => {
+        "winner_orphaned" if pending.observed || pending.conflicting_witness => {
             pending.observed = false;
+            pending.conflicting_witness = false;
         }
         "winner_orphaned" => {
-            return Err(invalid("winner is orphaned before best-chain observation"));
+            return Err(invalid(
+                "winner is orphaned before best-chain observation or conflicting-witness quarantine",
+            ));
         }
-        "winner_matured" if pending.observed => {
+        "winner_conflicting" if chain != WinnerChain::Wcash => {
+            return Err(invalid(
+                "only a Wcash winner can enter conflicting-witness quarantine",
+            ));
+        }
+        "winner_conflicting" if !pending.conflicting_witness => {
+            pending.observed = false;
+            pending.conflicting_witness = true;
+        }
+        "winner_conflicting" => {
+            return Err(invalid(
+                "winner enters conflicting-witness quarantine twice without exact best-chain observation",
+            ));
+        }
+        "winner_matured" if pending.observed && !pending.conflicting_witness => {
             pending_winners.remove(&key);
         }
         "winner_matured" => {
@@ -1510,6 +1532,7 @@ mod tests {
                 block_hash: "22".repeat(32),
                 height: 1,
                 observed: false,
+                conflicting_witness: false,
             },
         )]);
         let status = |record: &str| {
@@ -1532,9 +1555,39 @@ mod tests {
         apply_winner_status(&status("winner_orphaned"), &mut pending).unwrap();
         assert!(!pending[&key].observed);
         assert!(apply_winner_status(&status("winner_matured"), &mut pending).is_err());
+
+        apply_winner_status(&status("winner_conflicting"), &mut pending).unwrap();
+        assert!(pending[&key].conflicting_witness);
+        assert!(!pending[&key].observed);
+        assert!(apply_winner_status(&status("winner_conflicting"), &mut pending).is_err());
+        assert!(apply_winner_status(&status("winner_matured"), &mut pending).is_err());
+        apply_winner_status(&status("winner_orphaned"), &mut pending).unwrap();
+        assert!(!pending[&key].conflicting_witness);
+        assert!(!pending[&key].observed);
+
+        apply_winner_status(&status("winner_conflicting"), &mut pending).unwrap();
         apply_winner_status(&status("winner_observed"), &mut pending).unwrap();
+        assert!(!pending[&key].conflicting_witness);
         apply_winner_status(&status("winner_matured"), &mut pending).unwrap();
         assert!(!pending.contains_key(&key));
         assert!(apply_winner_status(&status("winner_orphaned"), &mut pending).is_err());
+
+        let zcash_key = WinnerKey {
+            share_id,
+            chain: WinnerChain::Zcash,
+        };
+        pending.insert(
+            zcash_key,
+            PendingWinnerStatus {
+                job_id: "ab".repeat(32),
+                block_hash: "22".repeat(32),
+                height: 1,
+                observed: false,
+                conflicting_witness: false,
+            },
+        );
+        let mut zcash_conflict = status("winner_conflicting");
+        zcash_conflict.chain = Some("zcash".to_string());
+        assert!(apply_winner_status(&zcash_conflict, &mut pending).is_err());
     }
 }

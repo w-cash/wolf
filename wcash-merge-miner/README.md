@@ -244,7 +244,14 @@ Zcash confirmation queries the exact winner hash and uses the lowest depth
 reported by reachable pinned nodes; authoritative unknown/not-best-chain
 answers veto maturity. Wcash confirmation uses `getauxblockstatus`, which binds
 the exact AuxPoW witness and confirmation depth in one state snapshot; matching
-only the witness-independent child block ID is never sufficient.
+only the witness-independent child block ID is never sufficient. Retained
+winners already observed on the best chain are polled without replaying their
+block submission on every generation. A different AuxPoW witness for the same
+Wcash block ID is durably quarantined and reported as
+`quarantined_conflicting_winners`; retries stay status-only while the conflict
+or node uncertainty remains. Exact best-chain observation clears the quarantine.
+An authoritative absence first flushes an orphan transition, then replays the
+original exact bytes so a crash cannot lose or silently replace the winner.
 
 Ordinary non-winning shares and authenticated worker identities are recorded in
 the same authoritative version-2 journal as winner outbox records. After
