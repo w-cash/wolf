@@ -560,6 +560,17 @@ impl NativeMiningCoordinator {
         &self.generation_descriptor
     }
 
+    /// Returns the time left before ordinary shares stop being current.
+    ///
+    /// The lifetime starts when this exact native candidate is prepared, not
+    /// when a downstream pool actor begins advertising it. Consumers which
+    /// start a second admission lease must therefore bound that lease by this
+    /// remaining duration rather than restarting [`MAX_JOB_AGE`].
+    pub fn remaining_job_lifetime(&self) -> Duration {
+        MAX_JOB_AGE
+            .saturating_sub(Instant::now().saturating_duration_since(self.candidate_created_at))
+    }
+
     /// Materializes exact winning blocks for a share validated by this generation.
     ///
     /// An ordinary accepted share returns no chain blocks. A dual-target winner returns both
