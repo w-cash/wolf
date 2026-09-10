@@ -108,10 +108,20 @@ pub struct NativeMiningCoordinator {
 }
 
 /// One exact consensus block produced by a validated merged-mining share.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct NativeWinnerBlock {
     block_hash_le: [u8; 32],
     block_bytes: Vec<u8>,
+}
+
+impl fmt::Debug for NativeWinnerBlock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeWinnerBlock")
+            .field("block_hash_le", &hex::encode(self.block_hash_le))
+            .field("block_bytes_len", &self.block_bytes.len())
+            .finish()
+    }
 }
 
 impl NativeWinnerBlock {
@@ -556,36 +566,15 @@ impl NativeMiningCoordinator {
         &self,
         share: &ValidatedNativeShare,
     ) -> Result<NativeWinnerMaterial, MinerError> {
-        if share.job_id() != self.generation_descriptor.job_id() {
-            return Err(MinerError::InvalidRequest(
-                "validated share belongs to a different native generation".to_string(),
-            ));
-        }
-
-        let wcash = share
-            .wcash_candidate()
-            .map(|winner| {
-                complete_wcash_candidate(
-                    &self.child_candidate_bytes,
-                    &display_hash(self.generation_descriptor.wcash_candidate_hash_le()),
-                    winner.encoded_proof(),
-                )
-                .map(|block_bytes| NativeWinnerBlock {
-                    block_hash_le: self.generation_descriptor.wcash_candidate_hash_le(),
-                    block_bytes,
-                })
-            })
-            .transpose()?;
-        let zcash = share.parent_block().map(|block_bytes| NativeWinnerBlock {
-            block_hash_le: share.parent_block_hash().into_le_bytes(),
-            block_bytes: block_bytes.to_vec(),
-        });
-
-        Ok(NativeWinnerMaterial {
-            job_id: share.job_id(),
-            wcash,
-            zcash,
-        })
+        materialize_winner_parts(
+            self.generation_descriptor.job_id(),
+            self.generation_descriptor.wcash_candidate_hash_le(),
+            &self.child_candidate_bytes,
+            share.job_id(),
+            share.wcash_candidate(),
+            share.parent_block_hash().into_le_bytes(),
+            share.parent_block(),
+        )
     }
 
     /// Stops issuing this generation and releases its node cache slot when safe.
@@ -730,6 +719,47 @@ impl NativeMiningCoordinator {
         drop(last_retry);
         self.retry_pending_winners(self.journal.all_pending()?)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_winner_parts(
+    expected_job_id: [u8; 32],
+    wcash_candidate_hash_le: [u8; 32],
+    child_candidate_bytes: &[u8],
+    share_job_id: [u8; 32],
+    wcash_candidate: Option<&crate::SolvedAuxPow>,
+    parent_block_hash_le: [u8; 32],
+    parent_block: Option<&[u8]>,
+) -> Result<NativeWinnerMaterial, MinerError> {
+    if share_job_id != expected_job_id {
+        return Err(MinerError::InvalidRequest(
+            "validated share belongs to a different native generation".to_string(),
+        ));
+    }
+
+    let wcash = wcash_candidate
+        .map(|winner| {
+            complete_wcash_candidate(
+                child_candidate_bytes,
+                &display_hash(wcash_candidate_hash_le),
+                winner.encoded_proof(),
+            )
+            .map(|block_bytes| NativeWinnerBlock {
+                block_hash_le: wcash_candidate_hash_le,
+                block_bytes,
+            })
+        })
+        .transpose()?;
+    let zcash = parent_block.map(|block_bytes| NativeWinnerBlock {
+        block_hash_le: parent_block_hash_le,
+        block_bytes: block_bytes.to_vec(),
+    });
+
+    Ok(NativeWinnerMaterial {
+        job_id: share_job_id,
+        wcash,
+        zcash,
+    })
 }
 
 struct OutboxRetryGuard<'a>(&'a AtomicBool);
@@ -2848,6 +2878,80 @@ mod tests {
             .expect("mainnet block fixture is a block")
     }
 
+    fn valid_wcash_materialization_fixture(
+    ) -> (Vec<u8>, [u8; 32], [u8; 32], crate::SolvedAuxPow, Vec<u8>) {
+        let completed_bytes =
+            Vec::from_hex(include_str!("vectors/wcash-valid-auxpow-block-1.txt").trim())
+                .expect("valid Wcash winner fixture is hex");
+        let completed: Block = completed_bytes
+            .as_slice()
+            .zcash_deserialize_into()
+            .expect("valid Wcash winner fixture is a block");
+        let child_hash = completed.hash().0;
+        let expanded_target: U256 = completed
+            .header
+            .difficulty_threshold
+            .to_expanded()
+            .expect("valid Wcash winner has an expanded target")
+            .into();
+        let child_target = Target::from_le_bytes(expanded_target.to_little_endian())
+            .expect("valid Wcash winner target is nonzero");
+        let proof_bytes = completed
+            .header
+            .solution
+            .as_wcash()
+            .expect("valid Wcash winner carries AuxPoW")
+            .as_bytes()
+            .to_vec();
+        let proof = AuxPowProof::decode(&proof_bytes).expect("valid Wcash AuxPoW decodes");
+        let validated = proof
+            .validate(child_hash, child_target)
+            .expect("valid Wcash AuxPoW passes every consensus check");
+        let parent_header = proof.parent_header().as_bytes();
+        let parent_header_input: [u8; 108] = parent_header[..108]
+            .try_into()
+            .expect("the valid parent header has 108 pre-nonce bytes");
+        let prepared = crate::PreparedJob::from_live_template(
+            child_hash,
+            child_target,
+            proof.coinbase_bytes().to_vec(),
+            parent_header_input,
+            proof.parent_merkle_branch().to_vec(),
+            proof.auth_data_merkle_branch().to_vec(),
+            proof.chain_history_root(),
+            validated.commitment().nonce(),
+        )
+        .expect("the valid proof reconstructs its frozen parent job");
+        let solved = prepared
+            .finalize(&parent_header[108..140], &parent_header[143..])
+            .expect("the valid parent proof finalizes through the production path");
+        assert_eq!(
+            solved.encoded_proof(),
+            proof_bytes,
+            "the reconstructed winner must retain the canonical proof bytes"
+        );
+
+        let mut proof_free = completed;
+        Arc::make_mut(&mut proof_free.header).solution =
+            Solution::for_wcash(Vec::new()).expect("an empty Wcash witness is canonical");
+        assert_eq!(
+            proof_free.hash().0,
+            child_hash,
+            "the Wcash block ID must remain proof-independent"
+        );
+        let candidate_bytes = proof_free
+            .zcash_serialize_to_vec()
+            .expect("proof-free Wcash candidate serializes");
+
+        (
+            candidate_bytes,
+            prepared.job_id_bytes(),
+            child_hash,
+            solved,
+            completed_bytes,
+        )
+    }
+
     fn read_test_rpc_request(stream: &mut std::net::TcpStream) -> serde_json::Value {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -3801,28 +3905,92 @@ mod tests {
     }
 
     #[test]
-    fn winner_material_preserves_exact_chain_bytes_and_generation() {
-        let wcash = NativeWinnerBlock {
-            block_hash_le: [0x71; 32],
-            block_bytes: vec![0x01, 0x02, 0x03],
-        };
-        let zcash = NativeWinnerBlock {
-            block_hash_le: [0x72; 32],
-            block_bytes: vec![0x04, 0x05],
-        };
+    fn winner_materialization_preserves_real_auxpow_and_exact_parent_bytes() {
+        let (candidate_bytes, job_id, child_hash, solved, completed_wcash_bytes) =
+            valid_wcash_materialization_fixture();
+        let parent = mainnet_genesis_block();
+        let parent_hash = parent.hash().0;
+        let parent_bytes = parent
+            .zcash_serialize_to_vec()
+            .expect("the exact Zcash fixture serializes");
+
+        let material = materialize_winner_parts(
+            job_id,
+            child_hash,
+            &candidate_bytes,
+            job_id,
+            Some(&solved),
+            parent_hash,
+            Some(&parent_bytes),
+        )
+        .expect("validated winner parts materialize without byte changes");
+        assert_eq!(material.job_id(), job_id);
+        let wcash = material.wcash().expect("the Wcash winner is retained");
+        assert_eq!(wcash.block_hash_le(), child_hash);
+        assert_eq!(wcash.block_bytes(), completed_wcash_bytes);
+        let decoded_wcash: Block = wcash
+            .block_bytes()
+            .zcash_deserialize_into()
+            .expect("materialized Wcash bytes decode");
+        assert_eq!(decoded_wcash.hash().0, child_hash);
+        assert_eq!(
+            decoded_wcash
+                .header
+                .solution
+                .as_wcash()
+                .expect("materialized Wcash block carries AuxPoW")
+                .as_bytes(),
+            solved.encoded_proof(),
+        );
+        let zcash = material.zcash().expect("the Zcash winner is retained");
+        assert_eq!(zcash.block_hash_le(), parent_hash);
+        assert_eq!(zcash.block_bytes(), parent_bytes);
+
+        let ordinary = materialize_winner_parts(
+            job_id,
+            child_hash,
+            &candidate_bytes,
+            job_id,
+            None,
+            [0x55; 32],
+            None,
+        )
+        .expect("an ordinary valid share has no winner blocks");
+        assert!(ordinary.wcash().is_none());
+        assert!(ordinary.zcash().is_none());
+
+        let mut wrong_job_id = job_id;
+        wrong_job_id[0] ^= 1;
+        assert!(matches!(
+            materialize_winner_parts(
+                job_id,
+                child_hash,
+                &candidate_bytes,
+                wrong_job_id,
+                Some(&solved),
+                parent_hash,
+                Some(&parent_bytes),
+            ),
+            Err(MinerError::InvalidRequest(message))
+                if message.contains("different native generation")
+        ));
+    }
+
+    #[test]
+    fn winner_material_debug_redacts_unsubmitted_block_bytes() {
+        let secret_bytes = vec![0xde, 0xad, 0xbe, 0xef, 0xfa, 0xce];
         let material = NativeWinnerMaterial {
             job_id: [0x70; 32],
-            wcash: Some(wcash.clone()),
-            zcash: Some(zcash.clone()),
+            wcash: Some(NativeWinnerBlock {
+                block_hash_le: [0x71; 32],
+                block_bytes: secret_bytes.clone(),
+            }),
+            zcash: None,
         };
 
-        assert_eq!(material.job_id(), [0x70; 32]);
-        assert_eq!(material.wcash(), Some(&wcash));
-        assert_eq!(material.zcash(), Some(&zcash));
-        assert_eq!(wcash.block_hash_le(), [0x71; 32]);
-        assert_eq!(wcash.block_bytes(), [0x01, 0x02, 0x03]);
-        assert_eq!(zcash.block_hash_le(), [0x72; 32]);
-        assert_eq!(zcash.block_bytes(), [0x04, 0x05]);
+        let debug = format!("{material:?}");
+        assert!(debug.contains("block_bytes_len: 6"));
+        assert!(!debug.contains(&format!("{secret_bytes:?}")));
     }
 
     #[test]
