@@ -49,6 +49,15 @@ pub trait PoolBackendRetainedJob: Send + Sync {
     /// Returns the exact proposal-validated descriptor retained by this job.
     fn descriptor(&self) -> JobDescriptor;
 
+    /// Returns the remaining native admission lifetime at the instant sampled.
+    ///
+    /// The actor samples its own monotonic clock before this method, then uses
+    /// the returned duration as an upper bound. Implementations must never
+    /// restart the underlying generation's lifetime. `None` means the job can
+    /// no longer be activated. This method runs under the actor mutex and must
+    /// be a bounded local clock read without RPC or other blocking I/O.
+    fn remaining_lifetime(&self) -> Option<Duration>;
+
     /// Returns whether this retained generation can presently validate work.
     fn is_healthy(&self) -> bool;
 
@@ -561,7 +570,7 @@ impl PoolBackendActor {
         validator: Arc<dyn PoolBackendRetainedJob>,
         superseded_grace: Duration,
     ) -> Result<BackendEvent, PoolBackendActorError> {
-        let descriptor = validator.descriptor();
+        let mut descriptor = validator.descriptor();
         descriptor
             .validate()
             .map_err(PoolBackendActorError::InvalidJob)?;
@@ -570,7 +579,19 @@ impl PoolBackendActor {
         }
 
         let mut state = self.lock_state()?;
+        // Sample the actor clock first. Because the native remaining lifetime
+        // is sampled afterwards, adding it to `now` cannot extend the native
+        // generation's absolute deadline.
         let now = self.clock.now();
+        let remaining_lifetime = validator
+            .remaining_lifetime()
+            .ok_or(PoolBackendActorError::RetainedJobUnhealthy)?;
+        let remaining_ms = u32::try_from(remaining_lifetime.as_millis()).unwrap_or(u32::MAX);
+        if remaining_ms == 0 {
+            return Err(PoolBackendActorError::RetainedJobUnhealthy);
+        }
+        descriptor.max_age_ms = descriptor.max_age_ms.min(remaining_ms);
+
         expire_jobs(&mut state, now)?;
         state
             .target_policy
@@ -969,9 +990,6 @@ impl PoolBackendActor {
         };
         if !advertised || acceptable_job(retained, now).is_none() {
             return Err(stale_job());
-        }
-        if !retained.validator.is_healthy() {
-            return Err(unhealthy_backend("retained job validator is unavailable"));
         }
         state
             .target_policy
@@ -1687,22 +1705,48 @@ mod tests {
     struct TestRetainedJob {
         descriptor: JobDescriptor,
         healthy: AtomicBool,
+        remaining_lifetime: Mutex<Option<Duration>>,
+        validated: Mutex<PoolBackendValidatedShare>,
         validations: AtomicUsize,
     }
 
     impl TestRetainedJob {
         fn new(descriptor: JobDescriptor) -> Self {
+            let remaining_lifetime = Some(Duration::from_millis(u64::from(descriptor.max_age_ms)));
             Self {
                 descriptor,
                 healthy: AtomicBool::new(true),
+                remaining_lifetime: Mutex::new(remaining_lifetime),
+                validated: Mutex::new(PoolBackendValidatedShare::ordinary()),
                 validations: AtomicUsize::new(0),
             }
+        }
+
+        fn set_remaining_lifetime(&self, remaining: Option<Duration>) {
+            *self
+                .remaining_lifetime
+                .lock()
+                .expect("test lifetime mutex is not poisoned") = remaining;
+        }
+
+        fn set_validated(&self, validated: PoolBackendValidatedShare) {
+            *self
+                .validated
+                .lock()
+                .expect("test validation mutex is not poisoned") = validated;
         }
     }
 
     impl PoolBackendRetainedJob for TestRetainedJob {
         fn descriptor(&self) -> JobDescriptor {
             self.descriptor.clone()
+        }
+
+        fn remaining_lifetime(&self) -> Option<Duration> {
+            *self
+                .remaining_lifetime
+                .lock()
+                .expect("test lifetime mutex is not poisoned")
         }
 
         fn is_healthy(&self) -> bool {
@@ -1714,7 +1758,11 @@ mod tests {
             _share: PoolBackendShareRequest<'_>,
         ) -> Result<PoolBackendValidatedShare, PoolBackendShareValidationError> {
             self.validations.fetch_add(1, Ordering::AcqRel);
-            Ok(PoolBackendValidatedShare::ordinary())
+            Ok(self
+                .validated
+                .lock()
+                .expect("test validation mutex is not poisoned")
+                .clone())
         }
     }
 
@@ -1998,6 +2046,60 @@ mod tests {
         }
     }
 
+    fn zcash_winner_fixture(byte: u8) -> (JobDescriptor, BackendRequest, Vec<u8>) {
+        let block_bytes = hex::decode(
+            include_str!("../../zebra-test/src/vectors/block-main-0-000-001.txt").trim(),
+        )
+        .expect("Zcash block-one fixture is hex");
+        let block: Block = block_bytes
+            .as_slice()
+            .zcash_deserialize_into()
+            .expect("Zcash block-one fixture decodes");
+        let mut descriptor = job(byte);
+        descriptor.header_input = Hex108::new(
+            block_bytes[..108]
+                .try_into()
+                .expect("Zcash v4 header input has 108 bytes"),
+        );
+        descriptor.zcash_previous_hash_le = Hex32::new(block.header.previous_block_hash.0);
+        descriptor.zcash_coinbase_txid_le = Hex32::new(block.transactions[0].hash().0);
+        descriptor.zcash_height = 1;
+        descriptor.zcash_maturity_confirmations = 1;
+        let expanded_target: U256 = block
+            .header
+            .difficulty_threshold
+            .to_expanded()
+            .expect("fixture compact target is valid")
+            .into();
+        descriptor.zcash_target_le = TargetLe::new(expanded_target.to_little_endian());
+
+        assert_eq!(&block_bytes[140..143], &[0xfd, 0x40, 0x05]);
+        let request = BackendRequest::SubmitShare {
+            version: BACKEND_PROTOCOL_VERSION,
+            id: 2,
+            job_id: descriptor.job_id.clone(),
+            identity: identity(),
+            target_le: TargetLe::new([0xff; 32]),
+            time: Hex4::new(
+                descriptor.header_input.as_bytes()[100..104]
+                    .try_into()
+                    .expect("header time has four bytes"),
+            ),
+            nonce: Hex32::new(
+                block_bytes[108..140]
+                    .try_into()
+                    .expect("Zcash nonce has 32 bytes"),
+            ),
+            solution: Box::new(Hex1344::new(
+                block_bytes[143..1487]
+                    .try_into()
+                    .expect("Zcash Equihash solution has 1344 bytes"),
+            )),
+        };
+
+        (descriptor, request, block_bytes)
+    }
+
     fn snapshot(actor: &PoolBackendActor, after_event_seq: u64) -> BackendMessage {
         actor
             .dispatch(
@@ -2151,6 +2253,139 @@ mod tests {
                 current: Some(AcceptableJob { job, .. }),
                 ..
             } if job.job_id == descriptor.job_id
+        ));
+    }
+
+    #[test]
+    fn activation_uses_remaining_native_lifetime_without_restarting_it() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let clock = Arc::new(TestClock::new());
+        let actor = actor(&path, &config, Arc::clone(&clock));
+        let descriptor = job(1);
+        let retained = Arc::new(TestRetainedJob::new(descriptor));
+        retained.set_remaining_lifetime(Some(Duration::from_millis(1_234)));
+
+        let activated = actor
+            .activate_job(retained, Duration::from_secs(5))
+            .expect("remaining native lifetime activates the job");
+        assert!(matches!(
+            activated,
+            BackendEvent::JobActivated { job, .. } if job.max_age_ms == 1_234
+        ));
+        assert!(matches!(
+            snapshot(&actor, 0),
+            BackendMessage::JobSnapshot {
+                current: Some(AcceptableJob {
+                    job,
+                    accept_for_ms: 1_234,
+                    ..
+                }),
+                ..
+            } if job.max_age_ms == 1_234
+        ));
+
+        clock.advance(Duration::from_millis(1_234));
+        assert!(matches!(
+            snapshot(&actor, 0),
+            BackendMessage::JobSnapshot { current: None, .. }
+        ));
+    }
+
+    #[test]
+    fn exhausted_native_lifetime_cannot_mutate_the_journal() {
+        for remaining in [None, Some(Duration::from_micros(999))] {
+            let directory = private_temp_dir();
+            let path = directory.path().join("actor.journal");
+            let config = config();
+            let actor = actor(&path, &config, Arc::new(TestClock::new()));
+            let retained = Arc::new(TestRetainedJob::new(job(1)));
+            retained.set_remaining_lifetime(remaining);
+
+            assert!(matches!(
+                actor.activate_job(retained, Duration::from_secs(5)),
+                Err(PoolBackendActorError::RetainedJobUnhealthy)
+            ));
+            assert_eq!(
+                actor
+                    .lock_state()
+                    .expect("actor mutex")
+                    .journal
+                    .current_event_seq()
+                    .expect("journal watermark"),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn unhealthy_validator_cannot_be_activated() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let actor = actor(&path, &config, Arc::new(TestClock::new()));
+        let retained = Arc::new(TestRetainedJob::new(job(1)));
+        retained.healthy.store(false, Ordering::Release);
+
+        assert!(matches!(
+            actor.activate_job(retained, Duration::from_secs(5)),
+            Err(PoolBackendActorError::RetainedJobUnhealthy)
+        ));
+        assert_eq!(
+            actor
+                .lock_state()
+                .expect("actor mutex")
+                .journal
+                .current_event_seq()
+                .expect("journal watermark"),
+            0
+        );
+    }
+
+    #[test]
+    fn unhealthy_status_cannot_suppress_an_exact_retained_winner() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let actor = actor(&path, &config, Arc::new(TestClock::new()));
+        let (descriptor, request, block_bytes) = zcash_winner_fixture(9);
+        let retained = Arc::new(TestRetainedJob::new(descriptor));
+        retained.set_validated(PoolBackendValidatedShare::with_winners(
+            None,
+            Some(block_bytes),
+        ));
+        actor
+            .activate_job(retained.clone(), Duration::from_secs(5))
+            .expect("activate exact winner fixture");
+
+        retained.healthy.store(false, Ordering::Release);
+        let response = actor
+            .dispatch(uuid(20), Some(1), BackendRequestKind::SubmitShare, request)
+            .expect("winner validation runs despite unhealthy status");
+        assert!(matches!(
+            response.last(),
+            Some(BackendMessage::ShareCommitted {
+                receipt: ShareReceipt { winners, .. },
+                replayed: false,
+                ..
+            }) if matches!(winners.as_slice(), [WinnerDescriptor { chain: MergedChain::Zcash, .. }])
+        ));
+        assert_eq!(retained.validations.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            actor
+                .dispatch(
+                    uuid(20),
+                    None,
+                    BackendRequestKind::Health,
+                    BackendRequest::Health {
+                        version: BACKEND_PROTOCOL_VERSION,
+                        id: 3,
+                    },
+                )
+                .expect("health response succeeds")
+                .as_slice(),
+            [BackendMessage::HealthStatus { healthy: false, .. }]
         ));
     }
 

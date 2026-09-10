@@ -20,6 +20,7 @@ mod coordinator;
 mod error;
 mod job;
 pub mod native;
+mod native_retained_job;
 pub mod pool_backend;
 mod pool_backend_actor;
 mod pool_backend_connection;
@@ -54,6 +55,7 @@ pub use native::{
     NativeZcashConfig, NativeZcashNetwork, NativeZcashProvider, ParentNodeOutcome,
     ParentSubmissionReport, ValidatedNativeShare,
 };
+pub use native_retained_job::NativePoolBackendRetainedJob;
 pub use pool_backend_actor::{
     PoolBackendActor, PoolBackendActorError, PoolBackendRetainedJob, PoolBackendShareRequest,
     PoolBackendShareValidationError, PoolBackendValidatedShare, PoolBackendWinnerKey,
