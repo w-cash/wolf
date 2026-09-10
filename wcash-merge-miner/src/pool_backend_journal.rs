@@ -325,6 +325,30 @@ pub enum PoolBackendJournalError {
         share_id: Hex32,
     },
 
+    /// Winner reconciliation named a share and chain absent from this journal.
+    #[error("pool backend winner {share_id}/{chain:?} is not retained")]
+    WinnerNotFound {
+        /// Stable proof identity that created the winner.
+        share_id: Hex32,
+        /// Independently reconciled merged-mining chain.
+        chain: MergedChain,
+    },
+
+    /// A reconciliation result was computed from an obsolete winner snapshot.
+    #[error(
+        "pool backend winner {share_id}/{chain:?} revision changed from {expected} to {actual}"
+    )]
+    WinnerRevisionConflict {
+        /// Stable proof identity that created the winner.
+        share_id: Hex32,
+        /// Independently reconciled merged-mining chain.
+        chain: MergedChain,
+        /// Per-winner event revision observed before external work began.
+        expected: u64,
+        /// Current per-winner event revision under the journal mutex.
+        actual: u64,
+    },
+
     /// A winning share did not carry exactly one bounded canonical block for
     /// each winner descriptor and no unrelated private block.
     #[error("invalid private {chain} winner block at event {event_seq}: {reason}")]
@@ -555,21 +579,111 @@ pub enum JournalWinnerLifecycle {
     },
 }
 
+/// One lifecycle result produced by a future winner-reconciliation worker.
+///
+/// This type remains crate-private so only the actor's authority-bound public
+/// snapshots can authorize a compare-and-swap transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum JournalWinnerTransition {
+    /// The exact retained block is on the sampled best chain.
+    Observed {
+        /// Exact best-chain tip used for the observation.
+        tip: ChainTip,
+        /// Confirmations computed from the same snapshot as `tip`.
+        confirmations: u32,
+    },
+    /// A previously observed or matured winner left the best chain.
+    Orphaned {
+        /// Exact replacement best-chain tip.
+        tip: ChainTip,
+    },
+    /// A conflicting Wcash AuxPoW witness occupies this block ID.
+    Quarantined {
+        /// Exact best-chain tip sampled with the conflict.
+        tip: ChainTip,
+    },
+    /// A quarantined Wcash winner is absent and eligible for resubmission.
+    Requeued {
+        /// Exact best-chain tip sampled before releasing quarantine.
+        tip: ChainTip,
+    },
+    /// An observed reward reached its immutable maturity threshold.
+    Matured {
+        /// Exact best-chain tip used for maturity.
+        tip: ChainTip,
+        /// Confirmations computed from the same snapshot as `tip`.
+        confirmations: u32,
+    },
+}
+
+impl JournalWinnerTransition {
+    fn into_event(self, event_seq: u64, state: &JournalWinnerState) -> BackendEvent {
+        let share_id = state.share_id.clone();
+        let job_id = state.job_id.clone();
+        let winner = state.winner.clone();
+        match self {
+            Self::Observed { tip, confirmations } => BackendEvent::WinnerObserved {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+                confirmations,
+            },
+            Self::Orphaned { tip } => BackendEvent::WinnerOrphaned {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+            },
+            Self::Quarantined { tip } => BackendEvent::WinnerQuarantined {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+            },
+            Self::Requeued { tip } => BackendEvent::WinnerRequeued {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+            },
+            Self::Matured { tip, confirmations } => BackendEvent::WinnerMatured {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+                confirmations,
+            },
+        }
+    }
+}
+
 /// Durable private state for one winner, reconstructed during journal replay.
 #[derive(Clone, Eq, PartialEq)]
-pub struct JournalWinnerState {
+pub(crate) struct JournalWinnerState {
     /// Stable accepted-share identity.
-    pub share_id: Hex32,
+    pub(crate) share_id: Hex32,
     /// Generation that created this winner.
-    pub job_id: Hex32,
+    pub(crate) job_id: Hex32,
     /// Immutable public winner facts.
-    pub winner: WinnerDescriptor,
+    pub(crate) winner: WinnerDescriptor,
     /// Validated parent header hash shared by both merged chains.
-    pub parent_hash_le: Hex32,
+    pub(crate) parent_hash_le: Hex32,
     /// Exact canonical block bytes retained by Wolf.
-    pub block_bytes: Vec<u8>,
+    pub(crate) block_bytes: Vec<u8>,
     /// Latest valid durable lifecycle state.
-    pub lifecycle: JournalWinnerLifecycle,
+    pub(crate) lifecycle: JournalWinnerLifecycle,
+    /// Event sequence of this winner's latest lifecycle mutation.
+    ///
+    /// The original `ShareCommitted` sequence is the initial revision. Unlike
+    /// the journal's global watermark, unrelated events do not invalidate a
+    /// reconciliation snapshot.
+    pub(crate) revision_event_seq: u64,
 }
 
 /// Lightweight winner-outbox counts for backend health reporting.
@@ -596,6 +710,7 @@ impl std::fmt::Debug for JournalWinnerState {
             .field("parent_hash_le", &self.parent_hash_le)
             .field("block_bytes_len", &self.block_bytes.len())
             .field("lifecycle", &self.lifecycle)
+            .field("revision_event_seq", &self.revision_event_seq)
             .finish()
     }
 }
@@ -632,6 +747,12 @@ struct JournalSemanticState {
     jobs: HashMap<Hex32, JournalJobState>,
     shares: HashMap<Hex32, JournalShareState>,
     winners: HashMap<WinnerKey, JournalWinnerState>,
+    /// Allocation-bounded journal-order index for incremental reconciliation.
+    ///
+    /// Winner state remains in the hash map for constant-time point updates.
+    /// Winners are never removed, so append order is stable across replay and
+    /// lets a cursor advance in constant time without scanning retained blocks.
+    winner_order: Vec<WinnerKey>,
 }
 
 struct JournalState {
@@ -1119,14 +1240,96 @@ impl PoolBackendJournal {
         })
     }
 
-    /// Returns all reconstructed winner states, including matured winners.
+    /// Returns the next retained winner in durable journal order while cloning
+    /// only that winner's bounded exact block.
     ///
-    /// No winner is deleted at maturity, because a later deep reorganization
-    /// can still orphan it and must retain the exact submitted bytes.
-    pub fn winner_states(&self) -> Result<Vec<JournalWinnerState>, PoolBackendJournalError> {
+    /// Matured winners remain enumerable because maturity is reversible under
+    /// a deep reorganization. Callers restart at `None` after reaching the end
+    /// of a pass; a per-winner revision prevents a result from overwriting any
+    /// lifecycle change made while external reconciliation was in flight.
+    pub(crate) fn next_winner_state(
+        &self,
+        after_ordinal: Option<usize>,
+    ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
         let state = self.lock_state()?;
         ensure_usable(&state)?;
-        Ok(state.semantic.winners.values().cloned().collect())
+        let index = match after_ordinal {
+            Some(ordinal) => ordinal
+                .checked_add(1)
+                .ok_or(PoolBackendJournalError::Overflow)?,
+            None => 0,
+        };
+        let Some(key) = state.semantic.winner_order.get(index) else {
+            return Ok(None);
+        };
+        let event_seq = next_event_seq(&state)?;
+        let winner =
+            state.semantic.winners.get(key).ok_or_else(|| {
+                semantic(event_seq, "winner index references absent private state")
+            })?;
+        Ok(Some((index, winner.clone())))
+    }
+
+    /// Returns one exact retained winner without materializing the outbox.
+    pub(crate) fn winner_state(
+        &self,
+        share_id: &Hex32,
+        chain: MergedChain,
+    ) -> Result<Option<JournalWinnerState>, PoolBackendJournalError> {
+        let state = self.lock_state()?;
+        ensure_usable(&state)?;
+        Ok(state
+            .semantic
+            .winners
+            .get(&WinnerKey {
+                share_id: share_id.clone(),
+                chain,
+            })
+            .cloned())
+    }
+
+    /// Applies one lifecycle result only if the named winner is still at the
+    /// exact per-winner revision used for the external observation.
+    ///
+    /// The comparison, event allocation, semantic validation, append, and
+    /// fsync all occur under the same journal mutex. Unrelated journal events
+    /// do not cause false conflicts, while a stale result for this winner can
+    /// never overwrite a newer lifecycle state.
+    pub(crate) fn compare_and_transition_winner(
+        &self,
+        share_id: &Hex32,
+        chain: MergedChain,
+        expected_revision: u64,
+        transition: JournalWinnerTransition,
+    ) -> Result<BackendEvent, PoolBackendJournalError> {
+        let mut state = self.lock_state()?;
+        ensure_usable(&state)?;
+        let key = WinnerKey {
+            share_id: share_id.clone(),
+            chain,
+        };
+        let winner = state.semantic.winners.get(&key).ok_or_else(|| {
+            PoolBackendJournalError::WinnerNotFound {
+                share_id: share_id.clone(),
+                chain,
+            }
+        })?;
+        if winner.revision_event_seq != expected_revision {
+            return Err(PoolBackendJournalError::WinnerRevisionConflict {
+                share_id: share_id.clone(),
+                chain,
+                expected: expected_revision,
+                actual: winner.revision_event_seq,
+            });
+        }
+
+        // Clone only public immutable metadata. Exact block bytes stay in the
+        // semantic outbox throughout the transition.
+        let event_seq = next_event_seq(&state)?;
+        let event = transition.into_event(event_seq, winner);
+        let blocks = PersistedWinnerBlocks::default();
+        self.append_locked(&mut state, event.clone(), blocks)?;
+        Ok(event)
     }
 
     /// Returns winner-outbox counts without cloning any retained block bytes.
@@ -1431,6 +1634,9 @@ impl JournalSemanticState {
                     .map_err(PoolBackendJournalError::Allocation)?;
                 self.winners
                     .try_reserve(receipt.winners.len())
+                    .map_err(PoolBackendJournalError::Allocation)?;
+                self.winner_order
+                    .try_reserve(receipt.winners.len())
                     .map_err(PoolBackendJournalError::Allocation)
             }
             _ => Ok(()),
@@ -1519,6 +1725,18 @@ impl JournalSemanticState {
                     &job.job,
                     event_seq,
                 )?;
+                for winner in &receipt.winners {
+                    let key = WinnerKey {
+                        share_id: receipt.share_id.clone(),
+                        chain: winner.chain,
+                    };
+                    if self.winners.contains_key(&key) {
+                        return Err(semantic(
+                            event_seq,
+                            "winner key was committed more than once",
+                        ));
+                    }
+                }
                 self.shares.insert(
                     receipt.share_id.clone(),
                     JournalShareState {
@@ -1543,26 +1761,19 @@ impl JournalSemanticState {
                         share_id: receipt.share_id.clone(),
                         chain: winner.chain,
                     };
-                    if self
-                        .winners
-                        .insert(
-                            key,
-                            JournalWinnerState {
-                                share_id: receipt.share_id.clone(),
-                                job_id: receipt.job_id.clone(),
-                                winner: winner.clone(),
-                                parent_hash_le: receipt.parent_hash_le.clone(),
-                                block_bytes: block_bytes.clone(),
-                                lifecycle: JournalWinnerLifecycle::Pending,
-                            },
-                        )
-                        .is_some()
-                    {
-                        return Err(semantic(
-                            event_seq,
-                            "winner key was committed more than once",
-                        ));
-                    }
+                    self.winner_order.push(key.clone());
+                    self.winners.insert(
+                        key,
+                        JournalWinnerState {
+                            share_id: receipt.share_id.clone(),
+                            job_id: receipt.job_id.clone(),
+                            winner: winner.clone(),
+                            parent_hash_le: receipt.parent_hash_le.clone(),
+                            block_bytes: block_bytes.clone(),
+                            lifecycle: JournalWinnerLifecycle::Pending,
+                            revision_event_seq: event_seq,
+                        },
+                    );
                 }
             }
             BackendEvent::WinnerObserved {
@@ -1597,6 +1808,7 @@ impl JournalSemanticState {
                     tip: tip.clone(),
                     confirmations: *confirmations,
                 };
+                state.revision_event_seq = event_seq;
             }
             BackendEvent::WinnerOrphaned {
                 share_id,
@@ -1618,6 +1830,7 @@ impl JournalSemanticState {
                     ));
                 }
                 state.lifecycle = JournalWinnerLifecycle::Orphaned { tip: tip.clone() };
+                state.revision_event_seq = event_seq;
             }
             BackendEvent::WinnerQuarantined {
                 share_id,
@@ -1639,6 +1852,7 @@ impl JournalSemanticState {
                     ));
                 }
                 state.lifecycle = JournalWinnerLifecycle::Quarantined { tip: tip.clone() };
+                state.revision_event_seq = event_seq;
             }
             BackendEvent::WinnerRequeued {
                 share_id,
@@ -1656,6 +1870,7 @@ impl JournalSemanticState {
                     ));
                 }
                 state.lifecycle = JournalWinnerLifecycle::Requeued { tip: tip.clone() };
+                state.revision_event_seq = event_seq;
             }
             BackendEvent::WinnerMatured {
                 share_id,
@@ -1674,6 +1889,7 @@ impl JournalSemanticState {
                     tip: tip.clone(),
                     confirmations: *confirmations,
                 };
+                state.revision_event_seq = event_seq;
             }
         }
         Ok(())
@@ -3203,11 +3419,13 @@ mod tests {
                 confirmations: 1,
             })
             .expect("mature winner");
-        let retained = journal.winner_states().expect("winner state");
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].block_bytes, block_bytes);
+        let (_, retained) = journal
+            .next_winner_state(None)
+            .expect("winner state")
+            .expect("winner is retained");
+        assert_eq!(retained.block_bytes, block_bytes);
         assert!(matches!(
-            retained[0].lifecycle,
+            retained.lifecycle,
             JournalWinnerLifecycle::Matured { .. }
         ));
         assert_eq!(
@@ -3217,11 +3435,13 @@ mod tests {
         drop(journal);
 
         let reopened = open(&path, &config);
-        let retained = reopened.winner_states().expect("replayed winner state");
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].block_bytes, block_bytes);
+        let (_, retained) = reopened
+            .next_winner_state(None)
+            .expect("replayed winner state")
+            .expect("winner is retained after replay");
+        assert_eq!(retained.block_bytes, block_bytes);
         assert!(matches!(
-            retained[0].lifecycle,
+            retained.lifecycle,
             JournalWinnerLifecycle::Matured { .. }
         ));
         reopened
@@ -3236,10 +3456,13 @@ mod tests {
                 },
             })
             .expect("deep reorganization reverses maturity");
-        let retained = reopened.winner_states().expect("orphaned state");
-        assert_eq!(retained[0].block_bytes, block_bytes);
+        let (_, retained) = reopened
+            .next_winner_state(None)
+            .expect("orphaned state")
+            .expect("winner remains retained after orphaning");
+        assert_eq!(retained.block_bytes, block_bytes);
         assert!(matches!(
-            retained[0].lifecycle,
+            retained.lifecycle,
             JournalWinnerLifecycle::Orphaned { .. }
         ));
         assert_eq!(
