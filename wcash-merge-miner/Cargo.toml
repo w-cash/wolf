@@ -24,7 +24,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
-wcash-pool-protocol = { git = "https://github.com/w-cash/pool.git", rev = "3b23f184a58da199c326d77c5486f8c9f54c32fc" }
+wcash-pool-protocol = { git = "https://github.com/w-cash/pool.git", rev = "adb66440a99a8dba9189ee15849e46e5a8c08441" }
 wcash-zcash-aux = { path = "../wcash-zcash-aux" }
 zcash_address.workspace = true
 zcash_protocol.workspace = true
