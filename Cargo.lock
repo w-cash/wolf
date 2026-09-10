@@ -6827,7 +6827,7 @@ dependencies = [
 [[package]]
 name = "wcash-pool-protocol"
 version = "0.1.0-alpha.1"
-source = "git+https://github.com/w-cash/pool.git?rev=3b23f184a58da199c326d77c5486f8c9f54c32fc#3b23f184a58da199c326d77c5486f8c9f54c32fc"
+source = "git+https://github.com/w-cash/pool.git?rev=adb66440a99a8dba9189ee15849e46e5a8c08441#adb66440a99a8dba9189ee15849e46e5a8c08441"
 dependencies = [
  "hex",
  "serde",
