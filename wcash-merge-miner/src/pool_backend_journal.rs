@@ -366,6 +366,11 @@ pub enum PoolBackendJournalError {
     #[error("ShareCommitted must use the atomic share append API")]
     ShareRequiresAtomicAppend,
 
+    /// Generic append is forbidden for winner lifecycle changes because every
+    /// transition must compare the exact authority-bound winner revision.
+    #[error("winner lifecycle events must use the compare-and-swap transition API")]
+    WinnerRequiresCompareAndSwap,
+
     /// The outer record and embedded event disagree about their sequence.
     #[error(
         "pool backend journal record sequence {record_seq} does not match embedded event sequence {event_seq}"
@@ -1147,18 +1152,30 @@ impl PoolBackendJournal {
         Ok(state.events.last().map_or(0, BackendEvent::event_seq))
     }
 
-    /// Semantically validates and durably appends one non-share event.
+    /// Semantically validates and durably appends one job-lifecycle event.
     ///
     /// The supplied sequence is ignored and replaced by the exact next value
     /// while the journal mutex is held. Accepted shares must use
     /// [`Self::append_share_committed`] so their exact private winner blocks are
-    /// covered by the same record digest and fsync.
+    /// covered by the same record digest and fsync. Winner lifecycle changes
+    /// must use the crate-private compare-and-swap path exposed through
+    /// [`crate::PoolBackendActor`].
     pub fn append_event(
         &self,
         event: BackendEvent,
     ) -> Result<BackendEvent, PoolBackendJournalError> {
         if matches!(event, BackendEvent::ShareCommitted { .. }) {
             return Err(PoolBackendJournalError::ShareRequiresAtomicAppend);
+        }
+        if matches!(
+            event,
+            BackendEvent::WinnerObserved { .. }
+                | BackendEvent::WinnerOrphaned { .. }
+                | BackendEvent::WinnerQuarantined { .. }
+                | BackendEvent::WinnerRequeued { .. }
+                | BackendEvent::WinnerMatured { .. }
+        ) {
+            return Err(PoolBackendJournalError::WinnerRequiresCompareAndSwap);
         }
         let mut state = self.lock_state()?;
         ensure_usable(&state)?;
@@ -3399,26 +3416,92 @@ mod tests {
             block_hash_le: Hex32::new(block_hash),
             height: 1,
         };
-        journal
-            .append_event(BackendEvent::WinnerObserved {
+        let committed_revision = commit.receipt.event_seq;
+        let replacement_tip = ChainTip {
+            block_hash_le: Hex32::new([0x91; 32]),
+            height: 1,
+        };
+        let direct_lifecycle_events = [
+            BackendEvent::WinnerObserved {
                 event_seq: 0,
                 share_id: commit.receipt.share_id.clone(),
                 job_id: descriptor.job_id.clone(),
                 winner: winner.clone(),
                 tip: tip.clone(),
                 confirmations: 1,
-            })
-            .expect("observe winner");
-        journal
-            .append_event(BackendEvent::WinnerMatured {
+            },
+            BackendEvent::WinnerOrphaned {
                 event_seq: 0,
                 share_id: commit.receipt.share_id.clone(),
                 job_id: descriptor.job_id.clone(),
                 winner: winner.clone(),
-                tip,
+                tip: replacement_tip.clone(),
+            },
+            BackendEvent::WinnerQuarantined {
+                event_seq: 0,
+                share_id: commit.receipt.share_id.clone(),
+                job_id: descriptor.job_id.clone(),
+                winner: winner.clone(),
+                tip: tip.clone(),
+            },
+            BackendEvent::WinnerRequeued {
+                event_seq: 0,
+                share_id: commit.receipt.share_id.clone(),
+                job_id: descriptor.job_id.clone(),
+                winner: winner.clone(),
+                tip: replacement_tip.clone(),
+            },
+            BackendEvent::WinnerMatured {
+                event_seq: 0,
+                share_id: commit.receipt.share_id.clone(),
+                job_id: descriptor.job_id.clone(),
+                winner: winner.clone(),
+                tip: tip.clone(),
                 confirmations: 1,
-            })
-            .expect("mature winner");
+            },
+        ];
+        for event in direct_lifecycle_events {
+            assert!(matches!(
+                journal.append_event(event),
+                Err(PoolBackendJournalError::WinnerRequiresCompareAndSwap)
+            ));
+        }
+        assert_eq!(
+            journal
+                .current_event_seq()
+                .expect("rejected direct lifecycle append preserves watermark"),
+            committed_revision
+        );
+        assert_eq!(
+            journal
+                .winner_state(&commit.receipt.share_id, MergedChain::Zcash)
+                .expect("read winner after rejected direct lifecycle append")
+                .expect("winner remains retained")
+                .revision_event_seq,
+            committed_revision
+        );
+        let observed = journal
+            .compare_and_transition_winner(
+                &commit.receipt.share_id,
+                MergedChain::Zcash,
+                committed_revision,
+                JournalWinnerTransition::Observed {
+                    tip: tip.clone(),
+                    confirmations: 1,
+                },
+            )
+            .expect("observe winner through revision CAS");
+        journal
+            .compare_and_transition_winner(
+                &commit.receipt.share_id,
+                MergedChain::Zcash,
+                observed.event_seq(),
+                JournalWinnerTransition::Matured {
+                    tip,
+                    confirmations: 1,
+                },
+            )
+            .expect("mature winner through revision CAS");
         let (_, retained) = journal
             .next_winner_state(None)
             .expect("winner state")
@@ -3445,16 +3528,14 @@ mod tests {
             JournalWinnerLifecycle::Matured { .. }
         ));
         reopened
-            .append_event(BackendEvent::WinnerOrphaned {
-                event_seq: 0,
-                share_id: commit.receipt.share_id,
-                job_id: descriptor.job_id,
-                winner,
-                tip: ChainTip {
-                    block_hash_le: Hex32::new([0x91; 32]),
-                    height: 1,
+            .compare_and_transition_winner(
+                &commit.receipt.share_id,
+                MergedChain::Zcash,
+                retained.revision_event_seq,
+                JournalWinnerTransition::Orphaned {
+                    tip: replacement_tip,
                 },
-            })
+            )
             .expect("deep reorganization reverses maturity");
         let (_, retained) = reopened
             .next_winner_state(None)
