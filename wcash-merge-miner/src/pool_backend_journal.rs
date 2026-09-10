@@ -13,6 +13,7 @@
 //! limits without changing the on-disk format.
 
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -24,12 +25,16 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 use wcash_pool_protocol::{
-    BackendEvent, BackendMessage, CanonicalUuid, Hex32, ProtocolError, BACKEND_PROTOCOL_VERSION,
-    MAX_BACKEND_PAYLOAD_BYTES, MAX_EVENT_PAGE_ITEMS,
+    BackendEvent, BackendMessage, CanonicalUuid, ChainTip, Hex32, JobDescriptor, MergedChain,
+    ProtocolError, ShareReceipt, TargetLe, WinnerDescriptor, WorkerIdentity,
+    BACKEND_PROTOCOL_VERSION, MAX_BACKEND_PAYLOAD_BYTES, MAX_EVENT_PAGE_ITEMS,
 };
+use zebra_chain::{block::Block, serialization::ZcashDeserializeInto};
+
+use crate::coordinator::{validate_persisted_winner_block, PersistedWinnerBlockKind};
 
 /// On-disk format implemented by this module.
-pub const JOURNAL_FORMAT_VERSION: u16 = 1;
+pub const JOURNAL_FORMAT_VERSION: u16 = 2;
 
 /// Maximum number of events retained and replayed by this foundation.
 pub const MAX_JOURNAL_EVENTS: usize = 1_000_000;
@@ -38,11 +43,14 @@ pub const MAX_JOURNAL_EVENTS: usize = 1_000_000;
 pub const MAX_JOURNAL_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Maximum size of one header or event line, including its newline.
-pub const MAX_JOURNAL_RECORD_BYTES: usize = MAX_BACKEND_PAYLOAD_BYTES + 4 * 1024;
+pub const MAX_JOURNAL_RECORD_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum decoded size of one exact Wcash or Zcash winner block.
+pub const MAX_WINNER_BLOCK_BYTES: usize = 2_000_000;
 
 const PRIVATE_FILE_MODE: u32 = 0o600;
-const HEADER_DIGEST_DOMAIN: &[u8] = b"wcash-pool/backend-journal-header/v1\0";
-const EVENT_DIGEST_DOMAIN: &[u8] = b"wcash-pool/backend-journal-event/v1\0";
+const HEADER_DIGEST_DOMAIN: &[u8] = b"wcash-pool/backend-journal-header/v2\0";
+const EVENT_DIGEST_DOMAIN: &[u8] = b"wcash-pool/backend-journal-event/v2\0";
 
 /// An error that prevents safe creation, replay, or use of the backend journal.
 #[derive(Debug, Error)]
@@ -301,6 +309,39 @@ pub enum PoolBackendJournalError {
         source: ProtocolError,
     },
 
+    /// A schema-valid event contradicts earlier durable journal state.
+    #[error("pool backend journal semantic violation at event {event_seq}: {reason}")]
+    SemanticViolation {
+        /// Sequence being validated, or the next sequence for a proposed append.
+        event_seq: u64,
+        /// Stable description of the violated state-machine invariant.
+        reason: &'static str,
+    },
+
+    /// A stable share ID was retried with different immutable data.
+    #[error("pool backend share {share_id} was retried with conflicting immutable data")]
+    ShareConflict {
+        /// Stable proof identity whose durable attribution or result changed.
+        share_id: Hex32,
+    },
+
+    /// A winning share did not carry exactly one bounded canonical block for
+    /// each winner descriptor and no unrelated private block.
+    #[error("invalid private {chain} winner block at event {event_seq}: {reason}")]
+    InvalidWinnerBlock {
+        /// Event whose private winner material is invalid.
+        event_seq: u64,
+        /// Chain whose exact block failed validation.
+        chain: &'static str,
+        /// Stable description of the failed binding or bound.
+        reason: String,
+    },
+
+    /// Generic append is forbidden for shares because winner bytes must be
+    /// committed atomically by `append_share_committed`.
+    #[error("ShareCommitted must use the atomic share append API")]
+    ShareRequiresAtomicAppend,
+
     /// The outer record and embedded event disagree about their sequence.
     #[error(
         "pool backend journal record sequence {record_seq} does not match embedded event sequence {event_seq}"
@@ -411,12 +452,26 @@ struct JournalHeader {
     chain_id: u32,
 }
 
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedWinnerBlocks {
+    wcash: Option<String>,
+    zcash: Option<String>,
+}
+
+impl PersistedWinnerBlocks {
+    fn is_empty(&self) -> bool {
+        self.wcash.is_none() && self.zcash.is_none()
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedEventRecord {
     record: EventRecordKind,
     event_seq: u64,
     event: BackendEvent,
+    winner_blocks: PersistedWinnerBlocks,
     previous_digest: Hex32,
     digest: Hex32,
 }
@@ -426,7 +481,143 @@ struct CanonicalUnsignedEventRecord<'a> {
     record: EventRecordKind,
     event_seq: u64,
     event: &'a BackendEvent,
+    winner_blocks: &'a PersistedWinnerBlocks,
     previous_digest: &'a Hex32,
+}
+
+/// Exact private block material committed with a winning share.
+///
+/// These bytes are never copied into the public [`BackendEvent`] stream. They
+/// remain in Wolf's owner-only journal so submissions and deep-reorganization
+/// handling can resume after a crash.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct JournalWinnerBlocks {
+    /// Canonical completed Wcash block, present exactly for a Wcash winner.
+    pub wcash: Option<Vec<u8>>,
+    /// Canonical completed Zcash block, present exactly for a Zcash winner.
+    pub zcash: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for JournalWinnerBlocks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JournalWinnerBlocks")
+            .field("wcash_bytes", &self.wcash.as_ref().map(Vec::len))
+            .field("zcash_bytes", &self.zcash.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
+/// Outcome of the atomic, idempotent accepted-share append.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalShareCommit {
+    /// Original durable receipt, including its internally allocated sequence.
+    pub receipt: ShareReceipt,
+    /// True when the exact immutable share was already durable.
+    pub replayed: bool,
+}
+
+/// Reconstructed lifecycle of one exact winning block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JournalWinnerLifecycle {
+    /// Exact bytes are retained for initial submission or reconciliation.
+    Pending,
+    /// The exact winner is on the sampled best chain.
+    Observed {
+        /// Tip used for the observation.
+        tip: ChainTip,
+        /// Confirmations at that tip.
+        confirmations: u32,
+    },
+    /// The winner left the sampled best chain but remains retained.
+    Orphaned {
+        /// Replacement best-chain tip.
+        tip: ChainTip,
+    },
+    /// A Wcash block with the same proof-independent ID but another witness is
+    /// on the sampled best chain.
+    Quarantined {
+        /// Tip at which the conflict was observed.
+        tip: ChainTip,
+    },
+    /// Exact retained Wcash bytes are eligible for resubmission.
+    Requeued {
+        /// Tip sampled before requeueing.
+        tip: ChainTip,
+    },
+    /// The reward reached its advertised maturity. It remains retained because
+    /// maturity is reversible under a deep reorganization.
+    Matured {
+        /// Tip used for the maturity decision.
+        tip: ChainTip,
+        /// Confirmations at that tip.
+        confirmations: u32,
+    },
+}
+
+/// Durable private state for one winner, reconstructed during journal replay.
+#[derive(Clone, Eq, PartialEq)]
+pub struct JournalWinnerState {
+    /// Stable accepted-share identity.
+    pub share_id: Hex32,
+    /// Generation that created this winner.
+    pub job_id: Hex32,
+    /// Immutable public winner facts.
+    pub winner: WinnerDescriptor,
+    /// Validated parent header hash shared by both merged chains.
+    pub parent_hash_le: Hex32,
+    /// Exact canonical block bytes retained by Wolf.
+    pub block_bytes: Vec<u8>,
+    /// Latest valid durable lifecycle state.
+    pub lifecycle: JournalWinnerLifecycle,
+}
+
+impl std::fmt::Debug for JournalWinnerState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JournalWinnerState")
+            .field("share_id", &self.share_id)
+            .field("job_id", &self.job_id)
+            .field("winner", &self.winner)
+            .field("parent_hash_le", &self.parent_hash_le)
+            .field("block_bytes_len", &self.block_bytes.len())
+            .field("lifecycle", &self.lifecycle)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WinnerKey {
+    share_id: Hex32,
+    chain: MergedChain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum JobLifecycle {
+    Active,
+    Invalidated,
+    Closed,
+}
+
+#[derive(Clone)]
+struct JournalJobState {
+    job: JobDescriptor,
+    lifecycle: JobLifecycle,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct JournalShareState {
+    receipt: ShareReceipt,
+    identity: WorkerIdentity,
+    target_le: TargetLe,
+    blocks: JournalWinnerBlocks,
+}
+
+#[derive(Default)]
+struct JournalSemanticState {
+    jobs: HashMap<Hex32, JournalJobState>,
+    shares: HashMap<Hex32, JournalShareState>,
+    winners: HashMap<WinnerKey, JournalWinnerState>,
 }
 
 struct JournalState {
@@ -434,6 +625,7 @@ struct JournalState {
     bytes_written: u64,
     last_digest: Hex32,
     events: Vec<BackendEvent>,
+    semantic: JournalSemanticState,
     poisoned: bool,
 }
 
@@ -578,6 +770,7 @@ impl PoolBackendJournal {
                 bytes_written,
                 last_digest,
                 events: Vec::new(),
+                semantic: JournalSemanticState::default(),
                 poisoned: false,
             }),
         })
@@ -669,6 +862,7 @@ impl PoolBackendJournal {
         let mut complete_bytes = header_line.consumed;
         let mut previous_digest = digest_header(&header)?;
         let mut events = Vec::new();
+        let mut semantic = JournalSemanticState::default();
         let mut line_number = 2u64;
         let mut repaired_or_recovered_tail = false;
 
@@ -682,6 +876,7 @@ impl PoolBackendJournal {
                         // the record delimiter. A client retry will then
                         // observe the original durable sequence idempotently.
                         validate_replayed_record(&record, &previous_digest, events.len())?;
+                        semantic.apply_record(&record)?;
                         ensure_event_fits_page(&record.event)?;
                         let repaired_consumed = line
                             .consumed
@@ -736,6 +931,7 @@ impl PoolBackendJournal {
                     }
                 })?;
             validate_replayed_record(&record, &previous_digest, events.len())?;
+            semantic.apply_record(&record)?;
             ensure_event_fits_page(&record.event)?;
             checked_append_limits(events.len(), complete_bytes, line.consumed)?;
             events
@@ -768,6 +964,7 @@ impl PoolBackendJournal {
                 bytes_written: complete_bytes,
                 last_digest: previous_digest,
                 events,
+                semantic,
                 poisoned: false,
             }),
         })
@@ -815,9 +1012,128 @@ impl PoolBackendJournal {
         Ok(state.events.last().map_or(0, BackendEvent::event_seq))
     }
 
-    /// Appends exactly the next validated event and fsyncs it before changing
-    /// in-memory state or returning success.
-    pub fn append_event(&self, event: BackendEvent) -> Result<(), PoolBackendJournalError> {
+    /// Semantically validates and durably appends one non-share event.
+    ///
+    /// The supplied sequence is ignored and replaced by the exact next value
+    /// while the journal mutex is held. Accepted shares must use
+    /// [`Self::append_share_committed`] so their exact private winner blocks are
+    /// covered by the same record digest and fsync.
+    pub fn append_event(
+        &self,
+        event: BackendEvent,
+    ) -> Result<BackendEvent, PoolBackendJournalError> {
+        if matches!(event, BackendEvent::ShareCommitted { .. }) {
+            return Err(PoolBackendJournalError::ShareRequiresAtomicAppend);
+        }
+        let mut state = self.lock_state()?;
+        ensure_usable(&state)?;
+        let event_seq = next_event_seq(&state)?;
+        let event = event_with_sequence(event, event_seq);
+        let blocks = PersistedWinnerBlocks::default();
+        self.append_locked(&mut state, event.clone(), blocks)?;
+        Ok(event)
+    }
+
+    /// Atomically validates, journals, and fsyncs one accepted share and every
+    /// exact winner block before returning its receipt.
+    ///
+    /// The journal computes the attribution ID and allocates the event sequence
+    /// under its mutex. An exact retry returns the original receipt without a
+    /// second event. Reusing the stable share ID with any changed immutable
+    /// field or private byte is rejected.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_share_committed(
+        &self,
+        job_id: Hex32,
+        share_id: Hex32,
+        parent_hash_le: Hex32,
+        winners: Vec<WinnerDescriptor>,
+        identity: WorkerIdentity,
+        target_le: TargetLe,
+        winner_blocks: JournalWinnerBlocks,
+    ) -> Result<JournalShareCommit, PoolBackendJournalError> {
+        let attribution_id = wcash_pool_protocol::canonical_attribution_id(&identity, &target_le)
+            .map_err(|source| PoolBackendJournalError::InvalidEvent {
+            event_seq: 0,
+            source,
+        })?;
+        let mut state = self.lock_state()?;
+        ensure_usable(&state)?;
+
+        if let Some(existing) = state.semantic.shares.get(&share_id) {
+            let candidate = ShareReceipt {
+                event_seq: existing.receipt.event_seq,
+                job_id,
+                share_id: share_id.clone(),
+                attribution_id,
+                parent_hash_le,
+                winners,
+            };
+            if existing.receipt == candidate
+                && existing.identity == identity
+                && existing.target_le == target_le
+                && existing.blocks == winner_blocks
+            {
+                return Ok(JournalShareCommit {
+                    receipt: existing.receipt.clone(),
+                    replayed: true,
+                });
+            }
+            return Err(PoolBackendJournalError::ShareConflict { share_id });
+        }
+
+        let event_seq = next_event_seq(&state)?;
+        let receipt = ShareReceipt {
+            event_seq,
+            job_id: job_id.clone(),
+            share_id,
+            attribution_id,
+            parent_hash_le,
+            winners,
+        };
+        let event = BackendEvent::ShareCommitted {
+            receipt: receipt.clone(),
+            job_id,
+            identity,
+            target_le,
+        };
+        let persisted_blocks = encode_winner_blocks(&winner_blocks, event_seq)?;
+        self.append_locked(&mut state, event, persisted_blocks)?;
+        Ok(JournalShareCommit {
+            receipt,
+            replayed: false,
+        })
+    }
+
+    /// Returns all reconstructed winner states, including matured winners.
+    ///
+    /// No winner is deleted at maturity, because a later deep reorganization
+    /// can still orphan it and must retain the exact submitted bytes.
+    pub fn winner_states(&self) -> Result<Vec<JournalWinnerState>, PoolBackendJournalError> {
+        let state = self.lock_state()?;
+        ensure_usable(&state)?;
+        Ok(state.semantic.winners.values().cloned().collect())
+    }
+
+    /// Returns every unique historical job descriptor and whether share
+    /// admission has been durably closed.
+    pub fn job_descriptors(&self) -> Result<Vec<(JobDescriptor, bool)>, PoolBackendJournalError> {
+        let state = self.lock_state()?;
+        ensure_usable(&state)?;
+        Ok(state
+            .semantic
+            .jobs
+            .values()
+            .map(|entry| (entry.job.clone(), entry.lifecycle == JobLifecycle::Closed))
+            .collect())
+    }
+
+    fn append_locked(
+        &self,
+        state: &mut JournalState,
+        event: BackendEvent,
+        winner_blocks: PersistedWinnerBlocks,
+    ) -> Result<(), PoolBackendJournalError> {
         event
             .validate()
             .map_err(|source| PoolBackendJournalError::InvalidEvent {
@@ -825,13 +1141,7 @@ impl PoolBackendJournal {
                 source,
             })?;
         ensure_event_fits_page(&event)?;
-
-        let mut state = self.lock_state()?;
-        ensure_usable(&state)?;
-        let current = state.events.last().map_or(0, BackendEvent::event_seq);
-        let expected = current
-            .checked_add(1)
-            .ok_or(PoolBackendJournalError::Overflow)?;
+        let expected = next_event_seq(state)?;
         if event.event_seq() != expected {
             return Err(PoolBackendJournalError::NonContiguousSequence {
                 expected,
@@ -843,12 +1153,14 @@ impl PoolBackendJournal {
             .events
             .try_reserve(1)
             .map_err(PoolBackendJournalError::Allocation)?;
+        state.semantic.reserve_for(&event)?;
         let previous_digest = state.last_digest.clone();
-        let digest = digest_event(&event, &previous_digest)?;
+        let digest = digest_event(&event, &winner_blocks, &previous_digest)?;
         let record = PersistedEventRecord {
             record: EventRecordKind::PoolBackendJournalEvent,
             event_seq: event.event_seq(),
             event,
+            winner_blocks,
             previous_digest,
             digest,
         };
@@ -860,6 +1172,10 @@ impl PoolBackendJournal {
         let new_length =
             checked_append_limits(state.events.len(), state.bytes_written, record_bytes)?;
 
+        // Apply before I/O so no semantically invalid record can ever reach
+        // disk. Any subsequent I/O failure poisons this in-memory instance;
+        // restart replay then decides whether the record was durable.
+        state.semantic.apply_record(&record)?;
         if let Err(error) = verify_locked_journal_path(&state.file, &self.path, state.bytes_written)
         {
             state.poisoned = true;
@@ -878,8 +1194,6 @@ impl PoolBackendJournal {
             return Err(error);
         }
 
-        // Capacity was reserved before the write; all state changes happen only
-        // after both the append and fsync have succeeded.
         state.bytes_written = new_length;
         state.last_digest = record.digest;
         state.events.push(record.event);
@@ -958,6 +1272,585 @@ impl PoolBackendJournal {
         self.state
             .lock()
             .map_err(|_| PoolBackendJournalError::MutexPoisoned)
+    }
+}
+
+fn next_event_seq(state: &JournalState) -> Result<u64, PoolBackendJournalError> {
+    state
+        .events
+        .last()
+        .map_or(0, BackendEvent::event_seq)
+        .checked_add(1)
+        .ok_or(PoolBackendJournalError::Overflow)
+}
+
+fn event_with_sequence(event: BackendEvent, event_seq: u64) -> BackendEvent {
+    match event {
+        BackendEvent::JobActivated { job, .. } => BackendEvent::JobActivated { event_seq, job },
+        BackendEvent::JobInvalidated {
+            job_id,
+            reason,
+            accept_for_ms,
+            ..
+        } => BackendEvent::JobInvalidated {
+            event_seq,
+            job_id,
+            reason,
+            accept_for_ms,
+        },
+        BackendEvent::GenerationClosed { job_id, .. } => {
+            BackendEvent::GenerationClosed { event_seq, job_id }
+        }
+        BackendEvent::ShareCommitted { .. } => {
+            unreachable!("share events are rejected before sequence allocation")
+        }
+        BackendEvent::WinnerObserved {
+            share_id,
+            job_id,
+            winner,
+            tip,
+            confirmations,
+            ..
+        } => BackendEvent::WinnerObserved {
+            event_seq,
+            share_id,
+            job_id,
+            winner,
+            tip,
+            confirmations,
+        },
+        BackendEvent::WinnerOrphaned {
+            share_id,
+            job_id,
+            winner,
+            tip,
+            ..
+        } => BackendEvent::WinnerOrphaned {
+            event_seq,
+            share_id,
+            job_id,
+            winner,
+            tip,
+        },
+        BackendEvent::WinnerQuarantined {
+            share_id,
+            job_id,
+            winner,
+            tip,
+            ..
+        } => BackendEvent::WinnerQuarantined {
+            event_seq,
+            share_id,
+            job_id,
+            winner,
+            tip,
+        },
+        BackendEvent::WinnerRequeued {
+            share_id,
+            job_id,
+            winner,
+            tip,
+            ..
+        } => BackendEvent::WinnerRequeued {
+            event_seq,
+            share_id,
+            job_id,
+            winner,
+            tip,
+        },
+        BackendEvent::WinnerMatured {
+            share_id,
+            job_id,
+            winner,
+            tip,
+            confirmations,
+            ..
+        } => BackendEvent::WinnerMatured {
+            event_seq,
+            share_id,
+            job_id,
+            winner,
+            tip,
+            confirmations,
+        },
+    }
+}
+
+impl JournalSemanticState {
+    fn reserve_for(&mut self, event: &BackendEvent) -> Result<(), PoolBackendJournalError> {
+        match event {
+            BackendEvent::JobActivated { .. } => self
+                .jobs
+                .try_reserve(1)
+                .map_err(PoolBackendJournalError::Allocation),
+            BackendEvent::ShareCommitted { receipt, .. } => {
+                self.shares
+                    .try_reserve(1)
+                    .map_err(PoolBackendJournalError::Allocation)?;
+                self.winners
+                    .try_reserve(receipt.winners.len())
+                    .map_err(PoolBackendJournalError::Allocation)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn apply_record(
+        &mut self,
+        record: &PersistedEventRecord,
+    ) -> Result<(), PoolBackendJournalError> {
+        let event_seq = record.event_seq;
+        match &record.event {
+            BackendEvent::JobActivated { job, .. } => {
+                require_no_private_blocks(&record.winner_blocks, event_seq)?;
+                if self.jobs.contains_key(&job.job_id) {
+                    return Err(semantic(event_seq, "job ID was activated more than once"));
+                }
+                self.jobs.insert(
+                    job.job_id.clone(),
+                    JournalJobState {
+                        job: job.clone(),
+                        lifecycle: JobLifecycle::Active,
+                    },
+                );
+            }
+            BackendEvent::JobInvalidated { job_id, .. } => {
+                require_no_private_blocks(&record.winner_blocks, event_seq)?;
+                let job = self
+                    .jobs
+                    .get_mut(job_id)
+                    .ok_or_else(|| semantic(event_seq, "invalidation references an unknown job"))?;
+                match job.lifecycle {
+                    JobLifecycle::Active => job.lifecycle = JobLifecycle::Invalidated,
+                    JobLifecycle::Invalidated => {
+                        return Err(semantic(event_seq, "job was invalidated more than once"));
+                    }
+                    JobLifecycle::Closed => {
+                        return Err(semantic(event_seq, "closed job cannot be invalidated"));
+                    }
+                }
+            }
+            BackendEvent::GenerationClosed { job_id, .. } => {
+                require_no_private_blocks(&record.winner_blocks, event_seq)?;
+                let job = self
+                    .jobs
+                    .get_mut(job_id)
+                    .ok_or_else(|| semantic(event_seq, "closure references an unknown job"))?;
+                if job.lifecycle == JobLifecycle::Closed {
+                    return Err(semantic(event_seq, "job was closed more than once"));
+                }
+                job.lifecycle = JobLifecycle::Closed;
+            }
+            BackendEvent::ShareCommitted {
+                receipt,
+                job_id,
+                identity,
+                target_le,
+            } => {
+                let job = self
+                    .jobs
+                    .get(job_id)
+                    .ok_or_else(|| semantic(event_seq, "share references an unknown job"))?;
+                if job.lifecycle == JobLifecycle::Closed {
+                    return Err(semantic(event_seq, "new share references a closed job"));
+                }
+                receipt.validate_for_job(&job.job).map_err(|source| {
+                    PoolBackendJournalError::InvalidEvent { event_seq, source }
+                })?;
+                if self.shares.contains_key(&receipt.share_id) {
+                    return Err(semantic(
+                        event_seq,
+                        "share ID already has a durable commit record",
+                    ));
+                }
+                let blocks = decode_and_validate_winner_blocks(
+                    &record.winner_blocks,
+                    receipt,
+                    &job.job,
+                    event_seq,
+                )?;
+                self.shares.insert(
+                    receipt.share_id.clone(),
+                    JournalShareState {
+                        receipt: receipt.clone(),
+                        identity: identity.clone(),
+                        target_le: target_le.clone(),
+                        blocks: blocks.clone(),
+                    },
+                );
+                for winner in &receipt.winners {
+                    let block_bytes = match winner.chain {
+                        MergedChain::Wcash => blocks
+                            .wcash
+                            .as_ref()
+                            .expect("validated Wcash winner bytes exist"),
+                        MergedChain::Zcash => blocks
+                            .zcash
+                            .as_ref()
+                            .expect("validated Zcash winner bytes exist"),
+                    };
+                    let key = WinnerKey {
+                        share_id: receipt.share_id.clone(),
+                        chain: winner.chain,
+                    };
+                    if self
+                        .winners
+                        .insert(
+                            key,
+                            JournalWinnerState {
+                                share_id: receipt.share_id.clone(),
+                                job_id: receipt.job_id.clone(),
+                                winner: winner.clone(),
+                                parent_hash_le: receipt.parent_hash_le.clone(),
+                                block_bytes: block_bytes.clone(),
+                                lifecycle: JournalWinnerLifecycle::Pending,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(semantic(
+                            event_seq,
+                            "winner key was committed more than once",
+                        ));
+                    }
+                }
+            }
+            BackendEvent::WinnerObserved {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                confirmations,
+                ..
+            } => {
+                require_no_private_blocks(&record.winner_blocks, event_seq)?;
+                let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
+                if matches!(state.lifecycle, JournalWinnerLifecycle::Matured { .. }) {
+                    return Err(semantic(
+                        event_seq,
+                        "matured winner cannot be observed again",
+                    ));
+                }
+                if let JournalWinnerLifecycle::Observed {
+                    confirmations: previous,
+                    ..
+                } = state.lifecycle
+                {
+                    if *confirmations < previous {
+                        return Err(semantic(
+                            event_seq,
+                            "winner confirmations decreased without an orphan event",
+                        ));
+                    }
+                }
+                state.lifecycle = JournalWinnerLifecycle::Observed {
+                    tip: tip.clone(),
+                    confirmations: *confirmations,
+                };
+            }
+            BackendEvent::WinnerOrphaned {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                ..
+            } => {
+                require_no_private_blocks(&record.winner_blocks, event_seq)?;
+                let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
+                if !matches!(
+                    state.lifecycle,
+                    JournalWinnerLifecycle::Observed { .. }
+                        | JournalWinnerLifecycle::Matured { .. }
+                ) {
+                    return Err(semantic(
+                        event_seq,
+                        "only an observed or matured winner can be orphaned",
+                    ));
+                }
+                state.lifecycle = JournalWinnerLifecycle::Orphaned { tip: tip.clone() };
+            }
+            BackendEvent::WinnerQuarantined {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                ..
+            } => {
+                require_no_private_blocks(&record.winner_blocks, event_seq)?;
+                let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
+                if matches!(
+                    state.lifecycle,
+                    JournalWinnerLifecycle::Quarantined { .. }
+                        | JournalWinnerLifecycle::Matured { .. }
+                ) {
+                    return Err(semantic(
+                        event_seq,
+                        "winner cannot enter quarantine from its current state",
+                    ));
+                }
+                state.lifecycle = JournalWinnerLifecycle::Quarantined { tip: tip.clone() };
+            }
+            BackendEvent::WinnerRequeued {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                ..
+            } => {
+                require_no_private_blocks(&record.winner_blocks, event_seq)?;
+                let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
+                if !matches!(state.lifecycle, JournalWinnerLifecycle::Quarantined { .. }) {
+                    return Err(semantic(
+                        event_seq,
+                        "only a quarantined winner can be requeued",
+                    ));
+                }
+                state.lifecycle = JournalWinnerLifecycle::Requeued { tip: tip.clone() };
+            }
+            BackendEvent::WinnerMatured {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                confirmations,
+                ..
+            } => {
+                require_no_private_blocks(&record.winner_blocks, event_seq)?;
+                let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
+                if !matches!(state.lifecycle, JournalWinnerLifecycle::Observed { .. }) {
+                    return Err(semantic(event_seq, "only an observed winner can mature"));
+                }
+                state.lifecycle = JournalWinnerLifecycle::Matured {
+                    tip: tip.clone(),
+                    confirmations: *confirmations,
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn exact_winner_mut(
+        &mut self,
+        event_seq: u64,
+        share_id: &Hex32,
+        job_id: &Hex32,
+        winner: &WinnerDescriptor,
+    ) -> Result<&mut JournalWinnerState, PoolBackendJournalError> {
+        let state = self
+            .winners
+            .get_mut(&WinnerKey {
+                share_id: share_id.clone(),
+                chain: winner.chain,
+            })
+            .ok_or_else(|| semantic(event_seq, "lifecycle event references an unknown winner"))?;
+        if state.job_id != *job_id || state.winner != *winner {
+            return Err(semantic(
+                event_seq,
+                "lifecycle event changed immutable winner metadata",
+            ));
+        }
+        Ok(state)
+    }
+}
+
+fn semantic(event_seq: u64, reason: &'static str) -> PoolBackendJournalError {
+    PoolBackendJournalError::SemanticViolation { event_seq, reason }
+}
+
+fn require_no_private_blocks(
+    blocks: &PersistedWinnerBlocks,
+    event_seq: u64,
+) -> Result<(), PoolBackendJournalError> {
+    if blocks.is_empty() {
+        Ok(())
+    } else {
+        Err(semantic(
+            event_seq,
+            "private winner blocks are only valid on ShareCommitted",
+        ))
+    }
+}
+
+fn encode_winner_blocks(
+    blocks: &JournalWinnerBlocks,
+    event_seq: u64,
+) -> Result<PersistedWinnerBlocks, PoolBackendJournalError> {
+    fn encode(
+        bytes: &Option<Vec<u8>>,
+        chain: &'static str,
+        event_seq: u64,
+    ) -> Result<Option<String>, PoolBackendJournalError> {
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        if bytes.is_empty() || bytes.len() > MAX_WINNER_BLOCK_BYTES {
+            return Err(PoolBackendJournalError::InvalidWinnerBlock {
+                event_seq,
+                chain,
+                reason: format!(
+                    "decoded block length must be in 1..={MAX_WINNER_BLOCK_BYTES}, found {}",
+                    bytes.len()
+                ),
+            });
+        }
+        Ok(Some(hex::encode(bytes)))
+    }
+    Ok(PersistedWinnerBlocks {
+        wcash: encode(&blocks.wcash, "Wcash", event_seq)?,
+        zcash: encode(&blocks.zcash, "Zcash", event_seq)?,
+    })
+}
+
+fn decode_and_validate_winner_blocks(
+    encoded: &PersistedWinnerBlocks,
+    receipt: &ShareReceipt,
+    job: &JobDescriptor,
+    event_seq: u64,
+) -> Result<JournalWinnerBlocks, PoolBackendJournalError> {
+    fn decode(
+        encoded: &Option<String>,
+        chain: &'static str,
+        event_seq: u64,
+    ) -> Result<Option<Vec<u8>>, PoolBackendJournalError> {
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        let maximum_encoded = MAX_WINNER_BLOCK_BYTES
+            .checked_mul(2)
+            .ok_or(PoolBackendJournalError::Overflow)?;
+        if encoded.is_empty()
+            || encoded.len() > maximum_encoded
+            || encoded.len() % 2 != 0
+            || !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(PoolBackendJournalError::InvalidWinnerBlock {
+                event_seq,
+                chain,
+                reason: format!(
+                    "block must be 1..={MAX_WINNER_BLOCK_BYTES} bytes of canonical lowercase hex"
+                ),
+            });
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(encoded.len() / 2)
+            .map_err(PoolBackendJournalError::Allocation)?;
+        bytes.resize(encoded.len() / 2, 0);
+        hex::decode_to_slice(encoded, &mut bytes).map_err(|error| {
+            PoolBackendJournalError::InvalidWinnerBlock {
+                event_seq,
+                chain,
+                reason: format!("invalid hexadecimal block bytes: {error}"),
+            }
+        })?;
+        Ok(Some(bytes))
+    }
+
+    let blocks = JournalWinnerBlocks {
+        wcash: decode(&encoded.wcash, "Wcash", event_seq)?,
+        zcash: decode(&encoded.zcash, "Zcash", event_seq)?,
+    };
+    for chain in [MergedChain::Wcash, MergedChain::Zcash] {
+        let winner = receipt.winners.iter().find(|winner| winner.chain == chain);
+        let bytes = match chain {
+            MergedChain::Wcash => blocks.wcash.as_deref(),
+            MergedChain::Zcash => blocks.zcash.as_deref(),
+        };
+        match (winner, bytes) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(PoolBackendJournalError::InvalidWinnerBlock {
+                    event_seq,
+                    chain: chain_name(chain),
+                    reason: "block bytes were supplied without a winner descriptor".to_string(),
+                });
+            }
+            (Some(_), None) => {
+                return Err(PoolBackendJournalError::InvalidWinnerBlock {
+                    event_seq,
+                    chain: chain_name(chain),
+                    reason: "winner descriptor has no exact retained block bytes".to_string(),
+                });
+            }
+            (Some(winner), Some(bytes)) => {
+                validate_exact_winner_block(bytes, winner, receipt, job, event_seq)?;
+            }
+        }
+    }
+    Ok(blocks)
+}
+
+fn validate_exact_winner_block(
+    block_bytes: &[u8],
+    winner: &WinnerDescriptor,
+    receipt: &ShareReceipt,
+    job: &JobDescriptor,
+    event_seq: u64,
+) -> Result<(), PoolBackendJournalError> {
+    let chain = chain_name(winner.chain);
+    let mut display_hash = *winner.block_hash_le.as_bytes();
+    display_hash.reverse();
+    let kind = match winner.chain {
+        MergedChain::Wcash => PersistedWinnerBlockKind::Wcash,
+        MergedChain::Zcash => PersistedWinnerBlockKind::Zcash,
+    };
+    let recovered_parent = validate_persisted_winner_block(
+        block_bytes,
+        &hex::encode(display_hash),
+        winner.height,
+        kind,
+    )
+    .map_err(|error| PoolBackendJournalError::InvalidWinnerBlock {
+        event_seq,
+        chain,
+        reason: error.to_string(),
+    })?;
+    if recovered_parent != *receipt.parent_hash_le.as_bytes() {
+        return Err(PoolBackendJournalError::InvalidWinnerBlock {
+            event_seq,
+            chain,
+            reason: "block proof does not bind the receipt parent hash".to_string(),
+        });
+    }
+    let block: Block = block_bytes.zcash_deserialize_into().map_err(|error| {
+        PoolBackendJournalError::InvalidWinnerBlock {
+            event_seq,
+            chain,
+            reason: format!("canonical block could not be decoded for metadata binding: {error}"),
+        }
+    })?;
+    let expected_previous = match winner.chain {
+        MergedChain::Wcash => &job.wcash_previous_hash_le,
+        MergedChain::Zcash => &job.zcash_previous_hash_le,
+    };
+    if block.header.previous_block_hash.0 != *expected_previous.as_bytes() {
+        return Err(PoolBackendJournalError::InvalidWinnerBlock {
+            event_seq,
+            chain,
+            reason: "block predecessor does not match its activated job".to_string(),
+        });
+    }
+    let coinbase_txid = block
+        .transactions
+        .first()
+        .map(|transaction| transaction.hash().0);
+    if coinbase_txid != Some(*winner.coinbase_txid_le.as_bytes()) {
+        return Err(PoolBackendJournalError::InvalidWinnerBlock {
+            event_seq,
+            chain,
+            reason: "block coinbase transaction ID does not match its winner descriptor"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+const fn chain_name(chain: MergedChain) -> &'static str {
+    match chain {
+        MergedChain::Wcash => "Wcash",
+        MergedChain::Zcash => "Zcash",
     }
 }
 
@@ -1071,7 +1964,13 @@ fn validate_replayed_record(
             event_seq: record.event_seq,
         });
     }
-    if record.digest != digest_event(&record.event, &record.previous_digest)? {
+    if record.digest
+        != digest_event(
+            &record.event,
+            &record.winner_blocks,
+            &record.previous_digest,
+        )?
+    {
         return Err(PoolBackendJournalError::DigestMismatch {
             event_seq: record.event_seq,
         });
@@ -1203,12 +2102,14 @@ fn digest_header(header: &JournalHeader) -> Result<Hex32, PoolBackendJournalErro
 
 fn digest_event(
     event: &BackendEvent,
+    winner_blocks: &PersistedWinnerBlocks,
     previous_digest: &Hex32,
 ) -> Result<Hex32, PoolBackendJournalError> {
     let unsigned = CanonicalUnsignedEventRecord {
         record: EventRecordKind::PoolBackendJournalEvent,
         event_seq: event.event_seq(),
         event,
+        winner_blocks,
         previous_digest,
     };
     digest_canonical(EVENT_DIGEST_DOMAIN, &unsigned, "unsigned event record")
@@ -1530,6 +2431,7 @@ mod tests {
 
     use serde_json::{json, Value};
     use tempfile::TempDir;
+    use wcash_pool_protocol::Hex108;
 
     use super::*;
 
@@ -1614,10 +2516,43 @@ mod tests {
         .expect("open test journal")
     }
 
-    fn event(event_seq: u64, byte: u8) -> BackendEvent {
-        BackendEvent::GenerationClosed {
-            event_seq,
+    fn job(byte: u8) -> JobDescriptor {
+        let mut header_input = [byte; 108];
+        header_input[..4].copy_from_slice(&4u32.to_le_bytes());
+        header_input[4..36].copy_from_slice(&[byte.wrapping_add(1); 32]);
+        header_input[100..104].copy_from_slice(&1u32.to_le_bytes());
+        JobDescriptor {
             job_id: Hex32::new([byte; 32]),
+            wcash_candidate_hash_le: Hex32::new([byte.wrapping_add(2); 32]),
+            header_input: Hex108::new(header_input),
+            wcash_previous_hash_le: Hex32::new([byte.wrapping_add(3); 32]),
+            zcash_previous_hash_le: Hex32::new([byte.wrapping_add(1); 32]),
+            wcash_coinbase_txid_le: Hex32::new([byte.wrapping_add(4); 32]),
+            zcash_coinbase_txid_le: Hex32::new([byte.wrapping_add(5); 32]),
+            wcash_target_le: TargetLe::new([0xff; 32]),
+            zcash_target_le: TargetLe::new([0xfe; 32]),
+            wcash_height: u32::from(byte) + 1,
+            zcash_height: u32::from(byte) + 2,
+            wcash_reward_zat: 625_000_000,
+            zcash_reward_zat: 100_000_000,
+            wcash_maturity_confirmations: 100,
+            zcash_maturity_confirmations: 100,
+            max_age_ms: 60_000,
+        }
+    }
+
+    fn event(event_seq: u64, byte: u8) -> BackendEvent {
+        BackendEvent::JobActivated {
+            event_seq,
+            job: job(byte),
+        }
+    }
+
+    fn identity(byte: u8) -> WorkerIdentity {
+        WorkerIdentity {
+            account_id: uuid(byte),
+            worker_id: uuid(byte.wrapping_add(1)),
+            label: format!("account.rig-{byte}"),
         }
     }
 
@@ -1952,26 +2887,232 @@ mod tests {
     }
 
     #[test]
-    fn append_rejects_invalid_or_non_next_sequence_without_poisoning() {
+    fn append_allocates_sequences_and_rejects_semantic_conflicts_without_poisoning() {
         let directory = private_temp_dir();
         let path = directory.path().join("backend.jsonl");
         let config = config();
         let journal = create(&path, &config);
+        let assigned = journal
+            .append_event(event(999, 2))
+            .expect("journal allocates the first sequence");
+        assert_eq!(assigned.event_seq(), 1);
         assert!(matches!(
-            journal.append_event(event(2, 2)),
-            Err(PoolBackendJournalError::NonContiguousSequence {
-                expected: 1,
-                actual: 2
-            })
+            journal.append_event(event(0, 2)),
+            Err(PoolBackendJournalError::SemanticViolation { .. })
         ));
+        let mut invalid = job(3);
+        invalid.max_age_ms = 0;
         assert!(matches!(
-            journal.append_event(event(0, 1)),
+            journal.append_event(BackendEvent::JobActivated {
+                event_seq: 0,
+                job: invalid,
+            }),
             Err(PoolBackendJournalError::InvalidEvent { .. })
         ));
-        journal
-            .append_event(event(1, 1))
+        let assigned = journal
+            .append_event(event(0, 1))
             .expect("validation errors do not poison journal");
-        assert_eq!(journal.current_event_seq().unwrap(), 1);
+        assert_eq!(assigned.event_seq(), 2);
+        assert_eq!(journal.current_event_seq().unwrap(), 2);
+    }
+
+    #[test]
+    fn accepted_share_commit_is_atomic_idempotent_and_reconstructed_on_replay() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("backend.jsonl");
+        let config = config();
+        let journal = create(&path, &config);
+        let descriptor = job(7);
+        journal
+            .append_event(BackendEvent::JobActivated {
+                event_seq: u64::MAX,
+                job: descriptor.clone(),
+            })
+            .expect("activate exact job");
+        let share_id = Hex32::new([0x71; 32]);
+        let parent_hash = Hex32::new([0x72; 32]);
+        let worker = identity(3);
+        let target = TargetLe::new([0x73; 32]);
+
+        let first = journal
+            .append_share_committed(
+                descriptor.job_id.clone(),
+                share_id.clone(),
+                parent_hash.clone(),
+                Vec::new(),
+                worker.clone(),
+                target.clone(),
+                JournalWinnerBlocks::default(),
+            )
+            .expect("commit ordinary share");
+        assert_eq!(first.receipt.event_seq, 2);
+        assert!(!first.replayed);
+        let replay = journal
+            .append_share_committed(
+                descriptor.job_id.clone(),
+                share_id.clone(),
+                parent_hash.clone(),
+                Vec::new(),
+                worker.clone(),
+                target.clone(),
+                JournalWinnerBlocks::default(),
+            )
+            .expect("retry exact share");
+        assert_eq!(replay.receipt, first.receipt);
+        assert!(replay.replayed);
+        assert_eq!(journal.current_event_seq().unwrap(), 2);
+
+        assert!(matches!(
+            journal.append_share_committed(
+                descriptor.job_id.clone(),
+                share_id.clone(),
+                parent_hash.clone(),
+                Vec::new(),
+                identity(8),
+                target.clone(),
+                JournalWinnerBlocks::default(),
+            ),
+            Err(PoolBackendJournalError::ShareConflict { .. })
+        ));
+        let raw = BackendEvent::ShareCommitted {
+            receipt: first.receipt.clone(),
+            job_id: descriptor.job_id.clone(),
+            identity: worker.clone(),
+            target_le: target.clone(),
+        };
+        assert!(matches!(
+            journal.append_event(raw),
+            Err(PoolBackendJournalError::ShareRequiresAtomicAppend)
+        ));
+        drop(journal);
+
+        let reopened = open(&path, &config);
+        let replay = reopened
+            .append_share_committed(
+                descriptor.job_id,
+                share_id,
+                parent_hash,
+                Vec::new(),
+                worker,
+                target,
+                JournalWinnerBlocks::default(),
+            )
+            .expect("replay state is reconstructed");
+        assert!(replay.replayed);
+        assert_eq!(reopened.current_event_seq().unwrap(), 2);
+    }
+
+    #[test]
+    fn exact_winner_bytes_and_reversible_maturity_survive_replay() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("backend.jsonl");
+        let config = config();
+        let journal = create(&path, &config);
+        let block_bytes = hex::decode(
+            include_str!("../../zebra-test/src/vectors/block-main-0-000-001.txt").trim(),
+        )
+        .expect("Zcash block-one fixture is hex");
+        let block: Block = block_bytes
+            .as_slice()
+            .zcash_deserialize_into()
+            .expect("Zcash block-one fixture decodes");
+        let block_hash = block.hash().0;
+        let coinbase_txid = block.transactions[0].hash().0;
+        let mut descriptor = job(9);
+        descriptor.zcash_previous_hash_le = Hex32::new(block.header.previous_block_hash.0);
+        descriptor.zcash_coinbase_txid_le = Hex32::new(coinbase_txid);
+        descriptor.zcash_height = 1;
+        descriptor.zcash_maturity_confirmations = 1;
+        let mut header_input = descriptor.header_input.clone().into_bytes();
+        header_input[4..36].copy_from_slice(&block.header.previous_block_hash.0);
+        descriptor.header_input = Hex108::new(header_input);
+        journal
+            .append_event(BackendEvent::JobActivated {
+                event_seq: 0,
+                job: descriptor.clone(),
+            })
+            .expect("activate exact Zcash fixture job");
+        let winner = WinnerDescriptor {
+            chain: MergedChain::Zcash,
+            block_hash_le: Hex32::new(block_hash),
+            height: 1,
+            coinbase_txid_le: Hex32::new(coinbase_txid),
+            reward_zat: descriptor.zcash_reward_zat,
+            maturity_confirmations: 1,
+        };
+        let commit = journal
+            .append_share_committed(
+                descriptor.job_id.clone(),
+                Hex32::new([0x81; 32]),
+                Hex32::new(block_hash),
+                vec![winner.clone()],
+                identity(4),
+                TargetLe::new([0xff; 32]),
+                JournalWinnerBlocks {
+                    wcash: None,
+                    zcash: Some(block_bytes.clone()),
+                },
+            )
+            .expect("commit consensus-valid exact Zcash block");
+        let tip = ChainTip {
+            block_hash_le: Hex32::new(block_hash),
+            height: 1,
+        };
+        journal
+            .append_event(BackendEvent::WinnerObserved {
+                event_seq: 0,
+                share_id: commit.receipt.share_id.clone(),
+                job_id: descriptor.job_id.clone(),
+                winner: winner.clone(),
+                tip: tip.clone(),
+                confirmations: 1,
+            })
+            .expect("observe winner");
+        journal
+            .append_event(BackendEvent::WinnerMatured {
+                event_seq: 0,
+                share_id: commit.receipt.share_id.clone(),
+                job_id: descriptor.job_id.clone(),
+                winner: winner.clone(),
+                tip,
+                confirmations: 1,
+            })
+            .expect("mature winner");
+        let retained = journal.winner_states().expect("winner state");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].block_bytes, block_bytes);
+        assert!(matches!(
+            retained[0].lifecycle,
+            JournalWinnerLifecycle::Matured { .. }
+        ));
+        drop(journal);
+
+        let reopened = open(&path, &config);
+        let retained = reopened.winner_states().expect("replayed winner state");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].block_bytes, block_bytes);
+        assert!(matches!(
+            retained[0].lifecycle,
+            JournalWinnerLifecycle::Matured { .. }
+        ));
+        reopened
+            .append_event(BackendEvent::WinnerOrphaned {
+                event_seq: 0,
+                share_id: commit.receipt.share_id,
+                job_id: descriptor.job_id,
+                winner,
+                tip: ChainTip {
+                    block_hash_le: Hex32::new([0x91; 32]),
+                    height: 1,
+                },
+            })
+            .expect("deep reorganization reverses maturity");
+        let retained = reopened.winner_states().expect("orphaned state");
+        assert_eq!(retained[0].block_bytes, block_bytes);
+        assert!(matches!(
+            retained[0].lifecycle,
+            JournalWinnerLifecycle::Orphaned { .. }
+        ));
     }
 
     #[test]
@@ -2132,11 +3273,14 @@ mod tests {
             .clone();
         drop(gap_journal);
         let gap_event = event(3, 3);
+        let winner_blocks = PersistedWinnerBlocks::default();
         let gap_record = PersistedEventRecord {
             record: EventRecordKind::PoolBackendJournalEvent,
             event_seq: 3,
-            digest: digest_event(&gap_event, &previous_digest).expect("event digest"),
+            digest: digest_event(&gap_event, &winner_blocks, &previous_digest)
+                .expect("event digest"),
             event: gap_event,
+            winner_blocks,
             previous_digest,
         };
         let mut bytes = serde_json::to_vec(&gap_record).expect("gap record");
