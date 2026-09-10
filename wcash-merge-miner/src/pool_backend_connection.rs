@@ -60,6 +60,9 @@ pub(crate) enum BackendConnectionStateError {
     /// A replay connection cannot submit miner work.
     #[error("replay backend connections cannot submit shares")]
     SubmitOnReplayConnection,
+    /// Historical replay must finish before switching this connection to live work.
+    #[error("historical backend replay must complete before live subscription")]
+    ReplayIncomplete,
     /// Only one live subscription is permitted per connection.
     #[error("the backend connection is already subscribed to live jobs")]
     DuplicateSubscription,
@@ -77,6 +80,7 @@ impl BackendConnectionStateError {
 pub(crate) struct BackendConnectionState {
     role: BackendConnectionRole,
     last_request_id: u64,
+    replay_complete: bool,
 }
 
 impl Default for BackendConnectionState {
@@ -91,12 +95,20 @@ impl BackendConnectionState {
         Self {
             role: BackendConnectionRole::AwaitingHello,
             last_request_id: 0,
+            replay_complete: false,
         }
     }
 
     /// Returns the role already established for this connection.
     pub(crate) const fn role(&self) -> BackendConnectionRole {
         self.role
+    }
+
+    /// Records whether the last successfully flushed replay page reached the
+    /// durable journal watermark.
+    pub(crate) fn observe_replay_page(&mut self, complete: bool) {
+        debug_assert_eq!(self.role, BackendConnectionRole::Replay);
+        self.replay_complete = complete;
     }
 
     /// Returns the last accepted correlation identifier in tests.
@@ -167,10 +179,15 @@ impl BackendConnectionState {
             (BackendConnectionRole::Replay, BackendRequest::Health { .. }) => {
                 (BackendConnectionRole::Replay, BackendRequestKind::Health)
             }
-            (BackendConnectionRole::Replay, BackendRequest::SubscribeJobs { .. }) => (
-                BackendConnectionRole::Live,
-                BackendRequestKind::SubscribeJobs,
-            ),
+            (BackendConnectionRole::Replay, BackendRequest::SubscribeJobs { .. }) => {
+                if !self.replay_complete {
+                    return Err(BackendConnectionStateError::ReplayIncomplete);
+                }
+                (
+                    BackendConnectionRole::Live,
+                    BackendRequestKind::SubscribeJobs,
+                )
+            }
             (BackendConnectionRole::Replay, BackendRequest::SubmitShare { .. }) => {
                 return Err(BackendConnectionStateError::SubmitOnReplayConnection)
             }
@@ -303,10 +320,16 @@ mod tests {
             BackendRequestKind::ReadEvents
         );
         assert_eq!(state.role(), BackendConnectionRole::Replay);
+        assert!(matches!(
+            state.accept(&subscribe(3)),
+            Err(BackendConnectionStateError::ReplayIncomplete)
+        ));
+        assert_eq!(state.last_request_id(), 2);
         assert_eq!(
             state.accept(&read_events(3)).unwrap(),
             BackendRequestKind::ReadEvents
         );
+        state.observe_replay_page(true);
         assert_eq!(
             state.accept(&health(4)).unwrap(),
             BackendRequestKind::Health

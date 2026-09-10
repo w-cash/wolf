@@ -128,6 +128,29 @@ pub struct PoolBackendSession {
     peer_uid: u32,
 }
 
+/// Connection-local context supplied to one serialized backend request.
+///
+/// `after_live_event_seq` is the last event whose complete frame batch was
+/// successfully flushed on this connection. The actor uses it to return an
+/// exact contiguous live prefix without maintaining a second session cursor.
+#[derive(Clone, Copy, Debug)]
+pub struct PoolBackendRequestContext<'a> {
+    session: &'a PoolBackendSession,
+    after_live_event_seq: Option<u64>,
+}
+
+impl<'a> PoolBackendRequestContext<'a> {
+    /// Returns the authenticated session and peer facts.
+    pub const fn session(&self) -> &'a PoolBackendSession {
+        self.session
+    }
+
+    /// Returns the last live event durably flushed to this connection.
+    pub const fn after_live_event_seq(&self) -> Option<u64> {
+        self.after_live_event_seq
+    }
+}
+
 /// Immutable chain, payout, and journal authority exposed by one backend.
 ///
 /// Private fields prevent a listener implementation from accidentally
@@ -234,7 +257,7 @@ pub trait PoolBackendRequestHandler: Send + Sync {
     /// Handles one already-authorized and correctly sequenced request.
     fn handle(
         &self,
-        session: &PoolBackendSession,
+        context: PoolBackendRequestContext<'_>,
         kind: BackendRequestKind,
         request: BackendRequest,
     ) -> Result<Vec<BackendMessage>, PoolBackendHandlerError>;
@@ -486,7 +509,11 @@ fn serve_authorized_connection(
             }
         };
 
-        match handler.handle(session, kind, request) {
+        let context = PoolBackendRequestContext {
+            session,
+            after_live_event_seq: live_event_cursor,
+        };
+        match handler.handle(context, kind, request) {
             Ok(messages) => {
                 let next_live_event_cursor = validate_handler_messages(
                     kind,
@@ -498,6 +525,13 @@ fn serve_authorized_connection(
                     &messages,
                 )?;
                 write_unix_backend_messages(stream, &messages, config.write_timeout)?;
+                if kind == BackendRequestKind::ReadEvents {
+                    let complete = matches!(
+                        messages.last(),
+                        Some(BackendMessage::EventsPage { complete: true, .. })
+                    );
+                    state.observe_replay_page(complete);
+                }
                 live_event_cursor = next_live_event_cursor;
             }
             Err(error) => {
@@ -1059,7 +1093,7 @@ mod tests {
 
         fn handle(
             &self,
-            session: &PoolBackendSession,
+            context: PoolBackendRequestContext<'_>,
             kind: BackendRequestKind,
             request: BackendRequest,
         ) -> Result<Vec<BackendMessage>, PoolBackendHandlerError> {
@@ -1074,7 +1108,7 @@ mod tests {
             Ok(vec![BackendMessage::HelloOk {
                 version: BACKEND_PROTOCOL_VERSION,
                 id,
-                backend_session: session.backend_session(),
+                backend_session: context.session().backend_session(),
                 backend_instance: self.backend_instance,
                 journal_stream: self.journal_stream,
                 capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
