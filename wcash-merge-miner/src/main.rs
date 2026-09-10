@@ -23,8 +23,8 @@ use wcash_merge_miner::{
         DEFAULT_ZIP301_VALIDATION_LIMIT,
     },
     CoordinatorConfig, GenerationRetirement, JobConfig, MinerError, NativeMiningCoordinator,
-    NativeMiningSupervisor, NativeZcashConfig, PreparedJob, ShareProcessor, Zip301ClientConfig,
-    Zip301Config, Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
+    NativeMiningSupervisor, NativeZcashConfig, NativeZcashNetwork, PreparedJob, ShareProcessor,
+    Zip301ClientConfig, Zip301Config, Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
 };
 use wcash_zcash_aux::Target;
 use zcash_address::ZcashAddress;
@@ -48,6 +48,7 @@ const WCASH_VALIDATION_LIMIT: &str = "WCASH_VALIDATION_LIMIT";
 const WCASH_AUTHENTICATION_LIMIT: &str = "WCASH_AUTHENTICATION_LIMIT";
 const WCASH_EXPECTED_GENESIS_HASH: &str = "WCASH_EXPECTED_GENESIS_HASH";
 const ZCASH_EXPECTED_GENESIS_HASH: &str = "ZCASH_EXPECTED_GENESIS_HASH";
+const ZCASH_NETWORK: &str = "ZCASH_NETWORK";
 
 const USAGE: &str = r#"Wcash/Zcash merged-mining operator CLI
 
@@ -84,9 +85,12 @@ only be supplied through these optional, paired environment variables:
   ZCASH_TEMPLATE_RPC_USERNAME / ZCASH_TEMPLATE_RPC_PASSWORD
   ZCASH_VALIDATOR_RPC_USERNAME / ZCASH_VALIDATOR_RPC_PASSWORD
 
-Every native command requires WCASH_EXPECTED_GENESIS_HASH and
+Every native command requires WCASH_EXPECTED_GENESIS_HASH,
 ZCASH_EXPECTED_GENESIS_HASH (64 hex characters in conventional RPC display
-order). Every node is pinned to those height-zero hashes before work is issued.
+order), and ZCASH_NETWORK (`mainnet`, `testnet`, or `regtest`). The selected
+standard Zcash schedule must match the parent genesis and payout-address
+network, and the parent tip must be on NU6.3 or later. Every node is pinned to
+its height-zero hash before work is issued.
 
 Both native-serve commands additionally require WCASH_WORKER_CREDENTIALS (the
 path to a private version-1 exact-worker registry) and WCASH_SHARE_TARGET
@@ -686,6 +690,7 @@ struct EndpointSummary {
     zcash_template_authenticated: bool,
     zcash_validator_label: String,
     zcash_validator_authenticated: bool,
+    zcash_network: String,
     wcash_payout_address_source: &'static str,
     zcash_payout_address_source: &'static str,
 }
@@ -715,6 +720,9 @@ fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredN
         ZCASH_VALIDATOR_RPC_USERNAME,
         ZCASH_VALIDATOR_RPC_PASSWORD,
     )?;
+    let expected_wcash_genesis_hash = required_display_hash_env(WCASH_EXPECTED_GENESIS_HASH)?;
+    let expected_zcash_genesis_hash = required_display_hash_env(ZCASH_EXPECTED_GENESIS_HASH)?;
+    let expected_zcash_network = required_zcash_network_env()?;
     let summary = EndpointSummary {
         wcash_label: wcash_node.label().to_string(),
         wcash_authenticated,
@@ -722,14 +730,14 @@ fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredN
         zcash_template_authenticated,
         zcash_validator_label: validator_node.label().to_string(),
         zcash_validator_authenticated,
+        zcash_network: expected_zcash_network.to_string(),
         wcash_payout_address_source: WCASH_PAYOUT_ADDRESS,
         zcash_payout_address_source: ZCASH_PAYOUT_ADDRESS,
     };
-    let expected_wcash_genesis_hash = required_display_hash_env(WCASH_EXPECTED_GENESIS_HASH)?;
-    let expected_zcash_genesis_hash = required_display_hash_env(ZCASH_EXPECTED_GENESIS_HASH)?;
     let zcash = NativeZcashConfig::new(
         template_node,
         vec![validator_node],
+        expected_zcash_network,
         expected_zcash_genesis_hash,
         expected_parent_payout_address,
     )?;
@@ -759,6 +767,18 @@ fn required_display_hash_env(name: &'static str) -> Result<String, MinerError> {
         reason: error.to_string(),
     })?;
     Ok(encoded.to_ascii_lowercase())
+}
+
+fn required_zcash_network_env() -> Result<NativeZcashNetwork, MinerError> {
+    let configured = required_env(ZCASH_NETWORK)?;
+    match configured.as_str() {
+        "mainnet" => Ok(NativeZcashNetwork::Mainnet),
+        "testnet" => Ok(NativeZcashNetwork::Testnet),
+        "regtest" => Ok(NativeZcashNetwork::Regtest),
+        _ => Err(MinerError::InvalidRequest(format!(
+            "environment variable {ZCASH_NETWORK} must be exactly `mainnet`, `testnet`, or `regtest`"
+        ))),
+    }
 }
 
 fn endpoint_from_env(
@@ -886,6 +906,7 @@ fn native_preflight(
             "child_target": display_target(job.required_target()),
         },
         "zcash": {
+            "network": endpoints.zcash_network,
             "payout_address": {
                 "configured": true,
                 "source": endpoints.zcash_payout_address_source,

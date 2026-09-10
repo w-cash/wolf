@@ -23,7 +23,10 @@ use zcash_address::unified::{Container, Receiver};
 use zcash_protocol::consensus::NetworkType;
 use zebra_chain::{
     block::{Block, Height},
-    parameters::{Network, NetworkKind},
+    parameters::{
+        subsidy::{block_subsidy, miner_subsidy},
+        Network, NetworkKind,
+    },
     primitives::{WcashAddress, WcashAddressKind},
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     transparent,
@@ -849,16 +852,30 @@ fn validate_wcash_candidate_payout(
         ));
     }
 
-    if advertised_value == 0
-        && coinbase.outputs().is_empty()
-        && !coinbase.has_sapling_shielded_data()
-        && !coinbase.has_orchard_shielded_data()
-        && !coinbase.has_ironwood_shielded_data()
-    {
-        return Ok(ValidatedWcashCandidatePayout {
-            value_zatoshis: 0,
-            verification: NativeWcashPayoutVerification::NoReward,
-        });
+    let candidate_height = Height(height);
+    let expected_block_subsidy = block_subsidy(candidate_height, network).map_err(|error| {
+        MinerError::InvalidParentTemplate(format!(
+            "cannot calculate Wcash block subsidy at height {height}: {error}"
+        ))
+    })?;
+    let minimum_miner_payout = miner_subsidy(candidate_height, network, expected_block_subsidy)
+        .map_err(|error| {
+            MinerError::InvalidParentTemplate(format!(
+                "cannot calculate Wcash miner subsidy at height {height}: {error}"
+            ))
+        })?
+        .zatoshis();
+    if advertised_value < minimum_miner_payout {
+        return Err(MinerError::InvalidParentTemplate(format!(
+            "createauxblock coinbasevalue {advertised_value} is below the Wcash miner subsidy {minimum_miner_payout} at height {height}"
+        )));
+    }
+
+    if advertised_value == 0 && candidate.transactions.len() != 1 {
+        return Err(MinerError::InvalidParentTemplate(
+            "zero-value createauxblock candidate contains transactions whose fees cannot be authenticated"
+                .to_string(),
+        ));
     }
 
     match expected_payout.kind() {
@@ -911,7 +928,7 @@ fn validate_wcash_candidate_payout(
             if !zebra_chain::primitives::zcash_note_encryption::ironwood_outputs_are_private_from_zero_ovk(
                 coinbase,
                 network,
-                Height(height),
+                candidate_height,
             ) {
                 return Err(MinerError::InvalidParentTemplate(
                     "createauxblock Ironwood payout is publicly recoverable".to_string(),
@@ -2863,6 +2880,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::NativeZcashNetwork;
 
     fn mainnet_genesis_block() -> Block {
         Vec::from_hex(include_str!("../../zebra-test/src/vectors/block-main-0-000-000.txt").trim())
@@ -3188,7 +3206,10 @@ mod tests {
         let config = NativeZcashConfig::new(
             template_node,
             vec![proposal_validator],
-            "00".repeat(32),
+            NativeZcashNetwork::Regtest,
+            Network::new_regtest(Default::default())
+                .genesis_hash()
+                .to_string(),
             "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
                 .parse()
                 .expect("valid Zcash testnet address"),
@@ -3725,9 +3746,9 @@ mod tests {
         );
     }
 
-    fn wcash_coinbase_inputs() -> Vec<transparent::Input> {
+    fn wcash_coinbase_inputs(height: Height) -> Vec<transparent::Input> {
         vec![transparent::Input::Coinbase {
-            height: Height(1),
+            height,
             data: vec![0x51],
             sequence: u32::MAX,
         }]
@@ -3742,7 +3763,7 @@ mod tests {
         let coinbase = Transaction::test_v6_for_network(
             &network,
             Height(1),
-            wcash_coinbase_inputs(),
+            wcash_coinbase_inputs(Height(1)),
             vec![output],
             LockTime::unlocked(),
             Height(0),
@@ -3793,16 +3814,29 @@ mod tests {
             validate_wcash_candidate_payout(&candidate, &payout, &network, reward + 1, 1),
             "transparent outputs do not match coinbasevalue",
         );
+
+        let (underpaid_candidate, underpaid_payout) = transparent_wcash_candidate([0x53; 20], 1);
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout(
+                &underpaid_candidate,
+                &underpaid_payout,
+                &network,
+                1,
+                1,
+            ),
+            "below the Wcash miner subsidy",
+        );
     }
 
     #[test]
-    fn zero_value_candidate_needs_no_recipient_authentication() {
+    fn zero_value_candidate_requires_an_authenticated_tail_recipient() {
         let network = Network::new_wcash_regtest();
         let payout = WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, [0x53; 20]);
+        let subsidy_height = Height(1);
         let coinbase = Transaction::test_v6_for_network(
             &network,
-            Height(1),
-            wcash_coinbase_inputs(),
+            subsidy_height,
+            wcash_coinbase_inputs(subsidy_height),
             vec![],
             LockTime::unlocked(),
             Height(0),
@@ -3810,17 +3844,106 @@ mod tests {
         let mut candidate = Arc::unwrap_or_clone(wcash_regtest_genesis_block());
         candidate.transactions = vec![Arc::new(coinbase)];
 
-        assert_eq!(
-            validate_wcash_candidate_payout(&candidate, &payout, &network, 0, 1)
-                .expect("a zero-value candidate has no recipient to authenticate"),
-            ValidatedWcashCandidatePayout {
-                value_zatoshis: 0,
-                verification: NativeWcashPayoutVerification::NoReward,
-            }
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout(&candidate, &payout, &network, 0, subsidy_height.0),
+            "below the Wcash miner subsidy",
         );
         assert_invalid_candidate_payout(
-            validate_wcash_candidate_payout(&candidate, &payout, &network, -1, 1),
+            validate_wcash_candidate_payout(&candidate, &payout, &network, -1, subsidy_height.0),
             "negative coinbase value",
+        );
+
+        let zero_subsidy_height = Height(50_400_001);
+        assert_eq!(
+            block_subsidy(zero_subsidy_height, &network)
+                .expect("the Wcash tail subsidy is defined")
+                .zatoshis(),
+            0
+        );
+        let empty_coinbase = Transaction::test_v6_for_network(
+            &network,
+            zero_subsidy_height,
+            wcash_coinbase_inputs(zero_subsidy_height),
+            vec![],
+            LockTime::unlocked(),
+            Height(0),
+        );
+        let mut candidate = Arc::unwrap_or_clone(wcash_regtest_genesis_block());
+        candidate.transactions = vec![Arc::new(empty_coinbase)];
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout(
+                &candidate,
+                &payout,
+                &network,
+                0,
+                zero_subsidy_height.0,
+            ),
+            "does not pay only the configured transparent Wcash address",
+        );
+
+        let make_zero_output = |payout_hash| {
+            transparent::Output::new(
+                Amount::<NonNegative>::try_from(0).expect("zero is non-negative"),
+                transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, payout_hash).script(),
+            )
+        };
+        let wrong_coinbase = Transaction::test_v6_for_network(
+            &network,
+            zero_subsidy_height,
+            wcash_coinbase_inputs(zero_subsidy_height),
+            vec![make_zero_output([0x54; 20])],
+            LockTime::unlocked(),
+            Height(0),
+        );
+        candidate.transactions = vec![Arc::new(wrong_coinbase)];
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout(
+                &candidate,
+                &payout,
+                &network,
+                0,
+                zero_subsidy_height.0,
+            ),
+            "does not pay only the configured transparent Wcash address",
+        );
+
+        let zero_output = make_zero_output([0x53; 20]);
+        let coinbase = Transaction::test_v6_for_network(
+            &network,
+            zero_subsidy_height,
+            wcash_coinbase_inputs(zero_subsidy_height),
+            vec![zero_output],
+            LockTime::unlocked(),
+            Height(0),
+        );
+        candidate.transactions = vec![Arc::new(coinbase)];
+        assert_eq!(
+            validate_wcash_candidate_payout(
+                &candidate,
+                &payout,
+                &network,
+                0,
+                zero_subsidy_height.0,
+            )
+            .expect("a zero-valued tail output authenticates its configured recipient"),
+            ValidatedWcashCandidatePayout {
+                value_zatoshis: 0,
+                verification: NativeWcashPayoutVerification::ExactTransparentRecipient,
+            }
+        );
+
+        candidate
+            .transactions
+            .push(candidate.transactions[0].clone());
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout(
+                &candidate,
+                &payout,
+                &network,
+                0,
+                zero_subsidy_height.0,
+            ),
+            "fees cannot be authenticated",
         );
     }
 
@@ -3841,7 +3964,7 @@ mod tests {
                 .expect("NU6.3 defines the Ironwood pool");
         let coinbase = Transaction::test_v6_with_bundles(
             NetworkUpgrade::Nu6_3,
-            wcash_coinbase_inputs(),
+            wcash_coinbase_inputs(Height(1)),
             vec![output],
             LockTime::unlocked(),
             Height(0),
@@ -3864,7 +3987,10 @@ mod tests {
                 .expect("valid template endpoint"),
             vec![RpcEndpoint::new("http://127.0.0.1:18242", None, None)
                 .expect("valid validator endpoint")],
-            "11".repeat(32),
+            NativeZcashNetwork::Regtest,
+            Network::new_regtest(Default::default())
+                .genesis_hash()
+                .to_string(),
             "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
                 .parse()
                 .expect("valid Zcash testnet address"),

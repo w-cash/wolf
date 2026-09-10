@@ -29,6 +29,20 @@ pub fn publicly_recoverable_coinbase_value_to(
     transaction: &Transaction,
     expected_address: &ZcashAddress,
 ) -> Option<u64> {
+    publicly_recoverable_coinbase_value_and_output_count_to(transaction, expected_address)
+        .map(|(value, _output_count)| value)
+}
+
+/// Returns the total publicly recoverable coinbase value sent to `expected_address` and the
+/// number of matching outputs, provided every shielded output uses one of its receivers.
+///
+/// The count distinguishes a genuine zero-valued payout in the subsidy tail from a coinbase that
+/// has no output for the configured miner. See [`publicly_recoverable_coinbase_value_to`] for the
+/// payout-recovery and validation rules shared by both APIs.
+pub fn publicly_recoverable_coinbase_value_and_output_count_to(
+    transaction: &Transaction,
+    expected_address: &ZcashAddress,
+) -> Option<(u64, usize)> {
     publicly_recoverable_coinbase_value_to_inner(transaction, expected_address, true)
 }
 
@@ -43,13 +57,14 @@ pub fn publicly_recoverable_coinbase_shielded_value_to(
     expected_address: &ZcashAddress,
 ) -> Option<u64> {
     publicly_recoverable_coinbase_value_to_inner(transaction, expected_address, false)
+        .map(|(value, _output_count)| value)
 }
 
 fn publicly_recoverable_coinbase_value_to_inner(
     transaction: &Transaction,
     expected_address: &ZcashAddress,
     include_transparent: bool,
-) -> Option<u64> {
+) -> Option<(u64, usize)> {
     if !transaction.is_coinbase() {
         return None;
     }
@@ -59,6 +74,7 @@ fn publicly_recoverable_coinbase_value_to_inner(
     transaction.network_upgrade()?;
     let transaction = transaction.inner();
     let mut recovered_value = 0u64;
+    let mut matching_output_count = 0usize;
 
     if let Some(bundle) = transaction.transparent_bundle() {
         for output in &bundle.vout {
@@ -68,6 +84,7 @@ fn publicly_recoverable_coinbase_value_to_inner(
             };
             if include_transparent && expected_address.matches_receiver(&receiver) {
                 recovered_value = recovered_value.checked_add(output.value().into_u64())?;
+                matching_output_count = matching_output_count.checked_add(1)?;
             }
         }
     }
@@ -77,6 +94,7 @@ fn publicly_recoverable_coinbase_value_to_inner(
             return None;
         }
         recovered_value = recovered_value.checked_add(value)?;
+        matching_output_count = matching_output_count.checked_add(1)?;
         Some(())
     };
 
@@ -129,7 +147,7 @@ fn publicly_recoverable_coinbase_value_to_inner(
         }
     }
 
-    Some(recovered_value)
+    Some((recovered_value, matching_output_count))
 }
 
 /// Returns true if all Sapling, Orchard, or Ironwood outputs, if any, decrypt successfully
@@ -314,11 +332,47 @@ mod tests {
                 "only outputs owned by the configured receiver are counted"
             );
             assert_eq!(
+                publicly_recoverable_coinbase_value_and_output_count_to(
+                    &coinbase,
+                    &expected_address
+                ),
+                Some((625_012_345, 1)),
+                "the matching-output count authenticates the configured recipient"
+            );
+            assert_eq!(
                 publicly_recoverable_coinbase_shielded_value_to(&coinbase, &expected_address),
                 Some(0),
                 "the compatibility API continues to exclude transparent value"
             );
         }
+    }
+
+    #[test]
+    fn recoverable_coinbase_count_distinguishes_zero_payout_from_missing_recipient() {
+        let expected_address = ZcashAddress::from_transparent_p2pkh(NetworkType::Test, [0x11; 20]);
+        let other_receiver = Receiver::P2pkh([0x22; 20]);
+
+        let zero_payout =
+            transparent_coinbase(vec![transparent_output(Receiver::P2pkh([0x11; 20]), 0)]);
+        assert_eq!(
+            publicly_recoverable_coinbase_value_and_output_count_to(
+                &zero_payout,
+                &expected_address
+            ),
+            Some((0, 1)),
+            "a zero-valued output still authenticates its recipient"
+        );
+
+        let missing_recipient =
+            transparent_coinbase(vec![transparent_output(other_receiver, 25_000)]);
+        assert_eq!(
+            publicly_recoverable_coinbase_value_and_output_count_to(
+                &missing_recipient,
+                &expected_address
+            ),
+            Some((0, 0)),
+            "a zero sum alone must not imply that the configured recipient is present"
+        );
     }
 
     #[test]

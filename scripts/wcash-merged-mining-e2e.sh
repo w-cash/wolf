@@ -149,6 +149,7 @@ fi
 
 export WCASH_EXPECTED_GENESIS_HASH=70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c
 export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327
+export ZCASH_NETWORK=regtest
 # `native-job` durably activates its job identifier. Keep its inspection-only
 # activation in a separate journal so the following `native-mine` invocation
 # cannot silently reuse one accounting identity on the unchanged tip.

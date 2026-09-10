@@ -59,6 +59,7 @@ The current local identities are pinned explicitly:
 ```sh
 export WCASH_EXPECTED_GENESIS_HASH=70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c
 export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327
+export ZCASH_NETWORK=regtest
 WCASH_JOURNAL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wcash-native-e2e.XXXXXX")"
 chmod 700 "$WCASH_JOURNAL_DIR"
 export WCASH_SHARE_JOURNAL="$WCASH_JOURNAL_DIR/journal.jsonl"
@@ -97,6 +98,13 @@ for compatibility with existing pool operations; supported shielded Zcash
 addresses remain explicit alternatives. The coordinator checks the
 template-node commitment, exact coinbase payout policy, and the independent
 validator's ordinary template before releasing work.
+
+`ZCASH_NETWORK` selects one canonical parent reward schedule. Use `regtest` only
+with the included NU6.3-at-height-1 local parent configs, `testnet` for the
+public Zcash Testnet, and `mainnet` for Zcash Mainnet. The coordinator binds that
+schedule to the configured genesis hash, payout-address namespace, coinbase
+branch ID, and minimum miner subsidy before releasing work. Parent work before
+NU6.3 is rejected.
 
 Prepare one job and exercise every preflight without mining:
 
