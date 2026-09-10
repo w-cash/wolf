@@ -249,10 +249,11 @@ impl AdjustedDifficulty {
                 return self.network.target_difficulty_limit();
             };
 
-        // Since the PoWLimits are `2^251 − 1` for Testnet, and `2^243 − 1` for
-        // Mainnet, the sum of 17 `ExpandedDifficulty` will be less than or equal
-        // to: `(2^251 − 1) * 17 = 2^255 + 2^251 - 17`. Therefore, the sum can
-        // not overflow a u256 value.
+        // For the built-in retargeting profiles, PoWLimits are at most
+        // `2^251 − 1` for the default Testnet and `2^243 − 1` for Mainnet
+        // (custom profiles such as Wcash can be harder). Therefore, the sum of
+        // 17 `ExpandedDifficulty` is at most `(2^251 − 1) * 17 =
+        // 2^255 + 2^251 - 17` and cannot overflow a u256 value.
         let total: ExpandedDifficulty = averaging_window_thresholds
             .iter()
             .map(|compact| {

@@ -9,7 +9,8 @@ declare -a child_pids=()
 wcash_rpc=http://127.0.0.1:38232
 zcash_template_rpc=http://127.0.0.1:18232
 zcash_validator_rpc=http://127.0.0.1:18242
-wcash_genesis=d95a9f2f1daf07d48fb3c863ad7334ec630a4a7077da98c8f7e65f8c0e277cf1
+wcash_genesis=0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a
+wcash_launch_target=0000008859000000000000000000000000000000000000000000000000000000
 wcash_payout_address=WT6kWkxJzyp4LdwrjtvvuVFRbkMhH2SsBeq
 
 cleanup() {
@@ -64,7 +65,8 @@ cleanup() {
 trap 'cleanup $?' EXIT
 trap 'cleanup 130' INT TERM
 
-for binary in zcash-zebrad wcash-zebrad wcash-merge-miner wcash-wallet; do
+required_binaries=(zcash-zebrad wcash-zebrad wcash-merge-miner wcash-wallet)
+for binary in "${required_binaries[@]}"; do
   if [[ ! -x "$repo_root/target/release/$binary" ]]; then
     echo "missing release binary: target/release/$binary" >&2
     exit 1
@@ -166,10 +168,10 @@ rpc_call "$wcash_rpc" getblockchaininfo | python3 -c '
 import json,sys
 result=json.load(sys.stdin)["result"]
 assert result["blocks"] == 0, result
-assert result["bestblockhash"] == "d95a9f2f1daf07d48fb3c863ad7334ec630a4a7077da98c8f7e65f8c0e277cf1", result
+assert result["bestblockhash"] == sys.argv[1], result
 assert result["chainSupply"]["chainValueZat"] == 0, result
 assert all(pool["chainValueZat"] == 0 for pool in result["valuePools"]), result
-'
+' "$wcash_genesis"
 
 # A valid address from the separate Wcash regtest namespace must not be usable
 # on public Testnet, even though its receiver payload has the same shape.
@@ -215,7 +217,8 @@ if [[ "$aux_template_ready" != true ]]; then
   echo "Wcash Testnet clean-tip template service did not become ready" >&2
   exit 1
 fi
-python3 - "$runtime_dir/createauxblock.json" "$wcash_genesis" <<'PY'
+python3 - "$runtime_dir/createauxblock.json" "$wcash_genesis" \
+  "$wcash_launch_target" <<'PY'
 import json
 import sys
 
@@ -228,7 +231,8 @@ assert result["previousblockhash"] == sys.argv[2], result
 assert result["coinbasevalue"] == 625_000_000, result
 assert len(result["hash"]) == 64, result
 assert len(result["retiretoken"]) == 64, result
-assert len(result["target"]) == 64, result
+assert result["target"] == sys.argv[3], result
+assert result["bits"] == "1e008859", result
 assert result["data"], result
 PY
 
@@ -280,15 +284,26 @@ native_args=(
 
 "$repo_root/target/release/wcash-merge-miner" native-job \
   "${native_args[@]}" >"$runtime_dir/native-job.json"
+python3 - "$runtime_dir/native-job.json" "$wcash_launch_target" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as result_file:
+    result = json.load(result_file)
+assert result["rpc"]["proposal_gate"] == "passed", result
+assert result["wcash"]["child_target"] == sys.argv[2], result
+assert len(result["wcash"]["child_block_hash"]) == 64, result
+assert len(result["job"]["job_id"]) == 64, result
+PY
 
 # `native-job` durably activates its exact job ID. The long-running pool owns a
 # separate authoritative journal so its identical first template is not
 # mistaken for an unsafe in-ledger job-ID replay.
 export WCASH_SHARE_JOURNAL="$runtime_dir/journal.jsonl"
 
-# The backend target must be at least as easy as both networks. Reconnecting
-# the reference miner until a Wcash winner is found remains bounded because the
-# initial testnet target is at the public proof-of-work limit.
+# The backend target must be at least as easy as both networks. This target is
+# advertised during the handshake below, but the smoke test never submits a
+# share or tries to solve the hardened public Wcash Testnet target.
 share_target="$(python3 - "$runtime_dir/native-job.json" <<'PY'
 import json
 import sys
@@ -339,55 +354,80 @@ PY
 pool_pid=$!
 child_pids+=("$pool_pid")
 
-export WCASH_STRATUM_PASSWORD=local-testnet-password-change-me
-wcash_height=0
-for attempt in {0..15}; do
-  wait_for_tcp 38237 "Wcash Testnet pool"
-  start_nonce=$((attempt * 512))
-  if "$repo_root/target/release/wcash-merge-miner" zip301-mine \
-    127.0.0.1:38237 rig.testnet-e2e 512 "$start_nonce" \
-    >"$runtime_dir/zip301-mine-$attempt.json" \
-    2>"$runtime_dir/zip301-mine-$attempt.log"; then
-    :
-  fi
-  # A connection can close after durable submission but before the client reads
-  # its response, so chain state—not client exit status—is authoritative.
-  wcash_height="$(rpc_result "$wcash_rpc" getblockcount 2>/dev/null || true)"
-  [[ "$wcash_height" == 1 ]] && break
-done
-unset WCASH_STRATUM_PASSWORD
+wait_for_tcp 38237 "Wcash Testnet pool"
+python3 - 38237 "$WCASH_SHARE_TARGET" \
+  "$runtime_dir/zip301-handshake.json" <<'PY'
+import copy
+import json
+import socket
+import sys
 
-if [[ "$wcash_height" != 1 ]]; then
-  echo "ZIP-301 testnet miner did not find a Wcash block in 16 bounded shares" >&2
-  exit 1
-fi
+port = int(sys.argv[1])
+expected_target = sys.argv[2]
+transcript_path = sys.argv[3]
+transcript = []
 
-for _attempt in {1..120}; do
-  template_height="$(rpc_result "$zcash_template_rpc" getblockcount 2>/dev/null || true)"
-  validator_height="$(rpc_result "$zcash_validator_rpc" getblockcount 2>/dev/null || true)"
-  if [[ "$template_height" =~ ^[1-9][0-9]*$ && "$template_height" == "$validator_height" ]]; then
-    break
-  fi
-  sleep 0.25
-done
-if [[ ! "$template_height" =~ ^[1-9][0-9]*$ || "$template_height" != "$validator_height" ]]; then
-  echo "the two Zcash parent nodes did not accept the same mined chain" >&2
-  exit 1
-fi
-[[ "$(rpc_result "$zcash_template_rpc" getbestblockhash)" == \
-   "$(rpc_result "$zcash_validator_rpc" getbestblockhash)" ]]
+sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+sock.settimeout(5)
+stream = sock.makefile("rwb", buffering=0)
 
-rpc_call "$wcash_rpc" getblockchaininfo | python3 -c '
-import json,sys
-result=json.load(sys.stdin)["result"]
-assert result["blocks"] == 1, result
-assert result["chainSupply"]["chainValue"] == 6.25, result
-assert result["chainSupply"]["chainValueZat"] == 625_000_000, result
-pools={pool["id"]: pool for pool in result["valuePools"]}
-assert pools["transparent"]["chainValue"] == 6.25, pools
-assert pools["transparent"]["chainValueZat"] == 625_000_000, pools
-assert all(pool["chainValueZat"] == 0 for name,pool in pools.items() if name != "transparent"), pools
-'
+def send(message):
+    recorded = copy.deepcopy(message)
+    if recorded.get("method") == "mining.authorize":
+        recorded["params"][1] = "<redacted>"
+    transcript.append({"direction": "client_to_pool", "message": recorded})
+    stream.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
+
+def receive():
+    line = stream.readline()
+    if not line:
+        raise RuntimeError("ZIP-301 listener closed unexpectedly")
+    message = json.loads(line)
+    transcript.append({"direction": "pool_to_client", "message": message})
+    return message
+
+try:
+    send({"id": 1, "method": "mining.subscribe", "params": []})
+    subscription = receive()
+    assert subscription["id"] == 1, subscription
+    assert subscription["error"] is None, subscription
+    assert subscription["result"][0] is None, subscription
+    nonce_1 = subscription["result"][1]
+    assert len(nonce_1) == 8 and len(bytes.fromhex(nonce_1)) == 4, subscription
+
+    send({
+        "id": 2,
+        "method": "mining.authorize",
+        "params": ["rig.testnet-e2e", "local-testnet-password-change-me"],
+    })
+    authorization = receive()
+    assert authorization == {"id": 2, "result": True, "error": None}, authorization
+
+    target = receive()
+    assert target["id"] is None, target
+    assert target["method"] == "mining.set_target", target
+    assert target["params"] == [expected_target], target
+
+    job = receive()
+    assert job["id"] is None, job
+    assert job["method"] == "mining.notify", job
+    assert len(job["params"]) == 8, job
+    for value, expected_length in zip(job["params"][:-1], [64, 8, 64, 64, 64, 8, 8]):
+        assert len(value) == expected_length, job
+        bytes.fromhex(value)
+    assert job["params"][-1] is True, job
+finally:
+    stream.close()
+    sock.close()
+
+with open(transcript_path, "w", encoding="utf-8") as transcript_file:
+    json.dump(
+        {"submitted_shares": 0, "messages": transcript},
+        transcript_file,
+        separators=(",", ":"),
+    )
+    transcript_file.write("\n")
+PY
 
 kill -TERM "$pool_pid" 2>/dev/null || true
 for _attempt in {1..40}; do
@@ -407,16 +447,17 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as result_file:
     result = json.load(result_file)
-worker = result["workers"]["rig.testnet-e2e"]
-assert worker["accepted_shares"] >= 1, worker
-assert worker["shares_by_authentication"] == {
-    "exact_credential": worker["accepted_shares"],
-}, worker
-assert 1 <= worker["wcash_winners"] <= worker["accepted_shares"], worker
-assert worker["zcash_winners"] == worker["accepted_shares"], worker
+assert result["accepted_shares"] == 0, result
+assert result["shares_by_authentication"] == {}, result
+assert result["workers"] == {}, result
 PY
 
-echo "Wcash Testnet genesis and native ZIP-301 mining phase passed at $wcash_genesis"
+echo "Wcash Testnet genesis, hard launch target, AuxPoW create/retire, and non-mining ZIP-301 handshake passed at $wcash_genesis"
+
+# This tail uses the bundled reference miner against easy local Regtest
+# targets. It is a mandatory release gate, not ASIC certification, and
+# must not be adapted to CPU-mine the ~31.5-million-work public Testnet target.
+echo "Running the mandatory wallet/mining E2E with the bundled Regtest reference miner"
 
 # Run a second, isolated Wcash Regtest child against the same two local Zcash
 # parent validators. This phase uses public test-only seeds, supplied to the

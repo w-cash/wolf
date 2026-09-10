@@ -83,9 +83,12 @@ pub const MIN_PUBLIC_ANCHOR_CONFIRMATIONS: u32 = 100;
 
 /// Canonical compact `nBits` value for the Wcash public-testnet proof-of-work limit.
 ///
-/// This is the compact encoding of `2^251 - 1`, matching the reviewed Zcash
-/// testnet limit while retaining a separate Wcash chain and proof format.
-pub const PUBLIC_TESTNET_POW_LIMIT_BITS: u32 = 0x2007_ffff;
+/// This launch limit targets approximately one block per 75 seconds at
+/// 420,000 Equihash solutions per second. It prevents modern Zcash ASICs from
+/// flooding the first public-Testnet generation with thousands of valid child
+/// witnesses per second. Normal adjustment can harden the target as aggregate
+/// hash rate grows, but cannot soften it below this launch limit.
+pub const PUBLIC_TESTNET_POW_LIMIT_BITS: u32 = 0x1e00_8859;
 
 /// Version of the fixed-width Bitcoin anchor encoding.
 pub const ANCHOR_ENCODING_VERSION: u8 = 1;
@@ -223,8 +226,8 @@ pub const fn network_identity(network: WcashNetwork) -> NetworkIdentity {
         },
         WcashNetwork::Testnet => NetworkIdentity {
             network,
-            domain_label: "Wcash/testnet/v4",
-            p2p_magic: [0x2f, 0x22, 0x9b, 0x8c],
+            domain_label: "Wcash/testnet/v5",
+            p2p_magic: [0x95, 0xd1, 0x40, 0x04],
         },
         WcashNetwork::Regtest => NetworkIdentity {
             network,
@@ -854,6 +857,19 @@ mod tests {
                 "each Wcash network must have unique P2P magic"
             );
         }
+    }
+
+    #[test]
+    fn public_testnet_pow_limit_is_frozen_for_asic_launch_capacity() {
+        assert_eq!(PUBLIC_TESTNET_POW_LIMIT_BITS, 0x1e00_8859);
+        assert_eq!(
+            decode_compact_target(PUBLIC_TESTNET_POW_LIMIT_BITS),
+            Ok([
+                0x00, 0x00, 0x00, 0x88, 0x59, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ])
+        );
     }
 
     #[test]

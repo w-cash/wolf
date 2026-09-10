@@ -20,8 +20,8 @@ The built-in Testnet profile freezes Bitcoin mainnet block 965,900, hash
 `0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851`.
 The release vector records Bitcoin height 966,011, or 112 confirmations counting
 the anchor block. Its complete Wcash genesis block ID is
-`d95a9f2f1daf07d48fb3c863ad7334ec630a4a7077da98c8f7e65f8c0e277cf1`.
-Its `Wcash/testnet/v4` P2P magic is `2f229b8c`; its default P2P and
+`0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a`.
+Its `Wcash/testnet/v5` P2P magic is `95d14004`; its default P2P and
 recommended loopback RPC ports are 38233 and 38232. It never inherits Zcash's
 DNS seeds.
 
@@ -115,10 +115,14 @@ belongs to the miner coinbase and is subject to the coinbase payout-mode rules b
 
 The target spacing is 75 seconds. Regtest deliberately uses its fixed
 proof-of-work limit. The built-in Testnet profile starts at compact target
-`0x2007ffff`
-(`2^251 - 1`) and uses the inherited damped 17-block retarget from launch. A
+`0x1e008859` (expanded target `00000088590000…`). That launch target expects
+approximately one block per 75 seconds at 420,000 Equihash solutions per
+second, instead of allowing a production ASIC to flood one child candidate
+with valid witnesses. Testnet uses the inherited damped 17-block retarget from launch. A
 candidate strictly more than 450 seconds after its predecessor may use the
-testnet proof-of-work limit; exactly 450 seconds does not trigger the rule.
+same Testnet proof-of-work limit; exactly 450 seconds does not trigger the rule.
+The limit is calibrated for one 420 KSol/s Equihash ASIC: Testnet has no
+CPU-easy fallback, so comparable launch hash rate is a liveness prerequisite.
 The maximum block-time rule is enforced from height 1, and template construction
 evaluates both rules using the candidate height, including the height-1 boundary.
 These public-testnet boundary conditions have frozen unit tests, but long-running

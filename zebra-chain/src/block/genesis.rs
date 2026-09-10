@@ -14,7 +14,7 @@ use crate::{
 
 /// Frozen display-order block ID of the public Wcash Testnet genesis block.
 pub const WCASH_TESTNET_GENESIS_HASH: &str =
-    "d95a9f2f1daf07d48fb3c863ad7334ec630a4a7077da98c8f7e65f8c0e277cf1";
+    "0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a";
 
 /// Genesis block for Regtest, copied from zcashd via `getblock 0 0` RPC method
 pub fn regtest_genesis_block() -> Arc<Block> {
