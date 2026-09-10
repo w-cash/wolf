@@ -113,6 +113,45 @@ difficulty. The boundary is strict: exactly 450 seconds is not enough. That
 minimum is the same ASIC-calibrated launch limit, not a CPU-easy recovery target.
 Comparable launch hash rate is therefore a Testnet liveness prerequisite.
 
+## Initial Z15 parent-target sampling
+
+The merge miner normally refuses to advertise a share target that does not
+include both network targets. Live Zcash Testnet can temporarily have a much
+easier parent target than Wcash's ASIC-calibrated launch target; using that
+parent target as an initial Z15 share target would make the ASIC submit nearly
+every solved Equihash proof.
+
+During this specific bootstrap condition, first run `native-job` and copy its
+exact Wcash `child_target`, then configure `native-serve` as follows:
+
+```sh
+export ZCASH_NETWORK=testnet
+export WCASH_SHARE_TARGET='<exact child_target from native-job>'
+export WCASH_TESTNET_PARENT_TARGET_SAMPLING=1
+```
+
+The value must be exactly `1`, and startup rejects the mode for Mainnet,
+Regtest, a child genesis other than the built-in Wcash Testnet, or more than one
+connected-client slot. The harder advertised target continues to capture every
+Wcash winner
+(about one target share per 75 seconds at the calibrated launch rate) while
+sampling only the Zcash winners that also meet it. This deliberately degrades
+parent-winner coverage; it does not change either chain's consensus target or
+the coordinator's independent winner classification.
+
+Inspect each generation's preflight output before connecting hardware. It must
+show `share_target_policy.mode` as `testnet_parent_target_sampling`,
+`captures_all_wcash_winners` as `true`, and
+`degraded_parent_coverage` as `true` while the parent target is easier. The
+process also emits an explicit warning. A sampled network winner is validated
+and synchronously recorded in the durable outbox before its ASIC ACK; the
+listener then stops admitting that generation, joins in-flight handlers, and
+explicitly flushes pending chain submissions before retirement or fresh work.
+Crash recovery retains the same exact-byte outbox replay guarantee.
+Do not increase the per-connection 64-submission-per-second safety cap. Unset
+`WCASH_TESTNET_PARENT_TARGET_SAMPLING` after this bootstrap exception is no
+longer required so the default full dual-target coverage is restored.
+
 ## Start a node
 
 Build the feature-isolated node binaries from the reviewed lockfile:

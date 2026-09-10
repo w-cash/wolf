@@ -18,7 +18,8 @@ use wcash_zcash_aux::{AuxPowError, Target};
 
 use crate::{
     accounting::{AuthenticatedWorker, WorkerAuthenticator},
-    MinerError, NativePreparedJob, ValidatedNativeShare, EQUIHASH_SOLUTION_BYTES,
+    MinerError, NativePreparedJob, NativeZcashNetwork, ValidatedNativeShare,
+    EQUIHASH_SOLUTION_BYTES,
 };
 
 /// Maximum ZIP-301 request frame accepted from one ASIC.
@@ -90,6 +91,7 @@ where
 #[derive(Clone)]
 pub struct Zip301Config {
     share_target: Target,
+    testnet_parent_target_sampling: bool,
     authentication: Zip301Authentication,
     maximum_clients: usize,
     maximum_parallel_authentications: usize,
@@ -112,6 +114,7 @@ impl Zip301Config {
         }
         Ok(Self {
             share_target,
+            testnet_parent_target_sampling: false,
             authentication: Zip301Authentication::SharedPassword(
                 Sha256::digest(password.as_bytes()).into(),
             ),
@@ -128,6 +131,7 @@ impl Zip301Config {
     ) -> Self {
         Self {
             share_target,
+            testnet_parent_target_sampling: false,
             authentication: Zip301Authentication::ExactWorkers(authenticator),
             maximum_clients: DEFAULT_ZIP301_CLIENT_LIMIT,
             maximum_parallel_authentications: DEFAULT_ZIP301_AUTHENTICATION_LIMIT,
@@ -140,6 +144,11 @@ impl Zip301Config {
         if maximum_clients == 0 || maximum_clients > 10_000 {
             return Err(MinerError::InvalidRequest(
                 "ZIP-301 client limit must be in 1..=10000".to_string(),
+            ));
+        }
+        if self.testnet_parent_target_sampling && maximum_clients != 1 {
+            return Err(MinerError::InvalidRequest(
+                "Testnet parent-target sampling requires exactly one ZIP-301 client".to_string(),
             ));
         }
         self.maximum_clients = maximum_clients;
@@ -178,9 +187,36 @@ impl Zip301Config {
         Ok(self)
     }
 
+    /// Allows a Testnet-only share target to sample, rather than cover, parent winners.
+    ///
+    /// The share target must still include the Wcash child target. Mainnet, Regtest,
+    /// and multi-client listeners deliberately have no equivalent mode.
+    pub fn with_testnet_parent_target_sampling(
+        mut self,
+        zcash_network: NativeZcashNetwork,
+    ) -> Result<Self, MinerError> {
+        if zcash_network != NativeZcashNetwork::Testnet {
+            return Err(MinerError::InvalidRequest(
+                "parent-target sampling is allowed only on Zcash Testnet".to_string(),
+            ));
+        }
+        if self.maximum_clients != 1 {
+            return Err(MinerError::InvalidRequest(
+                "Testnet parent-target sampling requires exactly one ZIP-301 client".to_string(),
+            ));
+        }
+        self.testnet_parent_target_sampling = true;
+        Ok(self)
+    }
+
     /// Returns the configured share target.
     pub const fn share_target(&self) -> Target {
         self.share_target
+    }
+
+    /// Returns true when parent winners may be sampled on Zcash Testnet.
+    pub const fn testnet_parent_target_sampling(&self) -> bool {
+        self.testnet_parent_target_sampling
     }
 
     /// Returns true when each exact worker has an independent credential.
@@ -194,6 +230,10 @@ impl std::fmt::Debug for Zip301Config {
         formatter
             .debug_struct("Zip301Config")
             .field("share_target", &self.share_target)
+            .field(
+                "testnet_parent_target_sampling",
+                &self.testnet_parent_target_sampling,
+            )
             .field(
                 "authentication",
                 &match &self.authentication {
@@ -323,6 +363,8 @@ fn serve_zip301_generation(
         config.share_target,
         job.job().required_target(),
         job.parent_target(),
+        job.parent_network(),
+        config.testnet_parent_target_sampling,
     )?;
     let maximum_clients = config.maximum_clients;
     let maximum_parallel_authentications = config.maximum_parallel_authentications;
@@ -338,6 +380,7 @@ fn serve_zip301_generation(
         authentications: ConnectionLimiter::new(maximum_parallel_authentications),
         validations: ConnectionLimiter::new(maximum_parallel_validations),
         shutdown: Arc::clone(&shutdown),
+        shutdown_reason: Arc::clone(&shutdown_reason),
     });
     let monitor_state = Arc::clone(&state);
     let monitor_shutdown = Arc::clone(&shutdown);
@@ -384,10 +427,24 @@ fn validate_share_target(
     share_target: Target,
     child_target: Target,
     parent_target: Target,
+    parent_network: NativeZcashNetwork,
+    testnet_parent_target_sampling: bool,
 ) -> Result<(), MinerError> {
-    if !share_target.includes(child_target) || !share_target.includes(parent_target) {
+    if testnet_parent_target_sampling && parent_network != NativeZcashNetwork::Testnet {
         return Err(MinerError::InvalidRequest(
-            "ZIP-301 share target must be at least as easy as both network targets".to_string(),
+            "parent-target sampling is allowed only on Zcash Testnet".to_string(),
+        ));
+    }
+    if !share_target.includes(child_target)
+        || (!testnet_parent_target_sampling && !share_target.includes(parent_target))
+    {
+        return Err(MinerError::InvalidRequest(
+            if testnet_parent_target_sampling {
+                "ZIP-301 Testnet sampling target must include the Wcash child network target"
+                    .to_string()
+            } else {
+                "ZIP-301 share target must be at least as easy as both network targets".to_string()
+            },
         ));
     }
     Ok(())
@@ -402,6 +459,7 @@ struct ServerState {
     authentications: ConnectionLimiter,
     validations: ConnectionLimiter,
     shutdown: Arc<AtomicBool>,
+    shutdown_reason: Arc<Mutex<Option<MinerError>>>,
 }
 
 fn serve_listener(
@@ -592,17 +650,18 @@ fn serve_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Result<()
                 write_message(&mut stream, &unsupported_extension(id))?;
             }
             "mining.submit" => {
-                let response = if !subscribed {
-                    rpc_error(id, 25, "not subscribed")
-                } else if !submission_rate.try_acquire(Instant::now()) {
-                    rpc_error(id, 20, "submission rate limit exceeded")
-                } else {
-                    match submit(&state, &authorized, nonce_1, params) {
-                        Ok(()) => rpc_success(id, Value::Bool(true)),
-                        Err(error) => rpc_error(id, error.code, error.message),
+                write_submit_response(&mut stream, id, || {
+                    if !subscribed {
+                        return Err(SubmitError {
+                            code: 25,
+                            message: "not subscribed".to_string(),
+                        });
                     }
-                };
-                write_message(&mut stream, &response)?;
+                    if !submission_rate.try_acquire(Instant::now()) {
+                        return Err(SubmitError::other("submission rate limit exceeded"));
+                    }
+                    submit(&state, &authorized, nonce_1, params)
+                })?;
             }
             _ => write_message(&mut stream, &rpc_error(id, 20, "unknown method"))?,
         }
@@ -776,10 +835,22 @@ fn submit(
         }
     }
 
-    if let Err(error) = state
-        .processor
-        .process_authenticated(processor_worker, &share)
-    {
+    if let Err(error) = complete_validated_share(
+        || {
+            state
+                .processor
+                .process_authenticated(processor_worker, &share)
+        },
+        || {
+            replay_reservation.retain();
+            request_rotation_after_durable_share(
+                &state.config,
+                is_network_winner,
+                &state.shutdown,
+                &state.shutdown_reason,
+            );
+        },
+    ) {
         let code = if matches!(
             &error,
             MinerError::StaleNativeJob(_)
@@ -795,8 +866,38 @@ fn submit(
             message: format!("share processing failed: {error}"),
         });
     }
-    replay_reservation.retain();
     Ok(())
+}
+
+fn complete_validated_share(
+    process_durably: impl FnOnce() -> Result<(), MinerError>,
+    after_durable_processing: impl FnOnce(),
+) -> Result<(), MinerError> {
+    process_durably()?;
+    after_durable_processing();
+    Ok(())
+}
+
+fn request_rotation_after_durable_share(
+    config: &Zip301Config,
+    is_network_winner: bool,
+    shutdown: &AtomicBool,
+    shutdown_reason: &Mutex<Option<MinerError>>,
+) {
+    if !is_network_winner || !config.testnet_parent_target_sampling {
+        return;
+    }
+
+    let mut reason = shutdown_reason
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reason.is_none() {
+        *reason = Some(MinerError::StaleNativeJob(
+            "Testnet parent-target sampling durably recorded a network winner; rotating work"
+                .to_string(),
+        ));
+        shutdown.store(true, Ordering::Release);
+    }
 }
 
 fn share_validation_error(error: MinerError) -> SubmitError {
@@ -967,7 +1068,19 @@ fn unsupported_extension(id: Value) -> Value {
     json!({"id": id, "result": false, "error": [20, "Not supported.", Value::Null]})
 }
 
-fn write_message(stream: &mut TcpStream, message: &Value) -> Result<(), MinerError> {
+fn write_submit_response<W: Write>(
+    stream: &mut W,
+    id: Value,
+    submit: impl FnOnce() -> Result<(), SubmitError>,
+) -> Result<(), MinerError> {
+    let response = match submit() {
+        Ok(()) => rpc_success(id, Value::Bool(true)),
+        Err(error) => rpc_error(id, error.code, error.message),
+    };
+    write_message(stream, &response)
+}
+
+fn write_message<W: Write>(stream: &mut W, message: &Value) -> Result<(), MinerError> {
     serde_json::to_writer(&mut *stream, message)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
@@ -1408,6 +1521,27 @@ impl Drop for ConnectionPermit {
 mod tests {
     use super::*;
 
+    struct EventWriter<'a> {
+        bytes: Vec<u8>,
+        events: &'a std::cell::RefCell<Vec<&'static str>>,
+        started: bool,
+    }
+
+    impl Write for EventWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.started {
+                self.events.borrow_mut().push("ack");
+                self.started = true;
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn accept_with_deadline(listener: &TcpListener) -> TcpStream {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -1513,10 +1647,207 @@ mod tests {
         };
         let child = target(0x20, 0x01);
         let parent = target(0x10, 0xff);
-        assert!(validate_share_target(target(0x30, 0), child, parent).is_ok());
-        assert!(validate_share_target(child, child, parent).is_ok());
-        assert!(validate_share_target(target(0x10, 0xfe), child, parent).is_err());
-        assert!(validate_share_target(target(0x20, 0), child, parent).is_err());
+        assert!(validate_share_target(
+            target(0x30, 0),
+            child,
+            parent,
+            NativeZcashNetwork::Mainnet,
+            false,
+        )
+        .is_ok());
+        assert!(
+            validate_share_target(child, child, parent, NativeZcashNetwork::Regtest, false,)
+                .is_ok()
+        );
+        assert!(validate_share_target(
+            target(0x10, 0xfe),
+            child,
+            parent,
+            NativeZcashNetwork::Testnet,
+            false,
+        )
+        .is_err());
+        assert!(validate_share_target(
+            target(0x20, 0),
+            child,
+            parent,
+            NativeZcashNetwork::Testnet,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn testnet_sampling_never_hides_a_wcash_winner() {
+        let target = |most_significant| {
+            let mut bytes = [0; 32];
+            bytes[31] = most_significant;
+            Target::from_le_bytes(bytes).expect("fixture target is nonzero")
+        };
+        let child = target(0x20);
+        let easier_parent = target(0x30);
+
+        assert!(validate_share_target(
+            child,
+            child,
+            easier_parent,
+            NativeZcashNetwork::Testnet,
+            false,
+        )
+        .is_err());
+        assert!(validate_share_target(
+            child,
+            child,
+            easier_parent,
+            NativeZcashNetwork::Testnet,
+            true,
+        )
+        .is_ok());
+        for network in [NativeZcashNetwork::Mainnet, NativeZcashNetwork::Regtest] {
+            assert!(validate_share_target(child, child, easier_parent, network, true).is_err());
+        }
+        assert!(validate_share_target(
+            target(0x1f),
+            child,
+            easier_parent,
+            NativeZcashNetwork::Testnet,
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parent_target_sampling_can_only_be_enabled_for_testnet() {
+        let config = || {
+            Zip301Config::new(Target::MAX, "correct horse battery")
+                .expect("strong fixture password")
+                .with_maximum_clients(1)
+                .expect("one bootstrap client")
+        };
+
+        assert!(config()
+            .with_testnet_parent_target_sampling(NativeZcashNetwork::Mainnet)
+            .is_err());
+        assert!(config()
+            .with_testnet_parent_target_sampling(NativeZcashNetwork::Regtest)
+            .is_err());
+        let testnet = config()
+            .with_testnet_parent_target_sampling(NativeZcashNetwork::Testnet)
+            .expect("public Testnet explicitly supports sampling");
+        assert!(testnet.testnet_parent_target_sampling());
+        assert!(testnet.clone().with_maximum_clients(2).is_err());
+        assert!(Zip301Config::new(Target::MAX, "correct horse battery")
+            .expect("strong fixture password")
+            .with_testnet_parent_target_sampling(NativeZcashNetwork::Testnet)
+            .is_err());
+    }
+
+    #[test]
+    fn sampled_network_winner_requests_prompt_generation_rotation() {
+        let default = Zip301Config::new(Target::MAX, "correct horse battery")
+            .expect("strong fixture password")
+            .with_maximum_clients(1)
+            .expect("one bootstrap client");
+        let sampled = default
+            .clone()
+            .with_testnet_parent_target_sampling(NativeZcashNetwork::Testnet)
+            .expect("public Testnet explicitly supports sampling");
+        let shutdown = AtomicBool::new(false);
+        let reason = Mutex::new(None);
+
+        request_rotation_after_durable_share(&default, true, &shutdown, &reason);
+        assert!(!shutdown.load(Ordering::Acquire));
+        request_rotation_after_durable_share(&sampled, false, &shutdown, &reason);
+        assert!(!shutdown.load(Ordering::Acquire));
+        request_rotation_after_durable_share(&sampled, true, &shutdown, &reason);
+        assert!(shutdown.load(Ordering::Acquire));
+        assert!(matches!(
+            reason.lock().expect("rotation reason mutex").as_ref(),
+            Some(MinerError::StaleNativeJob(message))
+                if message.contains("durably recorded a network winner")
+        ));
+    }
+
+    #[test]
+    fn durable_processor_success_precedes_rotation_and_ack_but_failure_does_not_rotate() {
+        let config = Zip301Config::new(Target::MAX, "correct horse battery")
+            .expect("strong fixture password")
+            .with_maximum_clients(1)
+            .expect("one bootstrap client")
+            .with_testnet_parent_target_sampling(NativeZcashNetwork::Testnet)
+            .expect("public Testnet explicitly supports sampling");
+        let shutdown = AtomicBool::new(false);
+        let reason = Mutex::new(None);
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut writer = EventWriter {
+            bytes: Vec::new(),
+            events: &events,
+            started: false,
+        };
+
+        write_submit_response(&mut writer, json!(7), || {
+            complete_validated_share(
+                || {
+                    events.borrow_mut().push("durable");
+                    Ok(())
+                },
+                || {
+                    events.borrow_mut().push("replay_retained");
+                    request_rotation_after_durable_share(&config, true, &shutdown, &reason);
+                    events.borrow_mut().push("rotation");
+                },
+            )
+            .map_err(|error| SubmitError::other(error.to_string()))
+        })
+        .expect("the accepted share response is written");
+        assert_eq!(
+            *events.borrow(),
+            ["durable", "replay_retained", "rotation", "ack"]
+        );
+        assert!(shutdown.load(Ordering::Acquire));
+        let response: Value = serde_json::from_slice(&writer.bytes).expect("valid response JSON");
+        assert_eq!(response, rpc_success(json!(7), Value::Bool(true)));
+
+        let failed_shutdown = AtomicBool::new(false);
+        let failed_reason = Mutex::new(None);
+        let failed_events = std::cell::RefCell::new(Vec::new());
+        let mut failed_writer = EventWriter {
+            bytes: Vec::new(),
+            events: &failed_events,
+            started: false,
+        };
+        write_submit_response(&mut failed_writer, json!(8), || {
+            complete_validated_share(
+                || {
+                    failed_events.borrow_mut().push("processor_failed");
+                    Err(MinerError::InvalidRequest(
+                        "fixture durability failure".to_string(),
+                    ))
+                },
+                || {
+                    request_rotation_after_durable_share(
+                        &config,
+                        true,
+                        &failed_shutdown,
+                        &failed_reason,
+                    );
+                    failed_events.borrow_mut().push("rotation");
+                },
+            )
+            .map_err(|error| SubmitError::other(error.to_string()))
+        })
+        .expect("the rejected share response is written");
+        assert_eq!(*failed_events.borrow(), ["processor_failed", "ack"]);
+        assert!(!failed_shutdown.load(Ordering::Acquire));
+        assert!(failed_reason
+            .lock()
+            .expect("rotation reason mutex")
+            .is_none());
+        let response: Value =
+            serde_json::from_slice(&failed_writer.bytes).expect("valid response JSON");
+        assert_eq!(response["id"], 8);
+        assert!(response["result"].is_null());
+        assert!(response["error"].is_array());
     }
 
     #[test]
