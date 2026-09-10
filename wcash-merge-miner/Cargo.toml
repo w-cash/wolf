@@ -16,12 +16,15 @@ blake2b_simd.workspace = true
 equihash = { version = "0.3", features = ["solver"] }
 fs2 = "0.4"
 hex = "0.4"
+nix = { workspace = true, features = ["socket", "user"] }
 rand_core = { workspace = true, features = ["getrandom"] }
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+wcash-pool-protocol = { git = "https://github.com/w-cash/pool.git", rev = "3b23f184a58da199c326d77c5486f8c9f54c32fc" }
 wcash-zcash-aux = { path = "../wcash-zcash-aux" }
 zcash_address.workspace = true
 zcash_protocol.workspace = true

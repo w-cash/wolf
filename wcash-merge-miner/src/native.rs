@@ -251,6 +251,12 @@ impl NativeZcashConfig {
     pub(crate) fn expected_genesis_hash(&self) -> &str {
         &self.expected_genesis_hash
     }
+
+    /// Returns the domain-separated commitment to the configured parent
+    /// block-reward recipient.
+    pub const fn expected_parent_payout_commitment(&self) -> [u8; 32] {
+        self.expected_parent_payout_commitment
+    }
 }
 
 /// Native pool backend backed by a template node and an explicit validation quorum.
@@ -1711,6 +1717,7 @@ fn decode_template_bytes(
 
 #[cfg(test)]
 mod tests {
+    use wcash_pool_protocol::ProtocolError;
     use wcash_zcash_aux::{auth_data_merkle_root, PROOF_VERSION};
     use zcash_address::ToAddress;
     use zcash_protocol::consensus::NetworkType;
@@ -1721,7 +1728,149 @@ mod tests {
     };
 
     use super::*;
-    use crate::{JobConfig, NATIVE_JOB_MAX_AGE_SECONDS};
+    use crate::{
+        pool_backend::{job_descriptor_from_native, PoolBackendAdapterError},
+        JobConfig, NATIVE_JOB_MAX_AGE_SECONDS,
+    };
+
+    fn pool_backend_descriptor_fixture(
+        parent_version: u32,
+        payout_verification: NativeWcashPayoutVerification,
+    ) -> NativeGenerationDescriptor {
+        let mut wcash_target_le = [0; 32];
+        wcash_target_le[0] = 0x12;
+        wcash_target_le[31] = 0x34;
+        let mut zcash_target_le = [0; 32];
+        zcash_target_le[0] = 0x56;
+        zcash_target_le[31] = 0x78;
+        let mut wcash_candidate_hash_le = [0x31; 32];
+        wcash_candidate_hash_le[0] = 0x01;
+        wcash_candidate_hash_le[31] = 0xfe;
+        let mut zcash_previous_hash_le = [0x32; 32];
+        zcash_previous_hash_le[0] = 0x02;
+        zcash_previous_hash_le[31] = 0xfd;
+        let mut wcash_previous_hash_le = [0x33; 32];
+        wcash_previous_hash_le[0] = 0x03;
+        wcash_previous_hash_le[31] = 0xfc;
+        let mut wcash_coinbase_txid_le = [0x34; 32];
+        wcash_coinbase_txid_le[0] = 0x04;
+        wcash_coinbase_txid_le[31] = 0xfb;
+        let parent_job = PreparedJob::new(
+            wcash_candidate_hash_le,
+            Target::from_le_bytes(wcash_target_le).expect("nonzero Wcash target"),
+            JobConfig {
+                parent_height: 73,
+                parent_version,
+                previous_block_hash: zcash_previous_hash_le,
+                timestamp: 0x4433_2211,
+                ..JobConfig::default()
+            },
+        )
+        .expect("valid parent job fixture");
+
+        NativeGenerationDescriptor::from_validated_parts(
+            &parent_job,
+            Target::from_le_bytes(zcash_target_le).expect("nonzero Zcash target"),
+            73,
+            312_500_000,
+            wcash_previous_hash_le,
+            wcash_coinbase_txid_le,
+            91,
+            625_000_000,
+            payout_verification,
+        )
+    }
+
+    #[test]
+    fn pool_backend_adapter_preserves_every_field_and_little_endian_byte() {
+        let native = pool_backend_descriptor_fixture(
+            4,
+            NativeWcashPayoutVerification::ExactTransparentRecipient,
+        );
+        let protocol =
+            job_descriptor_from_native(&native).expect("valid native descriptor converts");
+
+        assert_eq!(protocol.job_id.as_bytes(), &native.job_id());
+        assert_eq!(
+            protocol.wcash_candidate_hash_le.as_bytes(),
+            &native.wcash_candidate_hash_le()
+        );
+        assert_eq!(
+            protocol.header_input.as_bytes(),
+            native.parent_header_input()
+        );
+        assert_eq!(
+            protocol.wcash_previous_hash_le.as_bytes(),
+            &native.wcash_previous_hash_le()
+        );
+        assert_eq!(
+            protocol.zcash_previous_hash_le.as_bytes(),
+            &native.zcash_previous_hash_le()
+        );
+        assert_eq!(
+            protocol.wcash_coinbase_txid_le.as_bytes(),
+            &native.wcash_coinbase_txid_le()
+        );
+        assert_eq!(
+            protocol.zcash_coinbase_txid_le.as_bytes(),
+            &native.zcash_coinbase_txid_le()
+        );
+        assert_eq!(
+            protocol.wcash_target_le.as_bytes(),
+            &native.wcash_target_le()
+        );
+        assert_eq!(
+            protocol.zcash_target_le.as_bytes(),
+            &native.zcash_target_le()
+        );
+        assert_eq!(protocol.wcash_height, native.wcash_height());
+        assert_eq!(protocol.zcash_height, native.zcash_height());
+        assert_eq!(protocol.wcash_reward_zat, native.wcash_reward_zatoshis());
+        assert_eq!(protocol.zcash_reward_zat, native.zcash_reward_zatoshis());
+        assert_eq!(
+            protocol.wcash_maturity_confirmations,
+            native.wcash_maturity_confirmations()
+        );
+        assert_eq!(
+            protocol.zcash_maturity_confirmations,
+            native.zcash_maturity_confirmations()
+        );
+        assert_eq!(protocol.max_age_ms, native.max_age_milliseconds());
+        protocol
+            .validate()
+            .expect("the adapter returns a protocol-valid descriptor");
+    }
+
+    #[test]
+    fn pool_backend_adapter_rejects_protocol_invalid_native_metadata() {
+        let native = pool_backend_descriptor_fixture(
+            5,
+            NativeWcashPayoutVerification::ExactTransparentRecipient,
+        );
+
+        assert!(matches!(
+            job_descriptor_from_native(&native),
+            Err(PoolBackendAdapterError::InvalidJobDescriptor(
+                ProtocolError::InvalidField {
+                    field: "job.header_input.version",
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn pool_backend_adapter_rejects_private_wcash_payouts() {
+        let native = pool_backend_descriptor_fixture(
+            4,
+            NativeWcashPayoutVerification::TrustedPrivateTemplateNode,
+        );
+
+        assert_eq!(
+            job_descriptor_from_native(&native),
+            Err(PoolBackendAdapterError::UnverifiedWcashPayout)
+        );
+    }
 
     #[test]
     fn generation_descriptor_preserves_exact_consensus_metadata() {
