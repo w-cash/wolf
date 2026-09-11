@@ -6848,6 +6848,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http-body-util",
+ "nix",
  "orchard",
  "pczt",
  "prost",

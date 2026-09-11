@@ -7,6 +7,7 @@
 
 mod address;
 mod cache;
+mod identity;
 mod keys;
 mod network;
 mod rpc;
@@ -17,6 +18,7 @@ pub use address::{
     WalletAddressError,
 };
 pub use cache::{MemoryBlockCache, MemoryBlockCacheError};
+pub use identity::WalletDatabaseIdentityError;
 pub use keys::{derive_wallet_seed, derive_wallet_spending_key, WalletKeyError};
 pub use network::WalletNetwork;
 /// A chain position bound to its canonical internal-byte-order block hash.

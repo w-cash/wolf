@@ -10,6 +10,12 @@ use crate::WalletNetwork;
 const SEED_PERSONALIZATION: &[u8; 16] = b"WcashSeedV1_____";
 const DERIVATION_LABEL: &[u8] = b"Wcash wallet seed derivation version 1";
 
+/// Persistent identifier for the exact seed KDF implemented by this module.
+///
+/// This value must be incremented whenever the personalization, derivation
+/// label, input framing, network domain, or genesis binding changes.
+pub(crate) const WALLET_SEED_KDF_VERSION: u32 = 1;
+
 /// Errors returned while deriving Wcash wallet keys.
 #[derive(Debug, Error)]
 pub enum WalletKeyError {

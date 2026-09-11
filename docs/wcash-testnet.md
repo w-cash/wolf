@@ -274,6 +274,27 @@ a replacement before resolving those records is unsafe. The wallet is not an
 automatic shielding, batch payout, pool accounting, durable settlement, or
 idempotent-request system.
 
+Every newly initialized wallet database stores a Wcash-owned identity record
+before the librustzcash schema is opened or migrated. The record binds the file
+to the selected Wcash network, exact genesis hash, seed-KDF version, and
+transaction branch ID, and all four values are checked on every open. Wallet
+databases created before this record existed, including the pre-launch Testnet
+v4 profile, are intentionally not migrated in place because the v5 genesis also
+changed the keys derived from the same seed. Move an old file aside, initialize
+a new v5 database from the seed, and rescan; retain the old file as a backup
+until the rescan has been independently checked.
+
+On Unix, create the database beneath a directory owned by the wallet process's
+effective UID and not writable by a group or other users. The full canonical
+ancestor chain must also prevent another local account from replacing that
+directory. New wallet files are created atomically with mode `0600`. An
+existing file must be owned by the effective UID, have private permissions,
+and have exactly one hard link. The wallet retains the securely opened file
+while SQLite opens it and checks that the pathname still identifies the same
+device and inode. Unsafe ownership, permissions, links, or replacement are
+rejected instead of being silently repaired; correct them only after
+confirming the intended file and path.
+
 The passing automated run established this controlled local path:
 
 1. It derived separate miner and recipient addresses in the Wcash Regtest
