@@ -13,11 +13,10 @@ rust-version.workspace = true
 [dependencies]
 async-trait = "0.1"
 blake2b_simd.workspace = true
-bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
 futures-util.workspace = true
+fs2 = "0.4"
 hex.workspace = true
-http-body-util.workspace = true
 prost.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 rusqlite = "0.37"

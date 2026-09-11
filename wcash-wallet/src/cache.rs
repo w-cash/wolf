@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    ops::Range,
     sync::{Arc, Mutex},
 };
 
@@ -22,12 +23,16 @@ use zcash_protocol::{
 };
 use zebra_chain::orchard::shielded_data::AUTHORIZED_ACTION_SIZE;
 
+use crate::BlockRef;
+
 /// Largest compact-block batch accepted by the cache.
 ///
 /// This matches the public synchronizer limit. It bounds the data retained by
 /// the wallet after gRPC decoding; the transport must separately bound bytes
 /// while a streamed response is being decoded.
 pub(crate) const MAX_COMPACT_BLOCKS_PER_BATCH: u32 = 10_000;
+/// Largest compact-block range fetched through the Wcash-owned network boundary.
+pub(crate) const MAX_ATTESTED_COMPACT_BLOCKS_PER_RANGE: u32 = 16;
 
 /// Maximum number of Ironwood actions, and therefore emitted compact
 /// transactions, that can fit in a valid Wcash block.
@@ -35,7 +40,7 @@ pub(crate) const MAX_COMPACT_BLOCKS_PER_BATCH: u32 = 10_000;
 /// Each full-wire Ironwood action occupies the same 884 bytes as an authorized
 /// Orchard action. The byte reserved below for its vector length makes this a
 /// conservative upper bound; other transaction fields only reduce the limit.
-const MAX_IRONWOOD_ACTIONS_PER_BLOCK: usize =
+pub(crate) const MAX_IRONWOOD_ACTIONS_PER_BLOCK: usize =
     (MAX_BLOCK_BYTES - 1) / AUTHORIZED_ACTION_SIZE as usize;
 
 /// Errors returned by the in-memory compact-block cache.
@@ -85,6 +90,24 @@ pub enum MemoryBlockCacheError {
         maximum: u32,
         /// Number of compact blocks returned by the service.
         actual: usize,
+    },
+    /// A response did not contain exactly the requested half-open block range.
+    #[error(
+        "compact-block response does not match requested range {expected_start}..{expected_end}: got {actual_count} blocks"
+    )]
+    UnexpectedRange {
+        /// First requested height.
+        expected_start: u32,
+        /// Exclusive requested end height.
+        expected_end: u32,
+        /// Number of blocks returned by the service.
+        actual_count: usize,
+    },
+    /// The first downloaded block does not descend from the attested predecessor.
+    #[error("compact block {height} does not descend from the attested predecessor")]
+    WrongAttestedPredecessor {
+        /// First height in the requested range.
+        height: u32,
     },
     /// A canonical compact block exceeds the consensus full-block byte limit.
     #[error("compact block {height} is {actual} bytes, exceeding the {maximum}-byte safety limit")]
@@ -247,6 +270,70 @@ impl MemoryBlockCache {
     /// Returns true if the cache contains no blocks.
     pub fn is_empty(&self) -> Result<bool, MemoryBlockCacheError> {
         self.len().map(|len| len == 0)
+    }
+
+    /// Inserts one exact range after binding its first block to an independently
+    /// attested predecessor hash and Ironwood tree size.
+    pub(crate) async fn insert_attested_range(
+        &self,
+        compact_blocks: Vec<CompactBlock>,
+        expected_range: Range<u32>,
+        predecessor: BlockRef,
+        predecessor_ironwood_tree_size: u32,
+    ) -> Result<(), MemoryBlockCacheError> {
+        let expected_count = expected_range
+            .end
+            .checked_sub(expected_range.start)
+            .and_then(|count| usize::try_from(count).ok());
+        if expected_range.start == 0
+            || expected_range.is_empty()
+            || compact_blocks.is_empty()
+            || expected_count != Some(compact_blocks.len())
+            || compact_blocks.len()
+                > usize::try_from(MAX_ATTESTED_COMPACT_BLOCKS_PER_RANGE)
+                    .expect("the attested compact-block range limit fits in usize")
+            || predecessor.height.checked_add(1) != Some(expected_range.start)
+        {
+            return Err(MemoryBlockCacheError::UnexpectedRange {
+                expected_start: expected_range.start,
+                expected_end: expected_range.end,
+                actual_count: compact_blocks.len(),
+            });
+        }
+
+        for (offset, block) in compact_blocks.iter().enumerate() {
+            let offset =
+                u32::try_from(offset).map_err(|_| MemoryBlockCacheError::UnexpectedRange {
+                    expected_start: expected_range.start,
+                    expected_end: expected_range.end,
+                    actual_count: compact_blocks.len(),
+                })?;
+            let expected_height = expected_range.start.checked_add(offset).ok_or(
+                MemoryBlockCacheError::UnexpectedRange {
+                    expected_start: expected_range.start,
+                    expected_end: expected_range.end,
+                    actual_count: compact_blocks.len(),
+                },
+            )?;
+            if block.height != u64::from(expected_height) {
+                return Err(MemoryBlockCacheError::NonContiguousBatch {
+                    expected: expected_height,
+                    actual: u32::try_from(block.height).unwrap_or(u32::MAX),
+                });
+            }
+        }
+
+        let first = compact_blocks
+            .first()
+            .expect("a valid non-empty range has a first compact block");
+        if first.prev_hash.as_slice() != predecessor.hash {
+            return Err(MemoryBlockCacheError::WrongAttestedPredecessor {
+                height: expected_range.start,
+            });
+        }
+        Self::validate_block(first, Some(predecessor_ironwood_tree_size))?;
+
+        BlockCache::insert(self, compact_blocks).await
     }
 
     fn range_blocks(&self, range: &ScanRange) -> Result<Vec<CompactBlock>, MemoryBlockCacheError> {
@@ -1105,5 +1192,89 @@ mod tests {
             rejection_after_valid_prefix(oversized).await,
             MemoryBlockCacheError::OversizedBlock { height: 21, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn attested_range_requires_exact_heights_count_and_predecessor() {
+        let predecessor = BlockRef {
+            height: 9,
+            hash: [9; 32],
+        };
+
+        for expected_range in [10..10, Range { start: 11, end: 10 }] {
+            assert!(matches!(
+                MemoryBlockCache::default()
+                    .insert_attested_range(Vec::new(), expected_range, predecessor, 0)
+                    .await,
+                Err(MemoryBlockCacheError::UnexpectedRange { .. })
+            ));
+        }
+        let oversized = (10u64..27).map(block).collect();
+        assert!(matches!(
+            MemoryBlockCache::default()
+                .insert_attested_range(oversized, 10..27, predecessor, 0)
+                .await,
+            Err(MemoryBlockCacheError::UnexpectedRange { .. })
+        ));
+
+        for blocks in [vec![block(10)], vec![block(10), block(11), block(12)]] {
+            let cache = MemoryBlockCache::default();
+            assert!(matches!(
+                cache
+                    .insert_attested_range(blocks, 10..12, predecessor, 0)
+                    .await,
+                Err(MemoryBlockCacheError::UnexpectedRange { .. })
+            ));
+            assert!(cache.is_empty().unwrap());
+        }
+
+        let cache = MemoryBlockCache::default();
+        assert!(matches!(
+            cache
+                .insert_attested_range(vec![block(10), block(12)], 10..12, predecessor, 0)
+                .await,
+            Err(MemoryBlockCacheError::NonContiguousBatch {
+                expected: 11,
+                actual: 12,
+            })
+        ));
+        assert!(cache.is_empty().unwrap());
+
+        let mut wrong_parent = block(10);
+        wrong_parent.prev_hash = vec![8; 32];
+        assert!(matches!(
+            MemoryBlockCache::default()
+                .insert_attested_range(vec![wrong_parent], 10..11, predecessor, 0)
+                .await,
+            Err(MemoryBlockCacheError::WrongAttestedPredecessor { height: 10 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn attested_range_binds_the_first_tree_delta_and_accepts_a_valid_path() {
+        let predecessor = BlockRef {
+            height: 9,
+            hash: [9; 32],
+        };
+        let cache = MemoryBlockCache::default();
+        let valid = vec![ironwood_block(10, 2, 7), ironwood_block(11, 1, 8)];
+        cache
+            .insert_attested_range(valid, 10..12, predecessor, 5)
+            .await
+            .expect("the exact range extends the attested predecessor state");
+        assert_eq!(cache.len().unwrap(), 2);
+
+        let invalid = MemoryBlockCache::default();
+        assert!(matches!(
+            invalid
+                .insert_attested_range(vec![ironwood_block(10, 2, 8)], 10..11, predecessor, 5,)
+                .await,
+            Err(MemoryBlockCacheError::InvalidIronwoodTreeSize {
+                height: 10,
+                expected: 7,
+                actual: 8,
+            })
+        ));
+        assert!(invalid.is_empty().unwrap());
     }
 }

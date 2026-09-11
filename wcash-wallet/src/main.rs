@@ -107,7 +107,7 @@ enum Command {
     /// Download, validate, and scan compact blocks into SQLite.
     Sync {
         /// Maximum compact blocks per synchronizer batch.
-        #[arg(long, default_value_t = 1_000, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=16))]
         batch_size: u32,
     },
     /// Print the locally stored pool-separated wallet balance.
@@ -451,6 +451,16 @@ mod tests {
             "shield-coinbase",
             "--max-inputs",
             "101",
+        ])
+        .is_err());
+
+        assert!(Cli::try_parse_from([
+            "wcash-wallet",
+            "--network",
+            "regtest",
+            "sync",
+            "--batch-size",
+            "17",
         ])
         .is_err());
     }

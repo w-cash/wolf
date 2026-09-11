@@ -11,6 +11,7 @@ mod identity;
 mod keys;
 mod network;
 mod rpc;
+mod sync;
 mod wallet;
 
 pub use address::{
