@@ -8,6 +8,8 @@ use thiserror::Error;
 use crate::{keys::WALLET_SEED_KDF_VERSION, WalletNetwork};
 
 const IDENTITY_TABLE: &str = "ext_wcash_wallet_identity";
+pub(crate) const TRANSPARENT_SYNC_STATE_TABLE: &str = "ext_wcash_transparent_sync_state";
+pub(crate) const IRONWOOD_SYNC_STATE_TABLE: &str = "ext_wcash_ironwood_sync";
 const IDENTITY_FORMAT_VERSION: i64 = 1;
 
 /// Errors returned before a SQLite database is opened as a Wcash wallet.
@@ -85,8 +87,52 @@ pub(crate) fn verify_or_initialize_identity(
 
     let actual = read_identity(&transaction)?;
     verify_identity(network, actual)?;
+    ensure_transparent_sync_state(&transaction)?;
     transaction.commit()?;
     Ok(())
+}
+
+fn ensure_transparent_sync_state(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ext_wcash_transparent_sync_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            recovery_in_progress INTEGER NOT NULL CHECK (recovery_in_progress IN (0, 1)),
+            recovery_session BLOB,
+            completed_height INTEGER,
+            completed_hash BLOB,
+            CHECK (
+                (recovery_in_progress = 0 AND recovery_session IS NULL)
+                OR (
+                    recovery_in_progress = 1
+                    AND typeof(recovery_session) = 'blob'
+                    AND length(recovery_session) = 32
+                )
+            ),
+            CHECK (
+                (completed_height IS NULL AND completed_hash IS NULL)
+                OR (
+                    completed_height BETWEEN 0 AND 4294967295
+                    AND typeof(completed_hash) = 'blob'
+                    AND length(completed_hash) = 32
+                )
+            )
+        ) WITHOUT ROWID;
+        INSERT OR IGNORE INTO ext_wcash_transparent_sync_state (
+            singleton,
+            recovery_in_progress,
+            recovery_session,
+            completed_height,
+            completed_hash
+        ) VALUES (1, 0, NULL, NULL, NULL);
+        CREATE TABLE IF NOT EXISTS ext_wcash_ironwood_sync (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            verified_prefix_count INTEGER NOT NULL
+                CHECK (verified_prefix_count BETWEEN 0 AND 4294967295),
+            attested_tip_height INTEGER NOT NULL
+                CHECK (attested_tip_height BETWEEN 0 AND 4294967295),
+            attested_tip_hash BLOB NOT NULL CHECK (length(attested_tip_hash) = 32)
+        ) WITHOUT ROWID;",
+    )
 }
 
 fn schema_object_exists(connection: &Connection, name: &str) -> Result<bool, rusqlite::Error> {
@@ -297,6 +343,10 @@ mod tests {
         schema_object_exists(connection, IDENTITY_TABLE).unwrap()
     }
 
+    fn transparent_sync_state_table_exists(connection: &Connection) -> bool {
+        schema_object_exists(connection, TRANSPARENT_SYNC_STATE_TABLE).unwrap()
+    }
+
     fn open_error(path: &Path, network: WalletNetwork) -> WalletServiceError {
         match open_wallet_database(path, network) {
             Ok(_) => panic!("database unexpectedly passed its identity check"),
@@ -341,6 +391,24 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         let actual = read_identity(&connection).unwrap();
         assert_eq!(actual, WalletDatabaseIdentity::expected(network));
+        assert!(transparent_sync_state_table_exists(&connection));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT recovery_in_progress, recovery_session, completed_height, completed_hash
+                     FROM ext_wcash_transparent_sync_state
+                     WHERE singleton = 1",
+                    [],
+                    |row| Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    )),
+                )
+                .unwrap(),
+            (0, None, None, None)
+        );
         drop(connection);
 
         drop(open_wallet_database(&path, network).unwrap());

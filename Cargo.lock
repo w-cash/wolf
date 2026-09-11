@@ -6843,11 +6843,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "blake2b_simd",
- "bytes",
  "clap",
+ "fs2",
  "futures-util",
  "hex",
- "http-body-util",
  "nix",
  "orchard",
  "pczt",

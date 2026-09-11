@@ -1,16 +1,19 @@
 //! SQLite-backed Wcash wallet operations.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
     fs::{self, File, OpenOptions},
+    future::Future,
     num::NonZeroU32,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
+use fs2::FileExt;
 use orchard::keys::Scope as OrchardScope;
 use rand_core::{OsRng, RngCore};
-use rusqlite::OptionalExtension;
+use rusqlite::{params, OptionalExtension};
 use secrecy::SecretVec;
 use serde::Serialize;
 use thiserror::Error;
@@ -21,15 +24,19 @@ use zcash_client_backend::{
         propose_shielding_coinbase, propose_transfer, unlock_proposal_inputs, ConfirmationsPolicy,
         LockRequest, SpendingKeys,
     },
-    data_api::{Account, AccountBirthday, NullifierQuery, WalletRead, WalletWrite},
+    data_api::{
+        Account, AccountBirthday, NullifierQuery, OutputStatusFilter, TransactionDataRequest,
+        TransactionStatusFilter, TransactionsInvolvingAddress, WalletRead, WalletWrite,
+    },
     decrypt_transaction,
     fees::{standard::SingleOutputChangeStrategy, DustOutputPolicy, StandardFeeRule},
-    sync,
     wallet::{LockOwner, Note as WalletNote, OvkPolicy},
     zip321::{Payment, TransactionRequest},
     TransferType,
 };
-use zcash_client_sqlite::{util::SystemClock, wallet::init::init_wallet_db, AccountUuid, WalletDb};
+use zcash_client_sqlite::{
+    util::SystemClock, wallet::init::init_wallet_db, AccountUuid, ExtensionTransaction, WalletDb,
+};
 use zcash_primitives::transaction::{Transaction, TxVersion};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
@@ -45,15 +52,17 @@ use crate::{
     address::default_transparent_receiver,
     decode_recipient, derive_wallet_seed, derive_wallet_spending_key, encode_orchard_receiver,
     encode_transparent_coinbase_receiver,
-    identity::{open_wallet_connection, verify_or_initialize_identity},
+    identity::{
+        open_wallet_connection, verify_or_initialize_identity, TRANSPARENT_SYNC_STATE_TABLE,
+    },
     inspect_signed_transaction,
-    rpc::TRANSPARENT_UTXO_PAGE_OUTPUTS,
-    AttestedWcashClient, BlockRef, MemoryBlockCache, WalletAddressError,
+    rpc::{MAX_TRANSPARENT_HISTORY_BLOCKS_PER_REQUEST, TRANSPARENT_UTXO_PAGE_OUTPUTS},
+    sync, AttestedWcashClient, BlockRef, MemoryBlockCache, WalletAddressError,
     WalletDatabaseIdentityError, WalletKeyError, WalletNetwork, WalletRpcError,
 };
 
 /// Maximum compact blocks requested in one synchronization batch.
-pub const MAX_SYNC_BATCH_SIZE: u32 = crate::cache::MAX_COMPACT_BLOCKS_PER_BATCH;
+pub const MAX_SYNC_BATCH_SIZE: u32 = crate::cache::MAX_ATTESTED_COMPACT_BLOCKS_PER_RANGE;
 /// Maximum recipients in one experimental shielded transfer.
 pub const MAX_TRANSFER_RECIPIENTS: usize = 100;
 /// Maximum transaction expiry interval accepted by the wallet.
@@ -70,6 +79,8 @@ pub const COINBASE_SHIELDING_MATURITY: u32 = COINBASE_MATURITY_BLOCKS;
 /// The deterministic coinbase receiver is recoverable from height one even if
 /// it was published before this SQLite wallet was initialized.
 pub const TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT: u32 = 1;
+/// Maximum wall-clock duration of one restartable transparent recovery pass.
+pub const MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION: Duration = Duration::from_secs(5 * 60);
 
 /// Concrete SQLite wallet database used by this crate.
 pub type WalletDatabase = WalletDb<rusqlite::Connection, Network, SystemClock, OsRng>;
@@ -152,6 +163,24 @@ pub enum WalletServiceError {
     /// The live chain changed during synchronization or after transaction input selection.
     #[error("wallet chain state is stale; synchronize and rebuild the transaction")]
     StaleChain,
+    /// One restartable current-UTXO recovery pass exceeded its wall-clock limit.
+    #[error("transparent coinbase recovery exceeded its bounded session duration")]
+    TransparentRecoveryDeadline,
+    /// Another process is synchronizing or signing with this wallet.
+    #[error("wallet is busy with another synchronization or signing operation")]
+    WalletBusy,
+    /// Compact scanning has not been followed by a complete, canonical
+    /// transparent recovery pass for the stored tip.
+    #[error("transparent recovery is incomplete; synchronize the wallet before reading balances or signing")]
+    TransparentRecoveryIncomplete,
+    /// A transparent-recovery session tried to publish completion after its
+    /// durable ownership token had changed.
+    #[error("transparent recovery session lost ownership of its completion marker")]
+    TransparentRecoveryOwnershipLost,
+    /// SQLite requested a transparent-history shape outside Wcash's single
+    /// fixed payout receiver and mined-spend recovery policy.
+    #[error("wallet requested unsupported transparent history: {0}")]
+    UnexpectedTransparentHistoryRequest(&'static str),
     /// Signing succeeded and SQLite contains one or more transactions, but a
     /// subsequent retrieval or policy check failed.
     #[error(
@@ -175,6 +204,9 @@ pub enum WalletServiceError {
     /// The proposal would use a pool other than Ironwood.
     #[error("transfer proposal is not Ironwood-only")]
     NonIronwoodProposal,
+    /// The database contains value in a shielded pool disabled by Wcash.
+    #[error("wallet database contains disabled Sapling or legacy Orchard value")]
+    LegacyPoolState,
     /// Coinbase shielding found no mature, fully classified coinbase output.
     #[error(
         "no mature transparent coinbase output is available; coinbase requires 100 blocks and full transaction classification"
@@ -321,6 +353,12 @@ struct PendingTransactionRow {
     raw: Vec<u8>,
 }
 
+struct StoredTransparentCreator {
+    raw: Vec<u8>,
+    mined_height: u32,
+    tx_index: Option<i64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransferOutputRole {
     Payment,
@@ -334,6 +372,28 @@ struct BoundIronwoodOutput {
     memo: MemoBytes,
     role: TransferOutputRole,
     pool: ShieldedPool,
+}
+
+const WALLET_OPERATION_LOCK_SUFFIX: &str = ".wcash-operation.lock";
+const TRANSPARENT_RECOVERY_SESSION_BYTES: usize = 32;
+
+#[derive(Clone, Copy)]
+enum WalletOperationLockMode {
+    Shared,
+    Exclusive,
+}
+
+struct WalletOperationLock {
+    _file: File,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransparentRecoverySession([u8; TRANSPARENT_RECOVERY_SESSION_BYTES]);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransparentSyncState {
+    active_session: Option<TransparentRecoverySession>,
+    completed_tip: Option<BlockRef>,
 }
 
 /// Opens and migrates a wallet database without loading spend authority.
@@ -377,6 +437,200 @@ fn open_secured_wallet(
         SystemClock,
         OsRng,
     ))
+}
+
+fn acquire_wallet_operation_lock(
+    wallet_path: &Path,
+    mode: WalletOperationLockMode,
+) -> Result<WalletOperationLock, WalletServiceError> {
+    let lock_path = wallet_operation_lock_path(wallet_path)?;
+    let prepared = prepare_wallet_path(&lock_path)?;
+    let lock_result = match mode {
+        WalletOperationLockMode::Shared => FileExt::try_lock_shared(&prepared.opened_file),
+        WalletOperationLockMode::Exclusive => FileExt::try_lock_exclusive(&prepared.opened_file),
+    };
+    if let Err(error) = lock_result {
+        return if error.kind() == std::io::ErrorKind::WouldBlock {
+            Err(WalletServiceError::WalletBusy)
+        } else {
+            Err(WalletServiceError::Io(error))
+        };
+    }
+    prepared.verify_current_path()?;
+    Ok(WalletOperationLock {
+        _file: prepared.opened_file,
+    })
+}
+
+fn wallet_operation_lock_path(wallet_path: &Path) -> Result<PathBuf, WalletServiceError> {
+    let file_name = wallet_path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "wallet path must name a database file",
+        )
+    })?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(WALLET_OPERATION_LOCK_SUFFIX);
+    Ok(wallet_path.with_file_name(lock_name))
+}
+
+fn begin_transparent_recovery(
+    wallet: &mut WalletDatabase,
+) -> Result<TransparentRecoverySession, WalletServiceError> {
+    let mut session = TransparentRecoverySession([0; TRANSPARENT_RECOVERY_SESSION_BYTES]);
+    OsRng.fill_bytes(&mut session.0);
+    wallet.transactionally_with_extension(|_wallet, extension| {
+        // Validate the old row before replacing its token. Holding the
+        // exclusive operation lock means an active session cannot own it, so
+        // a valid in-progress row is durable crash residue and is safe to
+        // reclaim.
+        read_transparent_sync_state(extension)?;
+        let updated = extension.execute(
+            "UPDATE ext_wcash_transparent_sync_state
+             SET recovery_in_progress = 1,
+                 recovery_session = ?1
+             WHERE singleton = 1",
+            params![&session.0[..]],
+        )?;
+        if updated != 1 {
+            return Err(WalletServiceError::Database(
+                "transparent sync state singleton is missing".to_owned(),
+            ));
+        }
+        Ok(session)
+    })
+}
+
+fn complete_transparent_recovery(
+    wallet: &mut WalletDatabase,
+    session: TransparentRecoverySession,
+    expected_tip: BlockRef,
+) -> Result<(), WalletServiceError> {
+    wallet.transactionally_with_extension(|wallet, extension| {
+        let current_tip =
+            wallet
+                .get_max_height_hash()
+                .map_err(database_error)?
+                .map(|(height, hash)| BlockRef {
+                    height: height.into(),
+                    hash: hash.0,
+                });
+        if !transparent_tip_matches_wallet(expected_tip, current_tip) {
+            return Err(WalletServiceError::StaleChain);
+        }
+        let updated = extension.execute(
+            "UPDATE ext_wcash_transparent_sync_state
+             SET recovery_in_progress = 0,
+                 recovery_session = NULL,
+                 completed_height = ?1,
+                 completed_hash = ?2
+             WHERE singleton = 1
+               AND recovery_in_progress = 1
+               AND recovery_session = ?3",
+            params![expected_tip.height, &expected_tip.hash[..], &session.0[..]],
+        )?;
+        if updated != 1 {
+            return Err(WalletServiceError::TransparentRecoveryOwnershipLost);
+        }
+        Ok(())
+    })
+}
+
+fn require_transparent_recovery_complete(
+    wallet: &mut WalletDatabase,
+) -> Result<(), WalletServiceError> {
+    wallet.transactionally_with_extension(|wallet, extension| {
+        let state = read_transparent_sync_state(extension)?;
+        let current_tip =
+            wallet
+                .get_max_height_hash()
+                .map_err(database_error)?
+                .map(|(height, hash)| BlockRef {
+                    height: height.into(),
+                    hash: hash.0,
+                });
+        if state.active_session.is_none()
+            && state
+                .completed_tip
+                .is_some_and(|completed| transparent_tip_matches_wallet(completed, current_tip))
+        {
+            Ok(())
+        } else {
+            Err(WalletServiceError::TransparentRecoveryIncomplete)
+        }
+    })
+}
+
+fn read_transparent_sync_state(
+    extension: &ExtensionTransaction<'_>,
+) -> Result<TransparentSyncState, WalletServiceError> {
+    let object_type = extension.query_row(
+        "SELECT type FROM sqlite_schema WHERE name = ?1",
+        [TRANSPARENT_SYNC_STATE_TABLE],
+        |row| row.get::<_, String>(0),
+    )?;
+    if object_type != "table" {
+        return Err(WalletServiceError::Database(format!(
+            "{TRANSPARENT_SYNC_STATE_TABLE} is not a table"
+        )));
+    }
+    let (in_progress, session, completed_height, completed_hash) = extension.query_row(
+        "SELECT recovery_in_progress, recovery_session, completed_height, completed_hash
+         FROM ext_wcash_transparent_sync_state
+         WHERE singleton = 1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+            ))
+        },
+    )?;
+    let active_session = match (in_progress, session) {
+        (0, None) => None,
+        (1, Some(session)) => Some(TransparentRecoverySession(session.try_into().map_err(
+            |_| {
+                WalletServiceError::Database(
+                    "transparent recovery session token is malformed".to_owned(),
+                )
+            },
+        )?)),
+        _ => {
+            return Err(WalletServiceError::Database(
+                "transparent recovery state is malformed".to_owned(),
+            ))
+        }
+    };
+    let completed_tip = match (completed_height, completed_hash) {
+        (None, None) => None,
+        (Some(height), Some(hash)) => Some(BlockRef {
+            height: u32::try_from(height).map_err(|_| {
+                WalletServiceError::Database(
+                    "transparent recovery completion height is malformed".to_owned(),
+                )
+            })?,
+            hash: hash.try_into().map_err(|_| {
+                WalletServiceError::Database(
+                    "transparent recovery completion hash is malformed".to_owned(),
+                )
+            })?,
+        }),
+        _ => {
+            return Err(WalletServiceError::Database(
+                "transparent recovery completion tip is malformed".to_owned(),
+            ))
+        }
+    };
+    Ok(TransparentSyncState {
+        active_session,
+        completed_tip,
+    })
+}
+
+fn transparent_tip_matches_wallet(expected: BlockRef, wallet_tip: Option<BlockRef>) -> bool {
+    wallet_tip == Some(expected) || (expected.height == 0 && wallet_tip.is_none())
 }
 
 struct PreparedWalletPath {
@@ -593,6 +847,8 @@ pub async fn initialize_wallet(
     requested_birthday: Option<u32>,
 ) -> Result<InitializedWallet, WalletServiceError> {
     ensure_client_network(client, network)?;
+    let path = path.as_ref();
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
     let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
 
@@ -687,6 +943,7 @@ pub async fn synchronize_wallet(
     }
     ensure_client_network(client, network)?;
     let path = path.as_ref();
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
     let mut wallet = open_wallet_database(path, network)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
@@ -694,24 +951,17 @@ pub async fn synchronize_wallet(
         .get_account(account_id)
         .map_err(database_error)?
         .ok_or(WalletServiceError::AuthorityMismatch)?;
-    let coinbase_address = encode_transparent_coinbase_receiver(
-        account
-            .ufvk()
-            .ok_or(WalletServiceError::AuthorityMismatch)?,
-        network,
-    )?;
+    let account_ufvk = account
+        .ufvk()
+        .ok_or(WalletServiceError::AuthorityMismatch)?;
+    let coinbase_receiver = default_transparent_receiver(account_ufvk)?;
+    let coinbase_address = encode_transparent_coinbase_receiver(account_ufvk, network)?;
+    let recovery_session = begin_transparent_recovery(&mut wallet)?;
     let cache = MemoryBlockCache::default();
     let parameters = network.parameters();
-    let mut sync_client = client.sync_client();
-    sync::run(
-        &mut sync_client,
-        &parameters,
-        &cache,
-        &mut wallet,
-        batch_size,
-    )
-    .await
-    .map_err(|error| WalletServiceError::Synchronization(error.to_string()))?;
+    sync::run(client, &parameters, &cache, &mut wallet, batch_size)
+        .await
+        .map_err(|error| WalletServiceError::Synchronization(error.to_string()))?;
 
     let synced = wallet_balance_summary(&wallet, public_confirmation_policy())?;
     if !synced.synchronized {
@@ -733,49 +983,306 @@ pub async fn synchronize_wallet(
     if client.latest_block().await? != expected_tip {
         return Err(WalletServiceError::StaleChain);
     }
-    if let Some(mut page_start) = transparent_coinbase_recovery_start(tip_height) {
-        loop {
-            if client.latest_block().await? != expected_tip {
-                return Err(WalletServiceError::StaleChain);
+    if transparent_coinbase_recovery_start(tip_height).is_some() {
+        let recovery_deadline =
+            tokio::time::Instant::now() + MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION;
+        if let Err(error) = recover_transparent_coinbase(
+            client,
+            &parameters,
+            &mut wallet,
+            &coinbase_address,
+            coinbase_receiver,
+            expected_tip,
+            recovery_deadline,
+        )
+        .await
+        {
+            // Transparent recovery can commit verified transactions and
+            // request-frontier progress incrementally. If the complete pass
+            // does not finish, rewind one compact height so no later command
+            // can mistake this database for a fully synchronized wallet.
+            wallet
+                .truncate_to_height(BlockHeight::from_u32(tip_height.saturating_sub(1)))
+                .map_err(database_error)?;
+            return Err(error);
+        }
+    }
+    let recovered = wallet_balance_summary(&wallet, public_confirmation_policy())?;
+    if !recovered.synchronized || recovered.chain_tip_height != expected_tip.height {
+        return Err(WalletServiceError::NotSynchronized);
+    }
+    complete_transparent_recovery(&mut wallet, recovery_session, expected_tip)?;
+    Ok(recovered)
+}
+
+async fn recover_transparent_coinbase(
+    client: &mut AttestedWcashClient,
+    parameters: &zebra_chain::parameters::Network,
+    wallet: &mut WalletDatabase,
+    coinbase_address: &str,
+    coinbase_receiver: zcash_transparent::address::TransparentAddress,
+    expected_tip: BlockRef,
+    deadline: tokio::time::Instant,
+) -> Result<(), WalletServiceError> {
+    let mut page_start = TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT;
+    loop {
+        require_exact_recovery_tip(client, expected_tip, deadline).await?;
+        let page = await_transparent_recovery_rpc(
+            deadline,
+            client.transparent_unspent_page(
+                coinbase_address,
+                page_start,
+                expected_tip.height,
+                TRANSPARENT_UTXO_PAGE_OUTPUTS,
+            ),
+        )
+        .await?;
+        require_exact_recovery_tip(client, expected_tip, deadline).await?;
+        let next_start = page.next_start_height(page_start, TRANSPARENT_UTXO_PAGE_OUTPUTS)?;
+        let creators = page.into_complete_creators(next_start);
+        let stored_creators =
+            fully_classified_stored_creators(client, wallet, &creators, deadline)?;
+        for creator in creators {
+            if stored_creators.contains(&creator.txid()) {
+                continue;
             }
-            let page = client
-                .transparent_unspent_page(
-                    &coinbase_address,
-                    page_start,
-                    tip_height,
-                    TRANSPARENT_UTXO_PAGE_OUTPUTS,
+            require_exact_recovery_tip(client, expected_tip, deadline).await?;
+            let transaction = await_transparent_recovery_rpc(
+                deadline,
+                client.transparent_creator_transaction(creator),
+            )
+            .await?;
+            require_exact_recovery_tip(client, expected_tip, deadline).await?;
+            decrypt_and_store_transaction(
+                parameters,
+                wallet,
+                &transaction.transaction,
+                Some(BlockHeight::from_u32(transaction.height)),
+            )
+            .map_err(database_error)?;
+            ensure_transparent_recovery_deadline(deadline)?;
+        }
+        match next_start {
+            Some(next_start) => page_start = next_start,
+            None => break,
+        }
+    }
+
+    recover_transparent_spends(
+        client,
+        parameters,
+        wallet,
+        coinbase_address,
+        coinbase_receiver,
+        expected_tip,
+        deadline,
+    )
+    .await?;
+    require_exact_recovery_tip(client, expected_tip, deadline).await
+}
+
+fn fully_classified_stored_creators(
+    client: &AttestedWcashClient,
+    wallet: &mut WalletDatabase,
+    creators: &[crate::rpc::TransparentUnspentCreator],
+    deadline: tokio::time::Instant,
+) -> Result<HashSet<zcash_protocol::TxId>, WalletServiceError> {
+    wallet.transactionally_with_extension(|_wallet, extension| {
+        let mut fully_classified = HashSet::with_capacity(creators.len());
+        for creator in creators {
+            let stored = extension
+                .query_row(
+                    "SELECT raw, mined_height, tx_index
+                     FROM transactions
+                     WHERE txid = ?1
+                       AND raw IS NOT NULL
+                       AND mined_height IS NOT NULL",
+                    params![creator.txid().as_ref()],
+                    |row| {
+                        let mined_height = row.get::<_, i64>(1)?;
+                        Ok(StoredTransparentCreator {
+                            raw: row.get(0)?,
+                            mined_height: u32::try_from(mined_height).map_err(|_| {
+                                rusqlite::Error::IntegralValueOutOfRange(1, mined_height)
+                            })?,
+                            tx_index: row.get(2)?,
+                        })
+                    },
                 )
-                .await?;
-            if client.latest_block().await? != expected_tip {
-                return Err(WalletServiceError::StaleChain);
+                .optional()?;
+            let Some(stored) = stored else { continue };
+            let is_fully_classified = match client.validate_stored_transparent_creator(
+                creator,
+                &stored.raw,
+                stored.mined_height,
+            ) {
+                Ok(true) if stored.tx_index == Some(0) => true,
+                Ok(true) if stored.tx_index.is_none() => false,
+                Ok(true) => {
+                    return Err(WalletServiceError::Database(
+                        "stored coinbase creator has a nonzero transaction index".to_owned(),
+                    ))
+                }
+                Ok(false) if stored.tx_index.is_none_or(|index| index > 0) => true,
+                Ok(false) => {
+                    return Err(WalletServiceError::Database(
+                        "stored non-coinbase creator has an invalid transaction index".to_owned(),
+                    ))
+                }
+                Err(_) => false,
+            };
+            ensure_transparent_recovery_deadline(deadline)?;
+            if is_fully_classified {
+                fully_classified.insert(creator.txid());
             }
-            let next_start = page.next_start_height(page_start, TRANSPARENT_UTXO_PAGE_OUTPUTS)?;
-            for creator in page.into_complete_creators(next_start) {
-                if client.latest_block().await? != expected_tip {
-                    return Err(WalletServiceError::StaleChain);
-                }
-                let transaction = client.transparent_creator_transaction(creator).await?;
-                if client.latest_block().await? != expected_tip {
-                    return Err(WalletServiceError::StaleChain);
-                }
+        }
+        Ok(fully_classified)
+    })
+}
+
+async fn recover_transparent_spends(
+    client: &mut AttestedWcashClient,
+    parameters: &zebra_chain::parameters::Network,
+    wallet: &mut WalletDatabase,
+    coinbase_address: &str,
+    expected_receiver: zcash_transparent::address::TransparentAddress,
+    expected_tip: BlockRef,
+    deadline: tokio::time::Instant,
+) -> Result<(), WalletServiceError> {
+    let maximum_end = expected_tip.height.checked_add(1).ok_or(
+        WalletServiceError::UnexpectedTransparentHistoryRequest("chain-tip height overflow"),
+    )?;
+
+    loop {
+        ensure_transparent_recovery_deadline(deadline)?;
+        let groups = group_transparent_history_requests(
+            wallet.transaction_data_requests().map_err(database_error)?,
+            expected_receiver,
+            maximum_end,
+        )?;
+        let Some(((start, end), requests)) = groups.into_iter().next() else {
+            return Ok(());
+        };
+
+        let final_height = end - 1;
+        let expected_end =
+            await_transparent_recovery_rpc(deadline, client.compact_block_ref(final_height))
+                .await?;
+        let mut cursor = start;
+        while cursor < end {
+            let chunk_end = cursor
+                .checked_add(MAX_TRANSPARENT_HISTORY_BLOCKS_PER_REQUEST)
+                .map_or(end, |candidate| candidate.min(end));
+            let transactions = await_transparent_recovery_rpc(
+                deadline,
+                client.transparent_transactions_range(coinbase_address, cursor, chunk_end - 1),
+            )
+            .await?;
+            for transaction in transactions {
                 decrypt_and_store_transaction(
-                    &parameters,
-                    &mut wallet,
+                    parameters,
+                    wallet,
                     &transaction.transaction,
                     Some(BlockHeight::from_u32(transaction.height)),
                 )
                 .map_err(database_error)?;
-                if client.latest_block().await? != expected_tip {
-                    return Err(WalletServiceError::StaleChain);
-                }
+                ensure_transparent_recovery_deadline(deadline)?;
             }
-            match next_start {
-                Some(next_start) => page_start = next_start,
-                None => break,
-            }
+            cursor = chunk_end;
         }
+        if await_transparent_recovery_rpc(deadline, client.compact_block_ref(final_height)).await?
+            != expected_end
+        {
+            return Err(WalletServiceError::StaleChain);
+        }
+        for request in requests {
+            wallet
+                .notify_address_checked(request, BlockHeight::from_u32(final_height))
+                .map_err(database_error)?;
+        }
+        // Recompute after each durable notification because decrypting this
+        // range can discover spends, add creators, or retire other requests.
     }
-    wallet_balance_summary(&wallet, public_confirmation_policy())
+}
+
+fn group_transparent_history_requests(
+    requests: Vec<TransactionDataRequest>,
+    expected_receiver: zcash_transparent::address::TransparentAddress,
+    maximum_end: u32,
+) -> Result<BTreeMap<(u32, u32), Vec<TransactionsInvolvingAddress>>, WalletServiceError> {
+    let mut groups = BTreeMap::<(u32, u32), Vec<TransactionsInvolvingAddress>>::new();
+    for request in requests {
+        let TransactionDataRequest::TransactionsInvolvingAddress(request) = request else {
+            continue;
+        };
+        if request.tx_status_filter() != &TransactionStatusFilter::Mined
+            || request.output_status_filter() != &OutputStatusFilter::All
+        {
+            // librustzcash schedules `All/Unspent` probes for reserved ZIP 320
+            // ephemeral addresses even though Wcash never exposes or funds
+            // them. They are outside this fixed coinbase-recovery boundary. A
+            // mined/all-output request for another funded receiver is rejected
+            // below rather than silently ignored.
+            if request.address() == expected_receiver {
+                return Err(WalletServiceError::UnexpectedTransparentHistoryRequest(
+                    "coinbase receiver request is not mined all-output spend discovery",
+                ));
+            }
+            continue;
+        }
+        if request.address() != expected_receiver {
+            return Err(WalletServiceError::UnexpectedTransparentHistoryRequest(
+                "receiver is not the fixed coinbase address",
+            ));
+        }
+        let original_start: u32 = request.block_range_start().into();
+        let start = original_start.max(TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT);
+        let end: u32 = request
+            .block_range_end()
+            .ok_or(WalletServiceError::UnexpectedTransparentHistoryRequest(
+                "request has no finite end height",
+            ))?
+            .into();
+        if start >= end || end > maximum_end {
+            return Err(WalletServiceError::UnexpectedTransparentHistoryRequest(
+                "request range is outside the synchronized tip",
+            ));
+        }
+        groups.entry((start, end)).or_default().push(request);
+    }
+    Ok(groups)
+}
+
+async fn require_exact_recovery_tip(
+    client: &mut AttestedWcashClient,
+    expected_tip: BlockRef,
+    deadline: tokio::time::Instant,
+) -> Result<(), WalletServiceError> {
+    if await_transparent_recovery_rpc(deadline, client.latest_block()).await? == expected_tip {
+        Ok(())
+    } else {
+        Err(WalletServiceError::StaleChain)
+    }
+}
+
+async fn await_transparent_recovery_rpc<T>(
+    deadline: tokio::time::Instant,
+    operation: impl Future<Output = Result<T, WalletRpcError>>,
+) -> Result<T, WalletServiceError> {
+    tokio::time::timeout_at(deadline, operation)
+        .await
+        .map_err(|_| WalletServiceError::TransparentRecoveryDeadline)?
+        .map_err(WalletServiceError::Rpc)
+}
+
+fn ensure_transparent_recovery_deadline(
+    deadline: tokio::time::Instant,
+) -> Result<(), WalletServiceError> {
+    if tokio::time::Instant::now() >= deadline {
+        Err(WalletServiceError::TransparentRecoveryDeadline)
+    } else {
+        Ok(())
+    }
 }
 
 fn default_wallet_birthday(tip_height: u32) -> u32 {
@@ -792,7 +1299,10 @@ pub fn wallet_balance(
     path: impl AsRef<Path>,
     network: WalletNetwork,
 ) -> Result<WalletBalanceSummary, WalletServiceError> {
-    let wallet = open_wallet_database(path, network)?;
+    let path = path.as_ref();
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Shared)?;
+    let mut wallet = open_wallet_database(path, network)?;
+    require_transparent_recovery_complete(&mut wallet)?;
     wallet_balance_summary(&wallet, public_confirmation_policy())
 }
 
@@ -965,6 +1475,10 @@ fn wallet_balance_summary(
         .ok_or(WalletServiceError::NotSynchronized)?;
     let mut accounts = Vec::with_capacity(summary.account_balances().len());
     for (account_id, balance) in summary.account_balances() {
+        reject_legacy_balance_values(
+            balance.sapling_balance().total().into_u64(),
+            balance.orchard_balance().total().into_u64(),
+        )?;
         let ironwood = balance.ironwood_balance();
         let transparent_regular = balance.unshielded_regular_balance();
         let transparent_coinbase = balance.unshielded_coinbase_balance();
@@ -997,6 +1511,38 @@ fn wallet_balance_summary(
         synchronized: summary.is_synced(),
         accounts,
     })
+}
+
+pub(crate) fn ensure_no_legacy_pool_balances(
+    wallet: &WalletDatabase,
+) -> Result<(), WalletServiceError> {
+    let summary = wallet
+        .get_wallet_summary(public_confirmation_policy())
+        .map_err(database_error)?;
+    let Some(summary) = summary else {
+        // A newly initialized database has no balance view until its first
+        // compact scan. The same guard runs again before synchronization can
+        // return successfully.
+        return Ok(());
+    };
+    for balance in summary.account_balances().values() {
+        reject_legacy_balance_values(
+            balance.sapling_balance().total().into_u64(),
+            balance.orchard_balance().total().into_u64(),
+        )?;
+    }
+    Ok(())
+}
+
+fn reject_legacy_balance_values(
+    sapling_total_zat: u64,
+    orchard_total_zat: u64,
+) -> Result<(), WalletServiceError> {
+    if sapling_total_zat == 0 && orchard_total_zat == 0 {
+        Ok(())
+    } else {
+        Err(WalletServiceError::LegacyPoolState)
+    }
 }
 
 /// Creates, proves, signs, persists, and returns one Ironwood-only Wcash transaction.
@@ -1036,7 +1582,11 @@ pub async fn create_signed_transfer(
         ));
     }
 
+    let path = path.as_ref();
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
     let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
+    require_transparent_recovery_complete(&mut wallet)?;
+    ensure_no_legacy_pool_balances(&wallet)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
     let confirmations_policy = ConfirmationsPolicy::new_symmetrical(confirmation_count, false);
@@ -1439,7 +1989,11 @@ pub async fn create_signed_coinbase_shielding(
         )));
     }
 
+    let path = path.as_ref();
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
     let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
+    require_transparent_recovery_complete(&mut wallet)?;
+    ensure_no_legacy_pool_balances(&wallet)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
     let summary = wallet
@@ -2242,6 +2796,79 @@ mod tests {
     }
 
     #[test]
+    fn transparent_coinbase_recovery_has_a_hard_session_deadline() {
+        assert_eq!(
+            MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION,
+            Duration::from_secs(5 * 60)
+        );
+        let expired = tokio::time::Instant::now() - Duration::from_secs(1);
+        assert!(matches!(
+            ensure_transparent_recovery_deadline(expired),
+            Err(WalletServiceError::TransparentRecoveryDeadline)
+        ));
+    }
+
+    #[test]
+    fn transparent_history_groups_preserve_durable_request_boundaries() {
+        let receiver = zcash_transparent::address::TransparentAddress::PublicKeyHash([1; 20]);
+        let unused_ephemeral =
+            zcash_transparent::address::TransparentAddress::PublicKeyHash([2; 20]);
+        let spend_request = || {
+            TransactionDataRequest::transactions_involving_address(
+                receiver,
+                BlockHeight::from_u32(7),
+                Some(BlockHeight::from_u32(18)),
+                None,
+                TransactionStatusFilter::Mined,
+                OutputStatusFilter::All,
+            )
+        };
+        let ephemeral_probe = TransactionDataRequest::transactions_involving_address(
+            unused_ephemeral,
+            BlockHeight::from_u32(0),
+            None,
+            None,
+            TransactionStatusFilter::All,
+            OutputStatusFilter::Unspent,
+        );
+
+        let groups = group_transparent_history_requests(
+            vec![spend_request(), ephemeral_probe, spend_request()],
+            receiver,
+            20,
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups.get(&(7, 18)).map(Vec::len), Some(2));
+
+        let foreign_spend_request = TransactionDataRequest::transactions_involving_address(
+            unused_ephemeral,
+            BlockHeight::from_u32(7),
+            Some(BlockHeight::from_u32(18)),
+            None,
+            TransactionStatusFilter::Mined,
+            OutputStatusFilter::All,
+        );
+        assert!(matches!(
+            group_transparent_history_requests(vec![foreign_spend_request], receiver, 20),
+            Err(WalletServiceError::UnexpectedTransparentHistoryRequest(_))
+        ));
+
+        let malformed_coinbase_request = TransactionDataRequest::transactions_involving_address(
+            receiver,
+            BlockHeight::from_u32(7),
+            None,
+            None,
+            TransactionStatusFilter::All,
+            OutputStatusFilter::Unspent,
+        );
+        assert!(matches!(
+            group_transparent_history_requests(vec![malformed_coinbase_request], receiver, 20),
+            Err(WalletServiceError::UnexpectedTransparentHistoryRequest(_))
+        ));
+    }
+
+    #[test]
     fn signed_shielding_amounts_bind_expiry_fee_and_ironwood_value() {
         assert!(shielding_amounts_match(
             140,
@@ -2535,6 +3162,130 @@ mod tests {
     }
 
     #[test]
+    fn transparent_recovery_marker_is_crash_resumable_tokenized_and_tip_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let network = WalletNetwork::Regtest;
+        let operation_lock =
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Exclusive)
+                .unwrap();
+        let mut wallet = open_wallet_database(&wallet_path, network).unwrap();
+
+        assert!(matches!(
+            require_transparent_recovery_complete(&mut wallet),
+            Err(WalletServiceError::TransparentRecoveryIncomplete)
+        ));
+        drop(wallet);
+
+        let completed_hash = [0x5a; 32];
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO blocks (height, hash, time, sapling_tree)
+                 VALUES (1, ?1, 0, X'')",
+                rusqlite::params![completed_hash],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut wallet = open_wallet_database(&wallet_path, network).unwrap();
+        let abandoned = begin_transparent_recovery(&mut wallet).unwrap();
+        assert!(matches!(
+            require_transparent_recovery_complete(&mut wallet),
+            Err(WalletServiceError::TransparentRecoveryIncomplete)
+        ));
+
+        // Reclaiming while the exclusive operation lock is held replaces a
+        // crash residue, and the abandoned owner can no longer publish.
+        let replacement = begin_transparent_recovery(&mut wallet).unwrap();
+        assert_ne!(abandoned, replacement);
+        let completed_tip = BlockRef {
+            height: 1,
+            hash: completed_hash,
+        };
+        assert!(matches!(
+            complete_transparent_recovery(&mut wallet, abandoned, completed_tip),
+            Err(WalletServiceError::TransparentRecoveryOwnershipLost)
+        ));
+        assert!(matches!(
+            require_transparent_recovery_complete(&mut wallet),
+            Err(WalletServiceError::TransparentRecoveryIncomplete)
+        ));
+        assert!(matches!(
+            complete_transparent_recovery(
+                &mut wallet,
+                replacement,
+                BlockRef {
+                    height: 1,
+                    hash: [0x7c; 32],
+                },
+            ),
+            Err(WalletServiceError::StaleChain)
+        ));
+        assert!(matches!(
+            require_transparent_recovery_complete(&mut wallet),
+            Err(WalletServiceError::TransparentRecoveryIncomplete)
+        ));
+        complete_transparent_recovery(&mut wallet, replacement, completed_tip).unwrap();
+        require_transparent_recovery_complete(&mut wallet).unwrap();
+        drop(wallet);
+        drop(operation_lock);
+
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        connection
+            .execute(
+                "UPDATE blocks SET hash = ?1 WHERE height = 1",
+                rusqlite::params![[0x6bu8; 32]],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            wallet_balance(&wallet_path, network),
+            Err(WalletServiceError::TransparentRecoveryIncomplete)
+        ));
+    }
+
+    #[test]
+    fn wallet_operation_lock_serializes_mutations_and_allows_shared_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+
+        let exclusive =
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Exclusive)
+                .unwrap();
+        assert!(matches!(
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Shared),
+            Err(WalletServiceError::WalletBusy)
+        ));
+        assert!(matches!(
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Exclusive),
+            Err(WalletServiceError::WalletBusy)
+        ));
+        drop(exclusive);
+
+        let first_shared =
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Shared).unwrap();
+        let second_shared =
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Shared).unwrap();
+        assert!(matches!(
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Exclusive),
+            Err(WalletServiceError::WalletBusy)
+        ));
+        drop((first_shared, second_shared));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let lock_path = wallet_operation_lock_path(&wallet_path).unwrap();
+            assert_eq!(
+                fs::metadata(lock_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
     fn post_signing_error_exposes_every_recovery_txid() {
         let error = WalletServiceError::PersistedTransactionsRequireReview {
             txids: vec!["11".repeat(32), "22".repeat(32)],
@@ -2591,6 +3342,17 @@ mod tests {
         assert_eq!(second[0].txid, zcash_protocol::TxId::from_bytes([3; 32]));
         assert_eq!(second[0].raw, vec![3; 3]);
         assert_eq!(next, None);
+    }
+
+    #[test]
+    fn disabled_pool_balances_fail_closed() {
+        assert!(reject_legacy_balance_values(0, 0).is_ok());
+        for (sapling, orchard) in [(1, 0), (0, 1), (1, 1)] {
+            assert!(matches!(
+                reject_legacy_balance_values(sapling, orchard),
+                Err(WalletServiceError::LegacyPoolState)
+            ));
+        }
     }
 
     #[cfg(unix)]
