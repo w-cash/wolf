@@ -153,6 +153,16 @@ pub struct AttestedWcashClient {
 }
 
 impl AttestedWcashClient {
+    /// Constructs a disconnected, already-network-bound client for local unit tests.
+    #[cfg(test)]
+    pub(crate) fn disconnected_for_test(network: WalletNetwork) -> Self {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        Self {
+            inner: CompactTxStreamerClient::new(channel).max_decoding_message_size(MAX_BLOCK_BYTES),
+            network,
+        }
+    }
+
     /// Connects to an endpoint and requires its reported chain, active branch,
     /// and height-zero block to match `network` before returning a usable client.
     pub async fn connect(endpoint: &str, network: WalletNetwork) -> Result<Self, WalletRpcError> {

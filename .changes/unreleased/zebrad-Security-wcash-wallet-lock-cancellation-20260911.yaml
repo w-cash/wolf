@@ -1,0 +1,4 @@
+project: zebrad
+kind: Security
+body: "Open Wcash wallet balance queries read-only under a shared operation lock so they cannot race schema migration, and add cooperative cancellation checkpoints between bounded synchronization units while preserving the existing synchronization API."
+time: 2026-09-11T20:10:59.000000000Z

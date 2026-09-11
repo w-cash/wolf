@@ -7,6 +7,10 @@ use std::{
     future::Future,
     num::NonZeroU32,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -83,6 +87,34 @@ pub const TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT: u32 = 1;
 /// Maximum wall-clock duration of one restartable transparent recovery pass.
 pub const MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION: Duration = Duration::from_secs(5 * 60);
 
+/// Cooperative cancellation handle for one wallet synchronization.
+///
+/// Cancellation is sticky and is observed between bounded network, scan, and
+/// recovery batches. It does not interrupt a request or SQLite transaction
+/// that is already in progress. Dropping a cancelled synchronization releases
+/// the wallet operation lock before the future returns.
+#[derive(Clone, Debug, Default)]
+pub struct WalletSyncCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl WalletSyncCancellation {
+    /// Creates a synchronization handle in the active state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Requests cancellation of every synchronization using this handle.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Returns whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
 /// Concrete SQLite wallet database used by this crate.
 pub type WalletDatabase = WalletDb<rusqlite::Connection, Network, SystemClock, OsRng>;
 
@@ -146,6 +178,9 @@ pub enum WalletServiceError {
     /// The compact-block synchronizer failed.
     #[error("wallet synchronization failed: {0}")]
     Synchronization(String),
+    /// The caller cooperatively cancelled wallet synchronization.
+    #[error("wallet synchronization was cancelled")]
+    SynchronizationCancelled,
     /// The requested account birthday cannot be represented on this chain.
     #[error("invalid wallet birthday: {0}")]
     InvalidBirthday(String),
@@ -386,6 +421,15 @@ struct StoredTransparentCreator {
     raw: Vec<u8>,
     mined_height: u32,
     tx_index: Option<i64>,
+}
+
+struct TransparentRecoveryContext<'a> {
+    parameters: &'a zebra_chain::parameters::Network,
+    coinbase_address: &'a str,
+    coinbase_receiver: zcash_transparent::address::TransparentAddress,
+    expected_tip: BlockRef,
+    deadline: tokio::time::Instant,
+    cancellation: &'a WalletSyncCancellation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1097,6 +1141,25 @@ pub async fn synchronize_wallet(
     network: WalletNetwork,
     batch_size: u32,
 ) -> Result<WalletBalanceSummary, WalletServiceError> {
+    let cancellation = WalletSyncCancellation::new();
+    synchronize_wallet_cancellable(client, path, network, batch_size, &cancellation).await
+}
+
+/// Synchronizes the wallet while permitting cooperative foreground cancellation.
+///
+/// This is the cancellable counterpart to [`synchronize_wallet`]. The handle
+/// is checked between bounded compact-block, subtree-root, transparent-UTXO,
+/// creator-transaction, and transparent-history batches. Cancelling leaves
+/// every completed SQLite transaction durable, marks the wallet as requiring
+/// a resumed synchronization, and releases the exclusive operation lock before
+/// returning [`WalletServiceError::SynchronizationCancelled`].
+pub async fn synchronize_wallet_cancellable(
+    client: &mut AttestedWcashClient,
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    batch_size: u32,
+    cancellation: &WalletSyncCancellation,
+) -> Result<WalletBalanceSummary, WalletServiceError> {
     if batch_size == 0 || batch_size > MAX_SYNC_BATCH_SIZE {
         return Err(WalletServiceError::InvalidRequest(format!(
             "sync batch size must be in 1..={MAX_SYNC_BATCH_SIZE}"
@@ -1105,6 +1168,7 @@ pub async fn synchronize_wallet(
     ensure_client_network(client, network)?;
     let path = path.as_ref();
     let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
+    ensure_sync_not_cancelled(cancellation)?;
     let mut wallet = open_wallet_database(path, network)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
@@ -1120,9 +1184,23 @@ pub async fn synchronize_wallet(
     let recovery_session = begin_transparent_recovery(&mut wallet)?;
     let cache = MemoryBlockCache::default();
     let parameters = network.parameters();
-    sync::run(client, &parameters, &cache, &mut wallet, batch_size)
-        .await
-        .map_err(|error| WalletServiceError::Synchronization(error.to_string()))?;
+    match sync::run(
+        client,
+        &parameters,
+        &cache,
+        &mut wallet,
+        batch_size,
+        cancellation,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(sync::WcashSyncError::Cancelled) => {
+            return Err(WalletServiceError::SynchronizationCancelled)
+        }
+        Err(error) => return Err(WalletServiceError::Synchronization(error.to_string())),
+    }
+    ensure_sync_not_cancelled(cancellation)?;
 
     let synced = wallet_balance_summary(&wallet, public_confirmation_policy())?;
     if !synced.synchronized {
@@ -1145,19 +1223,15 @@ pub async fn synchronize_wallet(
         return Err(WalletServiceError::StaleChain);
     }
     if transparent_coinbase_recovery_start(tip_height).is_some() {
-        let recovery_deadline =
-            tokio::time::Instant::now() + MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION;
-        if let Err(error) = recover_transparent_coinbase(
-            client,
-            &parameters,
-            &mut wallet,
-            &coinbase_address,
+        let recovery = TransparentRecoveryContext {
+            parameters: &parameters,
+            coinbase_address: &coinbase_address,
             coinbase_receiver,
             expected_tip,
-            recovery_deadline,
-        )
-        .await
-        {
+            deadline: tokio::time::Instant::now() + MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION,
+            cancellation,
+        };
+        if let Err(error) = recover_transparent_coinbase(client, &mut wallet, &recovery).await {
             // Transparent recovery can commit verified transactions and
             // request-frontier progress incrementally. If the complete pass
             // does not finish, rewind one compact height so no later command
@@ -1172,56 +1246,66 @@ pub async fn synchronize_wallet(
     if !recovered.synchronized || recovered.chain_tip_height != expected_tip.height {
         return Err(WalletServiceError::NotSynchronized);
     }
+    ensure_sync_not_cancelled(cancellation)?;
     complete_transparent_recovery(&mut wallet, recovery_session, expected_tip)?;
     Ok(recovered)
 }
 
+pub(crate) fn ensure_sync_not_cancelled(
+    cancellation: &WalletSyncCancellation,
+) -> Result<(), WalletServiceError> {
+    if cancellation.is_cancelled() {
+        Err(WalletServiceError::SynchronizationCancelled)
+    } else {
+        Ok(())
+    }
+}
+
 async fn recover_transparent_coinbase(
     client: &mut AttestedWcashClient,
-    parameters: &zebra_chain::parameters::Network,
     wallet: &mut WalletDatabase,
-    coinbase_address: &str,
-    coinbase_receiver: zcash_transparent::address::TransparentAddress,
-    expected_tip: BlockRef,
-    deadline: tokio::time::Instant,
+    recovery: &TransparentRecoveryContext<'_>,
 ) -> Result<(), WalletServiceError> {
     let mut page_start = TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT;
     loop {
-        require_exact_recovery_tip(client, expected_tip, deadline).await?;
+        require_exact_recovery_tip(client, recovery).await?;
         let page = await_transparent_recovery_rpc(
-            deadline,
+            recovery.deadline,
+            recovery.cancellation,
             client.transparent_unspent_page(
-                coinbase_address,
+                recovery.coinbase_address,
                 page_start,
-                expected_tip.height,
+                recovery.expected_tip.height,
                 TRANSPARENT_UTXO_PAGE_OUTPUTS,
             ),
         )
         .await?;
-        require_exact_recovery_tip(client, expected_tip, deadline).await?;
+        require_exact_recovery_tip(client, recovery).await?;
         let next_start = page.next_start_height(page_start, TRANSPARENT_UTXO_PAGE_OUTPUTS)?;
         let creators = page.into_complete_creators(next_start);
         let stored_creators =
-            fully_classified_stored_creators(client, wallet, &creators, deadline)?;
+            fully_classified_stored_creators(client, wallet, &creators, recovery)?;
         for creator in creators {
+            ensure_sync_not_cancelled(recovery.cancellation)?;
             if stored_creators.contains(&creator.txid()) {
                 continue;
             }
-            require_exact_recovery_tip(client, expected_tip, deadline).await?;
+            require_exact_recovery_tip(client, recovery).await?;
             let transaction = await_transparent_recovery_rpc(
-                deadline,
+                recovery.deadline,
+                recovery.cancellation,
                 client.transparent_creator_transaction(creator),
             )
             .await?;
-            require_exact_recovery_tip(client, expected_tip, deadline).await?;
+            require_exact_recovery_tip(client, recovery).await?;
             decrypt_and_store_transaction(
-                parameters,
+                recovery.parameters,
                 wallet,
                 &transaction.transaction,
                 Some(BlockHeight::from_u32(transaction.height)),
             )
             .map_err(database_error)?;
-            ensure_transparent_recovery_deadline(deadline)?;
+            ensure_transparent_recovery_deadline(recovery.deadline)?;
         }
         match next_start {
             Some(next_start) => page_start = next_start,
@@ -1229,28 +1313,20 @@ async fn recover_transparent_coinbase(
         }
     }
 
-    recover_transparent_spends(
-        client,
-        parameters,
-        wallet,
-        coinbase_address,
-        coinbase_receiver,
-        expected_tip,
-        deadline,
-    )
-    .await?;
-    require_exact_recovery_tip(client, expected_tip, deadline).await
+    recover_transparent_spends(client, wallet, recovery).await?;
+    require_exact_recovery_tip(client, recovery).await
 }
 
 fn fully_classified_stored_creators(
     client: &AttestedWcashClient,
     wallet: &mut WalletDatabase,
     creators: &[crate::rpc::TransparentUnspentCreator],
-    deadline: tokio::time::Instant,
+    recovery: &TransparentRecoveryContext<'_>,
 ) -> Result<HashSet<zcash_protocol::TxId>, WalletServiceError> {
     wallet.transactionally_with_extension(|_wallet, extension| {
         let mut fully_classified = HashSet::with_capacity(creators.len());
         for creator in creators {
+            ensure_sync_not_cancelled(recovery.cancellation)?;
             let stored = extension
                 .query_row(
                     "SELECT raw, mined_height, tx_index
@@ -1292,7 +1368,7 @@ fn fully_classified_stored_creators(
                 }
                 Err(_) => false,
             };
-            ensure_transparent_recovery_deadline(deadline)?;
+            ensure_transparent_recovery_deadline(recovery.deadline)?;
             if is_fully_classified {
                 fully_classified.insert(creator.txid());
             }
@@ -1303,22 +1379,19 @@ fn fully_classified_stored_creators(
 
 async fn recover_transparent_spends(
     client: &mut AttestedWcashClient,
-    parameters: &zebra_chain::parameters::Network,
     wallet: &mut WalletDatabase,
-    coinbase_address: &str,
-    expected_receiver: zcash_transparent::address::TransparentAddress,
-    expected_tip: BlockRef,
-    deadline: tokio::time::Instant,
+    recovery: &TransparentRecoveryContext<'_>,
 ) -> Result<(), WalletServiceError> {
-    let maximum_end = expected_tip.height.checked_add(1).ok_or(
+    let maximum_end = recovery.expected_tip.height.checked_add(1).ok_or(
         WalletServiceError::UnexpectedTransparentHistoryRequest("chain-tip height overflow"),
     )?;
 
     loop {
-        ensure_transparent_recovery_deadline(deadline)?;
+        ensure_sync_not_cancelled(recovery.cancellation)?;
+        ensure_transparent_recovery_deadline(recovery.deadline)?;
         let groups = group_transparent_history_requests(
             wallet.transaction_data_requests().map_err(database_error)?,
-            expected_receiver,
+            recovery.coinbase_receiver,
             maximum_end,
         )?;
         let Some(((start, end), requests)) = groups.into_iter().next() else {
@@ -1326,37 +1399,53 @@ async fn recover_transparent_spends(
         };
 
         let final_height = end - 1;
-        let expected_end =
-            await_transparent_recovery_rpc(deadline, client.compact_block_ref(final_height))
-                .await?;
+        let expected_end = await_transparent_recovery_rpc(
+            recovery.deadline,
+            recovery.cancellation,
+            client.compact_block_ref(final_height),
+        )
+        .await?;
         let mut cursor = start;
         while cursor < end {
+            ensure_sync_not_cancelled(recovery.cancellation)?;
             let chunk_end = cursor
                 .checked_add(MAX_TRANSPARENT_HISTORY_BLOCKS_PER_REQUEST)
                 .map_or(end, |candidate| candidate.min(end));
             let transactions = await_transparent_recovery_rpc(
-                deadline,
-                client.transparent_transactions_range(coinbase_address, cursor, chunk_end - 1),
+                recovery.deadline,
+                recovery.cancellation,
+                client.transparent_transactions_range(
+                    recovery.coinbase_address,
+                    cursor,
+                    chunk_end - 1,
+                ),
             )
             .await?;
             for transaction in transactions {
+                ensure_sync_not_cancelled(recovery.cancellation)?;
                 decrypt_and_store_transaction(
-                    parameters,
+                    recovery.parameters,
                     wallet,
                     &transaction.transaction,
                     Some(BlockHeight::from_u32(transaction.height)),
                 )
                 .map_err(database_error)?;
-                ensure_transparent_recovery_deadline(deadline)?;
+                ensure_transparent_recovery_deadline(recovery.deadline)?;
             }
             cursor = chunk_end;
         }
-        if await_transparent_recovery_rpc(deadline, client.compact_block_ref(final_height)).await?
+        if await_transparent_recovery_rpc(
+            recovery.deadline,
+            recovery.cancellation,
+            client.compact_block_ref(final_height),
+        )
+        .await?
             != expected_end
         {
             return Err(WalletServiceError::StaleChain);
         }
         for request in requests {
+            ensure_sync_not_cancelled(recovery.cancellation)?;
             wallet
                 .notify_address_checked(request, BlockHeight::from_u32(final_height))
                 .map_err(database_error)?;
@@ -1416,10 +1505,16 @@ fn group_transparent_history_requests(
 
 async fn require_exact_recovery_tip(
     client: &mut AttestedWcashClient,
-    expected_tip: BlockRef,
-    deadline: tokio::time::Instant,
+    recovery: &TransparentRecoveryContext<'_>,
 ) -> Result<(), WalletServiceError> {
-    if await_transparent_recovery_rpc(deadline, client.latest_block()).await? == expected_tip {
+    if await_transparent_recovery_rpc(
+        recovery.deadline,
+        recovery.cancellation,
+        client.latest_block(),
+    )
+    .await?
+        == recovery.expected_tip
+    {
         Ok(())
     } else {
         Err(WalletServiceError::StaleChain)
@@ -1428,12 +1523,16 @@ async fn require_exact_recovery_tip(
 
 async fn await_transparent_recovery_rpc<T>(
     deadline: tokio::time::Instant,
+    cancellation: &WalletSyncCancellation,
     operation: impl Future<Output = Result<T, WalletRpcError>>,
 ) -> Result<T, WalletServiceError> {
-    tokio::time::timeout_at(deadline, operation)
+    ensure_sync_not_cancelled(cancellation)?;
+    let result = tokio::time::timeout_at(deadline, operation)
         .await
         .map_err(|_| WalletServiceError::TransparentRecoveryDeadline)?
-        .map_err(WalletServiceError::Rpc)
+        .map_err(WalletServiceError::Rpc)?;
+    ensure_sync_not_cancelled(cancellation)?;
+    Ok(result)
 }
 
 fn ensure_transparent_recovery_deadline(
@@ -1455,14 +1554,19 @@ fn transparent_coinbase_recovery_start(tip_height: u32) -> Option<u32> {
         .then_some(TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT)
 }
 
-/// Returns current SQLite wallet balances without making a network request.
+/// Returns current SQLite wallet balances without a network request or migration.
+///
+/// Balance readers share the cooperative operation lock and open the existing
+/// database read-only. Schema creation and migration remain exclusive wallet
+/// operations, so a read can never write while another reader holds the lock.
 pub fn wallet_balance(
     path: impl AsRef<Path>,
     network: WalletNetwork,
 ) -> Result<WalletBalanceSummary, WalletServiceError> {
     let path = path.as_ref();
+    require_existing_wallet_file(path)?;
     let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Shared)?;
-    let mut wallet = open_wallet_database(path, network)?;
+    let mut wallet = open_existing_wallet_read_only(path, network)?;
     require_transparent_recovery_complete(&mut wallet)?;
     wallet_balance_summary(&wallet, public_confirmation_policy())
 }
@@ -3644,6 +3748,145 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn wallet_balance_never_migrates_under_a_shared_read_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        create_wallet_accounts(&wallet_path, WalletNetwork::Regtest, 1);
+
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        connection
+            .execute("DROP TABLE ext_wcash_ironwood_sync", [])
+            .unwrap();
+        drop(connection);
+
+        let reader_path = wallet_path.clone();
+        let (reader_ready_tx, reader_ready_rx) = std::sync::mpsc::channel();
+        let (reader_release_tx, reader_release_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let operation_lock =
+                acquire_wallet_operation_lock(&reader_path, WalletOperationLockMode::Shared)
+                    .unwrap();
+            reader_ready_tx.send(()).unwrap();
+            reader_release_rx.recv().unwrap();
+            drop(operation_lock);
+        });
+        reader_ready_rx.recv().unwrap();
+
+        assert!(matches!(
+            wallet_balance(&wallet_path, WalletNetwork::Regtest),
+            Err(WalletServiceError::TransparentRecoveryIncomplete)
+        ));
+
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        let ironwood_table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'ext_wcash_ironwood_sync'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!ironwood_table_exists);
+        drop(connection);
+
+        assert!(matches!(
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Exclusive),
+            Err(WalletServiceError::WalletBusy)
+        ));
+        reader_release_tx.send(()).unwrap();
+        reader.join().unwrap();
+
+        let migration =
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Exclusive)
+                .unwrap();
+        drop(open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap());
+        drop(migration);
+
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        let ironwood_table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'ext_wcash_ironwood_sync'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(ironwood_table_exists);
+    }
+
+    #[test]
+    fn wallet_balance_queries_a_completed_recovery_marker_without_modifying_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let network = WalletNetwork::Regtest;
+        create_wallet_accounts(&wallet_path, network, 1);
+
+        let operation_lock =
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Exclusive)
+                .unwrap();
+        let mut wallet = open_wallet_database(&wallet_path, network).unwrap();
+        wallet.update_chain_tip(BlockHeight::from_u32(0)).unwrap();
+        let recovery = begin_transparent_recovery(&mut wallet).unwrap();
+        complete_transparent_recovery(
+            &mut wallet,
+            recovery,
+            BlockRef {
+                height: 0,
+                hash: network.genesis_hash(),
+            },
+        )
+        .unwrap();
+        drop(wallet);
+        drop(operation_lock);
+
+        let database_before = fs::read(&wallet_path).unwrap();
+        assert!(matches!(
+            wallet_balance(&wallet_path, network),
+            Err(WalletServiceError::NotSynchronized)
+        ));
+        assert_eq!(fs::read(&wallet_path).unwrap(), database_before);
+    }
+
+    #[tokio::test]
+    async fn cancelled_sync_releases_the_operation_lock_before_network_or_database_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let network = WalletNetwork::Regtest;
+        let mut client = AttestedWcashClient::disconnected_for_test(network);
+        let cancellation = WalletSyncCancellation::new();
+        let cancellation_request = cancellation.clone();
+        std::thread::spawn(move || cancellation_request.cancel())
+            .join()
+            .unwrap();
+
+        let error = synchronize_wallet_cancellable(
+            &mut client,
+            &wallet_path,
+            network,
+            MAX_SYNC_BATCH_SIZE,
+            &cancellation,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            &error,
+            WalletServiceError::SynchronizationCancelled
+        ));
+        assert_eq!(error.to_string(), "wallet synchronization was cancelled");
+        assert!(cancellation.is_cancelled());
+        assert!(!wallet_path.exists());
+
+        let replacement =
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Exclusive)
+                .unwrap();
+        drop(replacement);
     }
 
     #[test]

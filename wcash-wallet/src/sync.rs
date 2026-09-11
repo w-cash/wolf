@@ -16,9 +16,10 @@ use zcash_client_sqlite::error::SqliteClientError;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
-    cache::MAX_ATTESTED_COMPACT_BLOCKS_PER_RANGE, identity::IRONWOOD_SYNC_STATE_TABLE,
-    wallet::WalletDatabase, AttestedWcashClient, BlockRef, MemoryBlockCache, MemoryBlockCacheError,
-    WalletRpcError,
+    cache::MAX_ATTESTED_COMPACT_BLOCKS_PER_RANGE,
+    identity::IRONWOOD_SYNC_STATE_TABLE,
+    wallet::{WalletDatabase, WalletSyncCancellation},
+    AttestedWcashClient, BlockRef, MemoryBlockCache, MemoryBlockCacheError, WalletRpcError,
 };
 
 const MAX_SESSION_RESTARTS: usize = 8;
@@ -44,6 +45,8 @@ enum StoredIronwoodPrefixAttestation {
 
 #[derive(Debug, Error)]
 pub(crate) enum WcashSyncError {
+    #[error("wallet synchronization was cancelled")]
+    Cancelled,
     #[error(transparent)]
     Rpc(#[from] WalletRpcError),
     #[error(transparent)]
@@ -83,6 +86,7 @@ pub(crate) async fn run(
     cache: &MemoryBlockCache,
     wallet: &mut WalletDatabase,
     batch_size: u32,
+    cancellation: &WalletSyncCancellation,
 ) -> Result<(), WcashSyncError> {
     if batch_size == 0 || batch_size > MAX_ATTESTED_COMPACT_BLOCKS_PER_RANGE {
         return Err(WcashSyncError::Scan(format!(
@@ -93,9 +97,11 @@ pub(crate) async fn run(
     let started_at = Instant::now();
     let mut session_restarts = 0usize;
     'session: loop {
+        ensure_not_cancelled(cancellation)?;
         ensure_session_deadline(started_at)?;
         let tip = client.latest_block().await?;
-        match reconcile_local_chain(client, cache, wallet, tip).await {
+        ensure_not_cancelled(cancellation)?;
+        match reconcile_local_chain(client, cache, wallet, tip, cancellation).await {
             Ok(false) => {}
             Ok(true) | Err(WcashSyncError::StaleTip) => {
                 bump_restart(&mut session_restarts)?;
@@ -112,6 +118,7 @@ pub(crate) async fn run(
         // Validate any previously scanned unstable tail before trusting or
         // replacing subtree roots for this session.
         loop {
+            ensure_not_cancelled(cancellation)?;
             ensure_session_deadline(started_at)?;
             let ranges = wallet.suggest_scan_ranges().map_err(database_error)?;
             let Some(range) = ranges
@@ -121,14 +128,15 @@ pub(crate) async fn run(
                 break;
             };
             let range = bounded_range(range, batch_size, tip.height)?;
-            let outcome = match scan_range(client, params, cache, wallet, tip, &range).await {
-                Ok(outcome) => outcome,
-                Err(WcashSyncError::StaleTip) => {
-                    bump_restart(&mut session_restarts)?;
-                    continue 'session;
-                }
-                Err(error) => return Err(error),
-            };
+            let outcome =
+                match scan_range(client, params, cache, wallet, tip, &range, cancellation).await {
+                    Ok(outcome) => outcome,
+                    Err(WcashSyncError::StaleTip) => {
+                        bump_restart(&mut session_restarts)?;
+                        continue 'session;
+                    }
+                    Err(error) => return Err(error),
+                };
             match outcome {
                 ScanOutcome::Complete => session_restarts = 0,
                 ScanOutcome::Restart => {
@@ -138,6 +146,7 @@ pub(crate) async fn run(
             }
         }
 
+        ensure_not_cancelled(cancellation)?;
         match ensure_tip(client, tip).await {
             Ok(()) => {}
             Err(WcashSyncError::StaleTip) => {
@@ -153,7 +162,13 @@ pub(crate) async fn run(
         }
         let subtree_refresh = tokio::time::timeout(
             MAX_SUBTREE_REFRESH_DURATION,
-            refresh_ironwood_subtrees(client, wallet, tip, tip_state.ironwood_tree_size),
+            refresh_ironwood_subtrees(
+                client,
+                wallet,
+                tip,
+                tip_state.ironwood_tree_size,
+                cancellation,
+            ),
         )
         .await
         .map_err(|_| WcashSyncError::SubtreeDeadline)?;
@@ -178,6 +193,7 @@ pub(crate) async fn run(
         }
 
         loop {
+            ensure_not_cancelled(cancellation)?;
             ensure_session_deadline(started_at)?;
             let ranges = wallet.suggest_scan_ranges().map_err(database_error)?;
             let Some(range) = ranges
@@ -188,14 +204,15 @@ pub(crate) async fn run(
                 break;
             };
             let range = bounded_range(range, batch_size, tip.height)?;
-            let outcome = match scan_range(client, params, cache, wallet, tip, &range).await {
-                Ok(outcome) => outcome,
-                Err(WcashSyncError::StaleTip) => {
-                    bump_restart(&mut session_restarts)?;
-                    continue 'session;
-                }
-                Err(error) => return Err(error),
-            };
+            let outcome =
+                match scan_range(client, params, cache, wallet, tip, &range, cancellation).await {
+                    Ok(outcome) => outcome,
+                    Err(WcashSyncError::StaleTip) => {
+                        bump_restart(&mut session_restarts)?;
+                        continue 'session;
+                    }
+                    Err(error) => return Err(error),
+                };
             match outcome {
                 ScanOutcome::Complete => session_restarts = 0,
                 ScanOutcome::Restart => {
@@ -205,7 +222,9 @@ pub(crate) async fn run(
             }
         }
 
+        ensure_not_cancelled(cancellation)?;
         if client.latest_block().await? == tip {
+            ensure_not_cancelled(cancellation)?;
             crate::wallet::ensure_no_legacy_pool_balances(wallet)
                 .map_err(|error| WcashSyncError::Database(error.to_string()))?;
             return Ok(());
@@ -224,7 +243,9 @@ async fn reconcile_local_chain(
     cache: &MemoryBlockCache,
     wallet: &mut WalletDatabase,
     session_tip: BlockRef,
+    cancellation: &WalletSyncCancellation,
 ) -> Result<bool, WcashSyncError> {
+    ensure_not_cancelled(cancellation)?;
     let Some((local_height, local_hash)) = wallet.get_max_height_hash().map_err(database_error)?
     else {
         return Ok(false);
@@ -233,6 +254,7 @@ async fn reconcile_local_chain(
 
     let canonical = if local_height <= session_tip.height {
         let canonical = client.compact_block_ref(local_height).await?;
+        ensure_not_cancelled(cancellation)?;
         ensure_tip(client, session_tip).await?;
         Some(canonical)
     } else {
@@ -247,7 +269,7 @@ async fn reconcile_local_chain(
         ));
     }
 
-    reset_to_genesis(client, cache, wallet, session_tip).await?;
+    reset_to_genesis(client, cache, wallet, session_tip, cancellation).await?;
     Ok(true)
 }
 
@@ -256,14 +278,18 @@ async fn reset_to_genesis(
     cache: &MemoryBlockCache,
     wallet: &mut WalletDatabase,
     session_tip: BlockRef,
+    cancellation: &WalletSyncCancellation,
 ) -> Result<(), WcashSyncError> {
+    ensure_not_cancelled(cancellation)?;
     let rewind_state = client.chain_state(0).await?;
+    ensure_not_cancelled(cancellation)?;
     ensure_tip(client, session_tip).await?;
     discard_unscanned_ironwood_roots(wallet)?;
     wallet
         .truncate_to_chain_state(rewind_state.state)
         .map_err(database_error)?;
     cache.truncate(BlockHeight::from_u32(0)).await?;
+    ensure_not_cancelled(cancellation)?;
     ensure_tip(client, session_tip).await?;
     Ok(())
 }
@@ -331,14 +357,18 @@ async fn scan_range(
     wallet: &mut WalletDatabase,
     session_tip: BlockRef,
     range: &ScanRange,
+    cancellation: &WalletSyncCancellation,
 ) -> Result<ScanOutcome, WcashSyncError> {
+    ensure_not_cancelled(cancellation)?;
     let start: u32 = range.block_range().start.into();
     let end: u32 = range.block_range().end.into();
     let predecessor_height = start
         .checked_sub(1)
         .ok_or_else(|| WcashSyncError::Scan("scan range starts before height one".to_owned()))?;
     let predecessor = client.chain_state(predecessor_height).await?;
+    ensure_not_cancelled(cancellation)?;
     let blocks = client.compact_block_range(start, end).await?;
+    ensure_not_cancelled(cancellation)?;
     ensure_tip(client, session_tip).await?;
     cache
         .insert_attested_range(
@@ -348,6 +378,7 @@ async fn scan_range(
             predecessor.ironwood_tree_size,
         )
         .await?;
+    ensure_not_cancelled(cancellation)?;
 
     let scan_result = scan_cached_blocks(
         params,
@@ -358,6 +389,7 @@ async fn scan_range(
         range.len(),
     );
     cache.delete(range.clone()).await?;
+    ensure_not_cancelled(cancellation)?;
 
     match scan_result {
         Ok(summary) if summary.scanned_range() == range.block_range().clone() => {
@@ -394,12 +426,22 @@ fn ensure_session_deadline(started_at: Instant) -> Result<(), WcashSyncError> {
     }
 }
 
+fn ensure_not_cancelled(cancellation: &WalletSyncCancellation) -> Result<(), WcashSyncError> {
+    if cancellation.is_cancelled() {
+        Err(WcashSyncError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 async fn refresh_ironwood_subtrees(
     client: &mut AttestedWcashClient,
     wallet: &mut WalletDatabase,
     tip: BlockRef,
     ironwood_tree_size: u32,
+    cancellation: &WalletSyncCancellation,
 ) -> Result<(), WcashSyncError> {
+    ensure_not_cancelled(cancellation)?;
     validate_ironwood_tree_size(tip.height, ironwood_tree_size)?;
 
     let completed_count = ironwood_tree_size >> IRONWOOD_SHARD_HEIGHT;
@@ -407,6 +449,7 @@ async fn refresh_ironwood_subtrees(
         Some((height, hash)) => {
             let local_height: u32 = height.into();
             let local_state = client.chain_state(local_height).await?;
+            ensure_not_cancelled(cancellation)?;
             if local_state.block.hash != hash.0 {
                 return Err(WcashSyncError::StaleTip);
             }
@@ -431,7 +474,8 @@ async fn refresh_ironwood_subtrees(
             discard_unscanned_ironwood_roots(wallet)?;
             return Err(WcashSyncError::SubtreeRestart);
         };
-        if !ironwood_prefix_attestation_is_canonical(client, tip, attestation).await? {
+        if !ironwood_prefix_attestation_is_canonical(client, tip, attestation, cancellation).await?
+        {
             discard_unscanned_ironwood_roots(wallet)?;
             return Err(WcashSyncError::SubtreeRestart);
         }
@@ -449,6 +493,7 @@ async fn refresh_ironwood_subtrees(
             let mut boundary = client
                 .ironwood_subtree_roots(boundary_index, 1, tip.height)
                 .await?;
+            ensure_not_cancelled(cancellation)?;
             let boundary = boundary.pop().ok_or(WcashSyncError::StaleSubtreeRoot)?;
             if boundary.root_hash() != &stored_root {
                 if unscanned_roots_are_cached {
@@ -478,6 +523,7 @@ async fn refresh_ironwood_subtrees(
 
     let mut start_index = existing_count;
     while start_index < completed_count {
+        ensure_not_cancelled(cancellation)?;
         let count = cmp::min(
             completed_count - start_index,
             cmp::min(
@@ -488,13 +534,21 @@ async fn refresh_ironwood_subtrees(
         let page = client
             .ironwood_subtree_roots(start_index, count, tip.height)
             .await?;
+        ensure_not_cancelled(cancellation)?;
         validate_subtree_heights(
             &mut previous_height,
             page.iter().map(|root| u32::from(root.subtree_end_height())),
         )?;
-        attestation =
-            persist_attested_ironwood_page(client, wallet, tip, attestation, start_index, &page)
-                .await?;
+        attestation = persist_attested_ironwood_page(
+            client,
+            wallet,
+            tip,
+            attestation,
+            start_index,
+            &page,
+            cancellation,
+        )
+        .await?;
         start_index = attestation.prefix_count;
     }
 
@@ -522,11 +576,14 @@ async fn ironwood_prefix_attestation_is_canonical(
     client: &mut AttestedWcashClient,
     current_tip: BlockRef,
     attestation: IronwoodPrefixAttestation,
+    cancellation: &WalletSyncCancellation,
 ) -> Result<bool, WcashSyncError> {
+    ensure_not_cancelled(cancellation)?;
     if attestation.tip.height > current_tip.height {
         return Ok(false);
     }
     let attested_state = client.chain_state(attestation.tip.height).await?;
+    ensure_not_cancelled(cancellation)?;
     ensure_tip(client, current_tip).await?;
     validate_ironwood_tree_size(attestation.tip.height, attested_state.ironwood_tree_size)?;
     Ok(attested_state.block == attestation.tip
@@ -540,12 +597,15 @@ async fn persist_attested_ironwood_page(
     expected_attestation: IronwoodPrefixAttestation,
     start_index: u32,
     page: &[CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>],
+    cancellation: &WalletSyncCancellation,
 ) -> Result<IronwoodPrefixAttestation, WcashSyncError> {
     // `ironwood_subtree_roots` has already enforced the requested count and
     // independently checked every completing block hash/tree-size transition.
     // Re-check the session tip immediately before the page's atomic SQLite
     // transaction so roots and their durable provenance cannot be separated.
+    ensure_not_cancelled(cancellation)?;
     ensure_tip(client, tip).await?;
+    ensure_not_cancelled(cancellation)?;
     commit_attested_ironwood_page(wallet, expected_attestation, start_index, page, tip)
 }
 
