@@ -59,6 +59,14 @@ impl WalletNetwork {
             Self::Regtest => 2,
         }
     }
+
+    /// Returns the stable network identifier persisted in wallet databases.
+    pub(crate) const fn database_identity_name(self) -> &'static str {
+        match self {
+            Self::Testnet => "wcash-testnet",
+            Self::Regtest => "wcash-regtest",
+        }
+    }
 }
 
 #[cfg(test)]

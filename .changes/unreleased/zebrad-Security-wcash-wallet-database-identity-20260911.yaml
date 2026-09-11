@@ -1,0 +1,4 @@
+project: zebrad
+kind: Security
+body: "Bind each Wcash wallet database to its exact network, genesis hash, seed-KDF version, and transaction branch ID before wallet migrations or data access. Unbound pre-launch databases, including the Testnet v4 profile, now require an explicit reset and seed rescan instead of silently opening under Testnet v5. On Unix, new database files are created atomically with private permissions; effective-UID ownership, ancestor safety, a single hard link, and the opened device/inode are verified before use."
+time: 2026-09-11T12:00:00.000000000Z

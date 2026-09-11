@@ -1,6 +1,12 @@
 //! SQLite-backed Wcash wallet operations.
 
-use std::{collections::HashMap, convert::Infallible, fs, num::NonZeroU32, path::Path};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    fs::{self, File, OpenOptions},
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+};
 
 use orchard::keys::Scope as OrchardScope;
 use rand_core::{OsRng, RngCore};
@@ -36,10 +42,14 @@ use zcash_transparent::bundle::OutPoint;
 use zebra_chain::{block::Height, parameters::Network};
 
 use crate::{
-    address::default_transparent_receiver, decode_recipient, derive_wallet_seed,
-    derive_wallet_spending_key, encode_orchard_receiver, encode_transparent_coinbase_receiver,
-    inspect_signed_transaction, rpc::TRANSPARENT_UTXO_PAGE_OUTPUTS, AttestedWcashClient, BlockRef,
-    MemoryBlockCache, WalletAddressError, WalletKeyError, WalletNetwork, WalletRpcError,
+    address::default_transparent_receiver,
+    decode_recipient, derive_wallet_seed, derive_wallet_spending_key, encode_orchard_receiver,
+    encode_transparent_coinbase_receiver,
+    identity::{open_wallet_connection, verify_or_initialize_identity},
+    inspect_signed_transaction,
+    rpc::TRANSPARENT_UTXO_PAGE_OUTPUTS,
+    AttestedWcashClient, BlockRef, MemoryBlockCache, WalletAddressError,
+    WalletDatabaseIdentityError, WalletKeyError, WalletNetwork, WalletRpcError,
 };
 
 /// Maximum compact blocks requested in one synchronization batch.
@@ -73,12 +83,39 @@ pub enum WalletServiceError {
     /// The wallet path is a symbolic link, which this tool refuses to follow.
     #[error("refusing to open a wallet database through a symbolic link")]
     SymlinkWalletPath,
+    /// The wallet path does not name a regular file.
+    #[error("wallet database path is not a regular file")]
+    NonRegularWalletPath,
+    /// Another local account can replace entries in the wallet's parent directory.
+    #[error("wallet database parent directory must not be group- or world-writable")]
+    InsecureWalletParent,
+    /// The wallet file or its parent is not owned by the process effective UID.
+    #[error("wallet database {object} must be owned by the process effective UID")]
+    InsecureWalletOwnership {
+        /// The object whose owner failed validation.
+        object: &'static str,
+    },
+    /// An ancestor can be replaced by an untrusted local account.
+    #[error("wallet database path has an unsafe ancestor: {0}")]
+    InsecureWalletAncestor(PathBuf),
+    /// An existing wallet file is readable or writable by another local account.
+    #[error("existing wallet database permissions must be private; set its mode to 0600")]
+    InsecureWalletPermissions,
+    /// A hard-linked database has another mutable name outside the checked path.
+    #[error("wallet database must have exactly one hard link")]
+    HardLinkedWalletPath,
+    /// The wallet pathname changed while its file was being opened.
+    #[error("wallet database path changed while it was being opened")]
+    WalletPathChanged,
     /// Opening the SQLite file failed.
     #[error("could not open wallet database: {0}")]
     Sqlite(#[from] rusqlite::Error),
     /// Applying the reviewed librustzcash schema failed.
     #[error("wallet database migration failed: {0}")]
     Migration(String),
+    /// The database is not bound to the selected Wcash chain and derivation.
+    #[error(transparent)]
+    Identity(#[from] WalletDatabaseIdentityError),
     /// A wallet database operation failed.
     #[error("wallet database operation failed: {0}")]
     Database(String),
@@ -328,11 +365,82 @@ fn open_secured_wallet(
     path: &Path,
     network: WalletNetwork,
 ) -> Result<WalletDatabase, WalletServiceError> {
+    let prepared = prepare_wallet_path(path)?;
+    let mut connection = open_wallet_connection(&prepared.canonical_path)?;
+    prepared.verify_current_path()?;
+    verify_or_initialize_identity(&mut connection, network)?;
+    prepared.verify_current_path()?;
+    rusqlite::vtab::array::load_module(&connection)?;
+    Ok(WalletDb::from_connection(
+        connection,
+        network.parameters(),
+        SystemClock,
+        OsRng,
+    ))
+}
+
+struct PreparedWalletPath {
+    canonical_path: PathBuf,
+    opened_file: File,
+}
+
+impl PreparedWalletPath {
+    fn verify_current_path(&self) -> Result<(), WalletServiceError> {
+        require_private_parent_and_ancestors(&self.canonical_path)?;
+        verify_named_file_matches(&self.canonical_path, &self.opened_file)
+    }
+}
+
+fn prepare_wallet_path(path: &Path) -> Result<PreparedWalletPath, WalletServiceError> {
     reject_symlink(path)?;
-    let wallet = WalletDb::for_path(path, network.parameters(), SystemClock, OsRng)?;
-    reject_symlink(path)?;
-    secure_wallet_permissions(path)?;
-    Ok(wallet)
+    let canonical_path = canonical_wallet_path(path)?;
+    require_private_parent_and_ancestors(&canonical_path)?;
+
+    let opened_file = match private_open_options(true).open(&canonical_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            require_private_regular_file(&canonical_path)?;
+            private_open_options(false).open(&canonical_path)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    require_private_opened_file(&opened_file)?;
+    require_private_parent_and_ancestors(&canonical_path)?;
+    verify_named_file_matches(&canonical_path, &opened_file)?;
+
+    Ok(PreparedWalletPath {
+        canonical_path,
+        opened_file,
+    })
+}
+
+fn private_open_options(create_new: bool) -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(create_new);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options
+            .mode(0o600)
+            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    }
+    options
+}
+
+fn canonical_wallet_path(path: &Path) -> Result<PathBuf, std::io::Error> {
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "wallet path must name a database file",
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(fs::canonicalize(parent)?.join(file_name))
 }
 
 fn reject_symlink(path: &Path) -> Result<(), WalletServiceError> {
@@ -347,15 +455,128 @@ fn reject_symlink(path: &Path) -> Result<(), WalletServiceError> {
 }
 
 #[cfg(unix)]
-fn secure_wallet_permissions(path: &Path) -> Result<(), WalletServiceError> {
-    use std::os::unix::fs::PermissionsExt;
+fn require_private_parent_and_ancestors(path: &Path) -> Result<(), WalletServiceError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let parent = path
+        .parent()
+        .expect("canonical wallet paths always have a parent directory");
+    let effective_uid = nix::unistd::geteuid().as_raw();
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(WalletServiceError::NonRegularWalletPath);
+    }
+    require_effective_uid(parent_metadata.uid(), effective_uid, "parent directory")?;
+    if parent_metadata.permissions().mode() & 0o022 != 0 {
+        return Err(WalletServiceError::InsecureWalletParent);
+    }
+
+    let mut protected_child_uid = parent_metadata.uid();
+    let mut ancestor = parent.parent();
+    while let Some(path) = ancestor {
+        let metadata = fs::symlink_metadata(path)?;
+        let owner_uid = metadata.uid();
+        let mode = metadata.permissions().mode();
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || (owner_uid != effective_uid && owner_uid != 0)
+            || (mode & 0o022 != 0
+                && (mode & 0o1000 == 0
+                    || (protected_child_uid != effective_uid && protected_child_uid != 0)))
+        {
+            return Err(WalletServiceError::InsecureWalletAncestor(
+                path.to_path_buf(),
+            ));
+        }
+
+        protected_child_uid = owner_uid;
+        ancestor = path.parent();
+    }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn secure_wallet_permissions(_path: &Path) -> Result<(), WalletServiceError> {
+fn require_private_parent_and_ancestors(_path: &Path) -> Result<(), WalletServiceError> {
+    Ok(())
+}
+
+fn require_private_regular_file(path: &Path) -> Result<(), WalletServiceError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(WalletServiceError::SymlinkWalletPath);
+    }
+    if !metadata.is_file() {
+        return Err(WalletServiceError::NonRegularWalletPath);
+    }
+
+    #[cfg(unix)]
+    {
+        validate_private_unix_file_metadata(&metadata)?;
+    }
+
+    Ok(())
+}
+
+fn require_private_opened_file(file: &File) -> Result<(), WalletServiceError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(WalletServiceError::NonRegularWalletPath);
+    }
+
+    #[cfg(unix)]
+    {
+        validate_private_unix_file_metadata(&metadata)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_unix_file_metadata(metadata: &fs::Metadata) -> Result<(), WalletServiceError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    require_effective_uid(metadata.uid(), nix::unistd::geteuid().as_raw(), "file")?;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(WalletServiceError::InsecureWalletPermissions);
+    }
+    if metadata.nlink() != 1 {
+        return Err(WalletServiceError::HardLinkedWalletPath);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_effective_uid(
+    owner_uid: u32,
+    effective_uid: u32,
+    object: &'static str,
+) -> Result<(), WalletServiceError> {
+    if owner_uid != effective_uid {
+        return Err(WalletServiceError::InsecureWalletOwnership { object });
+    }
+    Ok(())
+}
+
+fn verify_named_file_matches(path: &Path, file: &File) -> Result<(), WalletServiceError> {
+    let named = fs::symlink_metadata(path)?;
+    if named.file_type().is_symlink() {
+        return Err(WalletServiceError::SymlinkWalletPath);
+    }
+    if !named.is_file() {
+        return Err(WalletServiceError::NonRegularWalletPath);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let opened = file.metadata()?;
+        validate_private_unix_file_metadata(&named)?;
+        if opened.dev() != named.dev() || opened.ino() != named.ino() {
+            return Err(WalletServiceError::WalletPathChanged);
+        }
+    }
+
     Ok(())
 }
 
@@ -2390,6 +2611,130 @@ mod tests {
         assert!(matches!(
             open_wallet_database(&symlink_path, WalletNetwork::Regtest),
             Err(WalletServiceError::SymlinkWalletPath)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insecure_existing_wallet_permissions_are_rejected_without_rewriting_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        drop(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&wallet_path)
+                .unwrap(),
+        );
+        fs::set_permissions(&wallet_path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        assert!(matches!(
+            open_wallet_database(&wallet_path, WalletNetwork::Regtest),
+            Err(WalletServiceError::InsecureWalletPermissions)
+        ));
+        assert_eq!(
+            fs::metadata(wallet_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_wallet_parent_is_rejected_before_file_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let shared_parent = directory.path().join("shared");
+        fs::create_dir(&shared_parent).unwrap();
+        fs::set_permissions(&shared_parent, fs::Permissions::from_mode(0o770)).unwrap();
+        let wallet_path = shared_parent.join("wallet.sqlite");
+
+        assert!(matches!(
+            open_wallet_database(&wallet_path, WalletNetwork::Regtest),
+            Err(WalletServiceError::InsecureWalletParent)
+        ));
+        assert!(!wallet_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_must_match_the_process_effective_uid() {
+        let effective_uid = nix::unistd::geteuid().as_raw();
+        let different_uid = effective_uid.wrapping_add(1);
+
+        for object in ["file", "parent directory"] {
+            assert!(matches!(
+                require_effective_uid(different_uid, effective_uid, object),
+                Err(WalletServiceError::InsecureWalletOwnership {
+                    object: rejected_object,
+                }) if rejected_object == object
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_wallet_database_is_rejected() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let original_path = directory.path().join("original.sqlite");
+        let wallet_path = directory.path().join("wallet.sqlite");
+        drop(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&original_path)
+                .unwrap(),
+        );
+        fs::set_permissions(&original_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&original_path, &wallet_path).unwrap();
+
+        assert_eq!(fs::metadata(&wallet_path).unwrap().nlink(), 2);
+        assert!(matches!(
+            open_wallet_database(&wallet_path, WalletNetwork::Regtest),
+            Err(WalletServiceError::HardLinkedWalletPath)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_ancestor_above_private_parent_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let unsafe_ancestor = directory.path().join("shared");
+        let private_parent = unsafe_ancestor.join("wallet");
+        fs::create_dir(&unsafe_ancestor).unwrap();
+        fs::set_permissions(&unsafe_ancestor, fs::Permissions::from_mode(0o770)).unwrap();
+        fs::create_dir(&private_parent).unwrap();
+        fs::set_permissions(&private_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let wallet_path = private_parent.join("wallet.sqlite");
+        let canonical_unsafe_ancestor = fs::canonicalize(&unsafe_ancestor).unwrap();
+
+        assert!(matches!(
+            open_wallet_database(&wallet_path, WalletNetwork::Regtest),
+            Err(WalletServiceError::InsecureWalletAncestor(path))
+                if path == canonical_unsafe_ancestor
+        ));
+        assert!(!wallet_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pathname_replacement_is_detected_against_the_opened_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let moved_path = directory.path().join("moved.sqlite");
+        let opened = private_open_options(true).open(&wallet_path).unwrap();
+        fs::rename(&wallet_path, &moved_path).unwrap();
+        drop(private_open_options(true).open(&wallet_path).unwrap());
+
+        assert!(matches!(
+            verify_named_file_matches(&wallet_path, &opened),
+            Err(WalletServiceError::WalletPathChanged)
         ));
     }
 }

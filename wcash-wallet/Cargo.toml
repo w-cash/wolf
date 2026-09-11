@@ -56,6 +56,9 @@ zip32.workspace = true
 orchard.workspace = true
 zeroize = "1.8"
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["user"] }
+
 [dev-dependencies]
 pczt = "0.9.3"
 tempfile.workspace = true
