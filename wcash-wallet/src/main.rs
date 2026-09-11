@@ -1,4 +1,4 @@
-//! Command-line interface for the experimental local Wcash wallet.
+//! Command-line interface for the experimental Wcash wallet.
 
 use std::{
     io::{self, IsTerminal, Read},
@@ -73,7 +73,7 @@ impl From<CliNetwork> for WalletNetwork {
     }
 }
 
-/// Experimental one-shot Wcash wallet for a project-owned local Zebra.
+/// Experimental one-shot Wcash wallet for an attested Wcash compact-block service.
 #[derive(Debug, Parser)]
 #[command(name = "wcash-wallet", version, about)]
 struct Cli {
@@ -83,7 +83,7 @@ struct Cli {
     /// Persistent SQLite wallet path, required by wallet database commands.
     #[arg(long, global = true)]
     db: Option<PathBuf>,
-    /// Explicit loopback Zebra compact-block endpoint, for example http://127.0.0.1:38234.
+    /// HTTPS compact-block endpoint, or plaintext literal loopback for local development.
     #[arg(long, global = true)]
     lightwalletd: Option<String>,
     #[command(subcommand)]

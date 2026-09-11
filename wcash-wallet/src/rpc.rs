@@ -21,12 +21,12 @@ use thiserror::Error;
 use tonic::{
     body::Body,
     codegen::{http::Request, http::Response, Service},
-    transport::{Channel, Endpoint},
+    transport::{Channel, ClientTlsConfig, Endpoint},
     Code,
 };
 use zcash_client_backend::proto::service::{
-    compact_tx_streamer_client::CompactTxStreamerClient, BlockId, ChainSpec, GetAddressUtxosArg,
-    RawTransaction, TreeState, TxFilter,
+    compact_tx_streamer_client::CompactTxStreamerClient, BlockId, ChainSpec, Empty,
+    GetAddressUtxosArg, LightdInfo, RawTransaction, TreeState, TxFilter,
 };
 use zcash_keys::encoding::AddressCodec;
 use zcash_primitives::{
@@ -35,7 +35,10 @@ use zcash_primitives::{
 };
 use zcash_protocol::{constants::MAX_BLOCK_BYTES, TxId};
 use zcash_transparent::address::{Script, TransparentAddress};
-use zebra_chain::primitives::{WcashAddress, WcashAddressKind};
+use zebra_chain::{
+    parameters::ConsensusBranchId,
+    primitives::{WcashAddress, WcashAddressKind},
+};
 
 use crate::{address::encode_wcash_transparent_receiver, BlockRef, WalletNetwork};
 
@@ -161,7 +164,7 @@ impl TransparentUnspentPage {
     }
 }
 
-/// A compact-block client that has proved it serves one exact Wcash genesis.
+/// A compact-block client that has proved it serves one exact Wcash network.
 ///
 /// Network-sensitive methods are intentionally available only through this
 /// wrapper, so callers cannot accidentally scan, sign, or broadcast through an
@@ -174,12 +177,12 @@ pub struct AttestedWcashClient {
 }
 
 impl AttestedWcashClient {
-    /// Connects to an endpoint and requires its height-zero block to match the
-    /// frozen genesis for `network` before returning a usable client.
+    /// Connects to an endpoint and requires its reported chain, active branch,
+    /// and height-zero block to match `network` before returning a usable client.
     pub async fn connect(endpoint: &str, network: WalletNetwork) -> Result<Self, WalletRpcError> {
         let channel = connect_channel(endpoint).await?;
         let mut inner = CompactTxStreamerClient::new(channel.clone());
-        attest_genesis(&mut inner, network).await?;
+        attest_network(&mut inner, network).await?;
         Ok(Self {
             inner,
             channel,
@@ -579,9 +582,10 @@ pub enum WalletRpcError {
     /// The endpoint is not a valid absolute HTTP(S) URI.
     #[error("invalid lightwalletd endpoint: {0}")]
     InvalidEndpoint(String),
-    /// This experimental wallet only trusts a project-owned local Zebra.
-    #[error("the experimental wallet accepts only loopback Zebra endpoints")]
-    NonLoopbackEndpoint,
+    /// Plaintext transport was requested for a host that is not a literal
+    /// loopback IP address.
+    #[error("plaintext lightwalletd endpoints require a literal loopback IP address")]
+    InsecureEndpoint,
     /// Establishing the gRPC channel failed.
     #[error("could not connect to lightwalletd: {0}")]
     Connect(#[from] tonic::transport::Error),
@@ -612,6 +616,24 @@ pub enum WalletRpcError {
         /// Expected internal-byte-order genesis identifier.
         expected: String,
         /// Actual internal-byte-order genesis identifier.
+        actual: String,
+    },
+    /// The service reported the wrong BIP70 chain identifier.
+    #[error("lightwalletd chain mismatch: expected {expected}, got {actual}")]
+    WrongChainName {
+        /// Expected BIP70 network name.
+        expected: String,
+        /// Actual BIP70 network name.
+        actual: String,
+    },
+    /// The service reported a branch ID that is not active at its tip.
+    #[error("lightwalletd branch mismatch at height {height}: expected {expected}, got {actual}")]
+    WrongConsensusBranchId {
+        /// Height reported by the service.
+        height: u64,
+        /// Expected lowercase eight-digit branch identifier.
+        expected: String,
+        /// Actual branch identifier.
         actual: String,
     },
     /// A tree-state response used the wrong BIP70 network identifier.
@@ -773,9 +795,7 @@ pub enum BroadcastDisposition {
 }
 
 async fn connect_channel(endpoint: &str) -> Result<Channel, WalletRpcError> {
-    let endpoint = Endpoint::from_shared(endpoint.to_owned())
-        .map_err(|error| WalletRpcError::InvalidEndpoint(error.to_string()))?;
-    validate_endpoint(endpoint.uri().scheme_str(), endpoint.uri().host())?;
+    let endpoint = configured_endpoint(endpoint)?;
     let endpoint = endpoint
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
@@ -783,27 +803,55 @@ async fn connect_channel(endpoint: &str) -> Result<Channel, WalletRpcError> {
     Ok(endpoint.connect().await?)
 }
 
-fn validate_endpoint(scheme: Option<&str>, host: Option<&str>) -> Result<(), WalletRpcError> {
-    let scheme =
-        scheme.ok_or_else(|| WalletRpcError::InvalidEndpoint("missing URI scheme".to_owned()))?;
-    let host =
-        host.ok_or_else(|| WalletRpcError::InvalidEndpoint("missing endpoint host".to_owned()))?;
+fn configured_endpoint(endpoint: &str) -> Result<Endpoint, WalletRpcError> {
+    let mut endpoint = Endpoint::from_shared(endpoint.to_owned()).map_err(|_| {
+        WalletRpcError::InvalidEndpoint("endpoint must be an absolute HTTP(S) URI".to_owned())
+    })?;
+    validate_endpoint(endpoint.uri())?;
+    if endpoint.uri().scheme_str() == Some("https") {
+        endpoint = endpoint.tls_config(ClientTlsConfig::new().with_webpki_roots())?;
+    }
+    Ok(endpoint)
+}
+
+fn validate_endpoint(uri: &tonic::codegen::http::Uri) -> Result<(), WalletRpcError> {
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| WalletRpcError::InvalidEndpoint("missing URI scheme".to_owned()))?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| WalletRpcError::InvalidEndpoint("missing endpoint host".to_owned()))?;
+    if authority.as_str().contains('@') {
+        return Err(WalletRpcError::InvalidEndpoint(
+            "endpoint user information is not permitted".to_owned(),
+        ));
+    }
+    let host = uri
+        .host()
+        .ok_or_else(|| WalletRpcError::InvalidEndpoint("missing endpoint host".to_owned()))?;
     if !matches!(scheme, "http" | "https") {
         return Err(WalletRpcError::InvalidEndpoint(
             "endpoint scheme must be http or https".to_owned(),
         ));
     }
-    if !is_loopback_host(host) {
-        return Err(WalletRpcError::NonLoopbackEndpoint);
+    if host.eq_ignore_ascii_case("localhost") {
+        return Err(WalletRpcError::InvalidEndpoint(
+            "localhost names are not permitted; use a literal loopback IP".to_owned(),
+        ));
+    }
+    if scheme == "http" && !is_literal_loopback(host) {
+        return Err(WalletRpcError::InsecureEndpoint);
     }
     Ok(())
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+fn is_literal_loopback(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 async fn rewrite_sync_namespace_request(
@@ -921,6 +969,43 @@ fn validate_tree_state(
         })
 }
 
+async fn attest_network(
+    client: &mut LightwalletdClient,
+    network: WalletNetwork,
+) -> Result<BlockRef, WalletRpcError> {
+    let info = client.get_lightd_info(Empty {}).await?.into_inner();
+    validate_lightd_info(network, &info)?;
+    attest_genesis(client, network).await
+}
+
+fn validate_lightd_info(network: WalletNetwork, info: &LightdInfo) -> Result<(), WalletRpcError> {
+    let expected_chain = network.parameters().bip70_network_name();
+    if info.chain_name != expected_chain {
+        return Err(WalletRpcError::WrongChainName {
+            expected: expected_chain,
+            actual: info.chain_name.clone(),
+        });
+    }
+
+    // Zebra serializes its no-active-upgrade sentinel as eight zeroes while
+    // the best chain contains only genesis. Wcash activates its own branch at
+    // height one, so every later tip must report that network-specific value.
+    let expected_branch = if info.block_height == 0 {
+        format!("{:08x}", u32::from(ConsensusBranchId::RPC_MISSING_ID))
+    } else {
+        network.branch_id_hex()
+    };
+    if info.consensus_branch_id != expected_branch {
+        return Err(WalletRpcError::WrongConsensusBranchId {
+            height: info.block_height,
+            expected: expected_branch,
+            actual: info.consensus_branch_id.clone(),
+        });
+    }
+
+    Ok(())
+}
+
 async fn attest_genesis(
     client: &mut LightwalletdClient,
     network: WalletNetwork,
@@ -933,22 +1018,28 @@ async fn attest_genesis(
         })
         .await?
         .into_inner();
-    if block.height != 0 {
+    validate_genesis_block_id(network, block.height, &block.hash)
+}
+
+fn validate_genesis_block_id(
+    network: WalletNetwork,
+    height: u64,
+    hash: &[u8],
+) -> Result<BlockRef, WalletRpcError> {
+    if height != 0 {
         return Err(WalletRpcError::UnexpectedHeight {
             field: "genesis block",
             expected: 0,
-            actual: block.height,
+            actual: height,
         });
     }
-    let hash: [u8; 32] =
-        block
-            .hash
-            .as_slice()
-            .try_into()
-            .map_err(|_| WalletRpcError::MalformedBlockId {
-                field: "genesis hash",
-                height: block.height,
-            })?;
+    let hash: [u8; 32] = hash
+        .try_into()
+        .map_err(|_| WalletRpcError::MalformedBlockId {
+            field: "genesis hash",
+            height,
+        })?;
+    let expected = network.genesis_hash();
     if hash != expected {
         return Err(WalletRpcError::WrongGenesis {
             expected: hex::encode(expected),
@@ -1213,19 +1304,114 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endpoint_policy_accepts_only_loopback_zebra() {
-        assert!(validate_endpoint(Some("http"), Some("localhost")).is_ok());
-        assert!(validate_endpoint(Some("http"), Some("127.0.0.1")).is_ok());
-        assert!(validate_endpoint(Some("http"), Some("::1")).is_ok());
+    fn endpoint_policy_requires_tls_except_for_literal_loopback_ips() {
+        assert!(configured_endpoint("https://wallet-testnet.wcashexplorer.com").is_ok());
+        assert!(configured_endpoint("https://203.0.113.8:443").is_ok());
+        assert!(configured_endpoint("http://127.0.0.1:8234").is_ok());
+        assert!(configured_endpoint("http://127.255.255.254:8234").is_ok());
+        assert!(configured_endpoint("http://[::1]:8234").is_ok());
+
+        for endpoint in [
+            "http://example.com:8234",
+            "http://192.168.1.10:8234",
+            "http://10.0.0.10:8234",
+        ] {
+            assert!(matches!(
+                configured_endpoint(endpoint),
+                Err(WalletRpcError::InsecureEndpoint)
+            ));
+        }
+        for endpoint in ["http://localhost:8234", "https://localhost:8234"] {
+            assert!(matches!(
+                configured_endpoint(endpoint),
+                Err(WalletRpcError::InvalidEndpoint(_))
+            ));
+        }
         assert!(matches!(
-            validate_endpoint(Some("http"), Some("example.com")),
-            Err(WalletRpcError::NonLoopbackEndpoint)
+            configured_endpoint("ftp://wallet-testnet.wcashexplorer.com"),
+            Err(WalletRpcError::InvalidEndpoint(_))
+        ));
+    }
+
+    #[test]
+    fn endpoint_errors_do_not_echo_rejected_user_information() {
+        let secret = "never-print-this-password";
+        let error = configured_endpoint(&format!("https://wallet:{secret}@example.com"))
+            .expect_err("endpoint user information must be rejected");
+        assert!(!error.to_string().contains(secret));
+    }
+
+    fn lightd_info(height: u64, chain_name: &str, branch_id: &str) -> LightdInfo {
+        LightdInfo {
+            chain_name: chain_name.to_owned(),
+            consensus_branch_id: branch_id.to_owned(),
+            block_height: height,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn lightd_info_is_bound_to_the_wcash_chain_and_active_branch() {
+        let network = WalletNetwork::Testnet;
+        let chain_name = network.parameters().bip70_network_name();
+        let valid = lightd_info(1, &chain_name, &network.branch_id_hex());
+        assert!(validate_lightd_info(network, &valid).is_ok());
+
+        let wrong_chain = lightd_info(1, "main", &network.branch_id_hex());
+        assert!(matches!(
+            validate_lightd_info(network, &wrong_chain),
+            Err(WalletRpcError::WrongChainName { .. })
+        ));
+
+        let wrong_branch = lightd_info(1, &chain_name, "deadbeef");
+        assert!(matches!(
+            validate_lightd_info(network, &wrong_branch),
+            Err(WalletRpcError::WrongConsensusBranchId { .. })
+        ));
+    }
+
+    #[test]
+    fn genesis_tip_uses_only_the_no_active_upgrade_branch_sentinel() {
+        let network = WalletNetwork::Testnet;
+        let chain_name = network.parameters().bip70_network_name();
+        let genesis = lightd_info(0, &chain_name, "00000000");
+        assert!(validate_lightd_info(network, &genesis).is_ok());
+
+        let premature = lightd_info(0, &chain_name, &network.branch_id_hex());
+        assert!(matches!(
+            validate_lightd_info(network, &premature),
+            Err(WalletRpcError::WrongConsensusBranchId { .. })
+        ));
+
+        let stale = lightd_info(1, &chain_name, "00000000");
+        assert!(matches!(
+            validate_lightd_info(network, &stale),
+            Err(WalletRpcError::WrongConsensusBranchId { .. })
+        ));
+    }
+
+    #[test]
+    fn genesis_attestation_requires_the_exact_internal_hash_bytes() {
+        let network = WalletNetwork::Testnet;
+        let internal = network.genesis_hash();
+        assert_eq!(
+            validate_genesis_block_id(network, 0, &internal).unwrap(),
+            BlockRef {
+                height: 0,
+                hash: internal,
+            }
+        );
+
+        let mut display_order = internal;
+        display_order.reverse();
+        assert!(matches!(
+            validate_genesis_block_id(network, 0, &display_order),
+            Err(WalletRpcError::WrongGenesis { .. })
         ));
         assert!(matches!(
-            validate_endpoint(Some("https"), Some("example.com")),
-            Err(WalletRpcError::NonLoopbackEndpoint)
+            validate_genesis_block_id(network, 1, &internal),
+            Err(WalletRpcError::UnexpectedHeight { .. })
         ));
-        assert!(validate_endpoint(Some("https"), Some("::1")).is_ok());
     }
 
     fn valid_tree_state(block: BlockRef) -> TreeState {
