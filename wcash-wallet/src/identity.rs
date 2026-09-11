@@ -12,6 +12,20 @@ pub(crate) const TRANSPARENT_SYNC_STATE_TABLE: &str = "ext_wcash_transparent_syn
 pub(crate) const IRONWOOD_SYNC_STATE_TABLE: &str = "ext_wcash_ironwood_sync";
 const IDENTITY_FORMAT_VERSION: i64 = 1;
 
+/// Classification used when opening an existing database for inspection.
+///
+/// These variants intentionally contain no database values or SQLite details,
+/// so callers can display them without risking disclosure of wallet material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExistingWalletIdentityError {
+    /// The SQLite file contains no schema objects.
+    Empty,
+    /// The file is SQLite, but is not for the requested Wcash identity.
+    Foreign,
+    /// The Wcash identity or SQLite database cannot be interpreted safely.
+    Corrupt,
+}
+
 /// Errors returned before a SQLite database is opened as a Wcash wallet.
 #[derive(Debug, Error)]
 pub enum WalletDatabaseIdentityError {
@@ -67,6 +81,53 @@ pub(crate) fn open_wallet_connection(path: &Path) -> Result<Connection, rusqlite
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
     Connection::open_with_flags(path, flags)
+}
+
+/// Opens an existing SQLite file read-only, without creating a database or
+/// permitting migrations.
+pub(crate) fn open_wallet_connection_read_only(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    Connection::open_with_flags(path, flags)
+}
+
+/// Verifies an existing database identity without creating tables, rows, or
+/// migration state.
+pub(crate) fn verify_existing_identity(
+    connection: &Connection,
+    network: WalletNetwork,
+) -> Result<(), ExistingWalletIdentityError> {
+    let identity_exists = schema_object_exists(connection, IDENTITY_TABLE)
+        .map_err(|_| ExistingWalletIdentityError::Corrupt)?;
+    if !identity_exists {
+        return if schema_has_any_objects(connection)
+            .map_err(|_| ExistingWalletIdentityError::Corrupt)?
+        {
+            Err(ExistingWalletIdentityError::Foreign)
+        } else {
+            Err(ExistingWalletIdentityError::Empty)
+        };
+    }
+
+    let actual = read_identity(connection).map_err(|error| match error {
+        WalletDatabaseIdentityError::Mismatch { .. }
+        | WalletDatabaseIdentityError::PrelaunchIdentityMissing => {
+            ExistingWalletIdentityError::Foreign
+        }
+        WalletDatabaseIdentityError::Malformed(_) | WalletDatabaseIdentityError::Sqlite(_) => {
+            ExistingWalletIdentityError::Corrupt
+        }
+    })?;
+    verify_identity(network, actual).map_err(|error| match error {
+        WalletDatabaseIdentityError::Mismatch { .. }
+        | WalletDatabaseIdentityError::PrelaunchIdentityMissing => {
+            ExistingWalletIdentityError::Foreign
+        }
+        WalletDatabaseIdentityError::Malformed(_) | WalletDatabaseIdentityError::Sqlite(_) => {
+            ExistingWalletIdentityError::Corrupt
+        }
+    })
 }
 
 /// Verifies the persisted chain identity, or initializes it in an empty file.
