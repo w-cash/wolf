@@ -87,6 +87,17 @@ mod tests {
     }
 
     #[test]
+    fn testnet_v5_seed_domain_has_a_stable_vector() {
+        let master = SecretVec::new((0u8..32).collect());
+        let derived = derive_wallet_seed(&master, WalletNetwork::Testnet).unwrap();
+
+        assert_eq!(
+            hex::encode(derived.expose_secret()),
+            "92dc36b870456da70d67656db7730a849c4921e77d80cf525f8f82001d0c43b547cc6b5c96813175927bd0985bd21e5f3f2bc0e3bac790d046e9dc5062e6e158"
+        );
+    }
+
+    #[test]
     fn seed_length_is_checked_before_kdf() {
         assert!(matches!(
             derive_wallet_seed(&SecretVec::new(vec![0; 31]), WalletNetwork::Testnet),

@@ -189,7 +189,7 @@ mod tests {
 
         assert_eq!(
             encode_orchard_receiver(&testnet, WalletNetwork::Testnet).unwrap(),
-            "wutest1y8vqv8yds0dsh0fd8q8nm37q84fkjf33vy8e4cwyx29yl55avhq4udaevvtygde7ae5pvav8y02yqrggm36gnmphazpaqerxj5ja8grr"
+            "wutest17mvne4ygv9v8rkjf6yxnrveceejh8nutee8svp8swkgj7s7ac9ga36u2av8hgpc28cc42u474ypjq2jsdt64utcxtztm2jr6guvaryhh"
         );
         assert_eq!(
             encode_orchard_receiver(&regtest, WalletNetwork::Regtest).unwrap(),
@@ -197,7 +197,7 @@ mod tests {
         );
         assert_eq!(
             encode_transparent_coinbase_receiver(&testnet, WalletNetwork::Testnet).unwrap(),
-            "WTES2x4gFzRan36RGCoc2ZNb9SwFMQf2Pbg"
+            "WTNjqDPXEGEgKHS1YPtfEgdrqk6egFRULDz"
         );
         assert_eq!(
             encode_transparent_coinbase_receiver(&regtest, WalletNetwork::Regtest).unwrap(),
