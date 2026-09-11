@@ -53,7 +53,7 @@ use crate::{
 };
 
 /// Maximum compact blocks requested in one synchronization batch.
-pub const MAX_SYNC_BATCH_SIZE: u32 = 10_000;
+pub const MAX_SYNC_BATCH_SIZE: u32 = crate::cache::MAX_COMPACT_BLOCKS_PER_BATCH;
 /// Maximum recipients in one experimental shielded transfer.
 pub const MAX_TRANSFER_RECIPIENTS: usize = 100;
 /// Maximum transaction expiry interval accepted by the wallet.

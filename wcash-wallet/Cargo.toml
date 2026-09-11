@@ -44,6 +44,7 @@ zcash_keys = { workspace = true, features = [
   "sapling",
   "transparent-inputs",
 ] }
+zcash_note_encryption.workspace = true
 zcash_primitives = { workspace = true, features = [
   "circuits",
   "transparent-inputs",

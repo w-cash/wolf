@@ -1,0 +1,4 @@
+project: zebrad
+kind: Security
+body: "Reject malformed, oversized, non-contiguous, or non-Wcash compact blocks atomically before wallet scanning, including unsafe transaction identifiers and indices, legacy-pool content, unexpected transparent fields, invalid Ironwood actions, and inconsistent Ironwood tree-size transitions."
+time: 2026-09-11T18:00:00.000000000Z
