@@ -53,7 +53,8 @@ use crate::{
     decode_recipient, derive_wallet_seed, derive_wallet_spending_key, encode_orchard_receiver,
     encode_transparent_coinbase_receiver,
     identity::{
-        open_wallet_connection, verify_or_initialize_identity, TRANSPARENT_SYNC_STATE_TABLE,
+        open_wallet_connection, open_wallet_connection_read_only, verify_existing_identity,
+        verify_or_initialize_identity, ExistingWalletIdentityError, TRANSPARENT_SYNC_STATE_TABLE,
     },
     inspect_signed_transaction,
     rpc::{MAX_TRANSPARENT_HISTORY_BLOCKS_PER_REQUEST, TRANSPARENT_UTXO_PAGE_OUTPUTS},
@@ -88,6 +89,18 @@ pub type WalletDatabase = WalletDb<rusqlite::Connection, Network, SystemClock, O
 /// Errors returned by persistent Wcash wallet operations.
 #[derive(Debug, Error)]
 pub enum WalletServiceError {
+    /// The requested wallet database does not exist.
+    #[error("wallet database does not exist")]
+    WalletDatabaseMissing,
+    /// The existing SQLite database has no Wcash wallet account.
+    #[error("wallet database is empty")]
+    WalletDatabaseEmpty,
+    /// The existing SQLite database belongs to another application or Wcash network.
+    #[error("wallet database belongs to a different application or Wcash network")]
+    ForeignWalletDatabase,
+    /// The existing Wcash database cannot be interpreted safely.
+    #[error("wallet database is corrupt or incompatible")]
+    CorruptWalletDatabase,
     /// A local wallet path could not be inspected or secured.
     #[error("wallet file security check failed: {0}")]
     Io(#[from] std::io::Error),
@@ -243,6 +256,22 @@ pub struct InitializedWallet {
     pub transparent_coinbase_address: String,
     /// Whether this invocation created the account.
     pub created: bool,
+}
+
+/// Seedless metadata read from one existing Wcash wallet account.
+///
+/// This type contains public wallet identifiers and receiving addresses only;
+/// it never contains spending authority or viewing keys.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WalletInfo {
+    /// Opaque database account identifier.
+    pub account_id: String,
+    /// First block the wallet scans for account funds.
+    pub birthday_height: u32,
+    /// Canonical Wcash Unified Address for private receipts.
+    pub address: String,
+    /// Default Wcash P2PKH receiver for transparent coinbase payouts.
+    pub transparent_coinbase_address: String,
 }
 
 /// Wallet synchronization and balance summary.
@@ -408,6 +437,52 @@ pub fn open_wallet_database(
     Ok(wallet)
 }
 
+/// Inspects one existing Wcash wallet without a seed or network request.
+///
+/// The database is opened read-only after taking the wallet's shared operation
+/// lock. This function never creates a database, runs migrations, or modifies
+/// wallet state. It fails closed for empty, foreign-network, malformed, and
+/// incompatible databases.
+pub fn inspect_wallet(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+) -> Result<WalletInfo, WalletServiceError> {
+    let path = path.as_ref();
+    require_existing_wallet_file(path)?;
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Shared)?;
+    let wallet = open_existing_wallet_read_only(path, network)?;
+    let account_ids = wallet
+        .get_account_ids()
+        .map_err(|_| WalletServiceError::CorruptWalletDatabase)?;
+    let account_id = match account_ids.as_slice() {
+        [] => return Err(WalletServiceError::WalletDatabaseEmpty),
+        [account_id] => *account_id,
+        _ => {
+            return Err(WalletServiceError::UnexpectedAccountCount(
+                account_ids.len(),
+            ))
+        }
+    };
+    let account = wallet
+        .get_account(account_id)
+        .map_err(|_| WalletServiceError::CorruptWalletDatabase)?
+        .ok_or(WalletServiceError::CorruptWalletDatabase)?;
+    let ufvk = account
+        .ufvk()
+        .ok_or(WalletServiceError::CorruptWalletDatabase)?;
+    let address = encode_orchard_receiver(ufvk, network)
+        .map_err(|_| WalletServiceError::CorruptWalletDatabase)?;
+    let transparent_coinbase_address = encode_transparent_coinbase_receiver(ufvk, network)
+        .map_err(|_| WalletServiceError::CorruptWalletDatabase)?;
+
+    Ok(WalletInfo {
+        account_id: account_id.expose_uuid().to_string(),
+        birthday_height: account.birthday_height().into(),
+        address,
+        transparent_coinbase_address,
+    })
+}
+
 fn open_wallet_database_with_seed(
     path: impl AsRef<Path>,
     network: WalletNetwork,
@@ -419,6 +494,30 @@ fn open_wallet_database_with_seed(
     init_wallet_db(&mut wallet, Some(migration_seed))
         .map_err(|error| WalletServiceError::Migration(error.to_string()))?;
     Ok(wallet)
+}
+
+fn open_existing_wallet_read_only(
+    path: &Path,
+    network: WalletNetwork,
+) -> Result<WalletDatabase, WalletServiceError> {
+    let prepared = prepare_existing_wallet_path(path)?;
+    let connection = open_wallet_connection_read_only(&prepared.canonical_path)
+        .map_err(classify_read_only_open_error)?;
+    prepared.verify_current_path()?;
+    verify_existing_identity(&connection, network).map_err(|error| match error {
+        ExistingWalletIdentityError::Empty => WalletServiceError::WalletDatabaseEmpty,
+        ExistingWalletIdentityError::Foreign => WalletServiceError::ForeignWalletDatabase,
+        ExistingWalletIdentityError::Corrupt => WalletServiceError::CorruptWalletDatabase,
+    })?;
+    rusqlite::vtab::array::load_module(&connection)
+        .map_err(|_| WalletServiceError::CorruptWalletDatabase)?;
+    prepared.verify_current_path()?;
+    Ok(WalletDb::from_connection(
+        connection,
+        network.parameters(),
+        SystemClock,
+        OsRng,
+    ))
 }
 
 fn open_secured_wallet(
@@ -667,6 +766,68 @@ fn prepare_wallet_path(path: &Path) -> Result<PreparedWalletPath, WalletServiceE
         canonical_path,
         opened_file,
     })
+}
+
+fn require_existing_wallet_file(path: &Path) -> Result<(), WalletServiceError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(WalletServiceError::SymlinkWalletPath)
+        }
+        Ok(metadata) if !metadata.is_file() => Err(WalletServiceError::NonRegularWalletPath),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(WalletServiceError::WalletDatabaseMissing)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn prepare_existing_wallet_path(path: &Path) -> Result<PreparedWalletPath, WalletServiceError> {
+    require_existing_wallet_file(path)?;
+    let canonical_path = canonical_wallet_path(path)?;
+    require_private_parent_and_ancestors(&canonical_path)?;
+    require_private_regular_file(&canonical_path)?;
+
+    let opened_file = private_read_only_open_options()
+        .open(&canonical_path)
+        .map_err(classify_existing_file_open_error)?;
+    require_private_opened_file(&opened_file)?;
+    require_private_parent_and_ancestors(&canonical_path)?;
+    verify_named_file_matches(&canonical_path, &opened_file)?;
+
+    Ok(PreparedWalletPath {
+        canonical_path,
+        opened_file,
+    })
+}
+
+fn classify_read_only_open_error(error: rusqlite::Error) -> WalletServiceError {
+    match &error {
+        rusqlite::Error::SqliteFailure(code, _) if code.code == rusqlite::ErrorCode::CannotOpen => {
+            WalletServiceError::WalletDatabaseMissing
+        }
+        _ => WalletServiceError::CorruptWalletDatabase,
+    }
+}
+
+fn classify_existing_file_open_error(error: std::io::Error) -> WalletServiceError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        WalletServiceError::WalletDatabaseMissing
+    } else {
+        WalletServiceError::Io(error)
+    }
+}
+
+fn private_read_only_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    }
+    options
 }
 
 fn private_open_options(create_new: bool) -> OpenOptions {
@@ -2745,12 +2906,212 @@ fn database_error(error: impl std::fmt::Debug) -> WalletServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_client_backend::data_api::chain::ChainState;
+    use zcash_primitives::block::BlockHash;
+
+    fn create_wallet_accounts(
+        path: &Path,
+        network: WalletNetwork,
+        account_count: usize,
+    ) -> Vec<WalletInfo> {
+        let master_seed = SecretVec::new(vec![0x35; 32]);
+        let mut wallet = open_wallet_database_with_seed(path, network, &master_seed).unwrap();
+        let account_seed = derive_wallet_seed(&master_seed, network).unwrap();
+        let birthday = AccountBirthday::from_parts(
+            ChainState::empty(BlockHeight::from_u32(0), BlockHash(network.genesis_hash())),
+            None,
+        );
+        let mut accounts = Vec::with_capacity(account_count);
+        for index in 0..account_count {
+            let (account_id, usk) = wallet
+                .create_account(
+                    &format!("Wcash inspection test account {index}"),
+                    &account_seed,
+                    &birthday,
+                    Some("inspection-test-seed"),
+                )
+                .unwrap();
+            let ufvk = usk.to_unified_full_viewing_key();
+            accounts.push(WalletInfo {
+                account_id: account_id.expose_uuid().to_string(),
+                birthday_height: 1,
+                address: encode_orchard_receiver(&ufvk, network).unwrap(),
+                transparent_coinbase_address: encode_transparent_coinbase_receiver(&ufvk, network)
+                    .unwrap(),
+            });
+        }
+        accounts
+    }
 
     fn block_ref(height: u32, byte: u8) -> BlockRef {
         BlockRef {
             height,
             hash: [byte; 32],
         }
+    }
+
+    #[test]
+    fn seedless_inspection_returns_public_metadata_without_mutating_the_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let expected = create_wallet_accounts(&wallet_path, WalletNetwork::Testnet, 1)
+            .pop()
+            .unwrap();
+        let database_before = fs::read(&wallet_path).unwrap();
+
+        let actual = inspect_wallet(&wallet_path, WalletNetwork::Testnet).unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(fs::read(&wallet_path).unwrap(), database_before);
+        assert!(actual.address.starts_with("wutest1"));
+        assert!(actual.transparent_coinbase_address.starts_with("WT"));
+    }
+
+    #[test]
+    fn seedless_inspection_does_not_create_a_missing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("missing.sqlite");
+        let lock_path = wallet_operation_lock_path(&wallet_path).unwrap();
+
+        assert!(matches!(
+            inspect_wallet(&wallet_path, WalletNetwork::Testnet),
+            Err(WalletServiceError::WalletDatabaseMissing)
+        ));
+        assert!(!wallet_path.exists());
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn seedless_inspection_distinguishes_empty_wallet_files_and_accounts() {
+        let directory = tempfile::tempdir().unwrap();
+        let empty_path = directory.path().join("empty.sqlite");
+        drop(File::create(&empty_path).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&empty_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let empty_before = fs::read(&empty_path).unwrap();
+        assert!(matches!(
+            inspect_wallet(&empty_path, WalletNetwork::Testnet),
+            Err(WalletServiceError::WalletDatabaseEmpty)
+        ));
+        assert_eq!(fs::read(&empty_path).unwrap(), empty_before);
+
+        let no_account_path = directory.path().join("no-account.sqlite");
+        drop(open_wallet_database(&no_account_path, WalletNetwork::Testnet).unwrap());
+        let no_account_before = fs::read(&no_account_path).unwrap();
+        assert!(matches!(
+            inspect_wallet(&no_account_path, WalletNetwork::Testnet),
+            Err(WalletServiceError::WalletDatabaseEmpty)
+        ));
+        assert_eq!(fs::read(&no_account_path).unwrap(), no_account_before);
+    }
+
+    #[test]
+    fn seedless_inspection_rejects_foreign_databases_without_modification() {
+        let directory = tempfile::tempdir().unwrap();
+        let foreign_path = directory.path().join("foreign.sqlite");
+        let connection = rusqlite::Connection::open(&foreign_path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE unrelated_public_data (value INTEGER NOT NULL);")
+            .unwrap();
+        drop(connection);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&foreign_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let foreign_before = fs::read(&foreign_path).unwrap();
+
+        assert!(matches!(
+            inspect_wallet(&foreign_path, WalletNetwork::Testnet),
+            Err(WalletServiceError::ForeignWalletDatabase)
+        ));
+        assert_eq!(fs::read(&foreign_path).unwrap(), foreign_before);
+
+        let other_network_path = directory.path().join("other-network.sqlite");
+        create_wallet_accounts(&other_network_path, WalletNetwork::Testnet, 1);
+        assert!(matches!(
+            inspect_wallet(&other_network_path, WalletNetwork::Regtest),
+            Err(WalletServiceError::ForeignWalletDatabase)
+        ));
+    }
+
+    #[test]
+    fn seedless_inspection_rejects_corrupt_and_malformed_databases_generically() {
+        let directory = tempfile::tempdir().unwrap();
+        let corrupt_path = directory.path().join("corrupt.sqlite");
+        fs::write(&corrupt_path, b"not a SQLite database").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&corrupt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let corrupt_error = inspect_wallet(&corrupt_path, WalletNetwork::Testnet).unwrap_err();
+        assert!(matches!(
+            corrupt_error,
+            WalletServiceError::CorruptWalletDatabase
+        ));
+        assert_eq!(
+            corrupt_error.to_string(),
+            "wallet database is corrupt or incompatible"
+        );
+
+        let malformed_path = directory.path().join("malformed.sqlite");
+        create_wallet_accounts(&malformed_path, WalletNetwork::Testnet, 1);
+        let connection = rusqlite::Connection::open(&malformed_path).unwrap();
+        connection
+            .execute("DELETE FROM ext_wcash_wallet_identity", [])
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            inspect_wallet(&malformed_path, WalletNetwork::Testnet),
+            Err(WalletServiceError::CorruptWalletDatabase)
+        ));
+    }
+
+    #[test]
+    fn seedless_inspection_requires_exactly_one_account_and_a_shared_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        create_wallet_accounts(&wallet_path, WalletNetwork::Testnet, 2);
+        assert!(matches!(
+            inspect_wallet(&wallet_path, WalletNetwork::Testnet),
+            Err(WalletServiceError::UnexpectedAccountCount(2))
+        ));
+
+        let one_account_path = directory.path().join("one-account.sqlite");
+        create_wallet_accounts(&one_account_path, WalletNetwork::Testnet, 1);
+        let exclusive =
+            acquire_wallet_operation_lock(&one_account_path, WalletOperationLockMode::Exclusive)
+                .unwrap();
+        assert!(matches!(
+            inspect_wallet(&one_account_path, WalletNetwork::Testnet),
+            Err(WalletServiceError::WalletBusy)
+        ));
+        drop(exclusive);
+        assert!(inspect_wallet(&one_account_path, WalletNetwork::Testnet).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seedless_inspection_accepts_a_read_only_wallet_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        create_wallet_accounts(&wallet_path, WalletNetwork::Testnet, 1);
+        fs::set_permissions(&wallet_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        assert!(inspect_wallet(&wallet_path, WalletNetwork::Testnet).is_ok());
+        assert_eq!(
+            fs::metadata(&wallet_path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
     }
 
     #[test]
