@@ -49,6 +49,12 @@ pub trait PoolBackendRetainedJob: Send + Sync {
     /// Returns the exact proposal-validated descriptor retained by this job.
     fn descriptor(&self) -> JobDescriptor;
 
+    /// Returns the configured Wcash payout commitment authenticated for this job.
+    fn wcash_payout_commitment(&self) -> Hex32;
+
+    /// Returns the configured Zcash payout commitment authenticated for this job.
+    fn zcash_payout_commitment(&self) -> Hex32;
+
     /// Returns the remaining native admission lifetime at the instant sampled.
     ///
     /// The actor samples its own monotonic clock before this method, then uses
@@ -394,6 +400,10 @@ pub enum PoolBackendActorError {
     #[error("retained pool job is not healthy")]
     RetainedJobUnhealthy,
 
+    /// The retained native job was prepared for another collector authority.
+    #[error("retained pool job payout commitments do not match this backend journal")]
+    PayoutAuthorityMismatch,
+
     /// A winner key or snapshot belongs to another journal sequence namespace.
     #[error("winner reconciliation authority does not match this backend journal")]
     WinnerAuthorityMismatch,
@@ -574,6 +584,11 @@ impl PoolBackendActor {
         descriptor
             .validate()
             .map_err(PoolBackendActorError::InvalidJob)?;
+        if validator.wcash_payout_commitment() != self.authority_fields.wcash_payout_commitment
+            || validator.zcash_payout_commitment() != self.authority_fields.zcash_payout_commitment
+        {
+            return Err(PoolBackendActorError::PayoutAuthorityMismatch);
+        }
         if !validator.is_healthy() {
             return Err(PoolBackendActorError::RetainedJobUnhealthy);
         }
@@ -1704,6 +1719,8 @@ mod tests {
 
     struct TestRetainedJob {
         descriptor: JobDescriptor,
+        wcash_payout_commitment: Hex32,
+        zcash_payout_commitment: Hex32,
         healthy: AtomicBool,
         remaining_lifetime: Mutex<Option<Duration>>,
         validated: Mutex<PoolBackendValidatedShare>,
@@ -1715,6 +1732,8 @@ mod tests {
             let remaining_lifetime = Some(Duration::from_millis(u64::from(descriptor.max_age_ms)));
             Self {
                 descriptor,
+                wcash_payout_commitment: Hex32::new([0x33; 32]),
+                zcash_payout_commitment: Hex32::new([0x44; 32]),
                 healthy: AtomicBool::new(true),
                 remaining_lifetime: Mutex::new(remaining_lifetime),
                 validated: Mutex::new(PoolBackendValidatedShare::ordinary()),
@@ -1735,11 +1754,25 @@ mod tests {
                 .lock()
                 .expect("test validation mutex is not poisoned") = validated;
         }
+
+        fn with_payout_commitments(mut self, wcash: Hex32, zcash: Hex32) -> Self {
+            self.wcash_payout_commitment = wcash;
+            self.zcash_payout_commitment = zcash;
+            self
+        }
     }
 
     impl PoolBackendRetainedJob for TestRetainedJob {
         fn descriptor(&self) -> JobDescriptor {
             self.descriptor.clone()
+        }
+
+        fn wcash_payout_commitment(&self) -> Hex32 {
+            self.wcash_payout_commitment.clone()
+        }
+
+        fn zcash_payout_commitment(&self) -> Hex32 {
+            self.zcash_payout_commitment.clone()
         }
 
         fn remaining_lifetime(&self) -> Option<Duration> {
@@ -2291,6 +2324,32 @@ mod tests {
             snapshot(&actor, 0),
             BackendMessage::JobSnapshot { current: None, .. }
         ));
+    }
+
+    #[test]
+    fn activation_rejects_a_job_for_another_payout_authority_without_journal_mutation() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let actor = actor(&path, &config, Arc::new(TestClock::new()));
+        let retained = Arc::new(TestRetainedJob::new(job(1)).with_payout_commitments(
+            Hex32::new([0x99; 32]),
+            config.zcash_payout_commitment.clone(),
+        ));
+
+        assert!(matches!(
+            actor.activate_job(retained, Duration::from_secs(5)),
+            Err(PoolBackendActorError::PayoutAuthorityMismatch)
+        ));
+        assert_eq!(
+            actor
+                .lock_state()
+                .expect("actor mutex")
+                .journal
+                .current_event_seq()
+                .expect("journal watermark"),
+            0
+        );
     }
 
     #[test]

@@ -17,21 +17,24 @@ equihash = { version = "0.3", features = ["solver"] }
 fs2 = "0.4"
 hex = "0.4"
 nix = { workspace = true, features = ["socket", "user"] }
+orchard.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+signal-hook = "0.3"
 thiserror = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 wcash-pool-protocol = { git = "https://github.com/w-cash/pool.git", rev = "adb66440a99a8dba9189ee15849e46e5a8c08441" }
 wcash-zcash-aux = { path = "../wcash-zcash-aux" }
 zcash_address.workspace = true
+zcash_note_encryption.workspace = true
 zcash_protocol.workspace = true
 zebra-chain = { path = "../zebra-chain", version = "12.0.0" }
+zeroize = "1.8"
 
 [dev-dependencies]
-orchard.workspace = true
 tempfile.workspace = true
 zebra-chain = { path = "../zebra-chain", version = "12.0.0", features = [
   "proptest-impl",

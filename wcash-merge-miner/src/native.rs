@@ -610,9 +610,16 @@ pub struct NativePreparedJob {
 pub enum NativeWcashPayoutVerification {
     /// Every output was matched to the configured transparent recipient.
     ExactTransparentRecipient,
-    /// The encrypted value and privacy shape were checked, but the recipient is trusted to the
-    /// private loopback template node because a payment address cannot decrypt its ciphertext.
-    TrustedPrivateTemplateNode,
+    /// Every Ironwood action was trial-decrypted with the configured read-only
+    /// incoming capability and matched to the configured private recipient.
+    ExactPrivateRecipient,
+}
+
+/// Domain-separated recipient commitments bound to one dual-chain generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativePayoutCommitments {
+    pub(crate) wcash: [u8; 32],
+    pub(crate) zcash: [u8; 32],
 }
 
 /// Exact proposal-validated metadata for one native merged-mining generation.
@@ -641,6 +648,8 @@ pub struct NativeGenerationDescriptor {
     zcash_maturity_confirmations: u32,
     max_age_milliseconds: u32,
     wcash_payout_verification: NativeWcashPayoutVerification,
+    wcash_payout_commitment: [u8; 32],
+    zcash_payout_commitment: [u8; 32],
 }
 
 impl NativeGenerationDescriptor {
@@ -655,6 +664,8 @@ impl NativeGenerationDescriptor {
         wcash_height: u32,
         wcash_reward_zatoshis: u64,
         wcash_payout_verification: NativeWcashPayoutVerification,
+        wcash_payout_commitment: [u8; 32],
+        zcash_payout_commitment: [u8; 32],
     ) -> Self {
         let mut zcash_previous_hash_le = [0; 32];
         zcash_previous_hash_le.copy_from_slice(&parent_job.parent_header_input()[4..36]);
@@ -677,6 +688,8 @@ impl NativeGenerationDescriptor {
             zcash_maturity_confirmations: NATIVE_COINBASE_MATURITY_CONFIRMATIONS,
             max_age_milliseconds: NATIVE_JOB_MAX_AGE_MILLISECONDS,
             wcash_payout_verification,
+            wcash_payout_commitment,
+            zcash_payout_commitment,
         }
     }
 
@@ -766,6 +779,16 @@ impl NativeGenerationDescriptor {
     /// Returns how strongly the configured Wcash reward recipient was authenticated.
     pub const fn wcash_payout_verification(&self) -> NativeWcashPayoutVerification {
         self.wcash_payout_verification
+    }
+
+    /// Returns the domain-separated configured Wcash reward-recipient commitment.
+    pub const fn wcash_payout_commitment(&self) -> [u8; 32] {
+        self.wcash_payout_commitment
+    }
+
+    /// Returns the domain-separated configured Zcash reward-recipient commitment.
+    pub const fn zcash_payout_commitment(&self) -> [u8; 32] {
+        self.zcash_payout_commitment
     }
 }
 
@@ -1046,6 +1069,7 @@ impl NativePreparedJob {
         wcash_height: u32,
         wcash_reward_zatoshis: u64,
         wcash_payout_verification: NativeWcashPayoutVerification,
+        payout_commitments: NativePayoutCommitments,
     ) -> NativeGenerationDescriptor {
         NativeGenerationDescriptor::from_validated_parts(
             &self.job,
@@ -1057,6 +1081,8 @@ impl NativePreparedJob {
             wcash_height,
             wcash_reward_zatoshis,
             wcash_payout_verification,
+            payout_commitments.wcash,
+            payout_commitments.zcash,
         )
     }
 
@@ -1790,6 +1816,8 @@ mod tests {
             91,
             625_000_000,
             payout_verification,
+            [0x41; 32],
+            [0x42; 32],
         )
     }
 
@@ -1872,16 +1900,14 @@ mod tests {
     }
 
     #[test]
-    fn pool_backend_adapter_rejects_private_wcash_payouts() {
+    fn pool_backend_adapter_accepts_exact_private_wcash_payouts() {
         let native = pool_backend_descriptor_fixture(
             4,
-            NativeWcashPayoutVerification::TrustedPrivateTemplateNode,
+            NativeWcashPayoutVerification::ExactPrivateRecipient,
         );
 
-        assert_eq!(
-            job_descriptor_from_native(&native),
-            Err(PoolBackendAdapterError::UnverifiedWcashPayout)
-        );
+        job_descriptor_from_native(&native)
+            .expect("an exactly trial-decrypted private payout is pool-safe");
     }
 
     #[test]
@@ -1912,6 +1938,8 @@ mod tests {
             91,
             625_000_000,
             NativeWcashPayoutVerification::ExactTransparentRecipient,
+            [0x45; 32],
+            [0x46; 32],
         );
 
         assert_eq!(descriptor.job_id(), parent_job.job_id_bytes());
@@ -1956,6 +1984,8 @@ mod tests {
             descriptor.wcash_payout_verification(),
             NativeWcashPayoutVerification::ExactTransparentRecipient
         );
+        assert_eq!(descriptor.wcash_payout_commitment(), [0x45; 32]);
+        assert_eq!(descriptor.zcash_payout_commitment(), [0x46; 32]);
     }
 
     #[test]

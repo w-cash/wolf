@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -15,10 +15,17 @@ use std::{
 };
 
 use hex::FromHex;
+use orchard::{
+    keys::{IncomingViewingKey, PreparedIncomingViewingKey},
+    note_encryption::IronwoodDomain,
+    Address as OrchardAddress,
+};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use wcash_zcash_aux::{AuxPowProof, Target, WCASH_AUXILIARY_CHAIN_ID};
+use wcash_zcash_aux::{
+    child_payout_address_commitment, AuxPowProof, Target, WCASH_AUXILIARY_CHAIN_ID,
+};
 use zcash_address::unified::{Container, Receiver};
 use zcash_protocol::consensus::NetworkType;
 use zebra_chain::{
@@ -35,11 +42,13 @@ use zebra_chain::{
         equihash::{Solution, WCASH_BLOCK_WIRE_VERSION},
     },
 };
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     accounting::{
         read_accounting_snapshot_from_reader, AuthenticatedWorker, WorkerAuthenticationProvenance,
     },
+    native::NativePayoutCommitments,
     rpc::{RpcEndpoint, ZebraRpcClient, DEFAULT_RPC_TIMEOUT},
     MinerError, NativeGenerationDescriptor, NativePreparedJob, NativeWcashPayoutVerification,
     NativeZcashConfig, NativeZcashProvider, ShareProcessor, ValidatedNativeShare,
@@ -57,6 +66,12 @@ pub struct CoordinatorConfig {
     pub zcash: NativeZcashConfig,
     /// Wcash address that receives the child coinbase.
     pub wcash_payout_address: String,
+    /// Read-only incoming capability required for a private Ironwood recipient.
+    ///
+    /// This value can recognize incoming notes but cannot authorize spending.
+    /// Use [`WcashIncomingViewingKey::read_private_file`] at the process boundary;
+    /// never place its raw encoding in arguments, environment variables, or logs.
+    pub wcash_payout_incoming_viewing_key: Option<WcashIncomingViewingKey>,
     /// Auxiliary-tree nonce; one-child native jobs normally use zero.
     pub auxiliary_nonce: u32,
 }
@@ -72,9 +87,79 @@ impl fmt::Debug for CoordinatorConfig {
             )
             .field("zcash", &self.zcash)
             .field("wcash_payout_address", &"[REDACTED]")
+            .field(
+                "wcash_payout_incoming_viewing_key",
+                &self
+                    .wcash_payout_incoming_viewing_key
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
+            )
             .field("auxiliary_nonce", &self.auxiliary_nonce)
             .finish()
     }
+}
+
+impl CoordinatorConfig {
+    /// Validates the configured Wcash payout authority and returns the exact
+    /// canonical recipient commitment used by native backend jobs.
+    ///
+    /// This preflight consumes no node state and exposes neither the recipient
+    /// nor its read-only incoming capability. It exists so an operator can pin
+    /// a backend journal to the same authority before opening a mining socket.
+    pub fn validated_wcash_payout_commitment(&self) -> Result<[u8; 32], MinerError> {
+        let (_, payout, _) = validate_wcash_payout_configuration(
+            &self.wcash_payout_address,
+            &self.expected_wcash_genesis_hash,
+            self.wcash_payout_incoming_viewing_key.clone(),
+        )?;
+        Ok(child_payout_address_commitment(&payout.encode()))
+    }
+}
+
+/// A read-only Wcash Ironwood incoming viewing capability.
+///
+/// This type deliberately exposes no raw-byte getter and cannot authorize a
+/// transaction. It is accepted only from a bounded, owner-private regular file
+/// or from raw bytes supplied by an embedding secret manager.
+#[derive(Clone)]
+pub struct WcashIncomingViewingKey(Arc<IncomingViewingKey>);
+
+impl fmt::Debug for WcashIncomingViewingKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WcashIncomingViewingKey([REDACTED])")
+    }
+}
+
+impl WcashIncomingViewingKey {
+    /// Parses the 64-byte raw Orchard incoming-viewing-key encoding.
+    pub fn from_raw_bytes(mut bytes: [u8; 64]) -> Result<Self, MinerError> {
+        let incoming_viewing_key = Option::from(IncomingViewingKey::from_bytes(&bytes));
+        bytes.zeroize();
+        incoming_viewing_key.map(Arc::new).map(Self).ok_or_else(|| {
+            MinerError::InvalidRequest(
+                "Wcash payout incoming viewing key is not a canonical raw Orchard IVK".to_string(),
+            )
+        })
+    }
+
+    /// Reads exactly one hexadecimal raw IVK from a private credential file.
+    ///
+    /// On Unix, the file must be owned by the effective user, have exactly one
+    /// hard link, and grant no group/other access. Its parent directory must
+    /// also be owned by the effective user and not group/other writable. These
+    /// checks are compatible with systemd `LoadCredential=` files.
+    pub fn read_private_file(path: impl AsRef<Path>) -> Result<Self, MinerError> {
+        read_private_wcash_ivk(path.as_ref())
+    }
+}
+
+#[derive(Clone)]
+enum WcashPayoutAuthority {
+    Transparent,
+    Ironwood {
+        recipient: OrchardAddress,
+        prepared_ivk: PreparedIncomingViewingKey,
+    },
 }
 
 /// Long-lived owner of native node clients and the authoritative share journal.
@@ -85,6 +170,7 @@ pub struct NativeMiningSupervisor {
     config: CoordinatorConfig,
     wcash_network: Network,
     wcash_payout_address: WcashAddress,
+    wcash_payout_authority: WcashPayoutAuthority,
     wcash_node: ZebraRpcClient,
     zcash: NativeZcashProvider,
     journal: Arc<ShareJournal>,
@@ -272,7 +358,7 @@ impl NativeMiningSupervisor {
 
     /// Opens and crash-recovers one durable journal for this process lifetime.
     pub fn open(
-        config: CoordinatorConfig,
+        mut config: CoordinatorConfig,
         journal_path: impl AsRef<Path>,
     ) -> Result<Self, MinerError> {
         if config.wcash_payout_address.is_empty()
@@ -297,10 +383,13 @@ impl NativeMiningSupervisor {
             &config.expected_wcash_genesis_hash,
             "expected Wcash genesis hash",
         )?;
-        let (wcash_network, wcash_payout_address) = validate_wcash_payout_configuration(
-            &config.wcash_payout_address,
-            &config.expected_wcash_genesis_hash,
-        )?;
+        let incoming_viewing_key = config.wcash_payout_incoming_viewing_key.take();
+        let (wcash_network, wcash_payout_address, wcash_payout_authority) =
+            validate_wcash_payout_configuration(
+                &config.wcash_payout_address,
+                &config.expected_wcash_genesis_hash,
+                incoming_viewing_key,
+            )?;
         let journal = Arc::new(ShareJournal::open(journal_path)?);
         let wcash_node = ZebraRpcClient::new(config.wcash_node.clone(), DEFAULT_RPC_TIMEOUT)?;
         let zcash = NativeZcashProvider::connect(config.zcash.clone())?;
@@ -308,6 +397,7 @@ impl NativeMiningSupervisor {
             config,
             wcash_network,
             wcash_payout_address,
+            wcash_payout_authority,
             wcash_node,
             zcash,
             journal,
@@ -445,9 +535,10 @@ impl NativeMiningSupervisor {
                 "createauxblock metadata does not match its serialized candidate".to_string(),
             ));
         }
-        let child_payout = validate_wcash_candidate_payout(
+        let child_payout = validate_wcash_candidate_payout_with_authority(
             &child_candidate,
             &self.wcash_payout_address,
+            &self.wcash_payout_authority,
             &self.wcash_network,
             child.coinbase_value,
             child.height,
@@ -470,6 +561,10 @@ impl NativeMiningSupervisor {
             child.height,
             child_payout.value_zatoshis,
             child_payout.verification,
+            NativePayoutCommitments {
+                wcash: child_payout_address_commitment(&self.wcash_payout_address.encode()),
+                zcash: config.zcash.expected_parent_payout_commitment(),
+            },
         );
         let expected_child_height = child.height.checked_sub(1).ok_or_else(|| {
             MinerError::InvalidParentTemplate("child height must be positive".to_string())
@@ -802,7 +897,8 @@ fn require_wcash_network_identity(
 fn validate_wcash_payout_configuration(
     encoded: &str,
     expected_genesis_hash: &str,
-) -> Result<(Network, WcashAddress), MinerError> {
+    incoming_viewing_key: Option<WcashIncomingViewingKey>,
+) -> Result<(Network, WcashAddress, WcashPayoutAuthority), MinerError> {
     let payout = WcashAddress::try_from_encoded(encoded).map_err(|error| {
         MinerError::InvalidRequest(format!("invalid Wcash payout address: {error}"))
     })?;
@@ -824,25 +920,69 @@ fn validate_wcash_payout_configuration(
             "Wcash payout address network does not match the pinned child genesis".to_string(),
         ));
     }
-    match payout.kind() {
-        WcashAddressKind::P2pkh(_) | WcashAddressKind::P2sh(_) => {}
-        WcashAddressKind::Unified(address)
-            if address
+    let authority = match payout.kind() {
+        WcashAddressKind::P2pkh(_) | WcashAddressKind::P2sh(_) => {
+            if incoming_viewing_key.is_some() {
+                return Err(MinerError::InvalidRequest(
+                    "a Wcash incoming viewing key must not be configured for a transparent payout"
+                        .to_string(),
+                ));
+            }
+            WcashPayoutAuthority::Transparent
+        }
+        WcashAddressKind::Unified(address) => {
+            let raw_receiver = address
                 .items()
                 .iter()
-                .any(|receiver| matches!(receiver, Receiver::Orchard(_))) => {}
+                .find_map(|receiver| match receiver {
+                    Receiver::Orchard(raw) => Some(*raw),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    MinerError::InvalidRequest(
+                        "Wcash Unified payout has no Ironwood receiver".to_string(),
+                    )
+                })?;
+            let recipient = Option::from(OrchardAddress::from_raw_address_bytes(&raw_receiver))
+                .ok_or_else(|| {
+                    MinerError::InvalidRequest(
+                        "Wcash Unified payout contains an invalid Ironwood receiver".to_string(),
+                    )
+                })?;
+            let incoming_viewing_key = incoming_viewing_key.ok_or_else(|| {
+                MinerError::InvalidRequest(
+                    "private Wcash Ironwood payout requires its read-only incoming viewing key"
+                        .to_string(),
+                )
+            })?;
+            if incoming_viewing_key
+                .0
+                .diversifier_index(&recipient)
+                .is_none()
+            {
+                return Err(MinerError::InvalidRequest(
+                    "Wcash payout incoming viewing key does not authorize the configured Ironwood receiver"
+                        .to_string(),
+                ));
+            }
+            WcashPayoutAuthority::Ironwood {
+                recipient,
+                prepared_ivk: incoming_viewing_key.0.prepare(),
+            }
+        }
         _ => {
             return Err(MinerError::InvalidRequest(
                 "Wcash payout must be transparent or Unified with an Orchard receiver".to_string(),
             ))
         }
-    }
-    Ok((network, payout))
+    };
+    Ok((network, payout, authority))
 }
 
-fn validate_wcash_candidate_payout(
+fn validate_wcash_candidate_payout_with_authority(
     candidate: &Block,
     expected_payout: &WcashAddress,
+    payout_authority: &WcashPayoutAuthority,
     network: &Network,
     advertised_value: i64,
     height: u32,
@@ -891,6 +1031,11 @@ fn validate_wcash_candidate_payout(
 
     match expected_payout.kind() {
         WcashAddressKind::P2pkh(hash) => {
+            if !matches!(payout_authority, WcashPayoutAuthority::Transparent) {
+                return Err(MinerError::InvalidRequest(
+                    "Wcash payout authority does not match its transparent address".to_string(),
+                ));
+            }
             let expected_script =
                 transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, *hash).script();
             let value_zatoshis =
@@ -901,6 +1046,11 @@ fn validate_wcash_candidate_payout(
             })
         }
         WcashAddressKind::P2sh(hash) => {
+            if !matches!(payout_authority, WcashPayoutAuthority::Transparent) {
+                return Err(MinerError::InvalidRequest(
+                    "Wcash payout authority does not match its transparent address".to_string(),
+                ));
+            }
             let expected_script =
                 transparent::Address::from_script_hash(NetworkKind::Mainnet, *hash).script();
             let value_zatoshis =
@@ -911,6 +1061,15 @@ fn validate_wcash_candidate_payout(
             })
         }
         WcashAddressKind::Unified(_) => {
+            let WcashPayoutAuthority::Ironwood {
+                recipient,
+                prepared_ivk,
+            } = payout_authority
+            else {
+                return Err(MinerError::InvalidRequest(
+                    "private Wcash payout has no matching incoming-viewing authority".to_string(),
+                ));
+            };
             if !coinbase.outputs().is_empty()
                 || coinbase.has_sapling_shielded_data()
                 || coinbase.has_orchard_shielded_data()
@@ -950,15 +1109,69 @@ fn validate_wcash_candidate_payout(
                     "createauxblock coinbase value exceeds u64".to_string(),
                 )
             })?;
+            let bundle = coinbase.ironwood_bundle().ok_or_else(|| {
+                MinerError::InvalidParentTemplate(
+                    "createauxblock candidate has no Ironwood payout bundle".to_string(),
+                )
+            })?;
+            let mut attributed_value = 0u64;
+            for action in bundle.actions() {
+                let domain = IronwoodDomain::for_action(action);
+                let (note, decrypted_recipient, _) =
+                    zcash_note_encryption::try_note_decryption(&domain, prepared_ivk, action)
+                        .ok_or_else(|| {
+                            MinerError::InvalidParentTemplate(
+                                "createauxblock contains an unattributed Ironwood payout action"
+                                    .to_string(),
+                            )
+                        })?;
+                if &decrypted_recipient != recipient {
+                    return Err(MinerError::InvalidParentTemplate(
+                        "createauxblock Ironwood action does not pay the configured Wcash receiver"
+                            .to_string(),
+                    ));
+                }
+                attributed_value = attributed_value
+                    .checked_add(note.value().inner())
+                    .ok_or_else(|| {
+                        MinerError::InvalidParentTemplate(
+                            "createauxblock attributed Ironwood value overflows u64".to_string(),
+                        )
+                    })?;
+            }
+            if attributed_value != value_zatoshis {
+                return Err(MinerError::InvalidParentTemplate(
+                    "createauxblock attributed Ironwood value does not match coinbasevalue"
+                        .to_string(),
+                ));
+            }
             Ok(ValidatedWcashCandidatePayout {
                 value_zatoshis,
-                verification: NativeWcashPayoutVerification::TrustedPrivateTemplateNode,
+                verification: NativeWcashPayoutVerification::ExactPrivateRecipient,
             })
         }
         WcashAddressKind::Tex(_) => Err(MinerError::InvalidRequest(
             "TEX is not a Wcash coinbase payout mode".to_string(),
         )),
     }
+}
+
+#[cfg(test)]
+fn validate_wcash_candidate_payout(
+    candidate: &Block,
+    expected_payout: &WcashAddress,
+    network: &Network,
+    advertised_value: i64,
+    height: u32,
+) -> Result<ValidatedWcashCandidatePayout, MinerError> {
+    validate_wcash_candidate_payout_with_authority(
+        candidate,
+        expected_payout,
+        &WcashPayoutAuthority::Transparent,
+        network,
+        advertised_value,
+        height,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2644,6 +2857,125 @@ fn coordinator_mutex_error(component: &str) -> MinerError {
     ))
 }
 
+const MAX_WCASH_IVK_FILE_BYTES: usize = 129;
+
+fn read_private_wcash_ivk(path: &Path) -> Result<WcashIncomingViewingKey, MinerError> {
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        || PathBuf::from_iter(path.components()).as_os_str() != path.as_os_str()
+    {
+        return Err(MinerError::InvalidRequest(
+            "Wcash payout IVK credential path must be absolute and lexically canonical".to_string(),
+        ));
+    }
+    let named = fs::symlink_metadata(path)?;
+    if named.file_type().is_symlink() || !named.is_file() {
+        return Err(MinerError::InvalidRequest(
+            "Wcash payout IVK credential must be a regular non-symbolic-link file".to_string(),
+        ));
+    }
+    let mut file = File::open(path)?;
+    validate_opened_private_wcash_ivk(&file, path)?;
+    let maximum =
+        u64::try_from(MAX_WCASH_IVK_FILE_BYTES).expect("the IVK credential byte limit fits in u64");
+    if file.metadata()?.len() > maximum {
+        return Err(MinerError::InvalidRequest(format!(
+            "Wcash payout IVK credential exceeds {MAX_WCASH_IVK_FILE_BYTES} bytes"
+        )));
+    }
+    let mut encoded = Zeroizing::new(Vec::with_capacity(MAX_WCASH_IVK_FILE_BYTES));
+    (&mut file).take(maximum + 1).read_to_end(&mut encoded)?;
+    if encoded.len() > MAX_WCASH_IVK_FILE_BYTES {
+        return Err(MinerError::InvalidRequest(format!(
+            "Wcash payout IVK credential exceeds {MAX_WCASH_IVK_FILE_BYTES} bytes"
+        )));
+    }
+    validate_opened_private_wcash_ivk(&file, path)?;
+    if encoded.last() == Some(&b'\n') {
+        encoded.pop();
+    }
+    if encoded.len() != 128 || !encoded.iter().all(u8::is_ascii_hexdigit) {
+        return Err(MinerError::InvalidRequest(
+            "Wcash payout IVK credential must contain exactly 128 hexadecimal characters"
+                .to_string(),
+        ));
+    }
+    let mut decoded = Zeroizing::new([0_u8; 64]);
+    hex::decode_to_slice(encoded.as_slice(), decoded.as_mut()).map_err(|_| {
+        MinerError::InvalidRequest(
+            "Wcash payout IVK credential contains malformed hexadecimal data".to_string(),
+        )
+    })?;
+    WcashIncomingViewingKey::from_raw_bytes(*decoded)
+}
+
+fn validate_opened_private_wcash_ivk(file: &File, path: &Path) -> Result<(), MinerError> {
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(MinerError::InvalidRequest(
+            "Wcash payout IVK credential is not a regular file".to_string(),
+        ));
+    }
+    let named = fs::symlink_metadata(path)?;
+    if named.file_type().is_symlink() || !named.is_file() {
+        return Err(MinerError::InvalidRequest(
+            "Wcash payout IVK credential path changed while it was opened".to_string(),
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        MinerError::InvalidRequest(
+            "Wcash payout IVK credential has no parent directory".to_string(),
+        )
+    })?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(MinerError::InvalidRequest(
+            "Wcash payout IVK credential parent must be a non-symbolic-link directory".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let effective_uid = nix::unistd::geteuid().as_raw();
+        if opened.uid() != effective_uid || parent_metadata.uid() != effective_uid {
+            return Err(MinerError::InvalidRequest(
+                "Wcash payout IVK credential and parent must be owned by the effective user"
+                    .to_string(),
+            ));
+        }
+        if opened.permissions().mode() & 0o077 != 0 {
+            return Err(MinerError::InvalidRequest(
+                "Wcash payout IVK credential must not be accessible by group or other users"
+                    .to_string(),
+            ));
+        }
+        if opened.nlink() != 1 {
+            return Err(MinerError::InvalidRequest(
+                "Wcash payout IVK credential must have exactly one hard link".to_string(),
+            ));
+        }
+        if parent_metadata.permissions().mode() & 0o022 != 0 {
+            return Err(MinerError::InvalidRequest(
+                "Wcash payout IVK credential parent must not be writable by group or other users"
+                    .to_string(),
+            ));
+        }
+        if opened.dev() != named.dev() || opened.ino() != named.ino() {
+            return Err(MinerError::InvalidRequest(
+                "Wcash payout IVK credential path was replaced while it was opened".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn sync_journal_parent_directory(path: &Path) -> Result<(), MinerError> {
     File::open(journal_parent_directory(path))?.sync_all()?;
@@ -3664,22 +3996,8 @@ mod tests {
         assert_eq!(status.observed, 1);
     }
 
-    fn orchard_unified_wcash_address(network: NetworkType) -> WcashAddress {
-        let zcash_fixture = match network {
-            NetworkType::Test => "utest10zg6frxk32ma8980kdv9473e4aclw7clq9hydzcj6l349pkqzxk2mmj3cn7j5x38w6l4wyryv50whnlrw0k9agzpdf5fxyj7kq96ukcp",
-            NetworkType::Regtest => "uregtest1pszqlgxaf5w8mu2yd9uygg8cswp0ec4f7eejqnqc35tztw4tk0sxnt3pym2f3s2872cy2ruuc5n8y9cen5q6ngzlmzu8ztrjesv8zm9j",
-            NetworkType::Main => unreachable!("Wcash mainnet is disabled"),
-        };
-        zcash_fixture
-            .parse::<zcash_address::ZcashAddress>()
-            .expect("the upstream Unified fixture is valid")
-            .convert::<WcashAddress>()
-            .expect("the Unified fixture is supported by Wcash")
-            .with_network(network)
-    }
-
     fn assert_invalid_wcash_payout(encoded: &str, genesis: &str, expected: &str) {
-        match validate_wcash_payout_configuration(encoded, genesis) {
+        match validate_wcash_payout_configuration(encoded, genesis, None) {
             Err(MinerError::InvalidRequest(message)) => assert!(
                 message.contains(expected),
                 "expected {expected:?} in rejection: {message}"
@@ -3689,8 +4007,32 @@ mod tests {
         }
     }
 
+    fn ironwood_wcash_recipient(
+        network: NetworkType,
+        seed: u8,
+    ) -> (WcashAddress, WcashIncomingViewingKey, OrchardAddress) {
+        use orchard::keys::{FullViewingKey, Scope, SpendingKey};
+
+        let spending_key = Option::<SpendingKey>::from(SpendingKey::from_bytes([seed; 32]))
+            .expect("the fixture spending key is valid");
+        let full_viewing_key = FullViewingKey::from(&spending_key);
+        let incoming_viewing_key = full_viewing_key.to_ivk(Scope::External);
+        let receiver = full_viewing_key.address_at(0u32, Scope::External);
+        let unified = zcash_address::unified::Address::try_from_items(vec![Receiver::Orchard(
+            receiver.to_raw_address_bytes(),
+        )])
+        .expect("the fixture receiver forms a Unified Address");
+        (
+            WcashAddress::from_unified(network, unified)
+                .expect("the fixture is a valid Wcash Unified Address"),
+            WcashIncomingViewingKey::from_raw_bytes(incoming_viewing_key.to_bytes())
+                .expect("the fixture IVK is canonical"),
+            receiver,
+        )
+    }
+
     #[test]
-    fn wcash_payout_configuration_accepts_public_and_private_test_network_modes() {
+    fn wcash_payout_configuration_accepts_public_and_exact_private_test_network_modes() {
         for (network, network_type) in [
             (Network::new_wcash_testnet(), NetworkType::Test),
             (Network::new_wcash_regtest(), NetworkType::Regtest),
@@ -3699,15 +4041,54 @@ mod tests {
             for payout in [
                 WcashAddress::from_transparent_p2pkh(network_type, [0; 20]),
                 WcashAddress::from_transparent_p2sh(network_type, [1; 20]),
-                orchard_unified_wcash_address(network_type),
             ] {
                 let encoded = payout.encode();
-                let (selected_network, selected_payout) =
-                    validate_wcash_payout_configuration(&encoded, &genesis)
+                let (selected_network, selected_payout, _) =
+                    validate_wcash_payout_configuration(&encoded, &genesis, None)
                         .expect("the matching Wcash payout is accepted");
                 assert_eq!(selected_network, network);
                 assert_eq!(selected_payout, payout);
             }
+
+            let (payout, ivk, _) = ironwood_wcash_recipient(network_type, 7);
+            let (selected_network, selected_payout, authority) =
+                validate_wcash_payout_configuration(&payout.encode(), &genesis, Some(ivk))
+                    .expect("the matching private Wcash payout and IVK are accepted");
+            assert_eq!(selected_network, network);
+            assert_eq!(selected_payout, payout);
+            assert!(matches!(authority, WcashPayoutAuthority::Ironwood { .. }));
+        }
+    }
+
+    #[test]
+    fn wcash_private_payout_configuration_rejects_missing_or_wrong_ivk_without_fallback() {
+        let network = Network::new_wcash_regtest();
+        let genesis = network.genesis_hash().to_string();
+        let (payout, _, _) = ironwood_wcash_recipient(NetworkType::Regtest, 8);
+        let (_, wrong_ivk, _) = ironwood_wcash_recipient(NetworkType::Regtest, 9);
+
+        assert_invalid_wcash_payout(
+            &payout.encode(),
+            &genesis,
+            "requires its read-only incoming viewing key",
+        );
+        match validate_wcash_payout_configuration(&payout.encode(), &genesis, Some(wrong_ivk)) {
+            Err(MinerError::InvalidRequest(message)) => {
+                assert!(message.contains("does not authorize"), "{message}")
+            }
+            Err(error) => panic!("unexpected payout rejection: {error}"),
+            Ok(_) => panic!("a wrong IVK was accepted"),
+        }
+
+        let transparent = WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, [0x44; 20]);
+        let (_, unused_ivk, _) = ironwood_wcash_recipient(NetworkType::Regtest, 10);
+        match validate_wcash_payout_configuration(&transparent.encode(), &genesis, Some(unused_ivk))
+        {
+            Err(MinerError::InvalidRequest(message)) => {
+                assert!(message.contains("must not be configured"), "{message}")
+            }
+            Err(error) => panic!("unexpected payout rejection: {error}"),
+            Ok(_) => panic!("an unused private authority was accepted"),
         }
     }
 
@@ -3787,6 +4168,69 @@ mod tests {
         )
     }
 
+    fn private_wcash_candidate(
+        recipients: &[(OrchardAddress, u64)],
+        declared_value: Option<i64>,
+    ) -> Block {
+        use orchard::{
+            builder::{Builder, BundleType},
+            bundle::{Authorized, BundleVersion, Flags},
+            primitives::redpallas,
+            value::NoteValue,
+            Anchor, Proof,
+        };
+        use zcash_protocol::value::ZatBalance;
+
+        let mut builder = Builder::new(
+            BundleType::Coinbase,
+            BundleVersion::ironwood_v3(),
+            Flags::SPENDS_DISABLED,
+            Anchor::empty_tree(),
+        )
+        .expect("the fixture Ironwood coinbase flags are valid");
+        for (recipient, value) in recipients {
+            builder
+                .add_output(None, *recipient, NoteValue::from_raw(*value), [0u8; 512])
+                .expect("the fixture Ironwood output is valid");
+        }
+        let mut rng = rand_core::OsRng;
+        let (unauthorized, _) = builder
+            .build::<ZatBalance>(&mut rng)
+            .expect("the fixture Ironwood bundle builds")
+            .expect("the fixture has at least one output");
+        let action_count = unauthorized.actions().len();
+        let mut bundle = unauthorized.map_authorization(
+            &mut (),
+            |_, _, _| redpallas::Signature::<redpallas::SpendAuth>::from([0u8; 64]),
+            |_, _| {
+                Authorized::from_parts(
+                    Proof::new(vec![0u8; Proof::expected_proof_size(action_count)]),
+                    redpallas::Signature::<redpallas::Binding>::from([0u8; 64]),
+                )
+            },
+        );
+        if let Some(declared_value) = declared_value {
+            bundle = bundle
+                .try_map_value_balance::<_, (), _>(|_| {
+                    Ok(ZatBalance::from_i64(-declared_value)
+                        .expect("the fixture declared balance is valid"))
+                })
+                .expect("the fixture balance mapping cannot fail");
+        }
+        let coinbase = Transaction::test_v6_with_bundles(
+            NetworkUpgrade::Nu6_3,
+            wcash_coinbase_inputs(Height(1)),
+            vec![],
+            LockTime::unlocked(),
+            Height(0),
+            None,
+            Some(bundle),
+        );
+        let mut candidate = Arc::unwrap_or_clone(wcash_regtest_genesis_block());
+        candidate.transactions = vec![Arc::new(coinbase)];
+        candidate
+    }
+
     fn assert_invalid_candidate_payout(
         result: Result<ValidatedWcashCandidatePayout, MinerError>,
         expected_message: &str,
@@ -3836,6 +4280,97 @@ mod tests {
                 1,
             ),
             "below the Wcash miner subsidy",
+        );
+    }
+
+    #[test]
+    fn wcash_private_candidate_trial_decrypts_every_action_to_the_exact_recipient() {
+        let network = Network::new_wcash_regtest();
+        let reward = 625_000_000i64;
+        let (payout, ivk, recipient) = ironwood_wcash_recipient(NetworkType::Regtest, 21);
+        let (_, _, other_recipient) = ironwood_wcash_recipient(NetworkType::Regtest, 22);
+        let (_, _, authority) = validate_wcash_payout_configuration(
+            &payout.encode(),
+            &network.genesis_hash().to_string(),
+            Some(ivk),
+        )
+        .expect("the fixture private authority is valid");
+
+        let candidate = private_wcash_candidate(&[(recipient, reward as u64)], None);
+        assert_eq!(
+            validate_wcash_candidate_payout_with_authority(
+                &candidate, &payout, &authority, &network, reward, 1,
+            )
+            .expect("the exactly attributed private payout is accepted"),
+            ValidatedWcashCandidatePayout {
+                value_zatoshis: reward as u64,
+                verification: NativeWcashPayoutVerification::ExactPrivateRecipient,
+            }
+        );
+
+        let unattributed = private_wcash_candidate(&[(other_recipient, reward as u64)], None);
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout_with_authority(
+                &unattributed,
+                &payout,
+                &authority,
+                &network,
+                reward,
+                1,
+            ),
+            "unattributed Ironwood payout action",
+        );
+
+        let split = private_wcash_candidate(
+            &[(recipient, (reward as u64) - 1), (other_recipient, 1)],
+            None,
+        );
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout_with_authority(
+                &split, &payout, &authority, &network, reward, 1,
+            ),
+            "unattributed Ironwood payout action",
+        );
+
+        let (transparent_fallback, _) = transparent_wcash_candidate([0x99; 20], reward);
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout_with_authority(
+                &transparent_fallback,
+                &payout,
+                &authority,
+                &network,
+                reward,
+                1,
+            ),
+            "does not use an Ironwood-only private payout",
+        );
+    }
+
+    #[test]
+    fn wcash_private_candidate_rejects_decrypted_value_balance_mismatch() {
+        let network = Network::new_wcash_regtest();
+        let note_value = 625_000_000i64;
+        let advertised_value = note_value + 1;
+        let (payout, ivk, recipient) = ironwood_wcash_recipient(NetworkType::Regtest, 23);
+        let (_, _, authority) = validate_wcash_payout_configuration(
+            &payout.encode(),
+            &network.genesis_hash().to_string(),
+            Some(ivk),
+        )
+        .expect("the fixture private authority is valid");
+        let candidate =
+            private_wcash_candidate(&[(recipient, note_value as u64)], Some(advertised_value));
+
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout_with_authority(
+                &candidate,
+                &payout,
+                &authority,
+                &network,
+                advertised_value,
+                1,
+            ),
+            "attributed Ironwood value does not match coinbasevalue",
         );
     }
 
@@ -4014,6 +4549,7 @@ mod tests {
             expected_wcash_genesis_hash: "22".repeat(32),
             zcash,
             wcash_payout_address: secret.to_string(),
+            wcash_payout_incoming_viewing_key: None,
             auxiliary_nonce: 0,
         };
         let debug = format!("{config:?}");
