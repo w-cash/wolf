@@ -1,4 +1,4 @@
-//! Durable, append-only journal for backend protocol-v1 events.
+//! Durable, append-only journal for versioned backend protocol events.
 //!
 //! The first line is a versioned header that binds this file to one backend
 //! installation, one journal sequence namespace, and one exact pair of chains.
@@ -446,7 +446,7 @@ pub enum PoolBackendJournalError {
     InvalidPageLimit {
         /// Page limit supplied by the caller.
         actual: u16,
-        /// Maximum page-item limit allowed by protocol v1.
+        /// Maximum page-item limit allowed by the active protocol.
         maximum: u16,
     },
 
@@ -795,11 +795,11 @@ pub struct JournalEventPage {
     pub next_event_seq: u64,
     /// True when this page reaches the current durable journal end.
     pub complete: bool,
-    /// Strictly contiguous protocol-v1 events.
+    /// Strictly contiguous versioned protocol events.
     pub events: Vec<BackendEvent>,
 }
 
-/// Locked, durable protocol-v1 backend journal.
+/// Locked, durable versioned backend journal.
 pub struct PoolBackendJournal {
     path: PathBuf,
     header: JournalHeader,

@@ -15,13 +15,13 @@ use crate::{
     MinerError, EQUIHASH_SOLUTION_BYTES,
 };
 
-/// One proposal-validated native generation retained for backend-v1 shares.
+/// One proposal-validated native generation retained for backend shares.
 ///
 /// The adapter owns the exact [`NativeMiningCoordinator`] which produced its
 /// descriptor. It validates submitted fields through that coordinator's frozen
 /// [`crate::NativePreparedJob`] and materializes winner blocks through the same
 /// coordinator. It never calls the legacy share processor or winner outbox, so
-/// only [`crate::PoolBackendActor`]'s journal can acknowledge a backend-v1 share.
+/// only [`crate::PoolBackendActor`]'s journal can acknowledge a backend share.
 ///
 /// Pool orchestration should store this value in an `Arc`, give a clone to
 /// [`crate::PoolBackendActor::activate_job`], then durably close the job and
@@ -34,7 +34,7 @@ pub struct NativePoolBackendRetainedJob {
 }
 
 impl NativePoolBackendRetainedJob {
-    /// Binds one exact coordinator to its backend-v1 descriptor.
+    /// Binds one exact coordinator to its backend descriptor.
     pub fn new(coordinator: NativeMiningCoordinator) -> Result<Self, PoolBackendAdapterError> {
         let descriptor = job_descriptor_from_native(coordinator.generation_descriptor())?;
         Ok(Self {

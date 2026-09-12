@@ -23,11 +23,11 @@ pub use crate::{
     pool_backend_transport::BackendTransportError,
 };
 
-/// A native generation could not be represented by the backend-v1 protocol.
+/// A native generation could not be represented by the current backend protocol.
 #[derive(Debug, Eq, Error, PartialEq)]
 pub enum PoolBackendAdapterError {
-    /// The converted descriptor violated a backend-v1 protocol invariant.
-    #[error("native generation is not a valid backend-v1 job descriptor: {0}")]
+    /// The converted descriptor violated a backend protocol invariant.
+    #[error("native generation is not a valid backend job descriptor: {0}")]
     InvalidJobDescriptor(#[source] ProtocolError),
 }
 
@@ -212,7 +212,7 @@ fn target_numeric_cmp(left: &TargetLe, right: &TargetLe) -> Ordering {
         .cmp(right.as_bytes().iter().rev())
 }
 
-/// Converts exact native generation metadata into a validated backend-v1 job.
+/// Converts exact native generation metadata into a validated backend job.
 ///
 /// Both supported payout classes have been authenticated exactly: transparent
 /// scripts by direct output matching, and private Ironwood notes by complete
