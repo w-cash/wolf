@@ -305,6 +305,22 @@ or node uncertainty remains. Exact best-chain observation clears the quarantine.
 An authoritative absence first flushes an orphan transition, then replays the
 original exact bytes so a crash cannot lose or silently replace the winner.
 
+The private `native-pool-backend` authority journal additionally caps one
+stream at 100,000 retained Wcash and Zcash winners. At the theoretical maximum
+of two winners every 75-second Wcash block, that leaves more than 43 days for a
+planned, externally checkpointed journal rollover; admission fails closed at
+the bound. The reconciler polls every non-matured winner fairly in journal
+order with fixed RPC pacing. Matured history is not replayed on every pass:
+one matured winner is re-audited per pass with an advancing round-robin cursor,
+so deep reorganizations remain detectable without node load growing with the
+full history. A Wcash `submitblock` rejection, or rejection by every pinned
+Zcash node, stops the backend unless exact status already proves the block is
+known. Ambiguous or unavailable submission remains durable, immediately makes
+backend health false, and is retried; it is never reported as a healthy
+successful submission. A confirmation count that regresses while the block is
+still reported canonical is treated as an inconsistent node response and fails
+closed. Only authoritative absence records an orphan transition.
+
 Ordinary non-winning shares and authenticated worker identities are recorded in
 the same authoritative version-2 journal as winner outbox records. After
 stopping the pool, produce a strict read-only aggregate with:

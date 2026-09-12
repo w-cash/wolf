@@ -48,6 +48,14 @@ pub const MAX_JOURNAL_RECORD_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum decoded size of one exact Wcash or Zcash winner block.
 pub const MAX_WINNER_BLOCK_BYTES: usize = 2_000_000;
 
+/// Maximum number of dual-chain winner records retained by one journal.
+///
+/// This explicit Testnet operational bound prevents winner indexes and the
+/// reconciliation working set from growing with chain history forever. At the
+/// theoretical maximum of two winners every 75-second Wcash block, it provides
+/// more than 43 days for a planned, externally checkpointed journal rollover.
+pub const MAX_RETAINED_WINNERS: usize = 100_000;
+
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const HEADER_DIGEST_DOMAIN: &[u8] = b"wcash-pool/backend-journal-header/v2\0";
 const EVENT_DIGEST_DOMAIN: &[u8] = b"wcash-pool/backend-journal-event/v2\0";
@@ -284,6 +292,15 @@ pub enum PoolBackendJournalError {
     #[error("pool backend journal reached the {maximum}-event safety limit")]
     EventCapacity {
         /// Maximum number of retained journal events.
+        maximum: usize,
+    },
+
+    /// The exact winner outbox reached its explicit operational bound.
+    #[error(
+        "pool backend journal reached the {maximum}-winner safety limit; complete a planned journal rollover before admitting more winning shares"
+    )]
+    WinnerCapacity {
+        /// Maximum number of retained Wcash and Zcash winners combined.
         maximum: usize,
     },
 
@@ -1268,23 +1285,49 @@ impl PoolBackendJournal {
         &self,
         after_ordinal: Option<usize>,
     ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
+        self.next_winner_state_by_maturity(after_ordinal, None)
+    }
+
+    /// Returns the next winner that has not reached reversible maturity.
+    pub(crate) fn next_unsettled_winner_state(
+        &self,
+        after_ordinal: Option<usize>,
+    ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
+        self.next_winner_state_by_maturity(after_ordinal, Some(false))
+    }
+
+    /// Returns the next reversibly matured winner for low-rate reorg audits.
+    pub(crate) fn next_matured_winner_state(
+        &self,
+        after_ordinal: Option<usize>,
+    ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
+        self.next_winner_state_by_maturity(after_ordinal, Some(true))
+    }
+
+    fn next_winner_state_by_maturity(
+        &self,
+        after_ordinal: Option<usize>,
+        matured: Option<bool>,
+    ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
         let state = self.lock_state()?;
         ensure_usable(&state)?;
-        let index = match after_ordinal {
+        let start = match after_ordinal {
             Some(ordinal) => ordinal
                 .checked_add(1)
                 .ok_or(PoolBackendJournalError::Overflow)?,
             None => 0,
         };
-        let Some(key) = state.semantic.winner_order.get(index) else {
-            return Ok(None);
-        };
-        let event_seq = next_event_seq(&state)?;
-        let winner =
-            state.semantic.winners.get(key).ok_or_else(|| {
+        for (index, key) in state.semantic.winner_order.iter().enumerate().skip(start) {
+            let event_seq = next_event_seq(&state)?;
+            let winner = state.semantic.winners.get(key).ok_or_else(|| {
                 semantic(event_seq, "winner index references absent private state")
             })?;
-        Ok(Some((index, winner.clone())))
+            let is_matured = matches!(winner.lifecycle, JournalWinnerLifecycle::Matured { .. });
+            if matured.is_none_or(|required| required == is_matured) {
+                return Ok(Some((index, winner.clone())));
+            }
+        }
+        Ok(None)
     }
 
     /// Returns one exact retained winner without materializing the outbox.
@@ -1646,6 +1689,7 @@ impl JournalSemanticState {
                 .try_reserve(1)
                 .map_err(PoolBackendJournalError::Allocation),
             BackendEvent::ShareCommitted { receipt, .. } => {
+                checked_winner_capacity(self.winner_order.len(), receipt.winners.len())?;
                 self.shares
                     .try_reserve(1)
                     .map_err(PoolBackendJournalError::Allocation)?;
@@ -1720,6 +1764,7 @@ impl JournalSemanticState {
                 identity,
                 target_le,
             } => {
+                checked_winner_capacity(self.winner_order.len(), receipt.winners.len())?;
                 let job = self
                     .jobs
                     .get(job_id)
@@ -1858,11 +1903,7 @@ impl JournalSemanticState {
             } => {
                 require_no_private_blocks(&record.winner_blocks, event_seq)?;
                 let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
-                if matches!(
-                    state.lifecycle,
-                    JournalWinnerLifecycle::Quarantined { .. }
-                        | JournalWinnerLifecycle::Matured { .. }
-                ) {
+                if matches!(state.lifecycle, JournalWinnerLifecycle::Quarantined { .. }) {
                     return Err(semantic(
                         event_seq,
                         "winner cannot enter quarantine from its current state",
@@ -2511,6 +2552,21 @@ fn checked_append_limits(
         });
     }
     Ok(new_length)
+}
+
+fn checked_winner_capacity(
+    current_winners: usize,
+    additional_winners: usize,
+) -> Result<usize, PoolBackendJournalError> {
+    let total = current_winners
+        .checked_add(additional_winners)
+        .ok_or(PoolBackendJournalError::Overflow)?;
+    if total > MAX_RETAINED_WINNERS {
+        return Err(PoolBackendJournalError::WinnerCapacity {
+            maximum: MAX_RETAINED_WINNERS,
+        });
+    }
+    Ok(total)
 }
 
 fn ensure_usable(state: &JournalState) -> Result<(), PoolBackendJournalError> {
@@ -3511,6 +3567,14 @@ mod tests {
             retained.lifecycle,
             JournalWinnerLifecycle::Matured { .. }
         ));
+        assert!(journal
+            .next_unsettled_winner_state(None)
+            .expect("unsettled tier remains readable")
+            .is_none());
+        assert!(journal
+            .next_matured_winner_state(None)
+            .expect("matured audit tier remains readable")
+            .is_some());
         assert_eq!(
             journal.winner_summary().expect("matured summary"),
             JournalWinnerSummary::default()
@@ -3546,6 +3610,14 @@ mod tests {
             retained.lifecycle,
             JournalWinnerLifecycle::Orphaned { .. }
         ));
+        assert!(reopened
+            .next_unsettled_winner_state(None)
+            .expect("orphaned winner returns to unsettled tier")
+            .is_some());
+        assert!(reopened
+            .next_matured_winner_state(None)
+            .expect("matured tier remains readable after reorg")
+            .is_none());
         assert_eq!(
             reopened.winner_summary().expect("orphaned summary"),
             JournalWinnerSummary {
@@ -3975,6 +4047,21 @@ mod tests {
             checked_append_limits(0, MAX_JOURNAL_BYTES, 1),
             Err(PoolBackendJournalError::JournalTooLarge { .. })
         ));
+        assert_eq!(
+            checked_winner_capacity(MAX_RETAINED_WINNERS - 1, 1)
+                .expect("the exact winner bound is admissible"),
+            MAX_RETAINED_WINNERS
+        );
+        assert!(matches!(
+            checked_winner_capacity(MAX_RETAINED_WINNERS, 1),
+            Err(PoolBackendJournalError::WinnerCapacity {
+                maximum: MAX_RETAINED_WINNERS
+            })
+        ));
+        assert!(matches!(
+            checked_winner_capacity(usize::MAX, 1),
+            Err(PoolBackendJournalError::Overflow)
+        ));
         assert!(matches!(
             check_record_size(MAX_JOURNAL_RECORD_BYTES + 1, 2),
             Err(PoolBackendJournalError::RecordTooLarge { .. })
@@ -3982,5 +4069,49 @@ mod tests {
         journal
             .append_event(event(1, 1))
             .expect("preflight cap errors do not poison the journal");
+    }
+
+    #[test]
+    fn winner_capacity_fails_during_preappend_reservation() {
+        let key = WinnerKey {
+            share_id: Hex32::new([0x71; 32]),
+            chain: MergedChain::Wcash,
+        };
+        let mut semantic = JournalSemanticState::default();
+        semantic
+            .winner_order
+            .try_reserve_exact(MAX_RETAINED_WINNERS)
+            .expect("bounded winner fixture allocation succeeds");
+        semantic.winner_order.resize(MAX_RETAINED_WINNERS, key);
+        let descriptor = job(7);
+        let event = BackendEvent::ShareCommitted {
+            receipt: ShareReceipt {
+                event_seq: 2,
+                job_id: descriptor.job_id.clone(),
+                share_id: Hex32::new([0x72; 32]),
+                attribution_id: Hex32::new([0x73; 32]),
+                parent_hash_le: Hex32::new([0x74; 32]),
+                winners: vec![WinnerDescriptor {
+                    chain: MergedChain::Wcash,
+                    block_hash_le: Hex32::new([0x75; 32]),
+                    height: descriptor.wcash_height,
+                    coinbase_txid_le: descriptor.wcash_coinbase_txid_le.clone(),
+                    reward_zat: descriptor.wcash_reward_zat,
+                    maturity_confirmations: descriptor.wcash_maturity_confirmations,
+                }],
+            },
+            job_id: descriptor.job_id,
+            identity: identity(7),
+            target_le: TargetLe::new([0xff; 32]),
+        };
+
+        assert!(matches!(
+            semantic.reserve_for(&event),
+            Err(PoolBackendJournalError::WinnerCapacity {
+                maximum: MAX_RETAINED_WINNERS
+            })
+        ));
+        assert!(semantic.shares.is_empty());
+        assert!(semantic.winners.is_empty());
     }
 }

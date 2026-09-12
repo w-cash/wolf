@@ -23,6 +23,7 @@ use orchard::{
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use wcash_pool_protocol::{ChainTip, Hex32, MergedChain, WinnerDescriptor};
 use wcash_zcash_aux::{
     child_payout_address_commitment, AuxPowProof, Target, WCASH_AUXILIARY_CHAIN_ID,
 };
@@ -48,11 +49,15 @@ use crate::{
     accounting::{
         read_accounting_snapshot_from_reader, AuthenticatedWorker, WorkerAuthenticationProvenance,
     },
-    native::NativePayoutCommitments,
+    native::{
+        native_chain_tip_on_node, submitblock_reason_is_inconclusive, NativeChainTip,
+        NativePayoutCommitments, ParentNodeOutcome, ParentSubmissionReport,
+    },
+    pool_backend::JournalWinnerLifecycle,
     rpc::{RpcEndpoint, ZebraRpcClient, DEFAULT_RPC_TIMEOUT},
     MinerError, NativeGenerationDescriptor, NativePreparedJob, NativeWcashPayoutVerification,
-    NativeZcashConfig, NativeZcashProvider, ShareProcessor, ValidatedNativeShare,
-    NATIVE_JOB_MAX_AGE_SECONDS,
+    NativeZcashConfig, NativeZcashProvider, PoolBackendWinnerSnapshot, PoolBackendWinnerTransition,
+    ShareProcessor, ValidatedNativeShare, NATIVE_JOB_MAX_AGE_SECONDS,
 };
 
 /// Complete native-node configuration for one frozen dual-mining job.
@@ -614,6 +619,33 @@ impl NativeMiningSupervisor {
         };
         preparation_guard.disarm();
         Ok(coordinator)
+    }
+
+    /// Reconciles one exact backend-v1 winner against its own chain only.
+    ///
+    /// Exact block bytes are already durable before this method can obtain a
+    /// snapshot. Pending, requeued, and orphaned winners are replayed through
+    /// idempotent node submission; observed and matured winners use status-only
+    /// checks. The caller must durably compare-and-apply the returned transition
+    /// through [`crate::PoolBackendActor`] before treating it as authoritative.
+    pub fn reconcile_pool_backend_winner(
+        &self,
+        snapshot: &PoolBackendWinnerSnapshot,
+    ) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
+        match snapshot.winner().chain {
+            MergedChain::Wcash => {
+                require_wcash_network_identity(
+                    &self.wcash_node,
+                    &self.config.expected_wcash_genesis_hash,
+                )?;
+                reconcile_wcash_pool_winner(&self.wcash_node, snapshot)
+            }
+            MergedChain::Zcash => {
+                self.zcash
+                    .require_network_identity(self.config.zcash.expected_genesis_hash())?;
+                reconcile_zcash_pool_winner(&self.zcash, snapshot)
+            }
+        }
     }
 }
 
@@ -1220,6 +1252,285 @@ fn validate_transparent_wcash_payout(
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PoolWinnerObservation {
+    Unavailable,
+    Absent { tip: ChainTip },
+    ConflictingWitness { tip: ChainTip },
+    Present { tip: ChainTip, confirmations: u32 },
+}
+
+fn reconcile_wcash_pool_winner(
+    wcash_node: &ZebraRpcClient,
+    snapshot: &PoolBackendWinnerSnapshot,
+) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
+    let winner = snapshot.winner();
+    let expected_hash = display_hash(*winner.block_hash_le.as_bytes());
+    validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Wcash, &expected_hash)?;
+    let should_submit = winner_lifecycle_requires_submission(snapshot.lifecycle());
+    let submission = if should_submit {
+        // `submitblock` is idempotent and remains valid after the candidate
+        // cache expires. The exact bytes were validated above and were durable
+        // before this reconciliation pass began.
+        Some(classify_wcash_submission(wcash_node.call_value(
+            "submitblock",
+            json!([hex::encode(snapshot.block_bytes())]),
+        )))
+    } else {
+        None
+    };
+
+    let before = native_chain_tip_on_node(wcash_node)?;
+    let observation = wcash_confirmation_depth_checked(
+        wcash_node,
+        winner.height,
+        &expected_hash,
+        snapshot.block_bytes(),
+        should_submit,
+    )?;
+    let after = native_chain_tip_on_node(wcash_node)?;
+    if before != after {
+        return Ok(None);
+    }
+    let tip = pool_chain_tip(before);
+    let observation = match observation {
+        WinnerObservation::Unavailable => PoolWinnerObservation::Unavailable,
+        WinnerObservation::Absent => PoolWinnerObservation::Absent { tip },
+        WinnerObservation::ConflictingWitness => PoolWinnerObservation::ConflictingWitness { tip },
+        WinnerObservation::Present { confirmations } => {
+            PoolWinnerObservation::Present { tip, confirmations }
+        }
+    };
+    require_wcash_submission_progress(&observation, submission)?;
+    pool_winner_transition(snapshot.lifecycle(), winner, observation)
+}
+
+fn reconcile_zcash_pool_winner(
+    zcash: &NativeZcashProvider,
+    snapshot: &PoolBackendWinnerSnapshot,
+) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
+    let winner = snapshot.winner();
+    let expected_hash = display_hash(*winner.block_hash_le.as_bytes());
+    validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Zcash, &expected_hash)?;
+    if winner_lifecycle_requires_submission(snapshot.lifecycle()) {
+        let report =
+            zcash.replay_parent_bytes(snapshot.block_bytes(), winner.height, &expected_hash)?;
+        require_parent_submission_progress(&report)?;
+    }
+
+    let before = zcash.consistent_chain_tip()?;
+    let confirmations = zcash.parent_confirmation_depth(winner.height, &expected_hash)?;
+    let after = zcash.consistent_chain_tip()?;
+    if before != after {
+        return Ok(None);
+    }
+    let tip = pool_chain_tip(before);
+    let observation = confirmations.map_or(
+        PoolWinnerObservation::Absent { tip: tip.clone() },
+        |confirmations| PoolWinnerObservation::Present { tip, confirmations },
+    );
+    pool_winner_transition(snapshot.lifecycle(), winner, observation)
+}
+
+fn classify_wcash_submission(
+    response: Result<serde_json::Value, MinerError>,
+) -> Result<(), MinerError> {
+    match response {
+        Ok(serde_json::Value::Null) => Ok(()),
+        Ok(serde_json::Value::String(reason)) => {
+            if submitblock_reason_is_inconclusive(&reason) {
+                Err(MinerError::WinnerSubmissionDeferred { chain: "Wcash" })
+            } else {
+                Err(MinerError::InvalidParentTemplate(
+                    "Wcash node authoritatively rejected exact durable winner bytes".to_string(),
+                ))
+            }
+        }
+        Ok(_) => Err(MinerError::RpcProtocol(
+            "Wcash submitblock returned an unexpected result type".to_string(),
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn require_wcash_submission_progress(
+    observation: &PoolWinnerObservation,
+    submission: Option<Result<(), MinerError>>,
+) -> Result<(), MinerError> {
+    let Some(submission) = submission else {
+        return Ok(());
+    };
+    if matches!(
+        observation,
+        PoolWinnerObservation::Present { .. } | PoolWinnerObservation::ConflictingWitness { .. }
+    ) {
+        return Ok(());
+    }
+    submission?;
+    Err(MinerError::WinnerSubmissionDeferred { chain: "Wcash" })
+}
+
+fn require_parent_submission_progress(report: &ParentSubmissionReport) -> Result<(), MinerError> {
+    if report.is_confirmed() {
+        return Ok(());
+    }
+    if report
+        .outcomes()
+        .iter()
+        .any(|outcome| matches!(outcome, ParentNodeOutcome::InvalidResponse { .. }))
+    {
+        return Err(MinerError::RpcProtocol(
+            "a pinned parent node returned a permanent submitblock RPC failure".to_string(),
+        ));
+    }
+    if !report.outcomes().is_empty()
+        && report
+            .outcomes()
+            .iter()
+            .all(|outcome| matches!(outcome, ParentNodeOutcome::Rejected { .. }))
+    {
+        return Err(MinerError::InvalidParentTemplate(
+            "every pinned parent node authoritatively rejected exact durable winner bytes"
+                .to_string(),
+        ));
+    }
+    Err(MinerError::WinnerSubmissionDeferred { chain: "Zcash" })
+}
+
+fn validate_pool_winner_material(
+    snapshot: &PoolBackendWinnerSnapshot,
+    kind: PersistedWinnerBlockKind,
+    expected_hash: &str,
+) -> Result<(), MinerError> {
+    let recovered_parent = validate_persisted_winner_block(
+        snapshot.block_bytes(),
+        expected_hash,
+        snapshot.winner().height,
+        kind,
+    )?;
+    if recovered_parent != *snapshot.parent_hash_le().as_bytes() {
+        return Err(MinerError::InvalidRequest(
+            "backend winner bytes do not bind their durable parent header hash".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn winner_lifecycle_requires_submission(lifecycle: &JournalWinnerLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        JournalWinnerLifecycle::Pending
+            | JournalWinnerLifecycle::Orphaned { .. }
+            | JournalWinnerLifecycle::Requeued { .. }
+    )
+}
+
+fn pool_chain_tip(tip: NativeChainTip) -> ChainTip {
+    ChainTip {
+        block_hash_le: Hex32::new(tip.block_hash_le),
+        height: tip.height,
+    }
+}
+
+fn pool_winner_transition(
+    lifecycle: &JournalWinnerLifecycle,
+    winner: &WinnerDescriptor,
+    observation: PoolWinnerObservation,
+) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
+    // Confirmation regression while a node still claims the block is
+    // canonical is internally inconsistent and stops reconciliation. Only an
+    // authoritative absence can move an observed or matured winner to orphaned.
+    match observation {
+        PoolWinnerObservation::Unavailable => Ok(None),
+        PoolWinnerObservation::Absent { tip } => match lifecycle {
+            JournalWinnerLifecycle::Observed { .. } | JournalWinnerLifecycle::Matured { .. } => {
+                Ok(Some(PoolBackendWinnerTransition::Orphaned { tip }))
+            }
+            JournalWinnerLifecycle::Quarantined { .. } => {
+                Ok(Some(PoolBackendWinnerTransition::Requeued { tip }))
+            }
+            JournalWinnerLifecycle::Pending
+            | JournalWinnerLifecycle::Orphaned { .. }
+            | JournalWinnerLifecycle::Requeued { .. } => Ok(None),
+        },
+        PoolWinnerObservation::ConflictingWitness { tip } => {
+            if winner.chain != MergedChain::Wcash {
+                return Err(MinerError::RpcProtocol(
+                    "a Zcash winner cannot have a proof-independent witness conflict".to_string(),
+                ));
+            }
+            if matches!(lifecycle, JournalWinnerLifecycle::Quarantined { .. }) {
+                Ok(None)
+            } else {
+                Ok(Some(PoolBackendWinnerTransition::Quarantined { tip }))
+            }
+        }
+        PoolWinnerObservation::Present { tip, confirmations } => {
+            let expected_confirmations = tip
+                .height
+                .checked_sub(winner.height)
+                .and_then(|depth| depth.checked_add(1))
+                .ok_or_else(|| {
+                    MinerError::RpcProtocol(
+                        "winner confirmation tip is below its block height".to_string(),
+                    )
+                })?;
+            if confirmations != expected_confirmations {
+                return Err(MinerError::RpcProtocol(
+                    "winner confirmations do not match the stable chain-tip snapshot".to_string(),
+                ));
+            }
+            match lifecycle {
+                JournalWinnerLifecycle::Matured {
+                    confirmations: previous,
+                    ..
+                } => {
+                    if confirmations < *previous || confirmations < winner.maturity_confirmations {
+                        return Err(MinerError::RpcProtocol(
+                            "a matured winner lost confirmations while remaining on the best chain"
+                                .to_string(),
+                        ));
+                    }
+                    Ok(None)
+                }
+                JournalWinnerLifecycle::Observed {
+                    tip: previous_tip,
+                    confirmations: previous,
+                } => {
+                    if confirmations < *previous {
+                        return Err(MinerError::RpcProtocol(
+                            "an observed winner lost confirmations without leaving the best chain"
+                                .to_string(),
+                        ));
+                    }
+                    if confirmations >= winner.maturity_confirmations {
+                        Ok(Some(PoolBackendWinnerTransition::Matured {
+                            tip,
+                            confirmations,
+                        }))
+                    } else if confirmations == *previous && &tip == previous_tip {
+                        Ok(None)
+                    } else {
+                        Ok(Some(PoolBackendWinnerTransition::Observed {
+                            tip,
+                            confirmations,
+                        }))
+                    }
+                }
+                JournalWinnerLifecycle::Pending
+                | JournalWinnerLifecycle::Orphaned { .. }
+                | JournalWinnerLifecycle::Quarantined { .. }
+                | JournalWinnerLifecycle::Requeued { .. } => {
+                    Ok(Some(PoolBackendWinnerTransition::Observed {
+                        tip,
+                        confirmations,
+                    }))
+                }
+            }
+        }
+    }
+}
+
 fn retry_pending_winners_with(
     wcash_node: &ZebraRpcClient,
     zcash: &NativeZcashProvider,
@@ -1410,32 +1721,50 @@ fn wcash_confirmation_depth(
     expected_block_bytes: &[u8],
     release_candidate: bool,
 ) -> WinnerObservation {
-    let expected_block: Block = match expected_block_bytes.zcash_deserialize_into() {
-        Ok(block) => block,
-        Err(_) => return WinnerObservation::Unavailable,
-    };
-    let Ok(expected_hash_raw) = parse_display_hash(expected_hash, "Wcash winner block hash") else {
-        return WinnerObservation::Unavailable;
-    };
-    let Ok(canonical) = expected_block.zcash_serialize_to_vec() else {
-        return WinnerObservation::Unavailable;
-    };
+    wcash_confirmation_depth_checked(
+        node,
+        height,
+        expected_hash,
+        expected_block_bytes,
+        release_candidate,
+    )
+    .unwrap_or(WinnerObservation::Unavailable)
+}
+
+fn wcash_confirmation_depth_checked(
+    node: &ZebraRpcClient,
+    height: u32,
+    expected_hash: &str,
+    expected_block_bytes: &[u8],
+    release_candidate: bool,
+) -> Result<WinnerObservation, MinerError> {
+    let expected_block: Block = expected_block_bytes
+        .zcash_deserialize_into()
+        .map_err(|error| {
+            MinerError::InvalidRequest(format!(
+                "durable Wcash winner is not a canonical block: {error}"
+            ))
+        })?;
+    let expected_hash_raw = parse_display_hash(expected_hash, "Wcash winner block hash")?;
+    let canonical = expected_block.zcash_serialize_to_vec()?;
     if canonical != expected_block_bytes
         || expected_block.hash().0 != expected_hash_raw
         || expected_block.coinbase_height().map(u32::from) != Some(height)
     {
-        return WinnerObservation::Unavailable;
+        return Err(MinerError::InvalidRequest(
+            "durable Wcash winner bytes do not match their immutable metadata".to_string(),
+        ));
     }
-    let Some(witness) = expected_block.header.solution.as_wcash() else {
-        return WinnerObservation::Unavailable;
-    };
-    let Ok(status) = node.call::<WcashAuxBlockStatus>(
+    let witness = expected_block.header.solution.as_wcash().ok_or_else(|| {
+        MinerError::InvalidRequest(
+            "durable Wcash winner does not contain an auxiliary proof".to_string(),
+        )
+    })?;
+    let status = node.call::<WcashAuxBlockStatus>(
         "getauxblockstatus",
         json!([expected_hash, hex::encode(witness.as_bytes())]),
-    ) else {
-        return WinnerObservation::Unavailable;
-    };
-    match status {
+    )?;
+    Ok(match status {
         WcashAuxBlockStatus::BestChain { confirmations } => {
             // Durable outbox replay uses `submitblock` so it remains valid after
             // the node's proof-free candidate cache expires or the node
@@ -1455,7 +1784,7 @@ fn wcash_confirmation_depth(
         WcashAuxBlockStatus::SideChain | WcashAuxBlockStatus::Unknown => WinnerObservation::Absent,
         WcashAuxBlockStatus::ConflictingWitness => WinnerObservation::ConflictingWitness,
         WcashAuxBlockStatus::Pending => WinnerObservation::Unavailable,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -3315,7 +3644,7 @@ mod tests {
 
     fn read_test_rpc_request(stream: &mut std::net::TcpStream) -> serde_json::Value {
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("set test RPC read timeout");
         let mut request = Vec::new();
         let mut buffer = [0u8; 4_096];
@@ -3602,6 +3931,135 @@ mod tests {
     }
 
     #[test]
+    fn parent_tip_snapshot_requires_every_pinned_node_to_agree() {
+        let tip_hash = "53".repeat(32);
+        let response = json!({
+            "blocks": 73,
+            "bestblockhash": tip_hash,
+        });
+        let (template, template_server) = spawn_scripted_rpc_server(vec![response.clone()]);
+        let (validator, validator_server) = spawn_scripted_rpc_server(vec![response]);
+        let provider = test_zcash_provider(template, validator);
+
+        let tip = provider
+            .consistent_chain_tip()
+            .expect("matching atomic parent tips are accepted");
+        assert_eq!(tip.height, 73);
+        assert_eq!(display_hash(tip.block_hash_le), tip_hash);
+
+        for server in [template_server, validator_server] {
+            let requests = server.join().expect("test RPC server exits");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["method"], "getblockchaininfo");
+            assert_eq!(requests[0]["params"], json!([]));
+        }
+    }
+
+    #[test]
+    fn parent_tip_snapshot_rejects_a_split_pinned_node_set() {
+        let (template, template_server) = spawn_scripted_rpc_server(vec![json!({
+            "blocks": 73,
+            "bestblockhash": "53".repeat(32),
+        })]);
+        let (validator, validator_server) = spawn_scripted_rpc_server(vec![json!({
+            "blocks": 73,
+            "bestblockhash": "54".repeat(32),
+        })]);
+        let provider = test_zcash_provider(template, validator);
+
+        assert!(matches!(
+            provider.consistent_chain_tip(),
+            Err(MinerError::ParentTipMismatch { .. })
+        ));
+        template_server.join().expect("template server exits");
+        validator_server.join().expect("validator server exits");
+    }
+
+    #[test]
+    fn retained_wcash_submission_classifies_authoritative_rejection_without_echoing_reason() {
+        assert!(classify_wcash_submission(Ok(serde_json::Value::Null)).is_ok());
+        let error =
+            classify_wcash_submission(Ok(json!("operator-controlled rejection diagnostic")))
+                .expect_err("an explicit Wcash rejection is terminal");
+        assert!(matches!(error, MinerError::InvalidParentTemplate(_)));
+        assert!(!error.to_string().contains("operator-controlled"));
+        assert!(matches!(
+            classify_wcash_submission(Ok(json!("duplicate-inconclusive"))),
+            Err(MinerError::WinnerSubmissionDeferred { chain: "Wcash" })
+        ));
+        assert!(matches!(
+            classify_wcash_submission(Ok(json!(true))),
+            Err(MinerError::RpcProtocol(_))
+        ));
+
+        let absent = PoolWinnerObservation::Absent {
+            tip: pool_tip(10, 0x31),
+        };
+        assert!(matches!(
+            require_wcash_submission_progress(&absent, Some(Ok(()))),
+            Err(MinerError::WinnerSubmissionDeferred { chain: "Wcash" })
+        ));
+        let rejection = classify_wcash_submission(Ok(json!("rejected")));
+        assert!(matches!(
+            require_wcash_submission_progress(&absent, Some(rejection)),
+            Err(MinerError::InvalidParentTemplate(_))
+        ));
+        let present = PoolWinnerObservation::Present {
+            tip: pool_tip(10, 0x31),
+            confirmations: 1,
+        };
+        assert!(require_wcash_submission_progress(
+            &present,
+            Some(classify_wcash_submission(Ok(json!("duplicate"))))
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn retained_parent_submission_distinguishes_rejection_from_deferred_propagation() {
+        let block = mainnet_block_one();
+        let block_bytes = block
+            .zcash_serialize_to_vec()
+            .expect("fixture block serializes");
+        let block_hash = display_hash(block.hash().0);
+        let absent_header = json!({
+            "hash": block_hash,
+            "confirmations": 0,
+            "height": 1,
+        });
+
+        let (template, template_server) =
+            spawn_scripted_rpc_server(vec![json!("template rejected"), absent_header.clone()]);
+        let (validator, validator_server) =
+            spawn_scripted_rpc_server(vec![json!("validator rejected"), absent_header.clone()]);
+        let provider = test_zcash_provider(template, validator);
+        let rejected = provider
+            .replay_parent_bytes(&block_bytes, 1, &block_hash)
+            .expect("per-node rejection report is returned");
+        assert!(matches!(
+            require_parent_submission_progress(&rejected),
+            Err(MinerError::InvalidParentTemplate(_))
+        ));
+        template_server.join().expect("template server exits");
+        validator_server.join().expect("validator server exits");
+
+        let (template, template_server) =
+            spawn_scripted_rpc_server(vec![json!("template rejected"), absent_header.clone()]);
+        let (validator, validator_server) =
+            spawn_scripted_rpc_server(vec![serde_json::Value::Null, absent_header]);
+        let provider = test_zcash_provider(template, validator);
+        let deferred = provider
+            .replay_parent_bytes(&block_bytes, 1, &block_hash)
+            .expect("mixed unconfirmed report is returned");
+        assert!(matches!(
+            require_parent_submission_progress(&deferred),
+            Err(MinerError::WinnerSubmissionDeferred { chain: "Zcash" })
+        ));
+        template_server.join().expect("template server exits");
+        validator_server.join().expect("validator server exits");
+    }
+
+    #[test]
     fn candidate_retirement_is_authenticated_idempotent_and_submission_safe() {
         let results = vec![
             json!({"state": "retired"}),
@@ -3806,6 +4264,152 @@ mod tests {
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0]["method"], "getauxblockstatus");
         }
+    }
+
+    fn pool_winner_fixture(chain: MergedChain) -> WinnerDescriptor {
+        WinnerDescriptor {
+            chain,
+            block_hash_le: Hex32::new([0x31; 32]),
+            height: 10,
+            coinbase_txid_le: Hex32::new([0x32; 32]),
+            reward_zat: 625_000_000,
+            maturity_confirmations: 100,
+        }
+    }
+
+    fn pool_tip(height: u32, byte: u8) -> ChainTip {
+        ChainTip {
+            block_hash_le: Hex32::new([byte; 32]),
+            height,
+        }
+    }
+
+    #[test]
+    fn backend_winner_transition_is_independent_idempotent_and_reorg_safe() {
+        let wcash = pool_winner_fixture(MergedChain::Wcash);
+        let first_tip = pool_tip(10, 0x31);
+        assert_eq!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Pending,
+                &wcash,
+                PoolWinnerObservation::Present {
+                    tip: first_tip.clone(),
+                    confirmations: 1,
+                },
+            )
+            .expect("pending Wcash observation is valid"),
+            Some(PoolBackendWinnerTransition::Observed {
+                tip: first_tip,
+                confirmations: 1,
+            })
+        );
+
+        let mature_tip = pool_tip(109, 0x40);
+        assert_eq!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Observed {
+                    tip: pool_tip(108, 0x3f),
+                    confirmations: 99,
+                },
+                &wcash,
+                PoolWinnerObservation::Present {
+                    tip: mature_tip.clone(),
+                    confirmations: 100,
+                },
+            )
+            .expect("maturity boundary is valid"),
+            Some(PoolBackendWinnerTransition::Matured {
+                tip: mature_tip.clone(),
+                confirmations: 100,
+            })
+        );
+        assert_eq!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Matured {
+                    tip: mature_tip,
+                    confirmations: 100,
+                },
+                &wcash,
+                PoolWinnerObservation::Absent {
+                    tip: pool_tip(111, 0x41),
+                },
+            )
+            .expect("deep reorganization is valid"),
+            Some(PoolBackendWinnerTransition::Orphaned {
+                tip: pool_tip(111, 0x41),
+            })
+        );
+
+        let conflict_tip = pool_tip(10, 0x31);
+        assert_eq!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Matured {
+                    tip: pool_tip(109, 0x40),
+                    confirmations: 100,
+                },
+                &wcash,
+                PoolWinnerObservation::ConflictingWitness {
+                    tip: conflict_tip.clone(),
+                },
+            )
+            .expect("a conflicting witness revokes mature Wcash state"),
+            Some(PoolBackendWinnerTransition::Quarantined { tip: conflict_tip })
+        );
+        assert_eq!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Quarantined {
+                    tip: pool_tip(10, 0x31),
+                },
+                &wcash,
+                PoolWinnerObservation::Absent {
+                    tip: pool_tip(12, 0x42),
+                },
+            )
+            .expect("an absent conflict can be durably requeued"),
+            Some(PoolBackendWinnerTransition::Requeued {
+                tip: pool_tip(12, 0x42),
+            })
+        );
+    }
+
+    #[test]
+    fn backend_winner_transition_rejects_inconsistent_confirmation_snapshots() {
+        let winner = pool_winner_fixture(MergedChain::Zcash);
+        assert!(matches!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Pending,
+                &winner,
+                PoolWinnerObservation::Present {
+                    tip: pool_tip(11, 0x44),
+                    confirmations: 1,
+                },
+            ),
+            Err(MinerError::RpcProtocol(_))
+        ));
+        assert!(matches!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Observed {
+                    tip: pool_tip(11, 0x44),
+                    confirmations: 2,
+                },
+                &winner,
+                PoolWinnerObservation::Present {
+                    tip: pool_tip(10, 0x31),
+                    confirmations: 1,
+                },
+            ),
+            Err(MinerError::RpcProtocol(_))
+        ));
+        assert!(matches!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Pending,
+                &winner,
+                PoolWinnerObservation::ConflictingWitness {
+                    tip: pool_tip(10, 0x31),
+                },
+            ),
+            Err(MinerError::RpcProtocol(_))
+        ));
     }
 
     #[test]

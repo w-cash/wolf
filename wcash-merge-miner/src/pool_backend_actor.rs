@@ -9,7 +9,10 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::{Duration, Instant},
 };
 
@@ -511,6 +514,7 @@ pub struct PoolBackendActor {
     authority: PoolBackendAuthority,
     authority_fields: AuthorityFields,
     clock: Arc<dyn ActorClock>,
+    winner_reconciliation_healthy: AtomicBool,
     state: Mutex<ActorState>,
 }
 
@@ -565,8 +569,18 @@ impl PoolBackendActor {
             authority,
             authority_fields,
             clock,
+            winner_reconciliation_healthy: AtomicBool::new(true),
             state: Mutex::new(state),
         })
+    }
+
+    /// Updates the live status of the sole winner-reconciliation worker.
+    ///
+    /// This flag affects only health reporting. Exact winners remain durable
+    /// and share validation remains consensus-authoritative during an outage.
+    pub fn set_winner_reconciliation_health(&self, healthy: bool) {
+        self.winner_reconciliation_healthy
+            .store(healthy, Ordering::Release);
     }
 
     /// Durably advertises a healthy exact job, superseding the current job
@@ -749,14 +763,43 @@ impl PoolBackendActor {
         &self,
         after: Option<&PoolBackendWinnerKey>,
     ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        self.next_winner_snapshot_with(after, PoolBackendJournal::next_winner_state)
+    }
+
+    /// Returns the next non-matured winner in durable journal order.
+    ///
+    /// Runtime reconciliation uses this tier for frequent submission and
+    /// confirmation checks. Reversible matured entries are sampled separately
+    /// so historical winners cannot create unbounded node RPC load.
+    pub fn next_unsettled_winner_snapshot(
+        &self,
+        after: Option<&PoolBackendWinnerKey>,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        self.next_winner_snapshot_with(after, PoolBackendJournal::next_unsettled_winner_state)
+    }
+
+    /// Returns the next matured winner in durable order for low-rate audits.
+    pub fn next_matured_winner_snapshot(
+        &self,
+        after: Option<&PoolBackendWinnerKey>,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        self.next_winner_snapshot_with(after, PoolBackendJournal::next_matured_winner_state)
+    }
+
+    fn next_winner_snapshot_with(
+        &self,
+        after: Option<&PoolBackendWinnerKey>,
+        select: fn(
+            &PoolBackendJournal,
+            Option<usize>,
+        ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError>,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
         if after.is_some_and(|key| key.journal_stream != self.authority_fields.journal_stream) {
             return Err(PoolBackendActorError::WinnerAuthorityMismatch);
         }
         let state = self.lock_state()?;
         let after_ordinal = after.map(|key| key.winner_ordinal);
-        state
-            .journal
-            .next_winner_state(after_ordinal)
+        select(&state.journal, after_ordinal)
             .map(|winner| {
                 winner.map(|(winner_ordinal, state)| PoolBackendWinnerSnapshot {
                     journal_stream: self.authority_fields.journal_stream,
@@ -1133,7 +1176,9 @@ impl PoolBackendActor {
                 .get(job_id)
                 .is_some_and(|job| job.validator.is_healthy() && acceptable_job(job, now).is_some())
         });
-        let healthy = current_healthy && recent_healthy;
+        let healthy = current_healthy
+            && recent_healthy
+            && self.winner_reconciliation_healthy.load(Ordering::Acquire);
         let response = BackendMessage::HealthStatus {
             version: BACKEND_PROTOCOL_VERSION,
             id,
@@ -2449,6 +2494,37 @@ mod tests {
     }
 
     #[test]
+    fn winner_reconciliation_outage_is_visible_in_backend_health() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let actor = actor(&path, &config, Arc::new(TestClock::new()));
+        actor
+            .activate_job(
+                Arc::new(TestRetainedJob::new(job(1))),
+                Duration::from_secs(5),
+            )
+            .expect("activate healthy job");
+        actor.set_winner_reconciliation_health(false);
+
+        assert!(matches!(
+            actor
+                .dispatch(
+                    uuid(20),
+                    None,
+                    BackendRequestKind::Health,
+                    BackendRequest::Health {
+                        version: BACKEND_PROTOCOL_VERSION,
+                        id: 2,
+                    },
+                )
+                .expect("health response succeeds")
+                .as_slice(),
+            [BackendMessage::HealthStatus { healthy: false, .. }]
+        ));
+    }
+
+    #[test]
     fn rotation_retains_two_jobs_and_closes_expired_grace() {
         let directory = private_temp_dir();
         let path = directory.path().join("actor.journal");
@@ -3016,6 +3092,71 @@ mod tests {
         assert!(matches!(
             orphaned.lifecycle(),
             JournalWinnerLifecycle::Orphaned { tip } if tip == &orphan_tip
+        ));
+    }
+
+    #[test]
+    fn conflicting_wcash_witness_revokes_a_matured_lifecycle() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let (journal, winner, _) = wcash_winner_journal(&path, &config);
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+        let pending = actor
+            .next_winner_snapshot(None)
+            .expect("enumerate winner")
+            .expect("Wcash winner is retained");
+        actor
+            .compare_and_apply_winner_transition(
+                &pending,
+                PoolBackendWinnerTransition::Observed {
+                    tip: ChainTip {
+                        block_hash_le: winner.block_hash_le.clone(),
+                        height: winner.height,
+                    },
+                    confirmations: 1,
+                },
+            )
+            .expect("observe exact Wcash winner");
+        let observed = actor
+            .winner_snapshot(&pending.key())
+            .expect("refresh winner")
+            .expect("winner remains retained");
+        actor
+            .compare_and_apply_winner_transition(
+                &observed,
+                PoolBackendWinnerTransition::Matured {
+                    tip: ChainTip {
+                        block_hash_le: Hex32::new([0xd1; 32]),
+                        height: winner.height + 1,
+                    },
+                    confirmations: 2,
+                },
+            )
+            .expect("mature exact Wcash winner");
+        let matured = actor
+            .winner_snapshot(&pending.key())
+            .expect("refresh matured winner")
+            .expect("matured winner remains retained");
+        let conflict_tip = ChainTip {
+            block_hash_le: Hex32::new([0xd2; 32]),
+            height: winner.height + 2,
+        };
+        actor
+            .compare_and_apply_winner_transition(
+                &matured,
+                PoolBackendWinnerTransition::Quarantined {
+                    tip: conflict_tip.clone(),
+                },
+            )
+            .expect("a different AuxPoW witness revokes matured status");
+        assert!(matches!(
+            actor
+                .winner_snapshot(&pending.key())
+                .expect("refresh quarantined winner")
+                .expect("quarantined winner remains retained")
+                .lifecycle(),
+            JournalWinnerLifecycle::Quarantined { tip } if tip == &conflict_tip
         ));
     }
 
