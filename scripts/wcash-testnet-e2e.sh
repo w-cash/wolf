@@ -12,6 +12,7 @@ zcash_validator_rpc=http://127.0.0.1:18242
 wcash_genesis=0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a
 wcash_launch_target=0000008859000000000000000000000000000000000000000000000000000000
 wcash_payout_address=WT6kWkxJzyp4LdwrjtvvuVFRbkMhH2SsBeq
+wallet_sync_batch_size=16
 
 cleanup() {
   local status=$1
@@ -583,10 +584,10 @@ mine_wallet_generation 3
 
 "$repo_root/target/release/wcash-wallet" \
   --network regtest --db "$sender_db" --lightwalletd "$wcash_wallet_grpc" \
-  sync --batch-size 100 >"$runtime_dir/sender-sync-before.json"
+  sync --batch-size "$wallet_sync_batch_size" >"$runtime_dir/sender-sync-before.json"
 "$repo_root/target/release/wcash-wallet" \
   --network regtest --db "$recipient_db" --lightwalletd "$wcash_wallet_grpc" \
-  sync --batch-size 100 >"$runtime_dir/recipient-sync-before.json"
+  sync --batch-size "$wallet_sync_batch_size" >"$runtime_dir/recipient-sync-before.json"
 python3 - "$runtime_dir/sender-sync-before.json" \
   "$runtime_dir/recipient-sync-before.json" <<'PY'
 import json
@@ -777,10 +778,10 @@ PY
 
 "$repo_root/target/release/wcash-wallet" \
   --network regtest --db "$sender_db" --lightwalletd "$wcash_wallet_grpc" \
-  sync --batch-size 100 >"$runtime_dir/sender-sync-after.json"
+  sync --batch-size "$wallet_sync_batch_size" >"$runtime_dir/sender-sync-after.json"
 "$repo_root/target/release/wcash-wallet" \
   --network regtest --db "$recipient_db" --lightwalletd "$wcash_wallet_grpc" \
-  sync --batch-size 100 >"$runtime_dir/recipient-sync-after.json"
+  sync --batch-size "$wallet_sync_batch_size" >"$runtime_dir/recipient-sync-after.json"
 python3 - "$runtime_dir/sender-sync-after.json" \
   "$runtime_dir/recipient-sync-after.json" <<'PY'
 import json
@@ -931,7 +932,7 @@ done
 
 "$repo_root/target/release/wcash-wallet" \
   --network regtest --db "$transparent_sender_db" --lightwalletd "$wcash_wallet_grpc" \
-  sync --batch-size 100 >"$runtime_dir/transparent-sync-immature.json"
+  sync --batch-size "$wallet_sync_batch_size" >"$runtime_dir/transparent-sync-immature.json"
 python3 - "$runtime_dir/transparent-sync-immature.json" <<'PY'
 import json
 import sys
@@ -976,7 +977,7 @@ PY
 mine_transparent_generation 100
 "$repo_root/target/release/wcash-wallet" \
   --network regtest --db "$transparent_sender_db" --lightwalletd "$wcash_wallet_grpc" \
-  sync --batch-size 100 >"$runtime_dir/transparent-sync-mature.json"
+  sync --batch-size "$wallet_sync_batch_size" >"$runtime_dir/transparent-sync-mature.json"
 python3 - "$runtime_dir/transparent-sync-mature.json" <<'PY'
 import json
 import sys
@@ -1017,7 +1018,7 @@ assert result["transparent_coinbase_address"] == expected_transparent, result
 PY
 "$repo_root/target/release/wcash-wallet" \
   --network regtest --db "$transparent_late_restore_db" --lightwalletd "$wcash_wallet_grpc" \
-  sync --batch-size 100 >"$runtime_dir/transparent-late-restore-sync.json"
+  sync --batch-size "$wallet_sync_batch_size" >"$runtime_dir/transparent-late-restore-sync.json"
 python3 - "$runtime_dir/transparent-late-restore-sync.json" <<'PY'
 import json
 import sys
@@ -1156,7 +1157,7 @@ PY
 
 "$repo_root/target/release/wcash-wallet" \
   --network regtest --db "$transparent_sender_db" --lightwalletd "$wcash_wallet_grpc" \
-  sync --batch-size 100 >"$runtime_dir/transparent-sync-shielded.json"
+  sync --batch-size "$wallet_sync_batch_size" >"$runtime_dir/transparent-sync-shielded.json"
 python3 - "$runtime_dir/transparent-sync-shielded.json" "$shielding_fee" <<'PY'
 import json
 import sys
