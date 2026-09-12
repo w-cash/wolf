@@ -16,6 +16,7 @@ use std::{
 
 use fs2::FileExt;
 use orchard::keys::Scope as OrchardScope;
+use prost::Message;
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension};
 use secrecy::SecretVec;
@@ -34,6 +35,7 @@ use zcash_client_backend::{
     },
     decrypt_transaction,
     fees::{standard::SingleOutputChangeStrategy, DustOutputPolicy, StandardFeeRule},
+    proto::proposal::Proposal as ProposalProto,
     wallet::{LockOwner, Note as WalletNote, OvkPolicy},
     zip321::{Payment, TransactionRequest},
     TransferType,
@@ -283,6 +285,9 @@ pub enum WalletServiceError {
     /// Transaction proving or signing failed.
     #[error("could not prove and sign transfer: {0}")]
     Signing(String),
+    /// The staged transaction proposal could not be decoded or no longer matches its wallet.
+    #[error("staged transaction proposal is invalid: {0}")]
+    InvalidStagedProposal(String),
     /// The wallet failed to persist or return the newly signed transaction.
     #[error("signed transaction was not stored by the wallet")]
     MissingSignedTransaction,
@@ -451,6 +456,66 @@ pub struct SignedTransaction {
     /// True after comparing the deterministic internal change receiver from
     /// the stored UFVK against the receiver derived from the stdin seed.
     pub internal_change_receiver_verified: bool,
+}
+
+/// A locally selected transaction proposal that has not loaded spending authority.
+///
+/// The proposal keeps its exact wallet tip, anchor, fee, and selected inputs in
+/// memory. It can be calculated without a network client while the wallet
+/// remains at the same synchronized state.
+pub struct StagedTransactionProposal {
+    network: WalletNetwork,
+    proposal: Vec<u8>,
+    expected_chain: (BlockRef, BlockRef),
+    lock_owner: LockOwner,
+    purpose: StagedTransactionPurpose,
+    target_height: u32,
+    expiry_height: u32,
+    fee_zat: u64,
+    value_to_shield_zat: Option<u64>,
+}
+
+impl StagedTransactionProposal {
+    /// Returns the exact ZIP 317 fee selected by the proposal.
+    pub const fn fee_zat(&self) -> u64 {
+        self.fee_zat
+    }
+
+    /// Returns the transparent value selected for a coinbase shield after its fee.
+    pub const fn value_to_shield_zat(&self) -> Option<u64> {
+        self.value_to_shield_zat
+    }
+}
+
+enum StagedTransactionPurpose {
+    Transfer {
+        expected_payments: Vec<BoundIronwoodOutput>,
+    },
+    CoinbaseShielding {
+        source: zcash_transparent::address::TransparentAddress,
+        destination_receiver: orchard::Address,
+        expected_outpoints: Vec<OutPoint>,
+        input_total_zat: u64,
+        payment_total_zat: u64,
+    },
+}
+
+/// A transaction calculated from one exact staged proposal.
+pub struct CalculatedTransaction {
+    signed: SignedTransaction,
+    network: WalletNetwork,
+    expected_chain: (BlockRef, BlockRef),
+}
+
+impl CalculatedTransaction {
+    /// Returns the exact signed transaction and its public metadata.
+    pub const fn signed(&self) -> &SignedTransaction {
+        &self.signed
+    }
+
+    fn into_signed(self) -> SignedTransaction {
+        self.signed
+    }
 }
 
 /// Signed transaction bytes recovered from the local wallet database.
@@ -2225,24 +2290,17 @@ fn reject_legacy_balance_values(
     }
 }
 
-/// Creates, proves, signs, persists, and returns one Ironwood-only Wcash transaction.
-///
-/// Values below 100 confirmations are accepted only for `Regtest` when
-/// `allow_unsafe_regtest_confirmations` is true. This is a one-shot experimental
-/// transfer operation, not a durable or idempotent pool settlement API.
+/// Selects and locks one Ironwood-only transfer without loading spending authority.
 #[allow(clippy::too_many_arguments)]
-pub async fn create_signed_transfer(
-    client: &mut AttestedWcashClient,
+pub fn propose_transfer_offline(
     path: impl AsRef<Path>,
     network: WalletNetwork,
-    master_seed: &SecretVec<u8>,
     recipients: Vec<TransferRecipient>,
     confirmations: u32,
     allow_unsafe_regtest_confirmations: bool,
     expiry_delta: u32,
     lock_for_blocks: u32,
-) -> Result<SignedTransaction, WalletServiceError> {
-    ensure_client_network(client, network)?;
+) -> Result<StagedTransactionProposal, WalletServiceError> {
     let confirmation_count =
         validate_confirmation_policy(network, confirmations, allow_unsafe_regtest_confirmations)?;
     if recipients.is_empty() || recipients.len() > MAX_TRANSFER_RECIPIENTS {
@@ -2250,21 +2308,11 @@ pub async fn create_signed_transfer(
             "recipient count must be in 1..={MAX_TRANSFER_RECIPIENTS}"
         )));
     }
-    if expiry_delta == 0
-        || expiry_delta > MAX_EXPIRY_DELTA
-        || lock_for_blocks < expiry_delta
-        || lock_for_blocks > MAX_LOCK_FOR_BLOCKS
-    {
-        return Err(WalletServiceError::InvalidRequest(
-            format!(
-                "expiry must be in 1..={MAX_EXPIRY_DELTA}, and lock lifetime must cover expiry without exceeding {MAX_LOCK_FOR_BLOCKS}"
-            ),
-        ));
-    }
+    validate_transaction_lifetime(expiry_delta, lock_for_blocks)?;
 
     let path = path.as_ref();
     let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
-    let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
+    let mut wallet = open_wallet_database(path, network)?;
     require_transparent_recovery_complete(&mut wallet)?;
     ensure_no_active_pending_transactions(&mut wallet, network)?;
     ensure_no_legacy_pool_balances(&wallet)?;
@@ -2328,14 +2376,13 @@ pub async fn create_signed_transfer(
         .iter()
         .map(|(payment, _)| payment.clone())
         .collect();
-    let expected_payment_outputs = prepared_payments
+    let expected_payments = prepared_payments
         .into_iter()
         .map(|(_, output)| output)
         .collect::<Vec<_>>();
     let request = TransactionRequest::new(payments)
         .map_err(|error| WalletServiceError::InvalidRequest(error.to_string()))?;
     let expected_request = request.clone();
-
     let fee_rule = StandardFeeRule::Zip317;
     let change_strategy = SingleOutputChangeStrategy::<WalletDatabase>::new(
         fee_rule,
@@ -2362,317 +2409,71 @@ pub async fn create_signed_transfer(
         )
         .map_err(|error| WalletServiceError::Proposal(format!("{error:?}")))?;
 
-    if proposal.steps().len() != 1
-        || proposal.steps().first().transaction_request() != &expected_request
-        || proposal.steps().first().payment_pools().len() != recipients.len()
-        || proposal.input_count_in_pool(PoolType::IRONWOOD) == 0
-        || proposal.input_count_in_pool(PoolType::SAPLING) != 0
-        || proposal.input_count_in_pool(PoolType::ORCHARD) != 0
-        || proposal.input_count_in_pool(PoolType::Transparent) != 0
-        || proposal
+    let valid = proposal.steps().len() == 1
+        && proposal.steps().first().transaction_request() == &expected_request
+        && proposal.steps().first().payment_pools().len() == recipients.len()
+        && proposal.input_count_in_pool(PoolType::IRONWOOD) > 0
+        && proposal.input_count_in_pool(PoolType::SAPLING) == 0
+        && proposal.input_count_in_pool(PoolType::ORCHARD) == 0
+        && proposal.input_count_in_pool(PoolType::Transparent) == 0
+        && proposal
             .steps()
             .iter()
             .flat_map(|step| step.payment_pools().values())
-            .any(|pool| *pool != PoolType::IRONWOOD)
-        || proposal
+            .all(|pool| *pool == PoolType::IRONWOOD)
+        && proposal
             .steps()
             .iter()
             .flat_map(|step| step.balance().proposed_change())
-            .any(|change| change.output_pool() != PoolType::IRONWOOD)
-    {
+            .all(|change| change.output_pool() == PoolType::IRONWOOD);
+    if !valid {
         let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
         return Err(WalletServiceError::NonIronwoodProposal);
     }
 
-    let target_height = BlockHeight::from(proposal.min_target_height());
-    let target_height_u32: u32 = target_height.into();
-    let anchor_height = match proposal.steps().first().anchor_height() {
-        Some(height) => height,
-        None => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::NonIronwoodProposal);
-        }
-    };
-    let current_heights = match wallet.get_target_and_anchor_heights(confirmation_count) {
-        Ok(Some(heights)) => heights,
-        Ok(None) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::StaleChain);
-        }
-        Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(database_error(error));
-        }
-    };
-    if BlockHeight::from(current_heights.0) != target_height || current_heights.1 != anchor_height {
-        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-        return Err(WalletServiceError::StaleChain);
-    }
-    let expected_chain = match expected_chain_refs(&wallet, network, target_height, anchor_height) {
-        Ok(expected) => expected,
-        Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(error);
-        }
-    };
-    if let Err(error) = revalidate_exact_chain_tip(client, expected_chain).await {
-        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-        return Err(error);
-    }
-
-    let usk = match derive_wallet_spending_key(master_seed, network, 0) {
-        Ok(usk) => usk,
-        Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(error.into());
-        }
-    };
-    if let Err(error) = verify_seed_authority(&wallet, account_id, master_seed, network) {
-        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-        return Err(error);
-    }
-    if let Err(error) = verify_internal_change_receiver(&wallet, account_id, &usk) {
-        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-        return Err(error);
-    }
-    let stored_ufvk = match wallet.get_account(account_id).map_err(database_error) {
-        Ok(Some(account)) => match account.ufvk() {
-            Some(ufvk) => ufvk.clone(),
-            None => {
-                let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-                return Err(WalletServiceError::AuthorityMismatch);
-            }
-        },
-        Ok(None) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::AuthorityMismatch);
-        }
-        Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(error);
-        }
-    };
-    let internal_change_receiver = match stored_ufvk.orchard() {
-        Some(fvk) => fvk.address_at(0u32, OrchardScope::Internal),
-        None => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::AuthorityMismatch);
-        }
-    };
-    let orchard_fvk = stored_ufvk
-        .orchard()
-        .expect("the internal receiver check requires an Orchard viewing key");
-    let expected_nullifiers = match proposal.steps().first().shielded_inputs().map(|inputs| {
-        inputs
-            .notes()
-            .iter()
-            .map(|received| match received.note() {
-                WalletNote::Orchard {
-                    note,
-                    pool: orchard::ValuePool::Ironwood,
-                } => Some(note.nullifier(orchard_fvk).to_bytes()),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-    }) {
-        Some(Some(nullifiers)) if !nullifiers.is_empty() => nullifiers,
-        _ => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::NonIronwoodProposal);
-        }
-    };
-    let known_wallet_nullifiers = match wallet.get_ironwood_nullifiers(NullifierQuery::All) {
-        Ok(nullifiers) => nullifiers
-            .into_iter()
-            .filter_map(|(known_account, nullifier)| {
-                (known_account == account_id).then_some(nullifier.to_bytes())
-            })
-            .collect::<Vec<_>>(),
-        Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(database_error(error));
-        }
-    };
-    let expected_ironwood_actions = match proposal.steps().first().ironwood_action_count(
-        proposal.steps().first().ironwood_bundle_padding(),
-        orchard::bundle::BundleVersion::ironwood_v3(),
-    ) {
-        Ok(count) => count,
-        Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::Proposal(error.to_owned()));
-        }
-    };
-    let expected_change_outputs = proposal
-        .steps()
-        .first()
-        .balance()
-        .proposed_change()
-        .iter()
-        .map(|change| BoundIronwoodOutput {
-            receiver: internal_change_receiver.to_raw_address_bytes(),
-            value_zat: change.value().into_u64(),
-            memo: change.memo().cloned().unwrap_or_else(MemoBytes::empty),
-            role: TransferOutputRole::InternalChange,
-            pool: ShieldedPool::Ironwood,
-        })
-        .collect::<Vec<_>>();
-
-    let expiry_height_u32 = match target_height_u32.checked_add(expiry_delta) {
-        Some(height) if height <= u32::from(Height::MAX_EXPIRY_HEIGHT) => height,
-        None => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::HeightOverflow);
-        }
-        Some(_) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::InvalidRequest(format!(
-                "transaction expiry height must not exceed {}",
-                u32::from(Height::MAX_EXPIRY_HEIGHT)
-            )));
-        }
-    };
-    let prover = LocalTxProver::bundled();
-    let created = match create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+    stage_proposal(
         &mut wallet,
-        &parameters,
-        &prover,
-        &prover,
-        &SpendingKeys::from_unified_spending_key(usk),
-        OvkPolicy::Sender,
-        &proposal,
-        Some(BlockHeight::from_u32(expiry_height_u32)),
-    ) {
-        Ok(created) => created,
-        Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::Signing(format!("{error:?}")));
-        }
-    };
-    if created.is_empty() {
-        return Err(WalletServiceError::MissingSignedTransaction);
-    }
-    if created.len() != 1 {
-        return Err(persisted_transactions_require_review(
-            &created,
-            "the signer returned an unexpected number of transactions",
-        ));
-    }
-    let txid = created[0];
-    let transaction = match wallet.get_transaction(txid) {
-        Ok(Some(transaction)) => transaction,
-        Ok(None) => {
-            return Err(persisted_transactions_require_review(
-                &created,
-                "the signed transaction could not be read back from SQLite",
-            ));
-        }
-        Err(error) => {
-            return Err(persisted_transactions_require_review(
-                &created,
-                format!("SQLite readback failed: {error:?}"),
-            ));
-        }
-    };
-    let mut raw = Vec::new();
-    if let Err(error) = transaction.write(&mut raw) {
-        return Err(persisted_transactions_require_review(
-            &created,
-            format!("signed transaction serialization failed: {error}"),
-        ));
-    }
-    let inspected = inspect_signed_transaction(&raw, network).map_err(|error| {
-        persisted_transactions_require_review(
-            &created,
-            format!("signed transaction policy inspection failed: {error}"),
-        )
-    })?;
-    let fee_zat = proposal.steps().first().balance().fee_required().into_u64();
-    let actual_fee = inspected
-        .fee_paid(|_| Ok::<_, zcash_protocol::value::BalanceError>(None))
-        .ok()
-        .flatten()
-        .map(Zatoshis::into_u64);
-    let serialized_outputs_match = signed_transfer_outputs_match(
-        &inspected,
-        &parameters,
-        account_id,
-        &stored_ufvk,
-        target_height_u32,
-        &expected_payment_outputs,
-        &expected_change_outputs,
-        &expected_nullifiers,
-        &known_wallet_nullifiers,
-        expected_ironwood_actions,
-    );
-    if inspected.txid() != txid
-        || inspected.transparent_bundle().is_some()
-        || u32::from(inspected.expiry_height()) != expiry_height_u32
-        || actual_fee != Some(fee_zat)
-        || !serialized_outputs_match
-    {
-        return Err(persisted_transactions_require_review(
-            &created,
-            "signed transfer identifier, expiry, inputs, fee, recipients, or change differs from the checked proposal",
-        ));
-    }
-    drop(wallet);
-    if let Err(error) =
-        revalidate_canonical_ancestors(client, expected_chain, expiry_height_u32).await
-    {
-        return Err(persisted_transactions_require_review(
-            &created,
-            format!("final canonical-chain validation failed: {error}"),
-        ));
-    }
-    Ok(SignedTransaction {
-        txid: txid.to_string(),
-        raw_transaction_hex: hex::encode(raw),
-        branch_id: network.branch_id_hex(),
-        target_height: target_height_u32,
-        expiry_height: expiry_height_u32,
-        fee_zat,
-        internal_change_receiver_verified: true,
-    })
+        network,
+        proposal,
+        lock_owner,
+        expiry_delta,
+        StagedTransactionPurpose::Transfer { expected_payments },
+        None,
+    )
 }
 
-/// Shields only mature, fully classified transparent coinbase outputs into the
-/// wallet's own private Ironwood receiver.
-///
-/// This operation deliberately exposes no maturity override. The reviewed
-/// `propose_shielding_coinbase` API selects coinbase outputs exclusively and
-/// applies the 100-block consensus maturity rule. It creates one private
-/// payment for the selected input value minus the ZIP 317 fee, with no
-/// transparent or shielded change.
-#[allow(clippy::too_many_arguments)]
-pub async fn create_signed_coinbase_shielding(
-    client: &mut AttestedWcashClient,
+/// Confirms that a master seed controls the stored Wcash account.
+pub fn verify_wallet_seed(
     path: impl AsRef<Path>,
     network: WalletNetwork,
     master_seed: &SecretVec<u8>,
+) -> Result<(), WalletServiceError> {
+    let path = path.as_ref();
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
+    let wallet = open_wallet_database_with_seed(path, network, master_seed)?;
+    let account_ids = wallet.get_account_ids().map_err(database_error)?;
+    let account_id = only_account(&account_ids)?;
+    verify_seed_authority(&wallet, account_id, master_seed, network)
+}
+
+/// Selects and locks mature transparent coinbase outputs without loading spending authority.
+pub fn propose_coinbase_shielding_offline(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
     maximum_inputs: usize,
     expiry_delta: u32,
     lock_for_blocks: u32,
-) -> Result<SignedTransaction, WalletServiceError> {
-    ensure_client_network(client, network)?;
+) -> Result<StagedTransactionProposal, WalletServiceError> {
     if maximum_inputs == 0 || maximum_inputs > MAX_COINBASE_SHIELDING_INPUTS {
         return Err(WalletServiceError::InvalidRequest(format!(
             "coinbase input limit must be in 1..={MAX_COINBASE_SHIELDING_INPUTS}"
         )));
     }
-    if expiry_delta == 0
-        || expiry_delta > MAX_EXPIRY_DELTA
-        || lock_for_blocks < expiry_delta
-        || lock_for_blocks > MAX_LOCK_FOR_BLOCKS
-    {
-        return Err(WalletServiceError::InvalidRequest(format!(
-            "expiry must be in 1..={MAX_EXPIRY_DELTA}, and lock lifetime must cover expiry without exceeding {MAX_LOCK_FOR_BLOCKS}"
-        )));
-    }
+    validate_transaction_lifetime(expiry_delta, lock_for_blocks)?;
 
     let path = path.as_ref();
     let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
-    let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
+    let mut wallet = open_wallet_database(path, network)?;
     require_transparent_recovery_complete(&mut wallet)?;
     ensure_no_active_pending_transactions(&mut wallet, network)?;
     ensure_no_legacy_pool_balances(&wallet)?;
@@ -2709,14 +2510,6 @@ pub async fn create_signed_coinbase_shielding(
         .orchard()
         .ok_or(WalletServiceError::AuthorityMismatch)?;
     let destination = private_destination.to_zcash_address(network.address_network());
-
-    let usk = derive_wallet_spending_key(master_seed, network, 0)?;
-    verify_seed_authority(&wallet, account_id, master_seed, network)?;
-    verify_internal_change_receiver(&wallet, account_id, &usk)?;
-    if default_transparent_receiver(&usk.to_unified_full_viewing_key())? != source {
-        return Err(WalletServiceError::AuthorityMismatch);
-    }
-
     let selector = GreedyInputSelector::new();
     let fee_rule = StandardFeeRule::Zip317;
     let lock_owner = LockOwner::new(random_lock_owner());
@@ -2742,37 +2535,31 @@ pub async fn create_signed_coinbase_shielding(
     .map_err(|error| WalletServiceError::Proposal(format!("{error:?}")))?
     .with_proposed_version(Some(TxVersion::V6));
 
-    let target_height = BlockHeight::from(proposal.min_target_height());
-    let target_height_u32: u32 = target_height.into();
+    let target_height = u32::from(BlockHeight::from(proposal.min_target_height()));
     let step = proposal.steps().first();
     let payment = step.transaction_request().payments().values().next();
-    let input_total = step
+    let input_total_zat = step
         .transparent_inputs()
         .iter()
         .try_fold(0u64, |total, input| {
             total.checked_add(input.value().into_u64())
-        });
-    let payment_total = payment
-        .and_then(|payment| payment.amount())
-        .map(Zatoshis::into_u64);
-    let fee_zat = step.balance().fee_required().into_u64();
-    let values_balance = input_total
-        .and_then(|total| {
-            payment_total
-                .and_then(|payment| payment.checked_add(fee_zat).map(|spent| (total, spent)))
         })
-        .is_some_and(|(total, spent)| total == spent);
+        .ok_or(WalletServiceError::HeightOverflow)?;
+    let payment_total_zat = payment
+        .and_then(|payment| payment.amount())
+        .map(Zatoshis::into_u64)
+        .ok_or(WalletServiceError::InvalidCoinbaseShieldingProposal)?;
+    let fee_zat = step.balance().fee_required().into_u64();
     let inputs_are_mature = step.transparent_inputs().iter().all(|input| {
         input
             .mined_height()
-            .is_some_and(|height| coinbase_is_mature(u32::from(height), target_height_u32))
+            .is_some_and(|height| coinbase_is_mature(u32::from(height), target_height))
     });
-    let valid_proposal = proposal.steps().len() == 1
+    let values_balance = payment_total_zat
+        .checked_add(fee_zat)
+        .is_some_and(|spent| spent == input_total_zat);
+    let valid = proposal.steps().len() == 1
         && proposal.proposed_version() == Some(TxVersion::V6)
-        // This reviewed API intentionally uses the explicit-payment proposal
-        // shape (`is_shielding == false`), rather than legacy all-in-change
-        // shielding. The transparent-only input and Ironwood-only payment
-        // invariants below define the operation.
         && !step.is_shielding()
         && !step.transparent_inputs().is_empty()
         && step.transparent_inputs().len() <= maximum_inputs
@@ -2795,88 +2582,344 @@ pub async fn create_signed_coinbase_shielding(
         && step.balance().proposed_change().is_empty()
         && step.prior_step_inputs().is_empty()
         && values_balance;
-    if !valid_proposal {
+    if !valid {
         let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
         return Err(WalletServiceError::InvalidCoinbaseShieldingProposal);
     }
-
-    let known_wallet_nullifiers = match wallet.get_ironwood_nullifiers(NullifierQuery::All) {
-        Ok(nullifiers) => nullifiers
-            .into_iter()
-            .filter_map(|(known_account, nullifier)| {
-                (known_account == account_id).then_some(nullifier.to_bytes())
-            })
-            .collect::<Vec<_>>(),
-        Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(database_error(error));
-        }
-    };
-    let expected_ironwood_actions = match step.ironwood_action_count(
-        step.ironwood_bundle_padding(),
-        orchard::bundle::BundleVersion::ironwood_v3(),
-    ) {
-        Ok(count) => count,
-        Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::Proposal(error.to_owned()));
-        }
-    };
 
     let expected_outpoints = step
         .transparent_inputs()
         .iter()
         .map(|input| input.outpoint().clone())
-        .collect::<Vec<_>>();
-    let anchor_height = match step.anchor_height() {
-        Some(height) => height,
-        None => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::InvalidCoinbaseShieldingProposal);
-        }
-    };
-    let current_heights =
-        match wallet.get_target_and_anchor_heights(proposal.confirmations_policy().trusted()) {
-            Ok(Some(heights)) => heights,
-            Ok(None) => {
-                let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-                return Err(WalletServiceError::StaleChain);
-            }
-            Err(error) => {
-                let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-                return Err(database_error(error));
-            }
-        };
+        .collect();
+    stage_proposal(
+        &mut wallet,
+        network,
+        proposal,
+        lock_owner,
+        expiry_delta,
+        StagedTransactionPurpose::CoinbaseShielding {
+            source,
+            destination_receiver,
+            expected_outpoints,
+            input_total_zat,
+            payment_total_zat,
+        },
+        Some(payment_total_zat),
+    )
+}
+
+fn validate_transaction_lifetime(
+    expiry_delta: u32,
+    lock_for_blocks: u32,
+) -> Result<(), WalletServiceError> {
+    if expiry_delta == 0
+        || expiry_delta > MAX_EXPIRY_DELTA
+        || lock_for_blocks < expiry_delta
+        || lock_for_blocks > MAX_LOCK_FOR_BLOCKS
+    {
+        Err(WalletServiceError::InvalidRequest(format!(
+            "expiry must be in 1..={MAX_EXPIRY_DELTA}, and lock lifetime must cover expiry without exceeding {MAX_LOCK_FOR_BLOCKS}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn stage_proposal<NoteRef>(
+    wallet: &mut WalletDatabase,
+    network: WalletNetwork,
+    proposal: zcash_client_backend::proposal::Proposal<StandardFeeRule, NoteRef>,
+    lock_owner: LockOwner,
+    expiry_delta: u32,
+    purpose: StagedTransactionPurpose,
+    value_to_shield_zat: Option<u64>,
+) -> Result<StagedTransactionProposal, WalletServiceError> {
+    let target_height = BlockHeight::from(proposal.min_target_height());
+    let target_height_u32 = u32::from(target_height);
+    let anchor_height = proposal.steps().first().anchor_height().ok_or(
+        WalletServiceError::InvalidStagedProposal("the proposal has no anchor height".to_owned()),
+    )?;
+    let current_heights = wallet
+        .get_target_and_anchor_heights(proposal.confirmations_policy().trusted())
+        .map_err(database_error)?
+        .ok_or(WalletServiceError::StaleChain)?;
     if BlockHeight::from(current_heights.0) != target_height || current_heights.1 != anchor_height {
-        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+        let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
         return Err(WalletServiceError::StaleChain);
     }
-    let expected_chain = match expected_chain_refs(&wallet, network, target_height, anchor_height) {
-        Ok(expected) => expected,
-        Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(error);
-        }
-    };
-    if let Err(error) = revalidate_exact_chain_tip(client, expected_chain).await {
-        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-        return Err(error);
+    let expected_chain = expected_chain_refs(wallet, network, target_height, anchor_height)?;
+    let expiry_height = target_height_u32
+        .checked_add(expiry_delta)
+        .ok_or(WalletServiceError::HeightOverflow)?;
+    if expiry_height > u32::from(Height::MAX_EXPIRY_HEIGHT) {
+        let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
+        return Err(WalletServiceError::InvalidRequest(format!(
+            "transaction expiry height must not exceed {}",
+            u32::from(Height::MAX_EXPIRY_HEIGHT)
+        )));
+    }
+    let fee_zat = proposal.steps().first().balance().fee_required().into_u64();
+    let proposal = ProposalProto::from_standard_proposal(&proposal).encode_to_vec();
+    Ok(StagedTransactionProposal {
+        network,
+        proposal,
+        expected_chain,
+        lock_owner,
+        purpose,
+        target_height: target_height_u32,
+        expiry_height,
+        fee_zat,
+        value_to_shield_zat,
+    })
+}
+
+/// Releases the exact input locks held by an abandoned staged proposal.
+pub fn cancel_staged_transaction(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    staged: StagedTransactionProposal,
+) -> Result<(), WalletServiceError> {
+    if staged.network != network {
+        return Err(WalletServiceError::InvalidStagedProposal(
+            "the proposal belongs to another Wcash network".to_owned(),
+        ));
+    }
+    let path = path.as_ref();
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
+    let mut wallet = open_wallet_database(path, network)?;
+    let parameters = network.parameters();
+    let proposal_proto = ProposalProto::decode(staged.proposal.as_slice())
+        .map_err(|error| WalletServiceError::InvalidStagedProposal(error.to_string()))?;
+    let proposal = proposal_proto
+        .try_into_standard_proposal(&parameters, &wallet)
+        .map_err(|error| WalletServiceError::InvalidStagedProposal(error.to_string()))?;
+    if ProposalProto::from_standard_proposal(&proposal).encode_to_vec() != staged.proposal {
+        return Err(WalletServiceError::InvalidStagedProposal(
+            "the proposal encoding is not canonical".to_owned(),
+        ));
+    }
+    unlock_proposal_inputs(&mut wallet, &proposal, staged.lock_owner).map_err(database_error)
+}
+
+/// Proves and signs one exact staged proposal without a network client.
+pub fn calculate_staged_transaction(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    master_seed: &SecretVec<u8>,
+    staged: &StagedTransactionProposal,
+) -> Result<CalculatedTransaction, WalletServiceError> {
+    if staged.network != network {
+        return Err(WalletServiceError::InvalidStagedProposal(
+            "the proposal belongs to another Wcash network".to_owned(),
+        ));
+    }
+    let path = path.as_ref();
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
+    let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
+    require_transparent_recovery_complete(&mut wallet)?;
+    ensure_no_active_pending_transactions(&mut wallet, network)?;
+    ensure_no_legacy_pool_balances(&wallet)?;
+    let parameters = network.parameters();
+    let proposal_proto = ProposalProto::decode(staged.proposal.as_slice())
+        .map_err(|error| WalletServiceError::InvalidStagedProposal(error.to_string()))?;
+    let proposal = proposal_proto
+        .try_into_standard_proposal(&parameters, &wallet)
+        .map_err(|error| WalletServiceError::InvalidStagedProposal(error.to_string()))?;
+    if ProposalProto::from_standard_proposal(&proposal).encode_to_vec() != staged.proposal {
+        return Err(WalletServiceError::InvalidStagedProposal(
+            "the proposal encoding is not canonical".to_owned(),
+        ));
+    }
+    let target_height = BlockHeight::from(proposal.min_target_height());
+    let target_height_u32 = u32::from(target_height);
+    let anchor_height = proposal.steps().first().anchor_height().ok_or(
+        WalletServiceError::InvalidStagedProposal("the proposal has no anchor height".to_owned()),
+    )?;
+    let current_heights = wallet
+        .get_target_and_anchor_heights(proposal.confirmations_policy().trusted())
+        .map_err(database_error)?
+        .ok_or(WalletServiceError::StaleChain)?;
+    let current_chain = expected_chain_refs(&wallet, network, target_height, anchor_height)?;
+    if target_height_u32 != staged.target_height
+        || staged.expiry_height <= staged.target_height
+        || staged.expiry_height > u32::from(Height::MAX_EXPIRY_HEIGHT)
+        || proposal.steps().first().balance().fee_required().into_u64() != staged.fee_zat
+        || BlockHeight::from(current_heights.0) != target_height
+        || current_heights.1 != anchor_height
+        || current_chain != staged.expected_chain
+    {
+        return Err(WalletServiceError::StaleChain);
     }
 
-    let expiry_height_u32 = match target_height_u32.checked_add(expiry_delta) {
-        Some(height) if height <= u32::from(Height::MAX_EXPIRY_HEIGHT) => height,
-        None => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::HeightOverflow);
+    let account_ids = wallet.get_account_ids().map_err(database_error)?;
+    let account_id = only_account(&account_ids)?;
+    let usk = derive_wallet_spending_key(master_seed, network, 0)?;
+    verify_seed_authority(&wallet, account_id, master_seed, network)?;
+    verify_internal_change_receiver(&wallet, account_id, &usk)?;
+    let stored_ufvk = wallet
+        .get_account(account_id)
+        .map_err(database_error)?
+        .and_then(|account| account.ufvk().cloned())
+        .ok_or(WalletServiceError::AuthorityMismatch)?;
+    let known_wallet_nullifiers = wallet
+        .get_ironwood_nullifiers(NullifierQuery::All)
+        .map_err(database_error)?
+        .into_iter()
+        .filter_map(|(known_account, nullifier)| {
+            (known_account == account_id).then_some(nullifier.to_bytes())
+        })
+        .collect::<Vec<_>>();
+
+    enum CalculatedPolicy<'a> {
+        Transfer {
+            expected_payments: &'a [BoundIronwoodOutput],
+            expected_change: Vec<BoundIronwoodOutput>,
+            expected_nullifiers: Vec<[u8; 32]>,
+            expected_action_count: usize,
+        },
+        CoinbaseShielding {
+            destination_receiver: &'a orchard::Address,
+            expected_outpoints: &'a [OutPoint],
+            input_total_zat: u64,
+            payment_total_zat: u64,
+            expected_action_count: usize,
+        },
+    }
+
+    let policy = match &staged.purpose {
+        StagedTransactionPurpose::Transfer { expected_payments } => {
+            let step = proposal.steps().first();
+            let orchard_fvk = stored_ufvk
+                .orchard()
+                .ok_or(WalletServiceError::AuthorityMismatch)?;
+            let expected_nullifiers = step
+                .shielded_inputs()
+                .and_then(|inputs| {
+                    inputs
+                        .notes()
+                        .iter()
+                        .map(|received| match received.note() {
+                            WalletNote::Orchard {
+                                note,
+                                pool: orchard::ValuePool::Ironwood,
+                            } => Some(note.nullifier(orchard_fvk).to_bytes()),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+                .filter(|nullifiers| !nullifiers.is_empty())
+                .ok_or(WalletServiceError::NonIronwoodProposal)?;
+            let expected_action_count = step
+                .ironwood_action_count(
+                    step.ironwood_bundle_padding(),
+                    orchard::bundle::BundleVersion::ironwood_v3(),
+                )
+                .map_err(|error| WalletServiceError::Proposal(error.to_owned()))?;
+            let internal_change_receiver = orchard_fvk.address_at(0u32, OrchardScope::Internal);
+            let expected_change = step
+                .balance()
+                .proposed_change()
+                .iter()
+                .map(|change| BoundIronwoodOutput {
+                    receiver: internal_change_receiver.to_raw_address_bytes(),
+                    value_zat: change.value().into_u64(),
+                    memo: change.memo().cloned().unwrap_or_else(MemoBytes::empty),
+                    role: TransferOutputRole::InternalChange,
+                    pool: ShieldedPool::Ironwood,
+                })
+                .collect();
+            let valid = proposal.steps().len() == 1
+                && step.payment_pools().len() == expected_payments.len()
+                && proposal.input_count_in_pool(PoolType::IRONWOOD) > 0
+                && proposal.input_count_in_pool(PoolType::SAPLING) == 0
+                && proposal.input_count_in_pool(PoolType::ORCHARD) == 0
+                && proposal.input_count_in_pool(PoolType::Transparent) == 0
+                && step
+                    .payment_pools()
+                    .values()
+                    .all(|pool| *pool == PoolType::IRONWOOD)
+                && step
+                    .balance()
+                    .proposed_change()
+                    .iter()
+                    .all(|change| change.output_pool() == PoolType::IRONWOOD);
+            if !valid {
+                return Err(WalletServiceError::NonIronwoodProposal);
+            }
+            CalculatedPolicy::Transfer {
+                expected_payments,
+                expected_change,
+                expected_nullifiers,
+                expected_action_count,
+            }
         }
-        Some(_) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::InvalidRequest(format!(
-                "transaction expiry height must not exceed {}",
-                u32::from(Height::MAX_EXPIRY_HEIGHT)
-            )));
+        StagedTransactionPurpose::CoinbaseShielding {
+            source,
+            destination_receiver,
+            expected_outpoints,
+            input_total_zat,
+            payment_total_zat,
+        } => {
+            if default_transparent_receiver(&usk.to_unified_full_viewing_key())? != *source {
+                return Err(WalletServiceError::AuthorityMismatch);
+            }
+            let step = proposal.steps().first();
+            let expected_action_count = step
+                .ironwood_action_count(
+                    step.ironwood_bundle_padding(),
+                    orchard::bundle::BundleVersion::ironwood_v3(),
+                )
+                .map_err(|error| WalletServiceError::Proposal(error.to_owned()))?;
+            let actual_outpoints = step
+                .transparent_inputs()
+                .iter()
+                .map(|input| input.outpoint().clone())
+                .collect::<Vec<_>>();
+            let inputs_are_mature = step.transparent_inputs().iter().all(|input| {
+                input
+                    .mined_height()
+                    .is_some_and(|height| coinbase_is_mature(u32::from(height), target_height_u32))
+            });
+            let valid = proposal.steps().len() == 1
+                && proposal.proposed_version() == Some(TxVersion::V6)
+                && !step.is_shielding()
+                && !step.transparent_inputs().is_empty()
+                && step
+                    .transparent_inputs()
+                    .iter()
+                    .all(|input| input.recipient_address() == source)
+                && inputs_are_mature
+                && unique_outpoint_sets_match(expected_outpoints, &actual_outpoints)
+                && proposal.input_count_in_pool(PoolType::Transparent)
+                    == step.transparent_inputs().len()
+                && proposal.input_count_in_pool(PoolType::SAPLING) == 0
+                && proposal.input_count_in_pool(PoolType::ORCHARD) == 0
+                && proposal.input_count_in_pool(PoolType::IRONWOOD) == 0
+                && step.transaction_request().payments().len() == 1
+                && step.payment_pools().len() == 1
+                && step
+                    .payment_pools()
+                    .values()
+                    .all(|pool| *pool == PoolType::IRONWOOD)
+                && step.balance().proposed_change().is_empty()
+                && step.prior_step_inputs().is_empty()
+                && payment_total_zat
+                    .checked_add(staged.fee_zat)
+                    .is_some_and(|spent| spent == *input_total_zat);
+            if !valid {
+                return Err(WalletServiceError::InvalidCoinbaseShieldingProposal);
+            }
+            CalculatedPolicy::CoinbaseShielding {
+                destination_receiver,
+                expected_outpoints,
+                input_total_zat: *input_total_zat,
+                payment_total_zat: *payment_total_zat,
+                expected_action_count,
+            }
         }
     };
+
     let prover = LocalTxProver::bundled();
     let created = match create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
         &mut wallet,
@@ -2886,11 +2929,11 @@ pub async fn create_signed_coinbase_shielding(
         &SpendingKeys::from_unified_spending_key(usk),
         OvkPolicy::Sender,
         &proposal,
-        Some(BlockHeight::from_u32(expiry_height_u32)),
+        Some(BlockHeight::from_u32(staged.expiry_height)),
     ) {
         Ok(created) => created,
         Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(&mut wallet, &proposal, staged.lock_owner);
             return Err(WalletServiceError::Signing(format!("{error:?}")));
         }
     };
@@ -2932,57 +2975,213 @@ pub async fn create_signed_coinbase_shielding(
             format!("signed transaction policy inspection failed: {error}"),
         )
     })?;
-    let exact_inputs = inspected.transparent_bundle().is_some_and(|bundle| {
-        let actual_outpoints = bundle
-            .vin
-            .iter()
-            .map(|input| input.prevout().clone())
-            .collect::<Vec<_>>();
-        bundle.vout.is_empty() && unique_outpoint_sets_match(&expected_outpoints, &actual_outpoints)
-    });
-    let serialized_policy_matches =
-        input_total
-            .zip(payment_total)
-            .is_some_and(|(input_total, payment_total)| {
-                signed_coinbase_shielding_matches(
+    let serialized_policy_matches = match policy {
+        CalculatedPolicy::Transfer {
+            expected_payments,
+            expected_change,
+            expected_nullifiers,
+            expected_action_count,
+        } => {
+            let actual_fee = inspected
+                .fee_paid(|_| Ok::<_, zcash_protocol::value::BalanceError>(None))
+                .ok()
+                .flatten()
+                .map(Zatoshis::into_u64);
+            inspected.transparent_bundle().is_none()
+                && actual_fee == Some(staged.fee_zat)
+                && signed_transfer_outputs_match(
+                    &inspected,
+                    &parameters,
+                    account_id,
+                    &stored_ufvk,
+                    target_height_u32,
+                    expected_payments,
+                    &expected_change,
+                    &expected_nullifiers,
+                    &known_wallet_nullifiers,
+                    expected_action_count,
+                )
+        }
+        CalculatedPolicy::CoinbaseShielding {
+            destination_receiver,
+            expected_outpoints,
+            input_total_zat,
+            payment_total_zat,
+            expected_action_count,
+        } => {
+            let exact_inputs = inspected.transparent_bundle().is_some_and(|bundle| {
+                let actual_outpoints = bundle
+                    .vin
+                    .iter()
+                    .map(|input| input.prevout().clone())
+                    .collect::<Vec<_>>();
+                bundle.vout.is_empty()
+                    && unique_outpoint_sets_match(expected_outpoints, &actual_outpoints)
+            });
+            exact_inputs
+                && signed_coinbase_shielding_matches(
                     &inspected,
                     &parameters,
                     account_id,
                     &stored_ufvk,
                     destination_receiver,
                     target_height_u32,
-                    expiry_height_u32,
-                    input_total,
-                    payment_total,
-                    fee_zat,
+                    staged.expiry_height,
+                    input_total_zat,
+                    payment_total_zat,
+                    staged.fee_zat,
                     &known_wallet_nullifiers,
-                    expected_ironwood_actions,
+                    expected_action_count,
                 )
-            });
-    if inspected.txid() != txid || !exact_inputs || !serialized_policy_matches {
-        return Err(persisted_transactions_require_review(
-            &created,
-            "signed transaction inputs, expiry, value, or private destination differ from the checked proposal",
-        ));
-    }
-    drop(wallet);
-    if let Err(error) =
-        revalidate_canonical_ancestors(client, expected_chain, expiry_height_u32).await
+        }
+    };
+    if inspected.txid() != txid
+        || u32::from(inspected.expiry_height()) != staged.expiry_height
+        || !serialized_policy_matches
     {
         return Err(persisted_transactions_require_review(
             &created,
+            "signed transaction differs from the exact staged proposal",
+        ));
+    }
+
+    Ok(CalculatedTransaction {
+        signed: SignedTransaction {
+            txid: txid.to_string(),
+            raw_transaction_hex: hex::encode(raw),
+            branch_id: network.branch_id_hex(),
+            target_height: staged.target_height,
+            expiry_height: staged.expiry_height,
+            fee_zat: staged.fee_zat,
+            internal_change_receiver_verified: true,
+        },
+        network,
+        expected_chain: staged.expected_chain,
+    })
+}
+
+/// Revalidates one calculated proposal's exact chain ancestors and broadcasts its bytes.
+pub async fn broadcast_calculated_transaction(
+    client: &mut AttestedWcashClient,
+    calculated: &CalculatedTransaction,
+) -> Result<crate::BroadcastResult, WalletServiceError> {
+    ensure_client_network(client, calculated.network)?;
+    revalidate_canonical_ancestors(
+        client,
+        calculated.expected_chain,
+        calculated.signed.expiry_height,
+    )
+    .await?;
+    let raw = hex::decode(&calculated.signed.raw_transaction_hex)
+        .map_err(|error| WalletServiceError::Signing(error.to_string()))?;
+    let inspected = inspect_signed_transaction(&raw, calculated.network)?;
+    if inspected.txid().to_string() != calculated.signed.txid
+        || u32::from(inspected.expiry_height()) != calculated.signed.expiry_height
+        || calculated.signed.branch_id != calculated.network.branch_id_hex()
+    {
+        return Err(WalletServiceError::InvalidStagedProposal(
+            "the calculated transaction metadata differs from its bytes".to_owned(),
+        ));
+    }
+    client
+        .broadcast_raw_transaction(raw)
+        .await
+        .map_err(WalletServiceError::from)
+}
+
+/// Creates, proves, signs, persists, and returns one Ironwood-only Wcash transaction.
+///
+/// Values below 100 confirmations are accepted only for `Regtest` when
+/// `allow_unsafe_regtest_confirmations` is true. This is a one-shot experimental
+/// transfer operation, not a durable or idempotent pool settlement API.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_signed_transfer(
+    client: &mut AttestedWcashClient,
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    master_seed: &SecretVec<u8>,
+    recipients: Vec<TransferRecipient>,
+    confirmations: u32,
+    allow_unsafe_regtest_confirmations: bool,
+    expiry_delta: u32,
+    lock_for_blocks: u32,
+) -> Result<SignedTransaction, WalletServiceError> {
+    ensure_client_network(client, network)?;
+    let path = path.as_ref();
+    let staged = propose_transfer_offline(
+        path,
+        network,
+        recipients,
+        confirmations,
+        allow_unsafe_regtest_confirmations,
+        expiry_delta,
+        lock_for_blocks,
+    )?;
+    revalidate_exact_chain_tip(client, staged.expected_chain).await?;
+    let calculated = calculate_staged_transaction(path, network, master_seed, &staged)?;
+    if let Err(error) = revalidate_canonical_ancestors(
+        client,
+        calculated.expected_chain,
+        calculated.signed.expiry_height,
+    )
+    .await
+    {
+        let raw = hex::decode(&calculated.signed.raw_transaction_hex)
+            .map_err(|error| WalletServiceError::Signing(error.to_string()))?;
+        let txid = inspect_signed_transaction(&raw, network)?.txid();
+        return Err(persisted_transactions_require_review(
+            [&txid],
             format!("final canonical-chain validation failed: {error}"),
         ));
     }
-    Ok(SignedTransaction {
-        txid: txid.to_string(),
-        raw_transaction_hex: hex::encode(raw),
-        branch_id: network.branch_id_hex(),
-        target_height: target_height_u32,
-        expiry_height: expiry_height_u32,
-        fee_zat,
-        internal_change_receiver_verified: true,
-    })
+    Ok(calculated.into_signed())
+}
+
+/// Shields only mature, fully classified transparent coinbase outputs into the
+/// wallet's own private Ironwood receiver.
+///
+/// This operation deliberately exposes no maturity override. The reviewed
+/// `propose_shielding_coinbase` API selects coinbase outputs exclusively and
+/// applies the 100-block consensus maturity rule. It creates one private
+/// payment for the selected input value minus the ZIP 317 fee, with no
+/// transparent or shielded change.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_signed_coinbase_shielding(
+    client: &mut AttestedWcashClient,
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    master_seed: &SecretVec<u8>,
+    maximum_inputs: usize,
+    expiry_delta: u32,
+    lock_for_blocks: u32,
+) -> Result<SignedTransaction, WalletServiceError> {
+    ensure_client_network(client, network)?;
+    let path = path.as_ref();
+    let staged = propose_coinbase_shielding_offline(
+        path,
+        network,
+        maximum_inputs,
+        expiry_delta,
+        lock_for_blocks,
+    )?;
+    revalidate_exact_chain_tip(client, staged.expected_chain).await?;
+    let calculated = calculate_staged_transaction(path, network, master_seed, &staged)?;
+    if let Err(error) = revalidate_canonical_ancestors(
+        client,
+        calculated.expected_chain,
+        calculated.signed.expiry_height,
+    )
+    .await
+    {
+        let raw = hex::decode(&calculated.signed.raw_transaction_hex)
+            .map_err(|error| WalletServiceError::Signing(error.to_string()))?;
+        let txid = inspect_signed_transaction(&raw, network)?.txid();
+        return Err(persisted_transactions_require_review(
+            [&txid],
+            format!("final canonical-chain validation failed: {error}"),
+        ));
+    }
+    Ok(calculated.into_signed())
 }
 
 fn random_lock_owner() -> [u8; 32] {
@@ -3127,7 +3326,7 @@ fn signed_coinbase_shielding_matches(
     parameters: &Network,
     account_id: AccountUuid,
     stored_ufvk: &zcash_keys::keys::UnifiedFullViewingKey,
-    destination_receiver: orchard::Address,
+    destination_receiver: &orchard::Address,
     target_height: u32,
     expiry_height: u32,
     input_total_zat: u64,
@@ -3187,7 +3386,7 @@ fn signed_coinbase_shielding_matches(
                 if output.account() == &account_id
                     && output.value_pool() == ShieldedPool::Ironwood
                     && output.note().1 == orchard::ValuePool::Ironwood
-                    && output.note().0.recipient() == destination_receiver
+                    && output.note().0.recipient() == *destination_receiver
                     && output.note().0.value().inner() == payment_total_zat
                     && output.transfer_type() == TransferType::Incoming
         )
@@ -4368,6 +4567,88 @@ mod tests {
         assert!(error.to_string().contains(&"11".repeat(32)));
         assert!(error.to_string().contains(&"22".repeat(32)));
         assert!(error.to_string().contains("list-pending"));
+    }
+
+    #[test]
+    fn staged_proposal_rejects_another_network_before_wallet_access() {
+        const FEE_ZAT: u64 = 10_000;
+        const SHIELD_VALUE_ZAT: u64 = 40_000;
+        const TARGET_HEIGHT: u32 = 200;
+        const EXPIRY_HEIGHT: u32 = 240;
+        const LOCK_OWNER_BYTE: u8 = 0x51;
+
+        let staged = StagedTransactionProposal {
+            network: WalletNetwork::Regtest,
+            proposal: Vec::new(),
+            expected_chain: (
+                block_ref(TARGET_HEIGHT - 1, 0x52),
+                block_ref(TARGET_HEIGHT - 2, 0x53),
+            ),
+            lock_owner: LockOwner::new([LOCK_OWNER_BYTE; 32]),
+            purpose: StagedTransactionPurpose::Transfer {
+                expected_payments: Vec::new(),
+            },
+            target_height: TARGET_HEIGHT,
+            expiry_height: EXPIRY_HEIGHT,
+            fee_zat: FEE_ZAT,
+            value_to_shield_zat: Some(SHIELD_VALUE_ZAT),
+        };
+        assert_eq!(staged.fee_zat(), FEE_ZAT);
+        assert_eq!(staged.value_to_shield_zat(), Some(SHIELD_VALUE_ZAT));
+
+        let directory = tempfile::tempdir().unwrap();
+        let seed = SecretVec::new(vec![0x54; 32]);
+        assert!(matches!(
+            calculate_staged_transaction(
+                directory.path().join("missing.sqlite"),
+                WalletNetwork::Testnet,
+                &seed,
+                &staged,
+            ),
+            Err(WalletServiceError::InvalidStagedProposal(_))
+        ));
+        assert_eq!(staged.fee_zat(), FEE_ZAT);
+        assert_eq!(staged.value_to_shield_zat(), Some(SHIELD_VALUE_ZAT));
+        assert!(matches!(
+            cancel_staged_transaction(
+                directory.path().join("missing.sqlite"),
+                WalletNetwork::Testnet,
+                staged,
+            ),
+            Err(WalletServiceError::InvalidStagedProposal(_))
+        ));
+        assert!(directory.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn calculated_broadcast_checks_network_before_chain_or_transport() {
+        const TARGET_HEIGHT: u32 = 300;
+        const EXPIRY_HEIGHT: u32 = 340;
+        const FEE_ZAT: u64 = 10_000;
+
+        let calculated = CalculatedTransaction {
+            signed: SignedTransaction {
+                txid: "00".repeat(32),
+                raw_transaction_hex: String::new(),
+                branch_id: WalletNetwork::Testnet.branch_id_hex(),
+                target_height: TARGET_HEIGHT,
+                expiry_height: EXPIRY_HEIGHT,
+                fee_zat: FEE_ZAT,
+                internal_change_receiver_verified: true,
+            },
+            network: WalletNetwork::Testnet,
+            expected_chain: (
+                block_ref(TARGET_HEIGHT - 1, 0x55),
+                block_ref(TARGET_HEIGHT - 2, 0x56),
+            ),
+        };
+        assert_eq!(calculated.signed().fee_zat, FEE_ZAT);
+        let mut client = AttestedWcashClient::disconnected_for_test(WalletNetwork::Regtest);
+
+        assert!(matches!(
+            broadcast_calculated_transaction(&mut client, &calculated).await,
+            Err(WalletServiceError::ClientNetworkMismatch)
+        ));
     }
 
     fn fake_pending_raw(txid: [u8; 32], expiry_height: u32) -> Vec<u8> {
