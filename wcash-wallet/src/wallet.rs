@@ -78,6 +78,8 @@ pub const MAX_LOCK_FOR_BLOCKS: u32 = 1_000;
 pub const MAX_COINBASE_SHIELDING_INPUTS: usize = 100;
 /// Maximum locally-created transactions returned by one recovery page.
 pub const MAX_PENDING_TRANSACTION_PAGE_SIZE: usize = 25;
+/// Maximum confirmed transactions returned by one history read.
+pub const MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE: usize = 50;
 /// Consensus maturity required before a transparent coinbase output can be
 /// shielded.
 pub const COINBASE_SHIELDING_MATURITY: u32 = COINBASE_MATURITY_BLOCKS;
@@ -364,6 +366,62 @@ pub struct AccountBalanceSummary {
     pub transparent_regular_total_zat: u64,
 }
 
+/// Direction of one confirmed transaction relative to the Wcash account.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmedTransactionDirection {
+    /// Value entered the account.
+    Incoming,
+    /// Value left the account.
+    Outgoing,
+    /// Value moved between pools controlled by the account.
+    Internal,
+}
+
+/// Wallet-visible purpose of one confirmed transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmedTransactionKind {
+    /// A regular value transfer.
+    Transfer,
+    /// A transparent coinbase receipt.
+    Coinbase,
+    /// Transparent coinbase value shielded into Ironwood.
+    Shielding,
+    /// A ZIP 318 pool migration involving Ironwood.
+    Migration,
+}
+
+/// Public metadata for one confirmed transaction.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConfirmedTransaction {
+    /// Canonical display-order transaction identifier.
+    pub txid: String,
+    /// Height of the block that mined the transaction.
+    pub mined_height: u32,
+    /// Direction relative to the wallet account.
+    pub direction: ConfirmedTransactionDirection,
+    /// Wallet-visible transaction purpose.
+    pub kind: ConfirmedTransactionKind,
+    /// Signed change to the account balance in zatoshis.
+    pub amount_delta_zat: i64,
+    /// Transaction fee in zatoshis when known by the wallet.
+    pub fee_zat: Option<u64>,
+    /// Block timestamp in Unix seconds when known by the wallet.
+    pub timestamp: Option<u32>,
+    /// Confirmations at the exact synchronized tip.
+    pub confirmations: u32,
+}
+
+/// A bounded newest-first transaction history at one exact synchronized tip.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConfirmedTransactionHistory {
+    /// Exact synchronized tip used to calculate confirmations.
+    pub exact_tip: BlockRef,
+    /// Confirmed transactions ordered newest first.
+    pub transactions: Vec<ConfirmedTransaction>,
+}
+
 /// One external shielded recipient supplied to transaction construction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferRecipient {
@@ -430,6 +488,19 @@ struct StoredTransparentCreator {
     tx_index: Option<i64>,
 }
 
+struct ConfirmedTransactionRow {
+    txid: Vec<u8>,
+    mined_height: i64,
+    tx_index: Option<i64>,
+    amount_delta_zat: i64,
+    fee_zat: Option<i64>,
+    timestamp: Option<i64>,
+    total_spent_zat: i64,
+    shielding: bool,
+    pool_crossing_zat: Option<i64>,
+    zip318_kind: i64,
+}
+
 struct TransparentRecoveryContext<'a> {
     parameters: &'a zebra_chain::parameters::Network,
     coinbase_address: &'a str,
@@ -456,6 +527,8 @@ struct BoundIronwoodOutput {
 
 const WALLET_OPERATION_LOCK_SUFFIX: &str = ".wcash-operation.lock";
 const TRANSPARENT_RECOVERY_SESSION_BYTES: usize = 32;
+const ZIP318_PREPARATION_CODE: i64 = 2;
+const ZIP318_TRANSFER_CODE: i64 = 3;
 
 #[derive(Clone, Copy)]
 enum WalletOperationLockMode {
@@ -1623,6 +1696,165 @@ pub fn wallet_balance_with_confirmations(
         &wallet,
         ConfirmationsPolicy::new_symmetrical(confirmations, false),
     )
+}
+
+/// Reads a bounded newest-first confirmed transaction history.
+///
+/// The exact synchronized tip and transaction rows come from one read-only
+/// SQLite snapshot. The query uses the reviewed wallet history view, including
+/// its Ironwood, transparent, shielding, and ZIP 318 classifications.
+pub fn confirmed_transaction_history(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    limit: usize,
+) -> Result<ConfirmedTransactionHistory, WalletServiceError> {
+    if limit == 0 || limit > MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE {
+        return Err(WalletServiceError::InvalidRequest(format!(
+            "confirmed transaction history size must be in 1..={MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE}"
+        )));
+    }
+    let path = path.as_ref();
+    require_existing_wallet_file(path)?;
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Shared)?;
+    let mut wallet = open_existing_wallet_read_only(path, network)?;
+    wallet.transactionally_with_extension(|wallet, extension| {
+        let account_ids = wallet.get_account_ids().map_err(database_error)?;
+        only_account(&account_ids)?;
+        let exact_tip = exact_synchronized_recovery_tip_in_transaction(wallet, extension)?;
+        let transactions = (0..limit)
+            .map(|offset| {
+                let offset = i64::try_from(offset).map_err(|_| {
+                    WalletServiceError::Database(
+                        "confirmed transaction offset is not representable".to_owned(),
+                    )
+                })?;
+                extension
+                    .query_row(
+                        "SELECT txid, mined_height, tx_index, account_balance_delta,
+                                fee_paid, block_time, total_spent, is_shielding,
+                                pool_crossing_value, zip318_kind
+                         FROM v_transactions
+                         WHERE mined_height IS NOT NULL
+                         ORDER BY mined_height DESC, COALESCE(tx_index, -1) DESC, txid DESC
+                         LIMIT 1 OFFSET ?1",
+                        [offset],
+                        |row| {
+                            Ok(ConfirmedTransactionRow {
+                                txid: row.get(0)?,
+                                mined_height: row.get(1)?,
+                                tx_index: row.get(2)?,
+                                amount_delta_zat: row.get(3)?,
+                                fee_zat: row.get(4)?,
+                                timestamp: row.get(5)?,
+                                total_spent_zat: row.get(6)?,
+                                shielding: row.get(7)?,
+                                pool_crossing_zat: row.get(8)?,
+                                zip318_kind: row.get(9)?,
+                            })
+                        },
+                    )
+                    .optional()
+                    .map_err(database_error)?
+                    .map(|row| confirmed_transaction(row, exact_tip))
+                    .transpose()
+            })
+            .take_while(|transaction| !matches!(transaction, Ok(None)))
+            .filter_map(Result::transpose)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ConfirmedTransactionHistory {
+            exact_tip,
+            transactions,
+        })
+    })
+}
+
+fn confirmed_transaction(
+    row: ConfirmedTransactionRow,
+    exact_tip: BlockRef,
+) -> Result<ConfirmedTransaction, WalletServiceError> {
+    let txid = zcash_protocol::TxId::from_bytes(row.txid.try_into().map_err(|_| {
+        WalletServiceError::Database(
+            "confirmed transaction has an invalid transaction identifier".to_owned(),
+        )
+    })?);
+    let mined_height = u32::try_from(row.mined_height).map_err(|_| {
+        WalletServiceError::Database("confirmed transaction has an invalid mined height".to_owned())
+    })?;
+    let confirmations = exact_tip
+        .height
+        .checked_sub(mined_height)
+        .and_then(|depth| depth.checked_add(1))
+        .ok_or_else(|| {
+            WalletServiceError::Database(
+                "confirmed transaction is above the synchronized tip".to_owned(),
+            )
+        })?;
+    let tx_index = row
+        .tx_index
+        .map(|index| {
+            u32::try_from(index).map_err(|_| {
+                WalletServiceError::Database(
+                    "confirmed transaction has an invalid block index".to_owned(),
+                )
+            })
+        })
+        .transpose()?;
+    let fee_zat = row
+        .fee_zat
+        .map(|fee| {
+            u64::try_from(fee).map_err(|_| {
+                WalletServiceError::Database("confirmed transaction has an invalid fee".to_owned())
+            })
+        })
+        .transpose()?;
+    let timestamp = row
+        .timestamp
+        .map(|timestamp| {
+            u32::try_from(timestamp).map_err(|_| {
+                WalletServiceError::Database(
+                    "confirmed transaction has an invalid block timestamp".to_owned(),
+                )
+            })
+        })
+        .transpose()?;
+    if row.total_spent_zat < 0 || row.pool_crossing_zat.is_some_and(|amount| amount <= 0) {
+        return Err(WalletServiceError::Database(
+            "confirmed transaction has invalid value metadata".to_owned(),
+        ));
+    }
+    let migration = row.zip318_kind == ZIP318_PREPARATION_CODE
+        || (row.zip318_kind == ZIP318_TRANSFER_CODE && row.pool_crossing_zat.is_some());
+    let kind = if row.shielding {
+        ConfirmedTransactionKind::Shielding
+    } else if migration {
+        ConfirmedTransactionKind::Migration
+    } else if tx_index == Some(0) && row.total_spent_zat == 0 {
+        ConfirmedTransactionKind::Coinbase
+    } else {
+        ConfirmedTransactionKind::Transfer
+    };
+    let direction = match kind {
+        ConfirmedTransactionKind::Shielding | ConfirmedTransactionKind::Migration => {
+            ConfirmedTransactionDirection::Internal
+        }
+        ConfirmedTransactionKind::Transfer | ConfirmedTransactionKind::Coinbase => {
+            if row.total_spent_zat == 0 {
+                ConfirmedTransactionDirection::Incoming
+            } else {
+                ConfirmedTransactionDirection::Outgoing
+            }
+        }
+    };
+    Ok(ConfirmedTransaction {
+        txid: txid.to_string(),
+        mined_height,
+        direction,
+        kind,
+        amount_delta_zat: row.amount_delta_zat,
+        fee_zat,
+        timestamp,
+        confirmations,
+    })
 }
 
 /// Recovers exact signed bytes previously persisted by transaction creation.
@@ -4285,6 +4517,248 @@ mod tests {
             ),
             Err(WalletServiceError::StaleChain)
         ));
+    }
+
+    #[test]
+    fn confirmed_history_reads_ironwood_and_transparent_rows_at_the_exact_tip() {
+        const TIP_HEIGHT: u32 = 100;
+        const IRONWOOD_HEIGHT: u32 = 90;
+        const COINBASE_HEIGHT: u32 = 95;
+        const IRONWOOD_TX_INDEX: u32 = 2;
+        const COINBASE_TX_INDEX: u32 = 0;
+        const IRONWOOD_VALUE_ZAT: u64 = 45_000;
+        const COINBASE_VALUE_ZAT: u64 = 50_000;
+        const IRONWOOD_TIMESTAMP: u32 = 1_757_640_000;
+        const COINBASE_TIMESTAMP: u32 = 1_757_640_300;
+        const IRONWOOD_TXID_BYTE: u8 = 0x81;
+        const COINBASE_TXID_BYTE: u8 = 0x82;
+        const TIP_HASH_BYTE: u8 = 0xaa;
+        const NOTE_BYTES: usize = 32;
+        const DIVERSIFIER_BYTES: usize = 11;
+        const NOTE_VERSION: u32 = 0;
+        const PAGE_SIZE: usize = 2;
+        const SINGLE_ROW: usize = 1;
+        const MINED_BLOCK_CONFIRMATION: u32 = 1;
+
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let network = WalletNetwork::Regtest;
+        create_wallet_accounts(&wallet_path, network, SINGLE_ROW);
+        let exact_tip = set_synchronized_test_tip(&wallet_path, network, TIP_HEIGHT, TIP_HASH_BYTE);
+
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        let account_id = connection
+            .query_row("SELECT id FROM accounts", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        let address_id = connection
+            .query_row("SELECT id FROM addresses LIMIT 1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE blocks SET time = ?1 WHERE height = ?2",
+                rusqlite::params![IRONWOOD_TIMESTAMP, IRONWOOD_HEIGHT],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE blocks SET time = ?1 WHERE height = ?2",
+                rusqlite::params![COINBASE_TIMESTAMP, COINBASE_HEIGHT],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO transactions
+                 (txid, block, mined_height, tx_index, min_observed_height)
+                 VALUES (?1, ?2, ?2, ?3, ?2)",
+                rusqlite::params![
+                    vec![IRONWOOD_TXID_BYTE; NOTE_BYTES],
+                    IRONWOOD_HEIGHT,
+                    IRONWOOD_TX_INDEX
+                ],
+            )
+            .unwrap();
+        let ironwood_transaction_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO ironwood_received_notes
+                 (transaction_id, action_index, account_id, diversifier, value, rho, rseed,
+                  is_change, note_version)
+                 VALUES (?1, 0, ?2, ?3, ?4, ?5, ?5, 0, ?6)",
+                rusqlite::params![
+                    ironwood_transaction_id,
+                    account_id,
+                    vec![0_u8; DIVERSIFIER_BYTES],
+                    IRONWOOD_VALUE_ZAT,
+                    vec![0_u8; NOTE_BYTES],
+                    NOTE_VERSION,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO transactions
+                 (txid, block, mined_height, tx_index, min_observed_height)
+                 VALUES (?1, ?2, ?2, ?3, ?2)",
+                rusqlite::params![
+                    vec![COINBASE_TXID_BYTE; NOTE_BYTES],
+                    COINBASE_HEIGHT,
+                    COINBASE_TX_INDEX
+                ],
+            )
+            .unwrap();
+        let coinbase_transaction_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO transparent_received_outputs
+                 (transaction_id, output_index, account_id, address, script, value_zat,
+                  max_observed_unspent_height, address_id)
+                 VALUES (?1, 0, ?2, 'WT-fixture', X'', ?3, ?4, ?5)",
+                rusqlite::params![
+                    coinbase_transaction_id,
+                    account_id,
+                    COINBASE_VALUE_ZAT,
+                    TIP_HEIGHT,
+                    address_id
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let history = confirmed_transaction_history(&wallet_path, network, PAGE_SIZE).unwrap();
+
+        assert_eq!(history.exact_tip, exact_tip);
+        assert_eq!(history.transactions.len(), PAGE_SIZE);
+        assert_eq!(
+            history.transactions[0],
+            ConfirmedTransaction {
+                txid: zcash_protocol::TxId::from_bytes([COINBASE_TXID_BYTE; NOTE_BYTES])
+                    .to_string(),
+                mined_height: COINBASE_HEIGHT,
+                direction: ConfirmedTransactionDirection::Incoming,
+                kind: ConfirmedTransactionKind::Coinbase,
+                amount_delta_zat: i64::try_from(COINBASE_VALUE_ZAT).unwrap(),
+                fee_zat: None,
+                timestamp: Some(COINBASE_TIMESTAMP),
+                confirmations: TIP_HEIGHT - COINBASE_HEIGHT + MINED_BLOCK_CONFIRMATION,
+            }
+        );
+        assert_eq!(
+            history.transactions[1],
+            ConfirmedTransaction {
+                txid: zcash_protocol::TxId::from_bytes([IRONWOOD_TXID_BYTE; NOTE_BYTES])
+                    .to_string(),
+                mined_height: IRONWOOD_HEIGHT,
+                direction: ConfirmedTransactionDirection::Incoming,
+                kind: ConfirmedTransactionKind::Transfer,
+                amount_delta_zat: i64::try_from(IRONWOOD_VALUE_ZAT).unwrap(),
+                fee_zat: None,
+                timestamp: Some(IRONWOOD_TIMESTAMP),
+                confirmations: TIP_HEIGHT - IRONWOOD_HEIGHT + MINED_BLOCK_CONFIRMATION,
+            }
+        );
+
+        let newest = confirmed_transaction_history(&wallet_path, network, SINGLE_ROW).unwrap();
+        assert_eq!(newest.transactions, history.transactions[..SINGLE_ROW]);
+    }
+
+    #[test]
+    fn confirmed_history_is_bounded_and_requires_complete_synchronization() {
+        const MAX_PLUS_ONE: usize = MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE + 1;
+        const ZERO_ROWS: usize = 0;
+        const ONE_ROW: usize = 1;
+        const TIP_HEIGHT: u32 = 100;
+        const TIP_HASH_BYTE: u8 = 0xaa;
+
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let network = WalletNetwork::Regtest;
+        create_wallet_accounts(&wallet_path, network, ONE_ROW);
+
+        assert!(matches!(
+            confirmed_transaction_history(&wallet_path, network, ONE_ROW),
+            Err(WalletServiceError::TransparentRecoveryIncomplete)
+        ));
+        assert!(matches!(
+            confirmed_transaction_history(&wallet_path, network, ZERO_ROWS),
+            Err(WalletServiceError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            confirmed_transaction_history(&wallet_path, network, MAX_PLUS_ONE),
+            Err(WalletServiceError::InvalidRequest(_))
+        ));
+
+        let exact_tip = set_synchronized_test_tip(&wallet_path, network, TIP_HEIGHT, TIP_HASH_BYTE);
+        let history = confirmed_transaction_history(
+            &wallet_path,
+            network,
+            MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE,
+        )
+        .unwrap();
+        assert_eq!(history.exact_tip, exact_tip);
+        assert!(history.transactions.is_empty());
+    }
+
+    #[test]
+    fn confirmed_history_classifies_internal_pool_movements() {
+        const TIP_HEIGHT: u32 = 100;
+        const MINED_HEIGHT: i64 = 90;
+        const TRANSACTION_INDEX: i64 = 4;
+        const FEE_ZAT: i64 = 10_000;
+        const SPENT_ZAT: i64 = 50_000;
+        const DELTA_ZAT: i64 = -FEE_ZAT;
+        const CROSSING_ZAT: i64 = 40_000;
+        const TXID_BYTE: u8 = 0x91;
+        const TXID_BYTES: usize = 32;
+        const TIP_HASH_BYTE: u8 = 0xbb;
+        const MINED_BLOCK_CONFIRMATION: u32 = 1;
+        const ZIP318_UNKNOWN_CODE: i64 = 0;
+
+        let row = |shielding, pool_crossing_zat, zip318_kind| ConfirmedTransactionRow {
+            txid: vec![TXID_BYTE; TXID_BYTES],
+            mined_height: MINED_HEIGHT,
+            tx_index: Some(TRANSACTION_INDEX),
+            amount_delta_zat: DELTA_ZAT,
+            fee_zat: Some(FEE_ZAT),
+            timestamp: None,
+            total_spent_zat: SPENT_ZAT,
+            shielding,
+            pool_crossing_zat,
+            zip318_kind,
+        };
+        let exact_tip = block_ref(TIP_HEIGHT, TIP_HASH_BYTE);
+
+        let shielding =
+            confirmed_transaction(row(true, None, ZIP318_UNKNOWN_CODE), exact_tip).unwrap();
+        assert_eq!(shielding.kind, ConfirmedTransactionKind::Shielding);
+        assert_eq!(shielding.direction, ConfirmedTransactionDirection::Internal);
+
+        let preparation =
+            confirmed_transaction(row(false, None, ZIP318_PREPARATION_CODE), exact_tip).unwrap();
+        assert_eq!(preparation.kind, ConfirmedTransactionKind::Migration);
+
+        let transfer = confirmed_transaction(
+            row(false, Some(CROSSING_ZAT), ZIP318_TRANSFER_CODE),
+            exact_tip,
+        )
+        .unwrap();
+        assert_eq!(transfer.kind, ConfirmedTransactionKind::Migration);
+        assert_eq!(transfer.fee_zat, Some(u64::try_from(FEE_ZAT).unwrap()));
+        assert_eq!(
+            serde_json::to_value(&transfer).unwrap(),
+            serde_json::json!({
+                "txid": zcash_protocol::TxId::from_bytes([TXID_BYTE; TXID_BYTES]).to_string(),
+                "mined_height": u32::try_from(MINED_HEIGHT).unwrap(),
+                "direction": "internal",
+                "kind": "migration",
+                "amount_delta_zat": DELTA_ZAT,
+                "fee_zat": u64::try_from(FEE_ZAT).unwrap(),
+                "timestamp": null,
+                "confirmations": TIP_HEIGHT - u32::try_from(MINED_HEIGHT).unwrap()
+                    + MINED_BLOCK_CONFIRMATION,
+            })
+        );
     }
 
     #[test]
