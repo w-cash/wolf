@@ -276,12 +276,11 @@ No public Wcash Testnet or community pool is deployed. A community-facing pool
 still needs project-operated seeds, an independently reviewed consensus
 specification, multi-node soak and reorg tests, vendor ASIC interoperability,
 and an operated TLS/variable-difficulty edge with durable accounting, payouts,
-and reorg-safe shielded settlement. The experimental one-shot wallet in this
-workspace can derive a transparent coinbase address and construct a bounded
-mature-coinbase shielding transaction, but it requires one exclusive writer per
-database and is not that operated payout system. After an ambiguous post-sign
-outcome, operators must recover the paginated persisted record and rebroadcast
-the exact signed bytes rather than create a replacement. Wcash mainnet remains
-disabled.
+and reorg-safe shielded settlement. The wallet provides an isolated,
+Testnet-only, crash-idempotent batch signing and exact-byte broadcast boundary,
+but it requires one exclusive writer per database and is not that operated pool
+ledger. After an ambiguous post-sign outcome, operators must recover the exact
+batch and rebroadcast the same bytes rather than create a replacement. Wcash
+mainnet remains disabled.
 Do not call this engineering profile production-ready or use it with funds of
 real value.

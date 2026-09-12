@@ -1,6 +1,6 @@
 //! Wcash address conversion at the wallet boundary.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zcash_keys::{
     address::UnifiedAddress,
@@ -12,7 +12,7 @@ use zebra_chain::primitives::{WcashAddress, WcashAddressKind, WcashAddressParseE
 use crate::WalletNetwork;
 
 /// Canonical receiver class returned by authoritative Wcash address validation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WcashReceiverKind {
     /// Unified Address containing the active private Ironwood receiver.

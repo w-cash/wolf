@@ -19,8 +19,10 @@ use orchard::keys::Scope as OrchardScope;
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension};
 use secrecy::SecretVec;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 use zcash_client_backend::{
     data_api::wallet::{
         create_proposed_transactions, decrypt_and_store_transaction,
@@ -58,7 +60,8 @@ use crate::{
     encode_transparent_coinbase_receiver,
     identity::{
         open_wallet_connection, open_wallet_connection_read_only, verify_existing_identity,
-        verify_or_initialize_identity, ExistingWalletIdentityError, TRANSPARENT_SYNC_STATE_TABLE,
+        verify_or_initialize_identity, ExistingWalletIdentityError, PAYOUT_BATCH_TABLE,
+        PAYOUT_OUTPUT_TABLE, TRANSPARENT_SYNC_STATE_TABLE,
     },
     inspect_signed_transaction,
     rpc::{MAX_TRANSPARENT_HISTORY_BLOCKS_PER_REQUEST, TRANSPARENT_UTXO_PAGE_OUTPUTS},
@@ -70,6 +73,8 @@ use crate::{
 pub const MAX_SYNC_BATCH_SIZE: u32 = crate::cache::MAX_ATTESTED_COMPACT_BLOCKS_PER_RANGE;
 /// Maximum recipients in one experimental shielded transfer.
 pub const MAX_TRANSFER_RECIPIENTS: usize = 100;
+/// Payout batch journal format written alongside the wallet transaction.
+pub const PAYOUT_BATCH_FORMAT_VERSION: u32 = 1;
 /// Maximum transaction expiry interval accepted by the wallet.
 pub const MAX_EXPIRY_DELTA: u32 = 100;
 /// Maximum note-lock lifetime accepted by the wallet.
@@ -276,6 +281,39 @@ pub enum WalletServiceError {
     /// A numeric height calculation overflowed.
     #[error("height calculation overflow")]
     HeightOverflow,
+    /// Pool settlement is deliberately unavailable outside the public Wcash Testnet.
+    #[error("idempotent pool payout signing is enabled only on Wcash Testnet")]
+    PayoutNetworkUnsupported,
+    /// A previously journaled batch identifier was presented with different facts.
+    #[error("payout batch {batch_id} conflicts with its durable request binding")]
+    PayoutBatchConflict {
+        /// Canonical UUID of the conflicting batch.
+        batch_id: String,
+    },
+    /// A batch row exists without the atomically committed transaction result.
+    #[error("payout batch {batch_id} is incomplete or corrupt; operator review is required")]
+    IncompletePayoutBatch {
+        /// Canonical UUID of the incomplete batch.
+        batch_id: String,
+    },
+    /// A signed payout exceeded the caller's durable fee authorization.
+    #[error("payout fee {actual_zat} exceeds authorized maximum {maximum_zat} zatoshis")]
+    PayoutFeeExceeded {
+        /// ZIP 317 fee computed for the exact transaction.
+        actual_zat: u64,
+        /// Maximum fee committed by the payout request.
+        maximum_zat: u64,
+    },
+    /// Signing committed atomically but final network revalidation was unavailable.
+    #[error(
+        "payout batch {batch_id} committed exact signed bytes but final chain validation failed: {reason}; recover this batch and do not sign a replacement"
+    )]
+    PersistedPayoutRequiresRecovery {
+        /// Canonical payout batch UUID.
+        batch_id: String,
+        /// Non-secret final validation failure.
+        reason: String,
+    },
 }
 
 /// Result of idempotently initializing one Wcash wallet account.
@@ -364,6 +402,168 @@ pub struct TransferRecipient {
     pub memo: Vec<u8>,
 }
 
+/// Public, seedless identity bound into every pool payout request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayoutWalletIdentity {
+    /// Native payout protocol and durable journal schema version.
+    pub protocol_version: u32,
+    /// The only network on which pool payout signing is currently enabled.
+    pub network: WalletNetwork,
+    /// Frozen Wcash genesis block identifier in conventional display order.
+    pub genesis_hash: String,
+    /// Frozen transaction consensus branch identifier.
+    pub branch_id: String,
+    /// UUID of the only wallet account funding the payout.
+    pub account_id: String,
+    /// Must be `ironwood`; legacy pools are not accepted as a funding source.
+    pub fund_source: PayoutFundSource,
+    /// Must be true when the request is authorized and signed.
+    pub synchronized: bool,
+}
+
+/// Private value pool from which a payout transaction spends.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PayoutFundSource {
+    /// The Wcash Ironwood pool.
+    Ironwood,
+}
+
+/// One ordered allocation in an idempotent pool payout request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayoutBatchOutput {
+    /// Pool-ledger allocation UUID; unique within one batch.
+    pub allocation_id: String,
+    /// Canonical Wcash Unified Address containing an Ironwood receiver.
+    pub canonical_address: String,
+    /// Must explicitly be `ironwood`.
+    pub receiver_kind: crate::WcashReceiverKind,
+    /// Exact payout amount in zatoshis.
+    pub amount_zat: u64,
+    /// Canonical lowercase hexadecimal memo bytes.
+    pub memo_hex: String,
+}
+
+/// Exact facts authorized by the pool for one idempotent Wcash payout.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayoutBatchRequest {
+    /// Canonical lowercase UUID assigned exactly once by the pool ledger.
+    pub batch_id: String,
+    /// Lowercase 32-byte pipeline commitment produced by the pool ledger.
+    pub request_commitment: String,
+    /// Exact wallet and chain identity observed during payout planning.
+    pub identity: PayoutWalletIdentity,
+    /// Ordered, non-empty payout allocations.
+    pub outputs: Vec<PayoutBatchOutput>,
+    /// Required note confirmations; public Testnet requires at least 100.
+    pub confirmations: u32,
+    /// Maximum ZIP 317 fee authorized by the pool, in zatoshis.
+    pub max_fee_zat: u64,
+}
+
+/// Minimal key used to recover one exact durable payout result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayoutBatchLookup {
+    /// Canonical payout batch UUID.
+    pub batch_id: String,
+    /// Lowercase 32-byte pipeline commitment originally authorized for the batch.
+    pub request_commitment: String,
+}
+
+/// Caller-supplied facts used to verify an exported result byte-for-byte.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayoutBatchInspectionRequest {
+    /// Canonical payout batch UUID.
+    pub batch_id: String,
+    /// Lowercase 32-byte pipeline commitment originally authorized for the batch.
+    pub request_commitment: String,
+    /// Canonical display-order transaction identifier.
+    pub txid: String,
+    /// Exact lowercase signed transaction serialization.
+    pub raw_transaction_hex: String,
+}
+
+/// Exact signed bytes and their complete durable payout binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SignedPayoutBatch {
+    /// Native payout protocol and durable journal schema version.
+    pub protocol_version: u32,
+    /// Canonical payout batch UUID.
+    pub batch_id: String,
+    /// Original pool pipeline commitment.
+    pub request_commitment: String,
+    /// Native canonical digest of every ordered signing fact.
+    pub request_facts_digest: String,
+    /// Frozen wallet identity authorized by the request.
+    pub identity: PayoutWalletIdentity,
+    /// Exact ordered outputs authorized and stored with this transaction.
+    pub outputs: Vec<PayoutBatchOutput>,
+    /// Canonical display-order transaction identifier.
+    pub txid: String,
+    /// Exact signed transaction serialization, lowercase hex encoded.
+    pub raw_transaction_hex: String,
+    /// SHA-256 of the exact raw transaction bytes.
+    pub raw_transaction_sha256: String,
+    /// ZIP 244 effecting-data digest in internal byte order.
+    pub unsigned_digest: String,
+    /// Wcash transaction consensus branch identifier.
+    pub branch_id: String,
+    /// Proposal target height.
+    pub target_height: u32,
+    /// Transaction expiry height.
+    pub expiry_height: u32,
+    /// Exact ZIP 317 fee in zatoshis.
+    pub fee_zat: u64,
+    /// True only after checking the deterministic wallet change receiver.
+    pub internal_change_receiver_verified: bool,
+    /// Always true: this response is reconstructed from atomically committed SQLite state.
+    pub stored: bool,
+}
+
+/// Safe, retryable classification of broadcasting one exact stored payout transaction.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PayoutBroadcastResult {
+    /// Canonical payout batch UUID.
+    pub batch_id: String,
+    /// Canonical display-order transaction identifier.
+    pub txid: String,
+    /// Authoritative or fail-closed submission disposition.
+    pub outcome: PayoutBroadcastOutcome,
+}
+
+/// Result class for exact payout transaction submission.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PayoutBroadcastOutcome {
+    /// The node accepted the transaction and proved it is live.
+    Accepted {
+        /// Exact status observed after submission.
+        status: crate::TransactionStatus,
+    },
+    /// The exact transaction was already live in the mempool or best chain.
+    AlreadyKnown {
+        /// Exact status observed before or after submission.
+        status: crate::TransactionStatus,
+    },
+    /// The node authoritatively rejected the transaction and still did not know it.
+    Rejected {
+        /// Node-defined rejection code.
+        code: i32,
+        /// Node-defined rejection message.
+        message: String,
+    },
+    /// Submission may have reached the node; retry only these durable exact bytes.
+    Ambiguous {
+        /// Non-secret transport, availability, timeout, or protocol failure.
+        reason: String,
+    },
+}
+
 /// Fully signed transaction bytes returned only to the caller.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SignedTransaction {
@@ -445,6 +645,43 @@ struct BoundIronwoodOutput {
     memo: MemoBytes,
     role: TransferOutputRole,
     pool: ShieldedPool,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedPayoutBatch {
+    batch_id: Uuid,
+    request_commitment: [u8; 32],
+    request_facts_digest: [u8; 32],
+    account_uuid: Uuid,
+    confirmations: u32,
+    max_fee_zat: u64,
+    outputs: Vec<PreparedPayoutOutput>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedPayoutOutput {
+    allocation_id: Uuid,
+    canonical_address: String,
+    amount_zat: u64,
+    memo: Vec<u8>,
+}
+
+struct StoredPayoutRow {
+    format_version: i64,
+    request_commitment: Vec<u8>,
+    request_facts_digest: Vec<u8>,
+    account_uuid: Vec<u8>,
+    confirmations: i64,
+    max_fee_zat: i64,
+    txid: Option<Vec<u8>>,
+    raw_transaction: Option<Vec<u8>>,
+    raw_sha256: Option<Vec<u8>>,
+    unsigned_digest: Option<Vec<u8>>,
+    fee_zat: Option<i64>,
+    target_height: Option<i64>,
+    expiry_height: Option<i64>,
+    change_verified: Option<i64>,
+    output_count: i64,
 }
 
 const WALLET_OPERATION_LOCK_SUFFIX: &str = ".wcash-operation.lock";
@@ -1810,6 +2047,688 @@ fn reject_legacy_balance_values(
     }
 }
 
+/// Returns the exact public wallet identity a pool must bind into payout requests.
+pub fn payout_wallet_identity(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+) -> Result<PayoutWalletIdentity, WalletServiceError> {
+    require_payout_testnet(network)?;
+    let path = path.as_ref();
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
+    let mut wallet = open_wallet_database(path, network)?;
+    require_transparent_recovery_complete(&mut wallet)?;
+    let account_ids = wallet.get_account_ids().map_err(database_error)?;
+    let account_id = only_account(&account_ids)?;
+    let summary = wallet
+        .get_wallet_summary(public_confirmation_policy())
+        .map_err(database_error)?
+        .ok_or(WalletServiceError::NotSynchronized)?;
+    Ok(expected_payout_identity(
+        network,
+        account_id.expose_uuid(),
+        summary.is_synced(),
+    ))
+}
+
+/// Recovers exact signed bytes for an atomically committed payout batch.
+pub fn recover_signed_payout_batch(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    lookup: &PayoutBatchLookup,
+) -> Result<Option<SignedPayoutBatch>, WalletServiceError> {
+    require_payout_testnet(network)?;
+    let batch_id = canonical_uuid("batch_id", &lookup.batch_id)?;
+    let request_commitment = canonical_hex32("request_commitment", &lookup.request_commitment)?;
+    let path = path.as_ref();
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
+    let mut wallet = open_wallet_database(path, network)?;
+    wallet.transactionally_with_extension(|wallet, extension| {
+        let stored = load_signed_payout_batch(extension, network, batch_id)?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if stored.request_commitment != hex::encode(request_commitment) {
+            return Err(WalletServiceError::PayoutBatchConflict {
+                batch_id: batch_id.hyphenated().to_string(),
+            });
+        }
+        let account_ids = wallet.get_account_ids().map_err(database_error)?;
+        let account_id = only_account(&account_ids)?;
+        if stored.identity.account_id != account_id.expose_uuid().hyphenated().to_string() {
+            return Err(WalletServiceError::IncompletePayoutBatch {
+                batch_id: batch_id.hyphenated().to_string(),
+            });
+        }
+        Ok(Some(stored))
+    })
+}
+
+/// Verifies caller-held payout bytes against their complete durable wallet binding.
+pub fn inspect_signed_payout_batch(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    request: &PayoutBatchInspectionRequest,
+) -> Result<SignedPayoutBatch, WalletServiceError> {
+    let lookup = PayoutBatchLookup {
+        batch_id: request.batch_id.clone(),
+        request_commitment: request.request_commitment.clone(),
+    };
+    let stored = recover_signed_payout_batch(path, network, &lookup)?.ok_or_else(|| {
+        WalletServiceError::InvalidRequest("payout batch was not found".to_owned())
+    })?;
+    if request.txid != stored.txid
+        || request.raw_transaction_hex != stored.raw_transaction_hex
+        || request.raw_transaction_hex != request.raw_transaction_hex.to_ascii_lowercase()
+    {
+        return Err(WalletServiceError::PayoutBatchConflict {
+            batch_id: stored.batch_id,
+        });
+    }
+    Ok(stored)
+}
+
+/// Broadcasts only caller-provided bytes that exactly match an atomically stored batch.
+///
+/// Every uncertain node or transport result is reported as `ambiguous`; the
+/// caller must retry this same inspection request and must never build a
+/// replacement transaction for the batch.
+pub async fn broadcast_signed_payout_batch(
+    client: &mut AttestedWcashClient,
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    request: &PayoutBatchInspectionRequest,
+) -> Result<PayoutBroadcastResult, WalletServiceError> {
+    require_payout_testnet(network)?;
+    ensure_client_network(client, network)?;
+    let stored = inspect_signed_payout_batch(path, network, request)?;
+    let raw = hex::decode(&stored.raw_transaction_hex).map_err(|_| {
+        WalletServiceError::IncompletePayoutBatch {
+            batch_id: stored.batch_id.clone(),
+        }
+    })?;
+    let outcome = match client.broadcast_raw_transaction(raw).await {
+        Ok(result) => match result.disposition {
+            crate::BroadcastDisposition::Submitted => PayoutBroadcastOutcome::Accepted {
+                status: result.status,
+            },
+            crate::BroadcastDisposition::AlreadyKnown => PayoutBroadcastOutcome::AlreadyKnown {
+                status: result.status,
+            },
+        },
+        Err(WalletRpcError::Rejected { code, message }) => {
+            PayoutBroadcastOutcome::Rejected { code, message }
+        }
+        Err(error) => PayoutBroadcastOutcome::Ambiguous {
+            reason: error.to_string(),
+        },
+    };
+    Ok(PayoutBroadcastResult {
+        batch_id: stored.batch_id,
+        txid: stored.txid,
+        outcome,
+    })
+}
+
+/// Creates exactly one durable Ironwood payout transaction for a pool batch.
+///
+/// The batch binding and exact signed bytes commit in the same SQLite
+/// transaction as librustzcash's wallet mutation. A retry with identical facts
+/// returns those bytes; a retry with any changed fact fails as a conflict.
+pub async fn create_idempotent_payout_batch(
+    client: &mut AttestedWcashClient,
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    master_seed: &SecretVec<u8>,
+    request: PayoutBatchRequest,
+) -> Result<SignedPayoutBatch, WalletServiceError> {
+    require_payout_testnet(network)?;
+    ensure_client_network(client, network)?;
+    let path = path.as_ref();
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
+    let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
+    let account_ids = wallet.get_account_ids().map_err(database_error)?;
+    let account_id = only_account(&account_ids)?;
+    let prepared = prepare_payout_request(&request, network, account_id.expose_uuid())?;
+
+    if let Some(stored) = wallet.transactionally_with_extension(|_wallet, extension| {
+        load_signed_payout_batch(extension, network, prepared.batch_id)
+    })? {
+        if stored.request_commitment == hex::encode(prepared.request_commitment)
+            && stored.request_facts_digest == hex::encode(prepared.request_facts_digest)
+        {
+            return Ok(stored);
+        }
+        return Err(WalletServiceError::PayoutBatchConflict {
+            batch_id: prepared.batch_id.hyphenated().to_string(),
+        });
+    }
+
+    let recipients = prepared
+        .outputs
+        .iter()
+        .map(|output| TransferRecipient {
+            address: output.canonical_address.clone(),
+            amount_zat: output.amount_zat,
+            memo: output.memo.clone(),
+        })
+        .collect();
+    create_signed_transfer_in_open_wallet(
+        client,
+        &mut wallet,
+        network,
+        master_seed,
+        recipients,
+        prepared.confirmations,
+        false,
+        40,
+        100,
+        Some(&prepared),
+    )
+    .await?;
+    drop(wallet);
+    drop(_operation_lock);
+
+    recover_signed_payout_batch(
+        path,
+        network,
+        &PayoutBatchLookup {
+            batch_id: prepared.batch_id.hyphenated().to_string(),
+            request_commitment: hex::encode(prepared.request_commitment),
+        },
+    )?
+    .ok_or(WalletServiceError::IncompletePayoutBatch {
+        batch_id: prepared.batch_id.hyphenated().to_string(),
+    })
+}
+
+fn require_payout_testnet(network: WalletNetwork) -> Result<(), WalletServiceError> {
+    if network == WalletNetwork::Testnet {
+        Ok(())
+    } else {
+        Err(WalletServiceError::PayoutNetworkUnsupported)
+    }
+}
+
+fn expected_payout_identity(
+    network: WalletNetwork,
+    account_id: Uuid,
+    synchronized: bool,
+) -> PayoutWalletIdentity {
+    PayoutWalletIdentity {
+        protocol_version: PAYOUT_BATCH_FORMAT_VERSION,
+        network,
+        genesis_hash: zebra_chain::block::Hash(network.genesis_hash()).to_string(),
+        branch_id: network.branch_id_hex(),
+        account_id: account_id.hyphenated().to_string(),
+        fund_source: PayoutFundSource::Ironwood,
+        synchronized,
+    }
+}
+
+fn prepare_payout_request(
+    request: &PayoutBatchRequest,
+    network: WalletNetwork,
+    account_id: Uuid,
+) -> Result<PreparedPayoutBatch, WalletServiceError> {
+    let expected_identity = expected_payout_identity(network, account_id, true);
+    if request.identity != expected_identity {
+        return Err(WalletServiceError::InvalidRequest(
+            "payout wallet identity does not match the synchronized Testnet wallet".to_owned(),
+        ));
+    }
+    if request.confirmations < 100 {
+        return Err(WalletServiceError::UnsafeConfirmations);
+    }
+    if request.max_fee_zat == 0 || i64::try_from(request.max_fee_zat).is_err() {
+        return Err(WalletServiceError::InvalidRequest(
+            "maximum payout fee must be a positive signed 64-bit zatoshi value".to_owned(),
+        ));
+    }
+    if request.outputs.is_empty() || request.outputs.len() > MAX_TRANSFER_RECIPIENTS {
+        return Err(WalletServiceError::InvalidRequest(format!(
+            "payout output count must be in 1..={MAX_TRANSFER_RECIPIENTS}"
+        )));
+    }
+    let batch_id = canonical_uuid("batch_id", &request.batch_id)?;
+    let request_commitment = canonical_hex32("request_commitment", &request.request_commitment)?;
+    let mut allocation_ids = HashSet::with_capacity(request.outputs.len());
+    let mut outputs = Vec::with_capacity(request.outputs.len());
+    for output in &request.outputs {
+        if output.receiver_kind != crate::WcashReceiverKind::Ironwood {
+            return Err(WalletServiceError::InvalidRequest(
+                "every payout receiver_kind must be ironwood".to_owned(),
+            ));
+        }
+        let allocation_id = canonical_uuid("allocation_id", &output.allocation_id)?;
+        if !allocation_ids.insert(allocation_id) {
+            return Err(WalletServiceError::InvalidRequest(
+                "allocation_id values must be unique within a payout batch".to_owned(),
+            ));
+        }
+        let validated = crate::validate_wcash_address(&output.canonical_address, network)?;
+        if validated.receiver_kind != crate::WcashReceiverKind::Ironwood
+            || validated.canonical != output.canonical_address
+        {
+            return Err(WalletServiceError::InvalidRequest(
+                "payout address must be canonical and Ironwood-capable".to_owned(),
+            ));
+        }
+        if output.amount_zat == 0 || i64::try_from(output.amount_zat).is_err() {
+            return Err(WalletServiceError::InvalidRequest(
+                "payout amount must be a positive signed 64-bit zatoshi value".to_owned(),
+            ));
+        }
+        let memo = canonical_hex("memo_hex", &output.memo_hex, 512)?;
+        outputs.push(PreparedPayoutOutput {
+            allocation_id,
+            canonical_address: output.canonical_address.clone(),
+            amount_zat: output.amount_zat,
+            memo,
+        });
+    }
+    let request_facts_digest = payout_request_facts_digest(
+        batch_id,
+        request_commitment,
+        &expected_identity,
+        request.confirmations,
+        request.max_fee_zat,
+        &outputs,
+    );
+    Ok(PreparedPayoutBatch {
+        batch_id,
+        request_commitment,
+        request_facts_digest,
+        account_uuid: account_id,
+        confirmations: request.confirmations,
+        max_fee_zat: request.max_fee_zat,
+        outputs,
+    })
+}
+
+fn canonical_uuid(field: &str, encoded: &str) -> Result<Uuid, WalletServiceError> {
+    let parsed = Uuid::parse_str(encoded).map_err(|_| {
+        WalletServiceError::InvalidRequest(format!("{field} must be a canonical lowercase UUID"))
+    })?;
+    if parsed.hyphenated().to_string() != encoded {
+        return Err(WalletServiceError::InvalidRequest(format!(
+            "{field} must be a canonical lowercase UUID"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn canonical_hex32(field: &str, encoded: &str) -> Result<[u8; 32], WalletServiceError> {
+    canonical_hex(field, encoded, 32)?
+        .try_into()
+        .map_err(|_| WalletServiceError::InvalidRequest(format!("{field} must contain 32 bytes")))
+}
+
+fn canonical_hex(
+    field: &str,
+    encoded: &str,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, WalletServiceError> {
+    if encoded.len() > maximum_bytes.saturating_mul(2)
+        || !encoded.len().is_multiple_of(2)
+        || encoded != encoded.to_ascii_lowercase()
+    {
+        return Err(WalletServiceError::InvalidRequest(format!(
+            "{field} must be canonical lowercase hexadecimal"
+        )));
+    }
+    let decoded = hex::decode(encoded).map_err(|_| {
+        WalletServiceError::InvalidRequest(format!(
+            "{field} must be canonical lowercase hexadecimal"
+        ))
+    })?;
+    if decoded.len() > maximum_bytes || hex::encode(&decoded) != encoded {
+        return Err(WalletServiceError::InvalidRequest(format!(
+            "{field} exceeds its byte bound"
+        )));
+    }
+    Ok(decoded)
+}
+
+fn payout_request_facts_digest(
+    batch_id: Uuid,
+    request_commitment: [u8; 32],
+    identity: &PayoutWalletIdentity,
+    confirmations: u32,
+    max_fee_zat: u64,
+    outputs: &[PreparedPayoutOutput],
+) -> [u8; 32] {
+    let mut state = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"WcashPayFactsV1!")
+        .to_state();
+    state.update(batch_id.as_bytes());
+    state.update(&request_commitment);
+    state.update(&identity.protocol_version.to_be_bytes());
+    update_length_prefixed(&mut state, identity.genesis_hash.as_bytes());
+    update_length_prefixed(&mut state, identity.branch_id.as_bytes());
+    update_length_prefixed(&mut state, identity.account_id.as_bytes());
+    state.update(&confirmations.to_be_bytes());
+    state.update(&max_fee_zat.to_be_bytes());
+    state.update(&(outputs.len() as u32).to_be_bytes());
+    for (ordinal, output) in outputs.iter().enumerate() {
+        state.update(&(ordinal as u32).to_be_bytes());
+        state.update(output.allocation_id.as_bytes());
+        update_length_prefixed(&mut state, output.canonical_address.as_bytes());
+        state.update(&output.amount_zat.to_be_bytes());
+        update_length_prefixed(&mut state, &output.memo);
+    }
+    state
+        .finalize()
+        .as_bytes()
+        .try_into()
+        .expect("32-byte digest")
+}
+
+fn update_length_prefixed(state: &mut blake2b_simd::State, bytes: &[u8]) {
+    state.update(&(bytes.len() as u32).to_be_bytes());
+    state.update(bytes);
+}
+
+fn load_signed_payout_batch(
+    extension: &ExtensionTransaction<'_>,
+    network: WalletNetwork,
+    batch_id: Uuid,
+) -> Result<Option<SignedPayoutBatch>, WalletServiceError> {
+    let object_types = extension.query_row(
+        "SELECT
+            (SELECT type FROM sqlite_schema WHERE name = ?1),
+            (SELECT type FROM sqlite_schema WHERE name = ?2)",
+        [PAYOUT_BATCH_TABLE, PAYOUT_OUTPUT_TABLE],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )?;
+    if object_types != (Some("table".to_owned()), Some("table".to_owned())) {
+        return Err(WalletServiceError::Database(
+            "payout journal schema is missing or malformed".to_owned(),
+        ));
+    }
+    let row = extension
+        .query_row(
+            "SELECT format_version, request_commitment, request_facts_digest, account_uuid,
+                    confirmations, max_fee_zat, txid, raw_transaction, raw_sha256,
+                    unsigned_digest, fee_zat, target_height, expiry_height,
+                    internal_change_receiver_verified,
+                    (SELECT COUNT(*) FROM ext_wcash_payout_outputs o
+                     WHERE o.batch_id = b.batch_id)
+             FROM ext_wcash_payout_batches b WHERE batch_id = ?1",
+            [batch_id.as_bytes().as_slice()],
+            |row| {
+                Ok(StoredPayoutRow {
+                    format_version: row.get(0)?,
+                    request_commitment: row.get(1)?,
+                    request_facts_digest: row.get(2)?,
+                    account_uuid: row.get(3)?,
+                    confirmations: row.get(4)?,
+                    max_fee_zat: row.get(5)?,
+                    txid: row.get(6)?,
+                    raw_transaction: row.get(7)?,
+                    raw_sha256: row.get(8)?,
+                    unsigned_digest: row.get(9)?,
+                    fee_zat: row.get(10)?,
+                    target_height: row.get(11)?,
+                    expiry_height: row.get(12)?,
+                    change_verified: row.get(13)?,
+                    output_count: row.get(14)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let malformed = || WalletServiceError::IncompletePayoutBatch {
+        batch_id: batch_id.hyphenated().to_string(),
+    };
+    if row.format_version != i64::from(PAYOUT_BATCH_FORMAT_VERSION) {
+        return Err(malformed());
+    }
+    let request_commitment: [u8; 32] =
+        row.request_commitment.try_into().map_err(|_| malformed())?;
+    let stored_facts_digest: [u8; 32] = row
+        .request_facts_digest
+        .try_into()
+        .map_err(|_| malformed())?;
+    let account_uuid = Uuid::from_slice(&row.account_uuid).map_err(|_| malformed())?;
+    let confirmations = u32::try_from(row.confirmations).map_err(|_| malformed())?;
+    let max_fee_zat = u64::try_from(row.max_fee_zat).map_err(|_| malformed())?;
+    let output_count = usize::try_from(row.output_count).map_err(|_| malformed())?;
+    if output_count == 0 || output_count > MAX_TRANSFER_RECIPIENTS {
+        return Err(malformed());
+    }
+    let mut prepared_outputs = Vec::with_capacity(output_count);
+    let mut outputs = Vec::with_capacity(output_count);
+    let mut allocation_ids = HashSet::with_capacity(output_count);
+    for ordinal in 0..output_count {
+        let ordinal_i64 = i64::try_from(ordinal).map_err(|_| malformed())?;
+        let (allocation_id, canonical_address, amount_zat, memo): (Vec<u8>, String, i64, Vec<u8>) =
+            extension.query_row(
+                "SELECT allocation_id, canonical_address, amount_zat, memo
+             FROM ext_wcash_payout_outputs WHERE batch_id = ?1 AND ordinal = ?2",
+                params![batch_id.as_bytes().as_slice(), ordinal_i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let allocation_id = Uuid::from_slice(&allocation_id).map_err(|_| malformed())?;
+        if !allocation_ids.insert(allocation_id) || memo.len() > 512 {
+            return Err(malformed());
+        }
+        let amount_zat = u64::try_from(amount_zat).map_err(|_| malformed())?;
+        let validated =
+            crate::validate_wcash_address(&canonical_address, network).map_err(|_| malformed())?;
+        if validated.receiver_kind != crate::WcashReceiverKind::Ironwood
+            || validated.canonical != canonical_address
+            || amount_zat == 0
+        {
+            return Err(malformed());
+        }
+        prepared_outputs.push(PreparedPayoutOutput {
+            allocation_id,
+            canonical_address: canonical_address.clone(),
+            amount_zat,
+            memo: memo.clone(),
+        });
+        outputs.push(PayoutBatchOutput {
+            allocation_id: allocation_id.hyphenated().to_string(),
+            canonical_address,
+            receiver_kind: crate::WcashReceiverKind::Ironwood,
+            amount_zat,
+            memo_hex: hex::encode(memo),
+        });
+    }
+    let identity = expected_payout_identity(network, account_uuid, true);
+    let computed_facts_digest = payout_request_facts_digest(
+        batch_id,
+        request_commitment,
+        &identity,
+        confirmations,
+        max_fee_zat,
+        &prepared_outputs,
+    );
+    if computed_facts_digest != stored_facts_digest {
+        return Err(malformed());
+    }
+    let (txid, raw, raw_sha256, unsigned_digest, fee_zat, target_height, expiry_height) = match (
+        row.txid,
+        row.raw_transaction,
+        row.raw_sha256,
+        row.unsigned_digest,
+        row.fee_zat,
+        row.target_height,
+        row.expiry_height,
+        row.change_verified,
+    ) {
+        (
+            Some(txid),
+            Some(raw),
+            Some(raw_sha256),
+            Some(unsigned_digest),
+            Some(fee_zat),
+            Some(target_height),
+            Some(expiry_height),
+            Some(1),
+        ) => (
+            txid,
+            raw,
+            raw_sha256,
+            unsigned_digest,
+            fee_zat,
+            target_height,
+            expiry_height,
+        ),
+        _ => return Err(malformed()),
+    };
+    if raw.is_empty() || raw.len() > zcash_protocol::constants::MAX_BLOCK_BYTES {
+        return Err(malformed());
+    }
+    let txid = zcash_protocol::TxId::from_bytes(txid.try_into().map_err(|_| malformed())?);
+    let wallet_raw: Option<Vec<u8>> = extension
+        .query_row(
+            "SELECT raw FROM transactions WHERE txid = ?1",
+            [txid.as_ref()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if wallet_raw.as_deref() != Some(raw.as_slice()) {
+        return Err(malformed());
+    }
+    let inspected = inspect_signed_transaction(&raw, network).map_err(|_| malformed())?;
+    let calculated_sha256: [u8; 32] = Sha256::digest(&raw).into();
+    if inspected.txid() != txid
+        || raw_sha256.as_slice() != calculated_sha256
+        || unsigned_digest.as_slice() != txid.as_ref()
+        || u32::from(inspected.expiry_height())
+            != u32::try_from(expiry_height).map_err(|_| malformed())?
+    {
+        return Err(malformed());
+    }
+    let fee_zat = u64::try_from(fee_zat).map_err(|_| malformed())?;
+    if fee_zat > max_fee_zat {
+        return Err(malformed());
+    }
+    Ok(Some(SignedPayoutBatch {
+        protocol_version: PAYOUT_BATCH_FORMAT_VERSION,
+        batch_id: batch_id.hyphenated().to_string(),
+        request_commitment: hex::encode(request_commitment),
+        request_facts_digest: hex::encode(stored_facts_digest),
+        identity,
+        outputs,
+        txid: txid.to_string(),
+        raw_transaction_hex: hex::encode(raw),
+        raw_transaction_sha256: hex::encode(calculated_sha256),
+        unsigned_digest: hex::encode(txid.as_ref()),
+        branch_id: network.branch_id_hex(),
+        target_height: u32::try_from(target_height).map_err(|_| malformed())?,
+        expiry_height: u32::try_from(expiry_height).map_err(|_| malformed())?,
+        fee_zat,
+        internal_change_receiver_verified: true,
+        stored: true,
+    }))
+}
+
+fn insert_payout_batch_intent(
+    extension: &ExtensionTransaction<'_>,
+    batch: &PreparedPayoutBatch,
+) -> Result<(), WalletServiceError> {
+    let inserted = extension.execute(
+        "INSERT INTO ext_wcash_payout_batches (
+            batch_id, format_version, request_commitment, request_facts_digest,
+            account_uuid, confirmations, max_fee_zat
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            batch.batch_id.as_bytes().as_slice(),
+            i64::from(PAYOUT_BATCH_FORMAT_VERSION),
+            &batch.request_commitment[..],
+            &batch.request_facts_digest[..],
+            batch.account_uuid.as_bytes().as_slice(),
+            i64::from(batch.confirmations),
+            i64::try_from(batch.max_fee_zat).map_err(|_| WalletServiceError::InvalidRequest(
+                "maximum payout fee is not representable".to_owned()
+            ))?,
+        ],
+    )?;
+    if inserted != 1 {
+        return Err(WalletServiceError::Database(
+            "payout batch intent was not inserted".to_owned(),
+        ));
+    }
+    for (ordinal, output) in batch.outputs.iter().enumerate() {
+        let inserted = extension.execute(
+            "INSERT INTO ext_wcash_payout_outputs (
+                batch_id, ordinal, allocation_id, canonical_address, amount_zat, memo
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                batch.batch_id.as_bytes().as_slice(),
+                i64::try_from(ordinal).map_err(|_| WalletServiceError::InvalidRequest(
+                    "payout ordinal is not representable".to_owned()
+                ))?,
+                output.allocation_id.as_bytes().as_slice(),
+                &output.canonical_address,
+                i64::try_from(output.amount_zat).map_err(|_| {
+                    WalletServiceError::InvalidRequest(
+                        "payout amount is not representable".to_owned(),
+                    )
+                })?,
+                &output.memo,
+            ],
+        )?;
+        if inserted != 1 {
+            return Err(WalletServiceError::Database(
+                "payout output was not inserted".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn complete_payout_batch(
+    extension: &ExtensionTransaction<'_>,
+    batch: &PreparedPayoutBatch,
+    signed: &SignedTransaction,
+    txid: zcash_protocol::TxId,
+    raw: &[u8],
+) -> Result<(), WalletServiceError> {
+    if signed.fee_zat > batch.max_fee_zat {
+        return Err(WalletServiceError::PayoutFeeExceeded {
+            actual_zat: signed.fee_zat,
+            maximum_zat: batch.max_fee_zat,
+        });
+    }
+    let raw_sha256: [u8; 32] = Sha256::digest(raw).into();
+    let updated = extension.execute(
+        "UPDATE ext_wcash_payout_batches SET
+            txid = ?2, raw_transaction = ?3, raw_sha256 = ?4,
+            unsigned_digest = ?5, fee_zat = ?6, target_height = ?7,
+            expiry_height = ?8, internal_change_receiver_verified = 1
+         WHERE batch_id = ?1 AND txid IS NULL",
+        params![
+            batch.batch_id.as_bytes().as_slice(),
+            txid.as_ref(),
+            raw,
+            &raw_sha256[..],
+            txid.as_ref(),
+            i64::try_from(signed.fee_zat).map_err(|_| WalletServiceError::InvalidRequest(
+                "payout fee is not representable".to_owned()
+            ))?,
+            i64::from(signed.target_height),
+            i64::from(signed.expiry_height),
+        ],
+    )?;
+    if updated != 1 {
+        return Err(WalletServiceError::Database(
+            "payout batch result was not atomically completed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Creates, proves, signs, persists, and returns one Ironwood-only Wcash transaction.
 ///
 /// Values below 100 confirmations are accepted only for `Regtest` when
@@ -1826,6 +2745,37 @@ pub async fn create_signed_transfer(
     allow_unsafe_regtest_confirmations: bool,
     expiry_delta: u32,
     lock_for_blocks: u32,
+) -> Result<SignedTransaction, WalletServiceError> {
+    let path = path.as_ref();
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
+    let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
+    create_signed_transfer_in_open_wallet(
+        client,
+        &mut wallet,
+        network,
+        master_seed,
+        recipients,
+        confirmations,
+        allow_unsafe_regtest_confirmations,
+        expiry_delta,
+        lock_for_blocks,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_signed_transfer_in_open_wallet(
+    client: &mut AttestedWcashClient,
+    wallet: &mut WalletDatabase,
+    network: WalletNetwork,
+    master_seed: &SecretVec<u8>,
+    recipients: Vec<TransferRecipient>,
+    confirmations: u32,
+    allow_unsafe_regtest_confirmations: bool,
+    expiry_delta: u32,
+    lock_for_blocks: u32,
+    payout_batch: Option<&PreparedPayoutBatch>,
 ) -> Result<SignedTransaction, WalletServiceError> {
     ensure_client_network(client, network)?;
     let confirmation_count =
@@ -1847,11 +2797,8 @@ pub async fn create_signed_transfer(
         ));
     }
 
-    let path = path.as_ref();
-    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
-    let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
-    require_transparent_recovery_complete(&mut wallet)?;
-    ensure_no_legacy_pool_balances(&wallet)?;
+    require_transparent_recovery_complete(wallet)?;
+    ensure_no_legacy_pool_balances(wallet)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
     let confirmations_policy = ConfirmationsPolicy::new_symmetrical(confirmation_count, false);
@@ -1933,7 +2880,7 @@ pub async fn create_signed_transfer(
     let parameters = network.parameters();
     let proposal =
         propose_transfer::<_, _, _, _, zcash_client_sqlite::wallet::commitment_tree::Error>(
-            &mut wallet,
+            wallet,
             &parameters,
             account_id,
             &selector,
@@ -1964,7 +2911,7 @@ pub async fn create_signed_transfer(
             .flat_map(|step| step.balance().proposed_change())
             .any(|change| change.output_pool() != PoolType::IRONWOOD)
     {
-        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+        let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
         return Err(WalletServiceError::NonIronwoodProposal);
     }
 
@@ -1973,73 +2920,73 @@ pub async fn create_signed_transfer(
     let anchor_height = match proposal.steps().first().anchor_height() {
         Some(height) => height,
         None => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(WalletServiceError::NonIronwoodProposal);
         }
     };
     let current_heights = match wallet.get_target_and_anchor_heights(confirmation_count) {
         Ok(Some(heights)) => heights,
         Ok(None) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(WalletServiceError::StaleChain);
         }
         Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(database_error(error));
         }
     };
     if BlockHeight::from(current_heights.0) != target_height || current_heights.1 != anchor_height {
-        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+        let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
         return Err(WalletServiceError::StaleChain);
     }
-    let expected_chain = match expected_chain_refs(&wallet, network, target_height, anchor_height) {
+    let expected_chain = match expected_chain_refs(wallet, network, target_height, anchor_height) {
         Ok(expected) => expected,
         Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(error);
         }
     };
     if let Err(error) = revalidate_exact_chain_tip(client, expected_chain).await {
-        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+        let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
         return Err(error);
     }
 
     let usk = match derive_wallet_spending_key(master_seed, network, 0) {
         Ok(usk) => usk,
         Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(error.into());
         }
     };
-    if let Err(error) = verify_seed_authority(&wallet, account_id, master_seed, network) {
-        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+    if let Err(error) = verify_seed_authority(wallet, account_id, master_seed, network) {
+        let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
         return Err(error);
     }
-    if let Err(error) = verify_internal_change_receiver(&wallet, account_id, &usk) {
-        let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+    if let Err(error) = verify_internal_change_receiver(wallet, account_id, &usk) {
+        let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
         return Err(error);
     }
     let stored_ufvk = match wallet.get_account(account_id).map_err(database_error) {
         Ok(Some(account)) => match account.ufvk() {
             Some(ufvk) => ufvk.clone(),
             None => {
-                let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+                let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
                 return Err(WalletServiceError::AuthorityMismatch);
             }
         },
         Ok(None) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(WalletServiceError::AuthorityMismatch);
         }
         Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(error);
         }
     };
     let internal_change_receiver = match stored_ufvk.orchard() {
         Some(fvk) => fvk.address_at(0u32, OrchardScope::Internal),
         None => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(WalletServiceError::AuthorityMismatch);
         }
     };
@@ -2061,7 +3008,7 @@ pub async fn create_signed_transfer(
     }) {
         Some(Some(nullifiers)) if !nullifiers.is_empty() => nullifiers,
         _ => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(WalletServiceError::NonIronwoodProposal);
         }
     };
@@ -2073,7 +3020,7 @@ pub async fn create_signed_transfer(
             })
             .collect::<Vec<_>>(),
         Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(database_error(error));
         }
     };
@@ -2083,7 +3030,7 @@ pub async fn create_signed_transfer(
     ) {
         Ok(count) => count,
         Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(WalletServiceError::Proposal(error.to_owned()));
         }
     };
@@ -2105,11 +3052,11 @@ pub async fn create_signed_transfer(
     let expiry_height_u32 = match target_height_u32.checked_add(expiry_delta) {
         Some(height) if height <= u32::from(Height::MAX_EXPIRY_HEIGHT) => height,
         None => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(WalletServiceError::HeightOverflow);
         }
         Some(_) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
             return Err(WalletServiceError::InvalidRequest(format!(
                 "transaction expiry height must not exceed {}",
                 u32::from(Height::MAX_EXPIRY_HEIGHT)
@@ -2117,107 +3064,111 @@ pub async fn create_signed_transfer(
         }
     };
     let prover = LocalTxProver::bundled();
-    let created = match create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
-        &mut wallet,
-        &parameters,
-        &prover,
-        &prover,
-        &SpendingKeys::from_unified_spending_key(usk),
-        OvkPolicy::Sender,
-        &proposal,
-        Some(BlockHeight::from_u32(expiry_height_u32)),
-    ) {
-        Ok(created) => created,
-        Err(error) => {
-            let _ = unlock_proposal_inputs(&mut wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::Signing(format!("{error:?}")));
-        }
-    };
-    if created.is_empty() {
-        return Err(WalletServiceError::MissingSignedTransaction);
-    }
-    if created.len() != 1 {
-        return Err(persisted_transactions_require_review(
-            &created,
-            "the signer returned an unexpected number of transactions",
-        ));
-    }
-    let txid = created[0];
-    let transaction = match wallet.get_transaction(txid) {
-        Ok(Some(transaction)) => transaction,
-        Ok(None) => {
-            return Err(persisted_transactions_require_review(
-                &created,
-                "the signed transaction could not be read back from SQLite",
-            ));
-        }
-        Err(error) => {
-            return Err(persisted_transactions_require_review(
-                &created,
-                format!("SQLite readback failed: {error:?}"),
-            ));
-        }
-    };
-    let mut raw = Vec::new();
-    if let Err(error) = transaction.write(&mut raw) {
-        return Err(persisted_transactions_require_review(
-            &created,
-            format!("signed transaction serialization failed: {error}"),
-        ));
-    }
-    let inspected = inspect_signed_transaction(&raw, network).map_err(|error| {
-        persisted_transactions_require_review(
-            &created,
-            format!("signed transaction policy inspection failed: {error}"),
-        )
-    })?;
     let fee_zat = proposal.steps().first().balance().fee_required().into_u64();
-    let actual_fee = inspected
-        .fee_paid(|_| Ok::<_, zcash_protocol::value::BalanceError>(None))
-        .ok()
-        .flatten()
-        .map(Zatoshis::into_u64);
-    let serialized_outputs_match = signed_transfer_outputs_match(
-        &inspected,
-        &parameters,
-        account_id,
-        &stored_ufvk,
-        target_height_u32,
-        &expected_payment_outputs,
-        &expected_change_outputs,
-        &expected_nullifiers,
-        &known_wallet_nullifiers,
-        expected_ironwood_actions,
-    );
-    if inspected.txid() != txid
-        || inspected.transparent_bundle().is_some()
-        || u32::from(inspected.expiry_height()) != expiry_height_u32
-        || actual_fee != Some(fee_zat)
-        || !serialized_outputs_match
-    {
-        return Err(persisted_transactions_require_review(
-            &created,
-            "signed transfer identifier, expiry, inputs, fee, recipients, or change differs from the checked proposal",
-        ));
+    if let Some(batch) = payout_batch {
+        if fee_zat > batch.max_fee_zat {
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::PayoutFeeExceeded {
+                actual_zat: fee_zat,
+                maximum_zat: batch.max_fee_zat,
+            });
+        }
     }
-    drop(wallet);
+    let signing_result = wallet.transactionally_with_extension(|transactional_wallet, extension| {
+        if let Some(batch) = payout_batch {
+            insert_payout_batch_intent(extension, batch)?;
+        }
+        let created = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+            transactional_wallet,
+            &parameters,
+            &prover,
+            &prover,
+            &SpendingKeys::from_unified_spending_key(usk),
+            OvkPolicy::Sender,
+            &proposal,
+            Some(BlockHeight::from_u32(expiry_height_u32)),
+        )
+        .map_err(|error| WalletServiceError::Signing(format!("{error:?}")))?;
+        if created.len() != 1 {
+            return Err(WalletServiceError::Signing(
+                "the signer returned an unexpected number of transactions".to_owned(),
+            ));
+        }
+        let txid = created[0];
+        let transaction = transactional_wallet
+            .get_transaction(txid)
+            .map_err(database_error)?
+            .ok_or(WalletServiceError::MissingSignedTransaction)?;
+        let mut raw = Vec::new();
+        transaction
+            .write(&mut raw)
+            .map_err(|error| WalletServiceError::Signing(error.to_string()))?;
+        let inspected = inspect_signed_transaction(&raw, network)?;
+        let actual_fee = inspected
+            .fee_paid(|_| Ok::<_, zcash_protocol::value::BalanceError>(None))
+            .ok()
+            .flatten()
+            .map(Zatoshis::into_u64);
+        let serialized_outputs_match = signed_transfer_outputs_match(
+            &inspected,
+            &parameters,
+            account_id,
+            &stored_ufvk,
+            target_height_u32,
+            &expected_payment_outputs,
+            &expected_change_outputs,
+            &expected_nullifiers,
+            &known_wallet_nullifiers,
+            expected_ironwood_actions,
+        );
+        if inspected.txid() != txid
+            || inspected.transparent_bundle().is_some()
+            || u32::from(inspected.expiry_height()) != expiry_height_u32
+            || actual_fee != Some(fee_zat)
+            || !serialized_outputs_match
+        {
+            return Err(WalletServiceError::Signing(
+                "signed transfer identifier, expiry, inputs, fee, recipients, or change differs from the checked proposal"
+                    .to_owned(),
+            ));
+        }
+        let signed = SignedTransaction {
+            txid: txid.to_string(),
+            raw_transaction_hex: hex::encode(&raw),
+            branch_id: network.branch_id_hex(),
+            target_height: target_height_u32,
+            expiry_height: expiry_height_u32,
+            fee_zat,
+            internal_change_receiver_verified: true,
+        };
+        if let Some(batch) = payout_batch {
+            complete_payout_batch(extension, batch, &signed, txid, &raw)?;
+        }
+        Ok(signed)
+    });
+    let signed = match signing_result {
+        Ok(signed) => signed,
+        Err(error) => {
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
+            return Err(error);
+        }
+    };
     if let Err(error) =
         revalidate_canonical_ancestors(client, expected_chain, expiry_height_u32).await
     {
-        return Err(persisted_transactions_require_review(
-            &created,
-            format!("final canonical-chain validation failed: {error}"),
-        ));
+        return if let Some(batch) = payout_batch {
+            Err(WalletServiceError::PersistedPayoutRequiresRecovery {
+                batch_id: batch.batch_id.hyphenated().to_string(),
+                reason: error.to_string(),
+            })
+        } else {
+            Err(WalletServiceError::PersistedTransactionsRequireReview {
+                txids: vec![signed.txid.clone()],
+                reason: format!("final canonical-chain validation failed: {error}"),
+            })
+        };
     }
-    Ok(SignedTransaction {
-        txid: txid.to_string(),
-        raw_transaction_hex: hex::encode(raw),
-        branch_id: network.branch_id_hex(),
-        target_height: target_height_u32,
-        expiry_height: expiry_height_u32,
-        fee_zat,
-        internal_change_receiver_verified: true,
-    })
+    Ok(signed)
 }
 
 /// Shields only mature, fully classified transparent coinbase outputs into the
@@ -3052,6 +4003,219 @@ mod tests {
             height,
             hash: [byte; 32],
         }
+    }
+
+    fn test_payout_request(account: &WalletInfo) -> PayoutBatchRequest {
+        let account_id = Uuid::parse_str(&account.account_id).unwrap();
+        PayoutBatchRequest {
+            batch_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+            request_commitment: "11".repeat(32),
+            identity: expected_payout_identity(WalletNetwork::Testnet, account_id, true),
+            outputs: vec![
+                PayoutBatchOutput {
+                    allocation_id: "550e8400-e29b-41d4-a716-446655440001".to_owned(),
+                    canonical_address: account.address.clone(),
+                    receiver_kind: crate::WcashReceiverKind::Ironwood,
+                    amount_zat: 50_000,
+                    memo_hex: hex::encode(b"ZECWEC-WEC-PAYOUT-V1\0test-one"),
+                },
+                PayoutBatchOutput {
+                    allocation_id: "550e8400-e29b-41d4-a716-446655440002".to_owned(),
+                    canonical_address: account.address.clone(),
+                    receiver_kind: crate::WcashReceiverKind::Ironwood,
+                    amount_zat: 75_000,
+                    memo_hex: hex::encode(b"ZECWEC-WEC-PAYOUT-V1\0test-two"),
+                },
+            ],
+            confirmations: 100,
+            max_fee_zat: 100_000,
+        }
+    }
+
+    #[test]
+    fn payout_request_digest_binds_order_commitment_identity_and_every_output_fact() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let account = create_wallet_accounts(&wallet_path, WalletNetwork::Testnet, 1)
+            .pop()
+            .unwrap();
+        let account_id = Uuid::parse_str(&account.account_id).unwrap();
+        let request = test_payout_request(&account);
+        let expected =
+            prepare_payout_request(&request, WalletNetwork::Testnet, account_id).unwrap();
+        assert_eq!(
+            prepare_payout_request(&request.clone(), WalletNetwork::Testnet, account_id)
+                .unwrap()
+                .request_facts_digest,
+            expected.request_facts_digest
+        );
+
+        let mut mutations = Vec::new();
+        let mut changed = request.clone();
+        changed.outputs.swap(0, 1);
+        mutations.push(changed);
+        let mut changed = request.clone();
+        changed.outputs[0].amount_zat += 1;
+        mutations.push(changed);
+        let mut changed = request.clone();
+        changed.outputs[0].memo_hex = hex::encode(b"different");
+        mutations.push(changed);
+        let mut changed = request.clone();
+        changed.outputs[0].allocation_id = "550e8400-e29b-41d4-a716-446655440003".to_owned();
+        mutations.push(changed);
+        let mut changed = request.clone();
+        changed.request_commitment = "22".repeat(32);
+        mutations.push(changed);
+        let mut changed = request.clone();
+        changed.confirmations += 1;
+        mutations.push(changed);
+        let mut changed = request.clone();
+        changed.max_fee_zat += 1;
+        mutations.push(changed);
+
+        for changed in mutations {
+            assert_ne!(
+                prepare_payout_request(&changed, WalletNetwork::Testnet, account_id)
+                    .unwrap()
+                    .request_facts_digest,
+                expected.request_facts_digest
+            );
+        }
+    }
+
+    #[test]
+    fn payout_request_validation_is_testnet_only_canonical_and_ironwood_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let account = create_wallet_accounts(&wallet_path, WalletNetwork::Testnet, 1)
+            .pop()
+            .unwrap();
+        let account_id = Uuid::parse_str(&account.account_id).unwrap();
+        let request = test_payout_request(&account);
+
+        assert!(matches!(
+            require_payout_testnet(WalletNetwork::Regtest),
+            Err(WalletServiceError::PayoutNetworkUnsupported)
+        ));
+        let mut bad = request.clone();
+        bad.batch_id.make_ascii_uppercase();
+        assert!(matches!(
+            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id),
+            Err(WalletServiceError::InvalidRequest(_))
+        ));
+        let mut bad = request.clone();
+        bad.outputs[1].allocation_id = bad.outputs[0].allocation_id.clone();
+        assert!(matches!(
+            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id),
+            Err(WalletServiceError::InvalidRequest(_))
+        ));
+        let mut bad = request.clone();
+        bad.outputs[0].receiver_kind = crate::WcashReceiverKind::TransparentP2pkh;
+        assert!(matches!(
+            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id),
+            Err(WalletServiceError::InvalidRequest(_))
+        ));
+        let mut bad = request.clone();
+        bad.outputs[0].canonical_address = account.transparent_coinbase_address;
+        assert!(prepare_payout_request(&bad, WalletNetwork::Testnet, account_id).is_err());
+        let mut bad = request;
+        bad.identity.synchronized = false;
+        assert!(matches!(
+            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id),
+            Err(WalletServiceError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn payout_intent_and_outputs_roll_back_as_one_crash_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let account = create_wallet_accounts(&wallet_path, WalletNetwork::Testnet, 1)
+            .pop()
+            .unwrap();
+        let account_id = Uuid::parse_str(&account.account_id).unwrap();
+        let prepared = prepare_payout_request(
+            &test_payout_request(&account),
+            WalletNetwork::Testnet,
+            account_id,
+        )
+        .unwrap();
+        let mut wallet = open_wallet_database(&wallet_path, WalletNetwork::Testnet).unwrap();
+        let result: Result<(), WalletServiceError> =
+            wallet.transactionally_with_extension(|_wallet, extension| {
+                insert_payout_batch_intent(extension, &prepared)?;
+                Err(WalletServiceError::InvalidRequest(
+                    "injected crash before signing commit".to_owned(),
+                ))
+            });
+        assert!(matches!(result, Err(WalletServiceError::InvalidRequest(_))));
+        drop(wallet);
+        let canonical_wallet_path = fs::canonicalize(&wallet_path).unwrap();
+        let connection = open_wallet_connection(&canonical_wallet_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM ext_wcash_payout_batches WHERE batch_id = ?1",
+                    [prepared.batch_id.as_bytes().as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM ext_wcash_payout_outputs", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn incomplete_or_tampered_payout_journal_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let account = create_wallet_accounts(&wallet_path, WalletNetwork::Testnet, 1)
+            .pop()
+            .unwrap();
+        let account_id = Uuid::parse_str(&account.account_id).unwrap();
+        let prepared = prepare_payout_request(
+            &test_payout_request(&account),
+            WalletNetwork::Testnet,
+            account_id,
+        )
+        .unwrap();
+        let mut wallet = open_wallet_database(&wallet_path, WalletNetwork::Testnet).unwrap();
+        wallet
+            .transactionally_with_extension::<_, _, WalletServiceError>(|_wallet, extension| {
+                insert_payout_batch_intent(extension, &prepared)
+            })
+            .unwrap();
+        assert!(matches!(
+            wallet.transactionally_with_extension(|_wallet, extension| {
+                load_signed_payout_batch(extension, WalletNetwork::Testnet, prepared.batch_id)
+            }),
+            Err(WalletServiceError::IncompletePayoutBatch { .. })
+        ));
+
+        drop(wallet);
+        let canonical_wallet_path = fs::canonicalize(&wallet_path).unwrap();
+        let connection = open_wallet_connection(&canonical_wallet_path).unwrap();
+        connection
+            .execute(
+                "UPDATE ext_wcash_payout_batches SET request_facts_digest = ?2 WHERE batch_id = ?1",
+                params![prepared.batch_id.as_bytes().as_slice(), &[0xabu8; 32]],
+            )
+            .unwrap();
+        drop(connection);
+        let mut wallet = open_wallet_database(&wallet_path, WalletNetwork::Testnet).unwrap();
+        assert!(matches!(
+            wallet.transactionally_with_extension(|_wallet, extension| {
+                load_signed_payout_batch(extension, WalletNetwork::Testnet, prepared.batch_id)
+            }),
+            Err(WalletServiceError::IncompletePayoutBatch { .. })
+        ));
     }
 
     #[test]
