@@ -31,8 +31,9 @@ use wcash_merge_miner::{
     },
     CoordinatorConfig, GenerationRetirement, JobConfig, MinerError, NativeMiningCoordinator,
     NativeMiningSupervisor, NativePoolBackendRetainedJob, NativeZcashConfig, NativeZcashNetwork,
-    PoolBackendActor, PoolBackendRetainedJob, PreparedJob, ShareProcessor, WcashIncomingViewingKey,
-    Zip301ClientConfig, Zip301Config, Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
+    PoolBackendActor, PoolBackendActorError, PoolBackendRetainedJob, PreparedJob, ShareProcessor,
+    WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config, Zip301LoopbackListener,
+    NATIVE_JOB_MAX_AGE_SECONDS,
 };
 use wcash_pool_protocol::{Hex32, JobInvalidationReason, TargetLe};
 use wcash_zcash_aux::{Target, WCASH_AUXILIARY_CHAIN_ID};
@@ -237,12 +238,141 @@ struct PoolBackendAuthorityFacts {
 enum PoolBackendGenerationControl {
     Rotate,
     Shutdown,
-    ListenerFailure(String),
+    ServiceFailure(String),
 }
 
 struct PoolBackendListenerWorkers {
     listener: Arc<PoolBackendListener>,
     threads: Vec<thread::JoinHandle<()>>,
+}
+
+struct PoolBackendWinnerWorker {
+    shutdown: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PoolBackendWinnerWorker {
+    fn spawn(
+        supervisor: Arc<NativeMiningSupervisor>,
+        actor: Arc<PoolBackendActor>,
+        shutdown: Arc<AtomicBool>,
+        failure: mpsc::Sender<String>,
+    ) -> Result<Self, io::Error> {
+        let worker_shutdown = Arc::clone(&shutdown);
+        let thread = thread::Builder::new()
+            .name("wcash-winner-reconciliation".to_string())
+            .spawn(move || {
+                let mut unsettled_after = None;
+                let mut matured_after = None;
+                let mut pass_healthy = true;
+                loop {
+                    if worker_shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let (snapshot, completes_pass) =
+                        match actor.next_unsettled_winner_snapshot(unsettled_after.as_ref()) {
+                            Ok(Some(snapshot)) => (snapshot, false),
+                            Ok(None) => {
+                                unsettled_after = None;
+                                match actor.next_matured_winner_snapshot(matured_after.as_ref()) {
+                                    Ok(Some(snapshot)) => (snapshot, true),
+                                    Ok(None) => {
+                                        matured_after = None;
+                                        actor.set_winner_reconciliation_health(pass_healthy);
+                                        pass_healthy = true;
+                                        if sleep_until_shutdown(
+                                            Duration::from_secs(1),
+                                            &worker_shutdown,
+                                        ) {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        actor.set_winner_reconciliation_health(false);
+                                        let _ = failure.send(format!(
+                                            "mature winner journal enumeration failed: {error}"
+                                        ));
+                                        break;
+                                    }
+                                }
+                            },
+                            Err(error) => {
+                                actor.set_winner_reconciliation_health(false);
+                                let _ = failure.send(format!(
+                                    "unsettled winner journal enumeration failed: {error}"
+                                ));
+                                break;
+                            }
+                        };
+                    let key = snapshot.key();
+                    match supervisor.reconcile_pool_backend_winner(&snapshot) {
+                        Ok(Some(transition)) => {
+                            match actor.compare_and_apply_winner_transition(&snapshot, transition) {
+                                Ok(_) | Err(PoolBackendActorError::WinnerRevisionConflict) => {}
+                                Err(error) => {
+                                    actor.set_winner_reconciliation_health(false);
+                                    let _ = failure.send(format!(
+                                        "winner lifecycle persistence failed: {error}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) if is_retryable_winner_reconciliation_error(&error) => {
+                            pass_healthy = false;
+                            actor.set_winner_reconciliation_health(false);
+                            eprintln!(
+                                "winner reconciliation dependency unavailable; exact bytes remain durable: {error}"
+                            );
+                        }
+                        Err(error) => {
+                            actor.set_winner_reconciliation_health(false);
+                            let _ = failure.send(format!(
+                                "winner reconciliation failed closed: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                    if completes_pass {
+                        matured_after = Some(key);
+                        actor.set_winner_reconciliation_health(pass_healthy);
+                        pass_healthy = true;
+                        if sleep_until_shutdown(Duration::from_secs(1), &worker_shutdown) {
+                            break;
+                        }
+                    } else {
+                        unsettled_after = Some(key);
+                        // Bound local-node RPC pressure while preserving fair
+                        // journal-order progress across every unsettled winner.
+                        if sleep_until_shutdown(Duration::from_millis(100), &worker_shutdown) {
+                            break;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            shutdown,
+            thread: Some(thread),
+        })
+    }
+
+    fn request_shutdown(&mut self) -> Result<(), io::Error> {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(worker) = self.thread.take() {
+            worker.join().map_err(|_| {
+                io::Error::other("winner reconciliation worker panicked during shutdown")
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PoolBackendWinnerWorker {
+    fn drop(&mut self) {
+        let _ = self.request_shutdown();
+    }
 }
 
 impl PoolBackendListenerWorkers {
@@ -391,12 +521,21 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     )?;
     let actor = Arc::new(PoolBackendActor::new(journal, runtime.target_policy)?);
     let share_journal = share_journal_path()?;
-    let supervisor = NativeMiningSupervisor::open(configured.config, share_journal)?;
+    let supervisor = Arc::new(NativeMiningSupervisor::open(
+        configured.config,
+        share_journal,
+    )?);
     let listener = Arc::new(PoolBackendListener::bind(runtime.listener)?);
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
     let (listener_failure_tx, listener_failure_rx) = mpsc::channel::<String>();
+    let mut winner_worker = PoolBackendWinnerWorker::spawn(
+        Arc::clone(&supervisor),
+        Arc::clone(&actor),
+        Arc::clone(&shutdown),
+        listener_failure_tx.clone(),
+    )?;
     let listeners = PoolBackendListenerWorkers::spawn(
         listener,
         Arc::clone(&actor),
@@ -409,10 +548,30 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     loop {
         if shutdown.load(Ordering::Acquire) {
             listeners.request_shutdown()?;
+            winner_worker.request_shutdown()?;
             return print_json(&json!({
                 "command": "native-pool-backend",
                 "result": "stopped",
             }));
+        }
+        match listener_failure_rx.try_recv() {
+            Ok(error) => {
+                listeners.request_shutdown()?;
+                winner_worker.request_shutdown()?;
+                return Err(MinerError::InvalidRequest(format!(
+                    "private pool backend service stopped: {error}"
+                ))
+                .into());
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                listeners.request_shutdown()?;
+                winner_worker.request_shutdown()?;
+                return Err(MinerError::InvalidRequest(
+                    "every private backend service worker stopped".to_string(),
+                )
+                .into());
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
         }
         let coordinator = match supervisor.prepare_generation() {
             Ok(coordinator) => {
@@ -424,12 +583,28 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                     "transient native backend preparation failure: {error}; retrying in {} second(s)",
                     preparation_backoff.as_secs()
                 );
-                if sleep_until_shutdown(preparation_backoff, shutdown.as_ref()) {
-                    listeners.request_shutdown()?;
-                    return print_json(&json!({
-                        "command": "native-pool-backend",
-                        "result": "stopped",
-                    }));
+                match wait_for_pool_backend_retry(
+                    preparation_backoff,
+                    shutdown.as_ref(),
+                    &listener_failure_rx,
+                ) {
+                    PoolBackendGenerationControl::Rotate => {}
+                    PoolBackendGenerationControl::Shutdown => {
+                        listeners.request_shutdown()?;
+                        winner_worker.request_shutdown()?;
+                        return print_json(&json!({
+                            "command": "native-pool-backend",
+                            "result": "stopped",
+                        }));
+                    }
+                    PoolBackendGenerationControl::ServiceFailure(error) => {
+                        listeners.request_shutdown()?;
+                        winner_worker.request_shutdown()?;
+                        return Err(MinerError::InvalidRequest(format!(
+                            "private pool backend service stopped: {error}"
+                        ))
+                        .into());
+                    }
                 }
                 preparation_backoff = (preparation_backoff * 2).min(Duration::from_secs(60));
                 continue;
@@ -481,10 +656,10 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                 break PoolBackendGenerationControl::Shutdown;
             }
             match listener_failure_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(error) => break PoolBackendGenerationControl::ListenerFailure(error),
+                Ok(error) => break PoolBackendGenerationControl::ServiceFailure(error),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    break PoolBackendGenerationControl::ListenerFailure(
-                        "every private backend listener stopped".to_string(),
+                    break PoolBackendGenerationControl::ServiceFailure(
+                        "every private backend service worker stopped".to_string(),
                     )
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -502,19 +677,54 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
         match control {
             PoolBackendGenerationControl::Rotate => {}
             PoolBackendGenerationControl::Shutdown => {
+                winner_worker.request_shutdown()?;
                 return print_json(&json!({
                     "command": "native-pool-backend",
                     "result": "stopped",
-                }))
+                }));
             }
-            PoolBackendGenerationControl::ListenerFailure(error) => {
+            PoolBackendGenerationControl::ServiceFailure(error) => {
+                winner_worker.request_shutdown()?;
                 return Err(MinerError::InvalidRequest(format!(
-                    "private pool backend listener stopped: {error}"
+                    "private pool backend service stopped: {error}"
                 ))
-                .into())
+                .into());
             }
         }
     }
+}
+
+fn wait_for_pool_backend_retry(
+    duration: Duration,
+    shutdown: &AtomicBool,
+    failures: &mpsc::Receiver<String>,
+) -> PoolBackendGenerationControl {
+    let Some(deadline) = Instant::now().checked_add(duration) else {
+        return PoolBackendGenerationControl::Rotate;
+    };
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return PoolBackendGenerationControl::Shutdown;
+        }
+        match failures.try_recv() {
+            Ok(error) => return PoolBackendGenerationControl::ServiceFailure(error),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return PoolBackendGenerationControl::ServiceFailure(
+                    "every private backend service worker stopped".to_string(),
+                )
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return PoolBackendGenerationControl::Rotate;
+        };
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
+fn is_retryable_winner_reconciliation_error(error: &MinerError) -> bool {
+    matches!(error, MinerError::WinnerSubmissionDeferred { .. })
+        || is_retryable_native_preparation_error(error)
 }
 
 fn sleep_until_shutdown(duration: Duration, shutdown: &AtomicBool) -> bool {
@@ -1880,7 +2090,40 @@ mod tests {
     }
 
     #[test]
+    fn pool_backend_retry_wait_wakes_for_shutdown_and_worker_failure() {
+        let shutdown = AtomicBool::new(true);
+        let (_failure_sender, failures) = mpsc::channel();
+        assert!(matches!(
+            wait_for_pool_backend_retry(Duration::from_secs(1), &shutdown, &failures),
+            PoolBackendGenerationControl::Shutdown
+        ));
+
+        let shutdown = AtomicBool::new(false);
+        let (failure_sender, failures) = mpsc::channel();
+        failure_sender
+            .send("durable winner journal failed".to_string())
+            .expect("failure channel remains open");
+        assert!(matches!(
+            wait_for_pool_backend_retry(Duration::from_secs(1), &shutdown, &failures),
+            PoolBackendGenerationControl::ServiceFailure(error)
+                if error == "durable winner journal failed"
+        ));
+
+        let (_failure_sender, failures) = mpsc::channel();
+        assert!(matches!(
+            wait_for_pool_backend_retry(Duration::ZERO, &shutdown, &failures),
+            PoolBackendGenerationControl::Rotate
+        ));
+    }
+
+    #[test]
     fn preparation_retry_accepts_only_explicit_transient_http_and_rpc_failures() {
+        assert!(is_retryable_winner_reconciliation_error(
+            &MinerError::WinnerSubmissionDeferred { chain: "Wcash" }
+        ));
+        assert!(!is_retryable_winner_reconciliation_error(
+            &MinerError::InvalidParentTemplate("authoritative winner rejection".to_string())
+        ));
         for status in [408, 425, 429, 500, 502, 503, 504] {
             let status = reqwest::StatusCode::from_u16(status).expect("valid HTTP status");
             assert!(

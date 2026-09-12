@@ -156,6 +156,14 @@ pub enum MinerError {
         message: String,
     },
 
+    /// A retained winner was submitted but no node could yet confirm or
+    /// authoritatively reject it. Exact bytes remain in the durable outbox.
+    #[error("{chain} winner submission is temporarily unconfirmed")]
+    WinnerSubmissionDeferred {
+        /// Stable chain label used in operator diagnostics.
+        chain: &'static str,
+    },
+
     /// An exact candidate parent block failed proposal validation.
     #[error("parent proposal rejected by {endpoint}: {reason}")]
     ParentProposalRejected {
