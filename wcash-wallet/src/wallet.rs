@@ -1087,7 +1087,29 @@ fn reject_symlink(path: &Path) -> Result<(), WalletServiceError> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "android"))]
+fn require_private_parent_and_ancestors(path: &Path) -> Result<(), WalletServiceError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let parent = path
+        .parent()
+        .expect("canonical wallet paths always have a parent directory");
+    let metadata = fs::symlink_metadata(parent)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(WalletServiceError::NonRegularWalletPath);
+    }
+    require_effective_uid(
+        metadata.uid(),
+        nix::unistd::geteuid().as_raw(),
+        "parent directory",
+    )?;
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(WalletServiceError::InsecureWalletParent);
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
 fn require_private_parent_and_ancestors(path: &Path) -> Result<(), WalletServiceError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -2678,7 +2700,7 @@ fn stage_proposal<NoteRef>(
 pub fn cancel_staged_transaction(
     path: impl AsRef<Path>,
     network: WalletNetwork,
-    staged: StagedTransactionProposal,
+    staged: &StagedTransactionProposal,
 ) -> Result<(), WalletServiceError> {
     if staged.network != network {
         return Err(WalletServiceError::InvalidStagedProposal(
@@ -4613,10 +4635,11 @@ mod tests {
             cancel_staged_transaction(
                 directory.path().join("missing.sqlite"),
                 WalletNetwork::Testnet,
-                staged,
+                &staged,
             ),
             Err(WalletServiceError::InvalidStagedProposal(_))
         ));
+        assert_eq!(staged.fee_zat(), FEE_ZAT);
         assert!(directory.path().read_dir().unwrap().next().is_none());
     }
 
@@ -5504,7 +5527,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn writable_ancestor_above_private_parent_is_rejected() {
         use std::os::unix::fs::PermissionsExt;
@@ -5525,6 +5548,27 @@ mod tests {
                 if path == canonical_unsafe_ancestor
         ));
         assert!(!wallet_path.exists());
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn android_accepts_a_private_wallet_directory_inside_the_app_sandbox() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let app_sandbox = directory.path().join("app");
+        let wallet_parent = app_sandbox.join("wallet");
+        fs::create_dir(&app_sandbox).unwrap();
+        fs::set_permissions(&app_sandbox, fs::Permissions::from_mode(0o771)).unwrap();
+        fs::create_dir(&wallet_parent).unwrap();
+        fs::set_permissions(&wallet_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let wallet_path = wallet_parent.join("wallet.sqlite");
+
+        drop(open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap());
+        assert_eq!(
+            fs::metadata(wallet_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[cfg(unix)]
