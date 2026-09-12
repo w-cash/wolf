@@ -21,7 +21,7 @@ use wcash_pool_protocol::{
     canonical_attribution_id, canonical_parent_header_hash_le, canonical_share_id, AcceptableJob,
     BackendErrorCode, BackendEvent, BackendMessage, BackendRequest, CanonicalUuid, ChainTip,
     Hex1344, Hex32, Hex4, JobDescriptor, JobInvalidationReason, MergedChain, ProtocolError,
-    ShareReceipt, TargetLe, WinnerDescriptor, WorkerIdentity, BACKEND_PROTOCOL_VERSION,
+    ShareReceipt, TargetBe, TargetLe, WinnerDescriptor, WorkerIdentity, BACKEND_PROTOCOL_VERSION,
     MAX_EVENT_PAGE_ITEMS, REQUIRED_BACKEND_CAPABILITIES,
 };
 
@@ -444,6 +444,7 @@ struct AuthorityFields {
     zcash_genesis: Hex32,
     wcash_payout_commitment: Hex32,
     zcash_payout_commitment: Hex32,
+    share_target_ceiling_be: TargetBe,
     chain_id: u32,
 }
 
@@ -533,6 +534,7 @@ impl PoolBackendActor {
         target_policy: PoolShareTargetPolicy,
         clock: Arc<dyn ActorClock>,
     ) -> Result<Self, PoolBackendActorError> {
+        let share_target_ceiling_be = TargetBe::from(target_policy.operator_easiest());
         let authority_fields = AuthorityFields {
             backend_instance: journal.backend_instance(),
             journal_stream: journal.journal_stream(),
@@ -540,6 +542,7 @@ impl PoolBackendActor {
             zcash_genesis: journal.zcash_genesis().clone(),
             wcash_payout_commitment: journal.wcash_payout_commitment().clone(),
             zcash_payout_commitment: journal.zcash_payout_commitment().clone(),
+            share_target_ceiling_be,
             chain_id: journal.chain_id(),
         };
         let authority = PoolBackendAuthority::new(
@@ -549,6 +552,7 @@ impl PoolBackendActor {
             authority_fields.zcash_genesis.clone(),
             authority_fields.wcash_payout_commitment.clone(),
             authority_fields.zcash_payout_commitment.clone(),
+            authority_fields.share_target_ceiling_be.clone(),
             authority_fields.chain_id,
         )
         .map_err(PoolBackendActorError::Authority)?;
@@ -952,6 +956,7 @@ impl PoolBackendActor {
             zcash_genesis: self.authority_fields.zcash_genesis.clone(),
             wcash_payout_commitment: self.authority_fields.wcash_payout_commitment.clone(),
             zcash_payout_commitment: self.authority_fields.zcash_payout_commitment.clone(),
+            share_target_ceiling_be: self.authority_fields.share_target_ceiling_be.clone(),
             chain_id: self.authority_fields.chain_id,
             current_event_seq: current,
         }])
@@ -2193,6 +2198,54 @@ mod tests {
             .expect("snapshot succeeds")
             .pop()
             .expect("snapshot response exists")
+    }
+
+    #[test]
+    fn hello_reconnects_publish_the_exact_asymmetric_target_authority() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("target-authority.journal");
+        let config = config();
+        let clock = Arc::new(TestClock::new());
+        let target_le_bytes = std::array::from_fn(|index| index as u8 + 1);
+        let target_policy = PoolShareTargetPolicy::new(TargetLe::new(target_le_bytes))
+            .expect("asymmetric test target is nonzero");
+        let expected_target = TargetBe::from(target_policy.operator_easiest());
+        let actor =
+            PoolBackendActor::new_with_clock(create_journal(&path, &config), target_policy, clock)
+                .expect("construct actor");
+
+        assert_eq!(
+            actor.persistent_authority().share_target_ceiling_be(),
+            &expected_target
+        );
+        assert_ne!(
+            expected_target.as_bytes(),
+            &target_le_bytes,
+            "the fixture must detect a missing byte-order conversion"
+        );
+
+        for (request_id, backend_session) in [(1, uuid(20)), (2, uuid(22))] {
+            let hello = actor
+                .dispatch(
+                    backend_session,
+                    None,
+                    BackendRequestKind::Hello,
+                    BackendRequest::Hello {
+                        version: BACKEND_PROTOCOL_VERSION,
+                        id: request_id,
+                        pool_instance: uuid(21),
+                        last_event_seq: 0,
+                    },
+                )
+                .expect("hello succeeds");
+            assert!(matches!(
+                hello.as_slice(),
+                [BackendMessage::HelloOk {
+                    share_target_ceiling_be,
+                    ..
+                }] if share_target_ceiling_be == &expected_target
+            ));
+        }
     }
 
     #[test]

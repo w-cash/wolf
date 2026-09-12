@@ -621,7 +621,7 @@ impl NativeMiningSupervisor {
         Ok(coordinator)
     }
 
-    /// Reconciles one exact backend-v1 winner against its own chain only.
+    /// Reconciles one exact backend winner against its own chain only.
     ///
     /// Exact block bytes are already durable before this method can obtain a
     /// snapshot. Pending, requeued, and orphaned winners are replayed through

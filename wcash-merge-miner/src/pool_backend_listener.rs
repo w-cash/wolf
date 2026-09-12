@@ -22,7 +22,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use wcash_pool_protocol::{
     canonical_attribution_id, canonical_share_id, BackendErrorCode, BackendEvent, BackendMessage,
-    BackendRequest, CanonicalUuid, BACKEND_PROTOCOL_VERSION, MAX_EVENT_PAGE_ITEMS,
+    BackendRequest, CanonicalUuid, TargetBe, BACKEND_PROTOCOL_VERSION, MAX_EVENT_PAGE_ITEMS,
 };
 
 use crate::{
@@ -165,6 +165,7 @@ pub struct PoolBackendAuthority {
     zcash_genesis: wcash_pool_protocol::Hex32,
     wcash_payout_commitment: wcash_pool_protocol::Hex32,
     zcash_payout_commitment: wcash_pool_protocol::Hex32,
+    share_target_ceiling_be: TargetBe,
     chain_id: u32,
 }
 
@@ -178,6 +179,7 @@ impl PoolBackendAuthority {
         zcash_genesis: wcash_pool_protocol::Hex32,
         wcash_payout_commitment: wcash_pool_protocol::Hex32,
         zcash_payout_commitment: wcash_pool_protocol::Hex32,
+        share_target_ceiling_be: TargetBe,
         chain_id: u32,
     ) -> Result<Self, PoolBackendListenerError> {
         if backend_instance.is_nil()
@@ -187,10 +189,11 @@ impl PoolBackendAuthority {
             || zcash_genesis.is_zero()
             || wcash_payout_commitment.is_zero()
             || zcash_payout_commitment.is_zero()
+            || share_target_ceiling_be.is_zero()
             || chain_id == 0
         {
             return Err(PoolBackendListenerError::InvalidConfiguration(
-                "backend authority identities, chains, and payout commitments must be nonzero and distinct where required",
+                "backend authority identities, chains, payout commitments, and share target ceiling must be nonzero and distinct where required",
             ));
         }
         Ok(Self {
@@ -200,6 +203,7 @@ impl PoolBackendAuthority {
             zcash_genesis,
             wcash_payout_commitment,
             zcash_payout_commitment,
+            share_target_ceiling_be,
             chain_id,
         })
     }
@@ -212,6 +216,11 @@ impl PoolBackendAuthority {
     /// Returns the stable journal sequence namespace.
     pub const fn journal_stream(&self) -> CanonicalUuid {
         self.journal_stream
+    }
+
+    /// Returns the immutable easiest share target in big-endian ZIP-301 order.
+    pub const fn share_target_ceiling_be(&self) -> &TargetBe {
+        &self.share_target_ceiling_be
     }
 }
 
@@ -707,6 +716,7 @@ fn validate_handler_messages(
                 zcash_genesis,
                 wcash_payout_commitment,
                 zcash_payout_commitment,
+                share_target_ceiling_be,
                 chain_id,
                 current_event_seq,
                 ..
@@ -718,6 +728,7 @@ fn validate_handler_messages(
             && *zcash_genesis == authority.zcash_genesis
             && *wcash_payout_commitment == authority.wcash_payout_commitment
             && *zcash_payout_commitment == authority.zcash_payout_commitment
+            && *share_target_ceiling_be == authority.share_target_ceiling_be
             && *chain_id == authority.chain_id
             && *current_event_seq >= *last_event_seq =>
         {
@@ -1248,6 +1259,7 @@ mod tests {
                 zcash_genesis: Hex32::new([2; 32]),
                 wcash_payout_commitment: Hex32::new([3; 32]),
                 zcash_payout_commitment: Hex32::new([4; 32]),
+                share_target_ceiling_be: test_share_target_ceiling_be(),
                 chain_id: 1,
                 current_event_seq: 0,
             }])
@@ -1286,6 +1298,23 @@ mod tests {
             &[wrong],
         )
         .is_err());
+    }
+
+    #[test]
+    fn backend_authority_rejects_a_zero_share_target_ceiling() {
+        assert!(matches!(
+            PoolBackendAuthority::new(
+                canonical_uuid("90bd8da9-9b49-4114-9aa8-2ca35aee013e"),
+                canonical_uuid("c4756682-e84b-4b0b-927f-0af145ae9826"),
+                Hex32::new([1; 32]),
+                Hex32::new([2; 32]),
+                Hex32::new([3; 32]),
+                Hex32::new([4; 32]),
+                TargetBe::new([0; 32]),
+                1,
+            ),
+            Err(PoolBackendListenerError::InvalidConfiguration(_))
+        ));
     }
 
     #[test]
@@ -1358,6 +1387,7 @@ mod tests {
             zcash_genesis,
             wcash_payout_commitment,
             zcash_payout_commitment,
+            share_target_ceiling_be,
             chain_id,
             current_event_seq,
             ..
@@ -1376,6 +1406,7 @@ mod tests {
             zcash_genesis,
             wcash_payout_commitment,
             zcash_payout_commitment,
+            share_target_ceiling_be,
             chain_id,
             current_event_seq,
         };
@@ -1387,6 +1418,28 @@ mod tests {
             &handler.persistent_authority(),
             None,
             &[wrong_session],
+        )
+        .is_err());
+
+        let mut wrong_target = hello_response(&handler, &session, request.id(), 7);
+        let BackendMessage::HelloOk {
+            share_target_ceiling_be,
+            ..
+        } = &mut wrong_target
+        else {
+            unreachable!("test helper returns hello_ok");
+        };
+        let mut changed = *share_target_ceiling_be.as_bytes();
+        changed[0] ^= 0x80;
+        *share_target_ceiling_be = TargetBe::new(changed);
+        assert!(validate_handler_messages(
+            BackendRequestKind::Hello,
+            BackendConnectionRole::Negotiated,
+            &request,
+            &session,
+            &handler.persistent_authority(),
+            None,
+            &[wrong_target],
         )
         .is_err());
     }
@@ -1604,6 +1657,7 @@ mod tests {
             Hex32::new([2; 32]),
             Hex32::new([3; 32]),
             Hex32::new([4; 32]),
+            test_share_target_ceiling_be(),
             1,
         )
         .expect("valid test authority")
@@ -1626,8 +1680,17 @@ mod tests {
             zcash_genesis: Hex32::new([2; 32]),
             wcash_payout_commitment: Hex32::new([3; 32]),
             zcash_payout_commitment: Hex32::new([4; 32]),
+            share_target_ceiling_be: test_share_target_ceiling_be(),
             chain_id: 1,
             current_event_seq,
         }
+    }
+
+    fn test_share_target_ceiling_be() -> TargetBe {
+        TargetBe::new([
+            0x00, 0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3,
+            0xd2, 0xe1, 0xf0, 0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x9a, 0xab,
+            0xbc, 0xcd, 0xde, 0xef,
+        ])
     }
 }
