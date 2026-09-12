@@ -1599,12 +1599,30 @@ pub fn wallet_balance(
     path: impl AsRef<Path>,
     network: WalletNetwork,
 ) -> Result<WalletBalanceSummary, WalletServiceError> {
+    wallet_balance_with_confirmations(path, network, COINBASE_SHIELDING_MATURITY, false)
+}
+
+/// Returns current SQLite wallet balances under an explicit confirmation policy.
+///
+/// A confirmation count below the public floor requires both `Regtest` and the
+/// explicit unsafe Regtest override. Policy validation precedes wallet access.
+pub fn wallet_balance_with_confirmations(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    confirmations: u32,
+    allow_unsafe_regtest_confirmations: bool,
+) -> Result<WalletBalanceSummary, WalletServiceError> {
+    let confirmations =
+        validate_confirmation_policy(network, confirmations, allow_unsafe_regtest_confirmations)?;
     let path = path.as_ref();
     require_existing_wallet_file(path)?;
     let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Shared)?;
     let mut wallet = open_existing_wallet_read_only(path, network)?;
     require_transparent_recovery_complete(&mut wallet)?;
-    wallet_balance_summary(&wallet, public_confirmation_policy())
+    wallet_balance_summary(
+        &wallet,
+        ConfirmationsPolicy::new_symmetrical(confirmations, false),
+    )
 }
 
 /// Recovers exact signed bytes previously persisted by transaction creation.
@@ -2985,7 +3003,7 @@ fn validate_confirmation_policy(
 ) -> Result<NonZeroU32, WalletServiceError> {
     let confirmations =
         NonZeroU32::new(confirmations).ok_or(WalletServiceError::UnsafeConfirmations)?;
-    if confirmations.get() < 100
+    if confirmations.get() < COINBASE_SHIELDING_MATURITY
         && !(network == WalletNetwork::Regtest && allow_unsafe_regtest_confirmations)
     {
         return Err(WalletServiceError::UnsafeConfirmations);
@@ -2995,7 +3013,8 @@ fn validate_confirmation_policy(
 
 fn public_confirmation_policy() -> ConfirmationsPolicy {
     ConfirmationsPolicy::new_symmetrical(
-        NonZeroU32::new(COINBASE_SHIELDING_MATURITY).expect("100 is nonzero"),
+        NonZeroU32::new(COINBASE_SHIELDING_MATURITY)
+            .expect("the consensus coinbase maturity is nonzero"),
         false,
     )
 }
@@ -3387,21 +3406,73 @@ mod tests {
 
     #[test]
     fn confirmation_floor_is_public_by_default_and_regtest_override_is_explicit() {
-        assert!(validate_confirmation_policy(WalletNetwork::Testnet, 100, false).is_ok());
+        const LOCAL_CONFIRMATIONS: u32 = 1;
+        const ZERO_CONFIRMATIONS: u32 = 0;
+        let below_public_confirmations = COINBASE_SHIELDING_MATURITY - LOCAL_CONFIRMATIONS;
+
+        assert!(validate_confirmation_policy(
+            WalletNetwork::Testnet,
+            COINBASE_SHIELDING_MATURITY,
+            false
+        )
+        .is_ok());
         assert!(matches!(
-            validate_confirmation_policy(WalletNetwork::Testnet, 99, true),
+            validate_confirmation_policy(WalletNetwork::Testnet, below_public_confirmations, true),
             Err(WalletServiceError::UnsafeConfirmations)
         ));
         assert!(matches!(
-            validate_confirmation_policy(WalletNetwork::Regtest, 1, false),
+            validate_confirmation_policy(WalletNetwork::Regtest, LOCAL_CONFIRMATIONS, false),
+            Err(WalletServiceError::UnsafeConfirmations)
+        ));
+        assert!(matches!(
+            validate_confirmation_policy(WalletNetwork::Regtest, ZERO_CONFIRMATIONS, true),
             Err(WalletServiceError::UnsafeConfirmations)
         ));
         assert_eq!(
-            validate_confirmation_policy(WalletNetwork::Regtest, 1, true)
+            validate_confirmation_policy(WalletNetwork::Regtest, LOCAL_CONFIRMATIONS, true)
                 .unwrap()
                 .get(),
-            1
+            LOCAL_CONFIRMATIONS
         );
+    }
+
+    #[test]
+    fn balance_policy_is_validated_before_wallet_access() {
+        const LOCAL_CONFIRMATIONS: u32 = 1;
+        let directory = tempfile::tempdir().unwrap();
+        let missing_wallet = directory.path().join("missing.sqlite");
+
+        assert!(matches!(
+            wallet_balance_with_confirmations(
+                &missing_wallet,
+                WalletNetwork::Testnet,
+                LOCAL_CONFIRMATIONS,
+                true,
+            ),
+            Err(WalletServiceError::UnsafeConfirmations)
+        ));
+        assert!(matches!(
+            wallet_balance_with_confirmations(
+                &missing_wallet,
+                WalletNetwork::Regtest,
+                LOCAL_CONFIRMATIONS,
+                false,
+            ),
+            Err(WalletServiceError::UnsafeConfirmations)
+        ));
+        assert!(matches!(
+            wallet_balance_with_confirmations(
+                &missing_wallet,
+                WalletNetwork::Regtest,
+                LOCAL_CONFIRMATIONS,
+                true,
+            ),
+            Err(WalletServiceError::WalletDatabaseMissing)
+        ));
+        assert!(matches!(
+            wallet_balance(&missing_wallet, WalletNetwork::Regtest),
+            Err(WalletServiceError::WalletDatabaseMissing)
+        ));
     }
 
     #[test]
