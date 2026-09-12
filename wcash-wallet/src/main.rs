@@ -28,6 +28,10 @@ const MAX_RAW_TRANSACTION_HEX_INPUT: u64 = 4_000_002;
 const MAX_WCASH_ADDRESS_INPUT: u64 = 1_024;
 const MAX_PAYOUT_REQUEST_JSON_INPUT: u64 = 512 * 1_024;
 const MAX_PAYOUT_INSPECTION_JSON_INPUT: u64 = 4_500_000;
+const MIN_PAYOUT_SEED_BYTES: usize = 32;
+const MAX_PAYOUT_SEED_BYTES: usize = 252;
+const PAYOUT_SIGN_FRAME_MAGIC: &[u8; 16] = b"WCASHPAYSIGNV1\0\0";
+const PAYOUT_SIGN_FRAME_HEADER_BYTES: usize = PAYOUT_SIGN_FRAME_MAGIC.len() + 2 + 4;
 
 #[derive(Debug, Error)]
 enum CliError {
@@ -65,6 +69,10 @@ enum CliError {
     },
     #[error("unsafe private seed input: {0}")]
     UnsafePrivateInput(String),
+    #[error("payout signing requires exactly one private seed source")]
+    MissingPayoutSeedSource,
+    #[error("invalid private payout-sign input frame")]
+    InvalidPayoutSignFrame,
     #[error("could not {operation} private seed input {path}: {source}")]
     PrivateInputIo {
         operation: &'static str,
@@ -212,8 +220,20 @@ enum Command {
     /// Atomically sign or recover one exact Testnet payout request read from stdin.
     PayoutSign {
         /// Absolute owner-private seed credential file; contents are never printed or logged.
-        #[arg(long)]
-        seed_file: PathBuf,
+        #[arg(
+            long,
+            value_name = "PATH",
+            required_unless_present = "seed_stdin",
+            conflicts_with = "seed_stdin"
+        )]
+        seed_file: Option<PathBuf>,
+        /// Read a bounded binary frame containing the raw seed and payout JSON from stdin.
+        #[arg(
+            long,
+            required_unless_present = "seed_file",
+            conflicts_with = "seed_file"
+        )]
+        seed_stdin: bool,
     },
     /// Recover an exact signed payout using a batch lookup read from stdin.
     PayoutRecover,
@@ -251,10 +271,54 @@ async fn main() {
     match run(Cli::parse()).await {
         Ok(()) => {}
         Err(error) => {
-            let output = serde_json::json!({ "error": error.to_string() });
-            eprintln!("{output}");
+            let output = CliFailure {
+                protocol_version: 1,
+                code: classify_cli_failure(&error),
+                error: error.to_string(),
+            };
+            if let Ok(encoded) = serde_json::to_string(&output) {
+                eprintln!("{encoded}");
+            }
             std::process::exit(1);
         }
+    }
+}
+
+#[derive(Serialize)]
+struct CliFailure {
+    protocol_version: u32,
+    code: CliFailureCode,
+    error: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CliFailureCode {
+    Rejected,
+    Unavailable,
+    IdempotencyConflict,
+    Ambiguous,
+}
+
+fn classify_cli_failure(error: &CliError) -> CliFailureCode {
+    match error {
+        CliError::Wallet(WalletServiceError::PayoutBatchConflict { .. }) => {
+            CliFailureCode::IdempotencyConflict
+        }
+        CliError::Wallet(
+            WalletServiceError::PersistedPayoutRequiresRecovery { .. }
+            | WalletServiceError::IncompletePayoutBatch { .. }
+            | WalletServiceError::PersistedTransactionsRequireReview { .. },
+        ) => CliFailureCode::Ambiguous,
+        CliError::Rpc(_)
+        | CliError::Wallet(
+            WalletServiceError::Rpc(_)
+            | WalletServiceError::Sqlite(_)
+            | WalletServiceError::Database(_)
+            | WalletServiceError::Synchronization(_)
+            | WalletServiceError::SynchronizationCancelled,
+        ) => CliFailureCode::Unavailable,
+        _ => CliFailureCode::Rejected,
     }
 }
 
@@ -416,10 +480,19 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             required_database(&cli.db)?,
             network,
         )?),
-        Command::PayoutSign { seed_file } => {
-            let request: PayoutBatchRequest =
-                read_json_stdin("payout request", MAX_PAYOUT_REQUEST_JSON_INPUT)?;
-            let seed = read_seed_file(&seed_file)?;
+        Command::PayoutSign {
+            seed_file,
+            seed_stdin,
+        } => {
+            let (request, seed) = if seed_stdin {
+                read_payout_sign_frame()?
+            } else {
+                let request = read_json_stdin("payout request", MAX_PAYOUT_REQUEST_JSON_INPUT)?;
+                let path = seed_file
+                    .as_deref()
+                    .ok_or(CliError::MissingPayoutSeedSource)?;
+                (request, read_seed_file(path)?)
+            };
             let mut client = connect_required(&cli.lightwalletd, network).await?;
             print_json(
                 &create_idempotent_payout_batch(
@@ -613,6 +686,74 @@ fn read_json_stdin<T: DeserializeOwned>(
         return Err(CliError::InputTooLong { field });
     }
     parse_json_input(field, &encoded, maximum_bytes)
+}
+
+/// Reads the private pool signer protocol without placing seed bytes in JSON,
+/// command-line arguments, environment variables, or persistent files.
+///
+/// The frame is `magic[16] || seed_len_be[2] || json_len_be[4] || seed || json`.
+/// Standard input must close after the exact frame so truncation and trailing
+/// content both fail closed.
+fn read_payout_sign_frame() -> Result<(PayoutBatchRequest, SecretVec<u8>), CliError> {
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        return Err(CliError::TerminalInput("private payout-sign frame"));
+    }
+    parse_payout_sign_frame(stdin.lock())
+}
+
+fn parse_payout_sign_frame(
+    reader: impl Read,
+) -> Result<(PayoutBatchRequest, SecretVec<u8>), CliError> {
+    let maximum = PAYOUT_SIGN_FRAME_HEADER_BYTES
+        .saturating_add(MAX_PAYOUT_SEED_BYTES)
+        .saturating_add(MAX_PAYOUT_REQUEST_JSON_INPUT as usize);
+    let mut frame = Zeroizing::new(Vec::new());
+    reader
+        .take(u64::try_from(maximum).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut frame)
+        .map_err(|source| CliError::Stdin {
+            field: "private payout-sign frame",
+            source,
+        })?;
+    if frame.len() > maximum || frame.len() < PAYOUT_SIGN_FRAME_HEADER_BYTES {
+        return Err(CliError::InvalidPayoutSignFrame);
+    }
+    if frame.get(..PAYOUT_SIGN_FRAME_MAGIC.len()) != Some(PAYOUT_SIGN_FRAME_MAGIC) {
+        return Err(CliError::InvalidPayoutSignFrame);
+    }
+
+    let seed_length = u16::from_be_bytes([
+        frame[PAYOUT_SIGN_FRAME_MAGIC.len()],
+        frame[PAYOUT_SIGN_FRAME_MAGIC.len() + 1],
+    ]) as usize;
+    let json_offset = PAYOUT_SIGN_FRAME_MAGIC.len() + 2;
+    let json_length = u32::from_be_bytes([
+        frame[json_offset],
+        frame[json_offset + 1],
+        frame[json_offset + 2],
+        frame[json_offset + 3],
+    ]) as usize;
+    if !(MIN_PAYOUT_SEED_BYTES..=MAX_PAYOUT_SEED_BYTES).contains(&seed_length)
+        || json_length == 0
+        || json_length > MAX_PAYOUT_REQUEST_JSON_INPUT as usize
+    {
+        return Err(CliError::InvalidPayoutSignFrame);
+    }
+    let seed_start = PAYOUT_SIGN_FRAME_HEADER_BYTES;
+    let json_start = seed_start
+        .checked_add(seed_length)
+        .ok_or(CliError::InvalidPayoutSignFrame)?;
+    let frame_end = json_start
+        .checked_add(json_length)
+        .ok_or(CliError::InvalidPayoutSignFrame)?;
+    if frame_end != frame.len() {
+        return Err(CliError::InvalidPayoutSignFrame);
+    }
+
+    let request = serde_json::from_slice(&frame[json_start..frame_end])?;
+    let seed = SecretVec::new(frame[seed_start..json_start].to_vec());
+    Ok((request, seed))
 }
 
 fn parse_json_input<T: DeserializeOwned>(
@@ -857,6 +998,110 @@ mod tests {
             parse_json_input::<BoundedInput>("payout request", r#"{"value":7,"ignored":true}"#, 64,),
             Err(CliError::Json(_))
         ));
+    }
+
+    fn payout_request_json() -> String {
+        serde_json::json!({
+            "batch_id": "10000000-0000-4000-8000-000000000001",
+            "request_commitment": "11".repeat(32),
+            "identity": {
+                "protocol_version": 1,
+                "network": "testnet",
+                "genesis_hash": "22".repeat(32),
+                "branch_id": "b3cfd27e",
+                "account_id": "20000000-0000-4000-8000-000000000002",
+                "fund_source": "ironwood",
+                "synchronized": true
+            },
+            "outputs": [{
+                "allocation_id": "30000000-0000-4000-8000-000000000003",
+                "canonical_address": "wutest1privatefixture",
+                "receiver_kind": "ironwood",
+                "amount_zat": 50_000,
+                "memo_hex": ""
+            }],
+            "confirmations": 100,
+            "max_fee_zat": 10_000
+        })
+        .to_string()
+    }
+
+    fn payout_sign_frame(seed: &[u8], json: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(PAYOUT_SIGN_FRAME_MAGIC);
+        frame.extend_from_slice(&(seed.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&(json.len() as u32).to_be_bytes());
+        frame.extend_from_slice(seed);
+        frame.extend_from_slice(json);
+        frame
+    }
+
+    #[test]
+    fn payout_sign_cli_requires_exactly_one_private_seed_source() {
+        let common = [
+            "wcash-wallet",
+            "--network",
+            "testnet",
+            "--db",
+            "/var/lib/wcash/wallet.sqlite",
+            "--lightwalletd",
+            "http://127.0.0.1:38234",
+            "payout-sign",
+        ];
+        let mut framed = common.to_vec();
+        framed.push("--seed-stdin");
+        assert!(Cli::try_parse_from(framed).is_ok());
+
+        let mut protected = common.to_vec();
+        protected.extend(["--seed-file", "/run/credentials/wcash.seed"]);
+        assert!(Cli::try_parse_from(protected).is_ok());
+
+        assert!(Cli::try_parse_from(common).is_err());
+        let mut both = common.to_vec();
+        both.extend(["--seed-stdin", "--seed-file", "/run/credentials/wcash.seed"]);
+        assert!(Cli::try_parse_from(both).is_err());
+    }
+
+    #[test]
+    fn payout_sign_frame_keeps_seed_out_of_json_and_rejects_malleation() {
+        use secrecy::ExposeSecret;
+
+        let seed = [0x5a; 32];
+        let json = payout_request_json();
+        assert!(!json.as_bytes().windows(seed.len()).any(|part| part == seed));
+        let frame = payout_sign_frame(&seed, json.as_bytes());
+        let (request, parsed_seed) = parse_payout_sign_frame(frame.as_slice()).unwrap();
+        assert_eq!(parsed_seed.expose_secret(), &seed);
+        assert_eq!(request.batch_id, "10000000-0000-4000-8000-000000000001");
+
+        let mut trailing = frame.clone();
+        trailing.push(0);
+        assert!(matches!(
+            parse_payout_sign_frame(trailing.as_slice()),
+            Err(CliError::InvalidPayoutSignFrame)
+        ));
+        assert!(matches!(
+            parse_payout_sign_frame(&frame[..frame.len() - 1]),
+            Err(CliError::InvalidPayoutSignFrame)
+        ));
+
+        let mut bad_magic = frame;
+        bad_magic[0] ^= 0xff;
+        assert!(matches!(
+            parse_payout_sign_frame(bad_magic.as_slice()),
+            Err(CliError::InvalidPayoutSignFrame)
+        ));
+    }
+
+    #[test]
+    fn payout_sign_frame_rejects_unsafe_seed_lengths_before_json_decode() {
+        let json = payout_request_json();
+        for seed in [vec![0x41; 31], vec![0x42; 253]] {
+            assert!(matches!(
+                parse_payout_sign_frame(payout_sign_frame(&seed, json.as_bytes()).as_slice()),
+                Err(CliError::InvalidPayoutSignFrame)
+            ));
+        }
     }
 
     #[cfg(unix)]
