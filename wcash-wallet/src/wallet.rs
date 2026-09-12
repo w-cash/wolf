@@ -427,6 +427,25 @@ pub struct ConfirmedTransactionHistory {
     pub transactions: Vec<ConfirmedTransaction>,
 }
 
+/// A confirmed transaction with the amount shown by upstream wallet history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConfirmedTransactionSummary {
+    /// Confirmed chain and wallet metadata.
+    pub transaction: ConfirmedTransaction,
+    /// Recipient value for a send, received value for a receipt or shield.
+    /// Compact-synced spends report `None` until their outgoing metadata is available.
+    pub value_zat: Option<u64>,
+}
+
+/// A bounded newest-first summary history at one exact synchronized tip.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConfirmedTransactionSummaryHistory {
+    /// Exact synchronized tip used to calculate confirmations.
+    pub exact_tip: BlockRef,
+    /// Confirmed summaries ordered newest first.
+    pub transactions: Vec<ConfirmedTransactionSummary>,
+}
+
 /// One external shielded recipient supplied to transaction construction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferRecipient {
@@ -561,6 +580,8 @@ struct ConfirmedTransactionRow {
     fee_zat: Option<i64>,
     timestamp: Option<i64>,
     total_spent_zat: i64,
+    total_received_zat: i64,
+    total_sent_zat: Option<i64>,
     shielding: bool,
     pool_crossing_zat: Option<i64>,
     zip318_kind: i64,
@@ -1795,6 +1816,23 @@ pub fn confirmed_transaction_history(
     network: WalletNetwork,
     limit: usize,
 ) -> Result<ConfirmedTransactionHistory, WalletServiceError> {
+    let summaries = confirmed_transaction_summary_history(path, network, limit)?;
+    Ok(ConfirmedTransactionHistory {
+        exact_tip: summaries.exact_tip,
+        transactions: summaries
+            .transactions
+            .into_iter()
+            .map(|summary| summary.transaction)
+            .collect(),
+    })
+}
+
+/// Reads confirmed transactions with the values used by upstream wallet history.
+pub fn confirmed_transaction_summary_history(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    limit: usize,
+) -> Result<ConfirmedTransactionSummaryHistory, WalletServiceError> {
     if limit == 0 || limit > MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE {
         return Err(WalletServiceError::InvalidRequest(format!(
             "confirmed transaction history size must be in 1..={MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE}"
@@ -1817,12 +1855,68 @@ pub fn confirmed_transaction_history(
                 })?;
                 extension
                     .query_row(
-                        "SELECT txid, mined_height, tx_index, account_balance_delta,
-                                fee_paid, block_time, total_spent, is_shielding,
-                                pool_crossing_value, zip318_kind
-                         FROM v_transactions
-                         WHERE mined_height IS NOT NULL
-                         ORDER BY mined_height DESC, COALESCE(tx_index, -1) DESC, txid DESC
+                        "SELECT summary.txid, summary.mined_height, summary.tx_index,
+                                summary.account_balance_delta, summary.fee_paid,
+                                summary.block_time, summary.total_spent, summary.total_received,
+                                (
+                                    SELECT SUM(sent_output.value)
+                                    FROM sent_notes sent_output
+                                    JOIN transactions sending_transaction
+                                      ON sending_transaction.id_tx = sent_output.transaction_id
+                                    LEFT JOIN v_received_outputs received_output
+                                      ON received_output.sent_note_id = sent_output.id
+                                    WHERE sending_transaction.txid = summary.txid
+                                      AND received_output.sent_note_id IS NULL
+                                ),
+                                summary.is_shielding OR (
+                                    summary.total_received > 0
+                                    AND EXISTS (
+                                        SELECT 1
+                                        FROM v_received_outputs spent_output
+                                        JOIN v_received_output_spends spend
+                                          ON spend.pool = spent_output.pool
+                                         AND spend.received_output_id = spent_output.id_within_pool_table
+                                        JOIN transactions spending_transaction
+                                          ON spending_transaction.id_tx = spend.transaction_id
+                                        WHERE spending_transaction.txid = summary.txid
+                                          AND spent_output.pool = 0
+                                    )
+                                    AND NOT EXISTS (
+                                        SELECT 1
+                                        FROM v_received_outputs spent_output
+                                        JOIN v_received_output_spends spend
+                                          ON spend.pool = spent_output.pool
+                                         AND spend.received_output_id = spent_output.id_within_pool_table
+                                        JOIN transactions spending_transaction
+                                          ON spending_transaction.id_tx = spend.transaction_id
+                                        WHERE spending_transaction.txid = summary.txid
+                                          AND spent_output.pool != 0
+                                    )
+                                    AND NOT EXISTS (
+                                        SELECT 1
+                                        FROM v_received_outputs received_output
+                                        JOIN transactions receiving_transaction
+                                          ON receiving_transaction.id_tx = received_output.transaction_id
+                                        WHERE receiving_transaction.txid = summary.txid
+                                          AND received_output.pool = 0
+                                    )
+                                    AND NOT EXISTS (
+                                        SELECT 1
+                                        FROM sent_notes sent_output
+                                        JOIN transactions sending_transaction
+                                          ON sending_transaction.id_tx = sent_output.transaction_id
+                                        LEFT JOIN v_received_outputs received_output
+                                          ON received_output.sent_note_id = sent_output.id
+                                        WHERE sending_transaction.txid = summary.txid
+                                          AND received_output.sent_note_id IS NULL
+                                    )
+                                ),
+                                summary.pool_crossing_value, summary.zip318_kind
+                         FROM v_transactions summary
+                         WHERE summary.mined_height IS NOT NULL
+                         ORDER BY summary.mined_height DESC,
+                                  COALESCE(summary.tx_index, -1) DESC,
+                                  summary.txid DESC
                          LIMIT 1 OFFSET ?1",
                         [offset],
                         |row| {
@@ -1834,31 +1928,33 @@ pub fn confirmed_transaction_history(
                                 fee_zat: row.get(4)?,
                                 timestamp: row.get(5)?,
                                 total_spent_zat: row.get(6)?,
-                                shielding: row.get(7)?,
-                                pool_crossing_zat: row.get(8)?,
-                                zip318_kind: row.get(9)?,
+                                total_received_zat: row.get(7)?,
+                                total_sent_zat: row.get(8)?,
+                                shielding: row.get(9)?,
+                                pool_crossing_zat: row.get(10)?,
+                                zip318_kind: row.get(11)?,
                             })
                         },
                     )
                     .optional()
                     .map_err(database_error)?
-                    .map(|row| confirmed_transaction(row, exact_tip))
+                    .map(|row| confirmed_transaction_summary(row, exact_tip))
                     .transpose()
             })
             .take_while(|transaction| !matches!(transaction, Ok(None)))
             .filter_map(Result::transpose)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(ConfirmedTransactionHistory {
+        Ok(ConfirmedTransactionSummaryHistory {
             exact_tip,
             transactions,
         })
     })
 }
 
-fn confirmed_transaction(
+fn confirmed_transaction_summary(
     row: ConfirmedTransactionRow,
     exact_tip: BlockRef,
-) -> Result<ConfirmedTransaction, WalletServiceError> {
+) -> Result<ConfirmedTransactionSummary, WalletServiceError> {
     let txid = zcash_protocol::TxId::from_bytes(row.txid.try_into().map_err(|_| {
         WalletServiceError::Database(
             "confirmed transaction has an invalid transaction identifier".to_owned(),
@@ -1904,7 +2000,11 @@ fn confirmed_transaction(
             })
         })
         .transpose()?;
-    if row.total_spent_zat < 0 || row.pool_crossing_zat.is_some_and(|amount| amount <= 0) {
+    if row.total_spent_zat < 0
+        || row.total_received_zat < 0
+        || row.total_sent_zat.is_some_and(|amount| amount < 0)
+        || row.pool_crossing_zat.is_some_and(|amount| amount <= 0)
+    {
         return Err(WalletServiceError::Database(
             "confirmed transaction has invalid value metadata".to_owned(),
         ));
@@ -1932,15 +2032,52 @@ fn confirmed_transaction(
             }
         }
     };
-    Ok(ConfirmedTransaction {
-        txid: txid.to_string(),
-        mined_height,
-        direction,
-        kind,
-        amount_delta_zat: row.amount_delta_zat,
-        fee_zat,
-        timestamp,
-        confirmations,
+    let total_sent_zat = row
+        .total_sent_zat
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| {
+            WalletServiceError::Database(
+                "confirmed outgoing transaction has an invalid sent value".to_owned(),
+            )
+        })?;
+    let value_zat = match (direction, kind) {
+        (_, ConfirmedTransactionKind::Shielding) | (ConfirmedTransactionDirection::Incoming, _) => {
+            Some(u64::try_from(row.total_received_zat).map_err(|_| {
+                WalletServiceError::Database(
+                    "confirmed transaction has an invalid received value".to_owned(),
+                )
+            })?)
+        }
+        (ConfirmedTransactionDirection::Outgoing, _) => match (total_sent_zat, fee_zat) {
+            (Some(value), _) => Some(value),
+            (None, Some(fee)) => Some(
+                row.amount_delta_zat
+                    .unsigned_abs()
+                    .checked_sub(fee)
+                    .ok_or_else(|| {
+                        WalletServiceError::Database(
+                            "confirmed outgoing transaction fee exceeds its balance change"
+                                .to_owned(),
+                        )
+                    })?,
+            ),
+            (None, None) => None,
+        },
+        (ConfirmedTransactionDirection::Internal, _) => Some(0),
+    };
+    Ok(ConfirmedTransactionSummary {
+        transaction: ConfirmedTransaction {
+            txid: txid.to_string(),
+            mined_height,
+            direction,
+            kind,
+            amount_delta_zat: row.amount_delta_zat,
+            fee_zat,
+            timestamp,
+            confirmations,
+        },
+        value_zat,
     })
 }
 
@@ -4968,6 +5105,137 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_summary_recognizes_wcash_coinbase_shielding() {
+        const TIP_HEIGHT: u32 = 100;
+        const FUNDING_HEIGHT: u32 = 90;
+        const SHIELDING_HEIGHT: u32 = 95;
+        const FUNDING_VALUE_ZAT: u64 = 50_000;
+        const FEE_ZAT: u64 = 10_000;
+        const SHIELDED_VALUE_ZAT: u64 = FUNDING_VALUE_ZAT - FEE_ZAT;
+        const FUNDING_TXID_BYTE: u8 = 0x81;
+        const SHIELDING_TXID_BYTE: u8 = 0x82;
+        const TIP_HASH_BYTE: u8 = 0xaa;
+        const NOTE_BYTES: usize = 32;
+        const DIVERSIFIER_BYTES: usize = 11;
+        const IRONWOOD_POOL_CODE: i64 = 4;
+        const OUTPUT_INDEX: i64 = 0;
+        const NOTE_VERSION: u32 = 0;
+        const ONE_ROW: usize = 1;
+
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let network = WalletNetwork::Regtest;
+        create_wallet_accounts(&wallet_path, network, ONE_ROW);
+        let exact_tip = set_synchronized_test_tip(&wallet_path, network, TIP_HEIGHT, TIP_HASH_BYTE);
+
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        let account_id = connection
+            .query_row("SELECT id FROM accounts", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        let address_id = connection
+            .query_row("SELECT id FROM addresses LIMIT 1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO transactions
+                 (txid, block, mined_height, tx_index, min_observed_height)
+                 VALUES (?1, ?2, ?2, 0, ?2)",
+                rusqlite::params![vec![FUNDING_TXID_BYTE; NOTE_BYTES], FUNDING_HEIGHT],
+            )
+            .unwrap();
+        let funding_transaction_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO transparent_received_outputs
+                 (transaction_id, output_index, account_id, address, script, value_zat,
+                  max_observed_unspent_height, address_id)
+                 VALUES (?1, ?2, ?3, 'WT-fixture', X'', ?4, ?5, ?6)",
+                rusqlite::params![
+                    funding_transaction_id,
+                    OUTPUT_INDEX,
+                    account_id,
+                    FUNDING_VALUE_ZAT,
+                    TIP_HEIGHT,
+                    address_id
+                ],
+            )
+            .unwrap();
+        let funding_output_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO transactions
+                 (txid, block, mined_height, tx_index, fee, min_observed_height)
+                 VALUES (?1, ?2, ?2, 1, ?3, ?2)",
+                rusqlite::params![
+                    vec![SHIELDING_TXID_BYTE; NOTE_BYTES],
+                    SHIELDING_HEIGHT,
+                    FEE_ZAT
+                ],
+            )
+            .unwrap();
+        let shielding_transaction_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO transparent_received_output_spends
+                 (transparent_received_output_id, transaction_id)
+                 VALUES (?1, ?2)",
+                rusqlite::params![funding_output_id, shielding_transaction_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sent_notes
+                 (transaction_id, output_pool, output_index, from_account_id, to_account_id, value)
+                 VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                rusqlite::params![
+                    shielding_transaction_id,
+                    IRONWOOD_POOL_CODE,
+                    OUTPUT_INDEX,
+                    account_id,
+                    SHIELDED_VALUE_ZAT
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ironwood_received_notes
+                 (transaction_id, action_index, account_id, diversifier, value, rho, rseed,
+                  is_change, note_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0, ?7)",
+                rusqlite::params![
+                    shielding_transaction_id,
+                    OUTPUT_INDEX,
+                    account_id,
+                    vec![0_u8; DIVERSIFIER_BYTES],
+                    SHIELDED_VALUE_ZAT,
+                    vec![0_u8; NOTE_BYTES],
+                    NOTE_VERSION
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let history =
+            confirmed_transaction_summary_history(&wallet_path, network, ONE_ROW).unwrap();
+
+        assert_eq!(history.exact_tip, exact_tip);
+        assert_eq!(history.transactions.len(), ONE_ROW);
+        let summary = &history.transactions[0];
+        assert_eq!(
+            summary.transaction.kind,
+            ConfirmedTransactionKind::Shielding
+        );
+        assert_eq!(
+            summary.transaction.direction,
+            ConfirmedTransactionDirection::Internal
+        );
+        assert_eq!(summary.transaction.fee_zat, Some(FEE_ZAT));
+        assert_eq!(summary.value_zat, Some(SHIELDED_VALUE_ZAT));
+    }
+
+    #[test]
     fn confirmed_history_is_bounded_and_requires_complete_synchronization() {
         const MAX_PLUS_ONE: usize = MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE + 1;
         const ZERO_ROWS: usize = 0;
@@ -5012,6 +5280,7 @@ mod tests {
         const FEE_ZAT: i64 = 10_000;
         const SPENT_ZAT: i64 = 50_000;
         const DELTA_ZAT: i64 = -FEE_ZAT;
+        const RECEIVED_ZAT: i64 = SPENT_ZAT - FEE_ZAT;
         const CROSSING_ZAT: i64 = 40_000;
         const TXID_BYTE: u8 = 0x91;
         const TXID_BYTES: usize = 32;
@@ -5027,6 +5296,8 @@ mod tests {
             fee_zat: Some(FEE_ZAT),
             timestamp: None,
             total_spent_zat: SPENT_ZAT,
+            total_received_zat: RECEIVED_ZAT,
+            total_sent_zat: None,
             shielding,
             pool_crossing_zat,
             zip318_kind,
@@ -5034,19 +5305,30 @@ mod tests {
         let exact_tip = block_ref(TIP_HEIGHT, TIP_HASH_BYTE);
 
         let shielding =
-            confirmed_transaction(row(true, None, ZIP318_UNKNOWN_CODE), exact_tip).unwrap();
+            confirmed_transaction_summary(row(true, None, ZIP318_UNKNOWN_CODE), exact_tip)
+                .unwrap()
+                .transaction;
         assert_eq!(shielding.kind, ConfirmedTransactionKind::Shielding);
         assert_eq!(shielding.direction, ConfirmedTransactionDirection::Internal);
+        let shielding_summary =
+            confirmed_transaction_summary(row(true, None, ZIP318_UNKNOWN_CODE), exact_tip).unwrap();
+        assert_eq!(
+            shielding_summary.value_zat,
+            Some(u64::try_from(RECEIVED_ZAT).unwrap())
+        );
 
         let preparation =
-            confirmed_transaction(row(false, None, ZIP318_PREPARATION_CODE), exact_tip).unwrap();
+            confirmed_transaction_summary(row(false, None, ZIP318_PREPARATION_CODE), exact_tip)
+                .unwrap()
+                .transaction;
         assert_eq!(preparation.kind, ConfirmedTransactionKind::Migration);
 
-        let transfer = confirmed_transaction(
+        let transfer = confirmed_transaction_summary(
             row(false, Some(CROSSING_ZAT), ZIP318_TRANSFER_CODE),
             exact_tip,
         )
-        .unwrap();
+        .unwrap()
+        .transaction;
         assert_eq!(transfer.kind, ConfirmedTransactionKind::Migration);
         assert_eq!(transfer.fee_zat, Some(u64::try_from(FEE_ZAT).unwrap()));
         assert_eq!(
@@ -5063,6 +5345,11 @@ mod tests {
                     + MINED_BLOCK_CONFIRMATION,
             })
         );
+
+        let mut metadata_poor = row(false, None, ZIP318_UNKNOWN_CODE);
+        metadata_poor.fee_zat = None;
+        let metadata_poor = confirmed_transaction_summary(metadata_poor, exact_tip).unwrap();
+        assert_eq!(metadata_poor.value_zat, None);
     }
 
     #[test]
