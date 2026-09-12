@@ -332,10 +332,11 @@ The passing automated run established this controlled local path:
     in Sapling and Orchard.
 
 This local pass goes beyond transaction serialization and wallet unit tests. It
-does not supply Internet-facing pool security, miner settlement,
-crash-idempotent payout batches, or reorg-safe accounting. Those require a
-separate durable service that freezes settlement across reorgs and cannot select
-or pay the same input twice.
+does not supply Internet-facing pool security, miner settlement, or reorg-safe
+accounting. The wallet now supplies the isolated crash-idempotent Testnet batch
+signing and exact-byte broadcast boundary documented in
+[`wcash-wallet-payout.md`](wcash-wallet-payout.md); the pool ledger must still
+freeze eligible allocations across reorgs before authorizing a batch.
 
 ## What is not ready
 

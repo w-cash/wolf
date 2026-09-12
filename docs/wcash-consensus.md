@@ -206,9 +206,11 @@ bounded, paginated recovery records containing the persisted transaction ID and
 exact signed bytes. After any ambiguous post-sign outcome, an operator must
 enumerate those pages, inspect transaction status, and rebroadcast the same bytes
 rather than construct a replacement. The wallet is restricted operationally to
-one exclusive writer per database. It deliberately does not implement automatic
-shielding, batch payouts, pool accounting, durable settlement, or idempotent
-payout requests.
+one exclusive writer per database. Its Testnet-only protocol-v1 payout boundary
+atomically binds one ordered batch request to exact signed bytes and makes exact
+retry idempotent. It deliberately does not implement automatic shielding, pool
+accounting, allocation eligibility, or reorg-safe settlement; see
+[`wcash-wallet-payout.md`](wcash-wallet-payout.md).
 
 The controlled-key private-transfer and transparent-coinbase shielding gates
 have passed in isolated Regtest. The transparent phase recovered all current

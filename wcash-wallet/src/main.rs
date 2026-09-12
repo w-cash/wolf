@@ -8,14 +8,17 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use secrecy::SecretVec;
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 use wcash_wallet::{
+    broadcast_signed_payout_batch, create_idempotent_payout_batch,
     create_signed_coinbase_shielding, create_signed_transfer, derive_wallet_spending_key,
     encode_orchard_receiver, encode_transparent_coinbase_receiver, initialize_wallet,
-    pending_signed_transactions, stored_signed_transaction, synchronize_wallet,
-    validate_wcash_address, wallet_balance, AttestedWcashClient, TransferRecipient,
-    WalletAddressError, WalletKeyError, WalletNetwork, WalletRpcError, WalletServiceError,
+    inspect_signed_payout_batch, payout_wallet_identity, pending_signed_transactions,
+    recover_signed_payout_batch, stored_signed_transaction, synchronize_wallet,
+    validate_wcash_address, wallet_balance, AttestedWcashClient, PayoutBatchInspectionRequest,
+    PayoutBatchLookup, PayoutBatchRequest, TransferRecipient, WalletAddressError, WalletKeyError,
+    WalletNetwork, WalletRpcError, WalletServiceError,
 };
 use zcash_protocol::TxId;
 use zeroize::Zeroizing;
@@ -23,6 +26,8 @@ use zeroize::Zeroizing;
 const MAX_SEED_HEX_INPUT: u64 = 506;
 const MAX_RAW_TRANSACTION_HEX_INPUT: u64 = 4_000_002;
 const MAX_WCASH_ADDRESS_INPUT: u64 = 1_024;
+const MAX_PAYOUT_REQUEST_JSON_INPUT: u64 = 512 * 1_024;
+const MAX_PAYOUT_INSPECTION_JSON_INPUT: u64 = 4_500_000;
 
 #[derive(Debug, Error)]
 enum CliError {
@@ -54,6 +59,14 @@ enum CliError {
     UnsafePrivateOutput(String),
     #[error("could not {operation} private IVK output {path}: {source}")]
     PrivateOutputIo {
+        operation: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+    #[error("unsafe private seed input: {0}")]
+    UnsafePrivateInput(String),
+    #[error("could not {operation} private seed input {path}: {source}")]
+    PrivateInputIo {
         operation: &'static str,
         path: PathBuf,
         source: io::Error,
@@ -194,6 +207,20 @@ enum Command {
         #[arg(long)]
         txid: String,
     },
+    /// Print the seedless identity required by the native Testnet payout protocol.
+    PayoutIdentity,
+    /// Atomically sign or recover one exact Testnet payout request read from stdin.
+    PayoutSign {
+        /// Absolute owner-private seed credential file; contents are never printed or logged.
+        #[arg(long)]
+        seed_file: PathBuf,
+    },
+    /// Recover an exact signed payout using a batch lookup read from stdin.
+    PayoutRecover,
+    /// Verify caller-held payout bytes against the durable batch read from stdin.
+    PayoutInspect,
+    /// Broadcast exact caller-held bytes only after matching the durable batch.
+    PayoutBroadcast,
 }
 
 #[derive(Serialize)]
@@ -385,6 +412,58 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 status,
             })
         }
+        Command::PayoutIdentity => print_json(&payout_wallet_identity(
+            required_database(&cli.db)?,
+            network,
+        )?),
+        Command::PayoutSign { seed_file } => {
+            let request: PayoutBatchRequest =
+                read_json_stdin("payout request", MAX_PAYOUT_REQUEST_JSON_INPUT)?;
+            let seed = read_seed_file(&seed_file)?;
+            let mut client = connect_required(&cli.lightwalletd, network).await?;
+            print_json(
+                &create_idempotent_payout_batch(
+                    &mut client,
+                    required_database(&cli.db)?,
+                    network,
+                    &seed,
+                    request,
+                )
+                .await?,
+            )
+        }
+        Command::PayoutRecover => {
+            let lookup: PayoutBatchLookup =
+                read_json_stdin("payout lookup", MAX_PAYOUT_REQUEST_JSON_INPUT)?;
+            print_json(&recover_signed_payout_batch(
+                required_database(&cli.db)?,
+                network,
+                &lookup,
+            )?)
+        }
+        Command::PayoutInspect => {
+            let request: PayoutBatchInspectionRequest =
+                read_json_stdin("payout inspection", MAX_PAYOUT_INSPECTION_JSON_INPUT)?;
+            print_json(&inspect_signed_payout_batch(
+                required_database(&cli.db)?,
+                network,
+                &request,
+            )?)
+        }
+        Command::PayoutBroadcast => {
+            let request: PayoutBatchInspectionRequest =
+                read_json_stdin("payout broadcast", MAX_PAYOUT_INSPECTION_JSON_INPUT)?;
+            let mut client = connect_required(&cli.lightwalletd, network).await?;
+            print_json(
+                &broadcast_signed_payout_batch(
+                    &mut client,
+                    required_database(&cli.db)?,
+                    network,
+                    &request,
+                )
+                .await?,
+            )
+        }
     }
 }
 
@@ -418,6 +497,10 @@ fn read_seed() -> Result<SecretVec<u8>, CliError> {
             field: "wallet seed",
         });
     }
+    parse_seed_input(&encoded)
+}
+
+fn parse_seed_input(encoded: &str) -> Result<SecretVec<u8>, CliError> {
     let encoded = encoded.trim();
     if encoded.is_empty() || encoded.chars().any(char::is_whitespace) {
         return Err(CliError::InvalidHexInput {
@@ -425,6 +508,122 @@ fn read_seed() -> Result<SecretVec<u8>, CliError> {
         });
     }
     decode_hex_value("wallet seed", encoded).map(SecretVec::new)
+}
+
+#[cfg(unix)]
+fn read_seed_file(path: &Path) -> Result<SecretVec<u8>, CliError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        || PathBuf::from_iter(path.components()) != path
+    {
+        return Err(CliError::UnsafePrivateInput(
+            "path must be absolute and lexically canonical".to_owned(),
+        ));
+    }
+    let named =
+        fs::symlink_metadata(path).map_err(|source| private_input_io("inspect", path, source))?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    let mut file = options
+        .open(path)
+        .map_err(|source| private_input_io("open", path, source))?;
+    let opened = file
+        .metadata()
+        .map_err(|source| private_input_io("inspect open", path, source))?;
+    if named.file_type().is_symlink()
+        || !named.is_file()
+        || !opened.is_file()
+        || opened.uid() != nix::unistd::geteuid().as_raw()
+        || opened.permissions().mode() & 0o077 != 0
+        || opened.nlink() != 1
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+    {
+        return Err(CliError::UnsafePrivateInput(
+            "seed credential must be one owner-private regular file with exactly one hard link"
+                .to_owned(),
+        ));
+    }
+    let mut encoded = Zeroizing::new(String::new());
+    (&mut file)
+        .take(MAX_SEED_HEX_INPUT.saturating_add(1))
+        .read_to_string(&mut encoded)
+        .map_err(|source| private_input_io("read", path, source))?;
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_SEED_HEX_INPUT {
+        return Err(CliError::InputTooLong {
+            field: "wallet seed",
+        });
+    }
+    let after = file
+        .metadata()
+        .map_err(|source| private_input_io("reinspect open", path, source))?;
+    let renamed = fs::symlink_metadata(path)
+        .map_err(|source| private_input_io("reinspect named", path, source))?;
+    if after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || renamed.dev() != opened.dev()
+        || renamed.ino() != opened.ino()
+    {
+        return Err(CliError::UnsafePrivateInput(
+            "seed credential pathname changed while it was read".to_owned(),
+        ));
+    }
+    parse_seed_input(&encoded)
+}
+
+#[cfg(not(unix))]
+fn read_seed_file(_path: &Path) -> Result<SecretVec<u8>, CliError> {
+    Err(CliError::UnsafePrivateInput(
+        "private seed credentials are currently supported only on Unix".to_owned(),
+    ))
+}
+
+fn private_input_io(operation: &'static str, path: &Path, source: io::Error) -> CliError {
+    CliError::PrivateInputIo {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn read_json_stdin<T: DeserializeOwned>(
+    field: &'static str,
+    maximum_bytes: u64,
+) -> Result<T, CliError> {
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        return Err(CliError::TerminalInput(field));
+    }
+    let mut encoded = String::new();
+    stdin
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_string(&mut encoded)
+        .map_err(|source| CliError::Stdin { field, source })?;
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > maximum_bytes {
+        return Err(CliError::InputTooLong { field });
+    }
+    parse_json_input(field, &encoded, maximum_bytes)
+}
+
+fn parse_json_input<T: DeserializeOwned>(
+    field: &'static str,
+    encoded: &str,
+    maximum_bytes: u64,
+) -> Result<T, CliError> {
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > maximum_bytes {
+        return Err(CliError::InputTooLong { field });
+    }
+    Ok(serde_json::from_str(encoded)?)
 }
 
 fn read_address() -> Result<String, CliError> {
@@ -602,6 +801,7 @@ fn print_json(value: &impl Serialize) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
 
     #[test]
     fn txid_parser_uses_canonical_display_order() {
@@ -635,6 +835,62 @@ mod tests {
             "/run/credentials/wcash-collector.ivk",
         ])
         .is_ok());
+    }
+
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    struct BoundedInput {
+        value: u32,
+    }
+
+    #[test]
+    fn payout_json_parser_is_bounded_and_rejects_unknown_fields() {
+        assert_eq!(
+            parse_json_input::<BoundedInput>("payout request", r#"{"value":7}"#, 32).unwrap(),
+            BoundedInput { value: 7 }
+        );
+        assert!(matches!(
+            parse_json_input::<BoundedInput>("payout request", r#"{"value":7}"#, 4),
+            Err(CliError::InputTooLong { .. })
+        ));
+        assert!(matches!(
+            parse_json_input::<BoundedInput>("payout request", r#"{"value":7,"ignored":true}"#, 64,),
+            Err(CliError::Json(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payout_seed_file_requires_one_owner_private_regular_inode() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let seed_path = directory.path().join("seed");
+        fs::write(&seed_path, format!("{}\n", "35".repeat(32))).unwrap();
+        fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&read_seed_file(&seed_path).unwrap()),
+            &vec![0x35; 32]
+        );
+
+        fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(
+            read_seed_file(&seed_path),
+            Err(CliError::UnsafePrivateInput(_))
+        ));
+        fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let link_path = directory.path().join("seed-link");
+        symlink(&seed_path, &link_path).unwrap();
+        assert!(matches!(
+            read_seed_file(&link_path),
+            Err(CliError::UnsafePrivateInput(_)) | Err(CliError::PrivateInputIo { .. })
+        ));
+        let hardlink_path = directory.path().join("seed-hardlink");
+        fs::hard_link(&seed_path, &hardlink_path).unwrap();
+        assert!(matches!(
+            read_seed_file(&seed_path),
+            Err(CliError::UnsafePrivateInput(_))
+        ));
     }
 
     #[test]

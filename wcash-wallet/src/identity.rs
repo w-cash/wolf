@@ -10,6 +10,8 @@ use crate::{keys::WALLET_SEED_KDF_VERSION, WalletNetwork};
 const IDENTITY_TABLE: &str = "ext_wcash_wallet_identity";
 pub(crate) const TRANSPARENT_SYNC_STATE_TABLE: &str = "ext_wcash_transparent_sync_state";
 pub(crate) const IRONWOOD_SYNC_STATE_TABLE: &str = "ext_wcash_ironwood_sync";
+pub(crate) const PAYOUT_BATCH_TABLE: &str = "ext_wcash_payout_batches";
+pub(crate) const PAYOUT_OUTPUT_TABLE: &str = "ext_wcash_payout_outputs";
 const IDENTITY_FORMAT_VERSION: i64 = 1;
 
 /// Classification used when opening an existing database for inspection.
@@ -192,6 +194,48 @@ fn ensure_transparent_sync_state(connection: &Connection) -> Result<(), rusqlite
             attested_tip_height INTEGER NOT NULL
                 CHECK (attested_tip_height BETWEEN 0 AND 4294967295),
             attested_tip_hash BLOB NOT NULL CHECK (length(attested_tip_hash) = 32)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS ext_wcash_payout_batches (
+            batch_id BLOB PRIMARY KEY CHECK (length(batch_id) = 16),
+            format_version INTEGER NOT NULL CHECK (format_version = 1),
+            request_commitment BLOB NOT NULL CHECK (length(request_commitment) = 32),
+            request_facts_digest BLOB NOT NULL CHECK (length(request_facts_digest) = 32),
+            account_uuid BLOB NOT NULL CHECK (length(account_uuid) = 16),
+            confirmations INTEGER NOT NULL CHECK (confirmations BETWEEN 100 AND 4294967295),
+            max_fee_zat INTEGER NOT NULL CHECK (max_fee_zat BETWEEN 0 AND 9223372036854775807),
+            txid BLOB CHECK (txid IS NULL OR length(txid) = 32),
+            raw_transaction BLOB,
+            raw_sha256 BLOB CHECK (raw_sha256 IS NULL OR length(raw_sha256) = 32),
+            unsigned_digest BLOB CHECK (unsigned_digest IS NULL OR length(unsigned_digest) = 32),
+            fee_zat INTEGER CHECK (fee_zat IS NULL OR fee_zat BETWEEN 0 AND 9223372036854775807),
+            target_height INTEGER CHECK (target_height IS NULL OR target_height BETWEEN 0 AND 4294967295),
+            expiry_height INTEGER CHECK (expiry_height IS NULL OR expiry_height BETWEEN 0 AND 4294967295),
+            internal_change_receiver_verified INTEGER
+                CHECK (internal_change_receiver_verified IS NULL OR internal_change_receiver_verified = 1),
+            CHECK (
+                (txid IS NULL AND raw_transaction IS NULL AND raw_sha256 IS NULL
+                    AND unsigned_digest IS NULL AND fee_zat IS NULL AND target_height IS NULL
+                    AND expiry_height IS NULL AND internal_change_receiver_verified IS NULL)
+                OR
+                (txid IS NOT NULL AND raw_transaction IS NOT NULL AND length(raw_transaction) > 0
+                    AND raw_sha256 IS NOT NULL AND unsigned_digest IS NOT NULL
+                    AND fee_zat IS NOT NULL AND target_height IS NOT NULL
+                    AND expiry_height IS NOT NULL AND internal_change_receiver_verified = 1)
+            )
+        ) WITHOUT ROWID;
+        CREATE UNIQUE INDEX IF NOT EXISTS ext_wcash_payout_batches_txid
+            ON ext_wcash_payout_batches(txid) WHERE txid IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS ext_wcash_payout_outputs (
+            batch_id BLOB NOT NULL CHECK (length(batch_id) = 16),
+            ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 99),
+            allocation_id BLOB NOT NULL CHECK (length(allocation_id) = 16),
+            canonical_address TEXT NOT NULL CHECK (length(canonical_address) BETWEEN 1 AND 1024),
+            amount_zat INTEGER NOT NULL CHECK (amount_zat BETWEEN 1 AND 9223372036854775807),
+            memo BLOB NOT NULL CHECK (length(memo) <= 512),
+            PRIMARY KEY (batch_id, ordinal),
+            UNIQUE (batch_id, allocation_id),
+            FOREIGN KEY (batch_id) REFERENCES ext_wcash_payout_batches(batch_id)
+                ON UPDATE RESTRICT ON DELETE RESTRICT
         ) WITHOUT ROWID;",
     )
 }
