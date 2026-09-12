@@ -11,6 +11,44 @@ The pool first obtains the exact public identity:
 wcash-wallet --network testnet --db /absolute/private/wallet.sqlite payout-identity
 ```
 
+Before creating a payout batch, the pool obtains a short-lived reconciliation
+observation from the same protected wallet and its loopback Wcash compact-block
+service:
+
+```console
+wcash-wallet \
+  --network testnet \
+  --db /absolute/private/wallet.sqlite \
+  --lightwalletd http://127.0.0.1:38234 \
+  payout-observe
+```
+
+The single JSON response contains `protocol_version`, `network`,
+`genesis_hash`, `branch_id`, `account_id`, `fund_source`, `synchronized`,
+`wallet_state_digest`, `wallet_spendable_zat`, `best_tip_hash`,
+`best_tip_height`, `observed_at`, and `valid_until`. `best_tip_hash` is
+lowercase hex in compact-block/wire byte order. `wallet_spendable_zat` is only
+confirmed, unlocked Ironwood value; transparent or legacy value is never
+reported as spendable payout authority.
+
+The wallet holds its shared operation lock while it compares the stored fully
+scanned tip with a latest-block response, an exact block-at-height response,
+and a second latest-block response. Any unsynchronized wallet, incomplete
+transparent-recovery marker, zero-height tip, account ambiguity, legacy-pool
+balance, endpoint error, or tip mismatch fails without producing an
+observation. The response is valid for four minutes. Its domain-separated
+BLAKE2b-256 state digest binds the schema version, Wcash network/genesis/branch,
+account UUID, Ironwood funding mode, synchronized flag, spendable value, and
+exact tip; timestamps are deliberately excluded so unchanged state has a
+stable digest.
+
+This is an integrity snapshot, not a remote consensus oracle. Its chain
+authority is the endpoint authenticated and network-attested by
+`wcash-wallet`; production therefore uses a protected literal-loopback endpoint
+backed by the pool's own Wcash node. The pool must also enforce expiry against
+its database clock and must never accept operator-supplied replacements for any
+response field.
+
 The pool commits that identity, an ordered non-empty allocation list, a minimum
 of 100 confirmations, and a maximum fee into its own durable payout intent. It
 then sends one protocol-version-1 JSON request on non-terminal standard input:

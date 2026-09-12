@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fs2::FileExt;
@@ -75,6 +75,10 @@ pub const MAX_SYNC_BATCH_SIZE: u32 = crate::cache::MAX_ATTESTED_COMPACT_BLOCKS_P
 pub const MAX_TRANSFER_RECIPIENTS: usize = 100;
 /// Payout batch journal format written alongside the wallet transaction.
 pub const PAYOUT_BATCH_FORMAT_VERSION: u32 = 1;
+/// Machine-readable wallet-observation schema version.
+pub const PAYOUT_OBSERVATION_FORMAT_VERSION: u32 = 1;
+/// Maximum lifetime of a payout wallet observation.
+pub const PAYOUT_OBSERVATION_VALIDITY_SECS: u64 = 4 * 60;
 /// Maximum transaction expiry interval accepted by the wallet.
 pub const MAX_EXPIRY_DELTA: u32 = 100;
 /// Maximum note-lock lifetime accepted by the wallet.
@@ -216,6 +220,9 @@ pub enum WalletServiceError {
     /// The live chain changed during synchronization or after transaction input selection.
     #[error("wallet chain state is stale; synchronize and rebuild the transaction")]
     StaleChain,
+    /// The host clock cannot produce a safe reconciliation timestamp.
+    #[error("system clock cannot produce a valid Unix timestamp")]
+    InvalidSystemClock,
     /// One restartable current-UTXO recovery pass exceeded its wall-clock limit.
     #[error("transparent coinbase recovery exceeded its bounded session duration")]
     TransparentRecoveryDeadline,
@@ -428,6 +435,42 @@ pub struct PayoutWalletIdentity {
 pub enum PayoutFundSource {
     /// The Wcash Ironwood pool.
     Ironwood,
+}
+
+/// Short-lived, seedless Wcash collector state for pool reconciliation.
+///
+/// `best_tip_hash` is lowercase hexadecimal in the internal byte order used by
+/// Wcash compact-block protobufs and the pool's chain wire records. The state
+/// digest excludes the timestamps, so an unchanged wallet snapshot has one
+/// stable identifier across repeated observations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PayoutWalletObservation {
+    /// Wallet-observation protocol version.
+    pub protocol_version: u32,
+    /// Exact Wcash network selected by the observer.
+    pub network: WalletNetwork,
+    /// Frozen Wcash genesis block identifier in conventional display order.
+    pub genesis_hash: String,
+    /// Frozen transaction consensus branch identifier.
+    pub branch_id: String,
+    /// UUID of the only wallet account funding payouts.
+    pub account_id: String,
+    /// Must be `ironwood`; legacy and transparent balances are not spendable by the payout signer.
+    pub fund_source: PayoutFundSource,
+    /// True only when the wallet's fully scanned tip equals the attested node tip.
+    pub synchronized: bool,
+    /// Domain-separated BLAKE2b-256 of the canonical, timestamp-free fields in this response.
+    pub wallet_state_digest: String,
+    /// Ironwood value immediately spendable under the public confirmation policy.
+    pub wallet_spendable_zat: u64,
+    /// Canonical best-chain tip hash in compact-block/wire byte order.
+    pub best_tip_hash: String,
+    /// Canonical best-chain tip height.
+    pub best_tip_height: u32,
+    /// Unix time at which the fully checked snapshot was completed.
+    pub observed_at: u64,
+    /// Unix time after which the pool must discard this observation.
+    pub valid_until: u64,
 }
 
 /// One ordered allocation in an idempotent pool payout request.
@@ -2068,6 +2111,136 @@ pub fn payout_wallet_identity(
         account_id.expose_uuid(),
         summary.is_synced(),
     ))
+}
+
+/// Returns one short-lived collector observation bound to an exact live chain tip.
+///
+/// The wallet database is held under its shared operation lock from the first
+/// live-tip read through the final revalidation. This prevents synchronization
+/// or signing from changing spendability while the snapshot is being attested.
+/// The connected compact-block service was already bound to the selected chain
+/// name, branch ID, and genesis by [`AttestedWcashClient::connect`]. This method
+/// additionally requires its latest-block response, its block-at-height
+/// response, and the wallet's stored fully scanned tip to match exactly.
+pub async fn payout_wallet_observation(
+    client: &mut AttestedWcashClient,
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+) -> Result<PayoutWalletObservation, WalletServiceError> {
+    require_payout_testnet(network)?;
+    ensure_client_network(client, network)?;
+    let path = path.as_ref();
+    require_existing_wallet_file(path)?;
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Shared)?;
+
+    let live_before = client.latest_block().await?;
+    let snapshot = read_payout_observation_snapshot(path, network)?;
+    let live_at_height = client.compact_block_ref(snapshot.tip.height).await?;
+    let live_after = client.latest_block().await?;
+    if !payout_observation_tips_match(snapshot.tip, live_before, live_at_height, live_after) {
+        return Err(WalletServiceError::StaleChain);
+    }
+
+    let observed_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| WalletServiceError::InvalidSystemClock)?
+        .as_secs();
+    let valid_until = observed_at
+        .checked_add(PAYOUT_OBSERVATION_VALIDITY_SECS)
+        .filter(|_| observed_at != 0)
+        .ok_or(WalletServiceError::InvalidSystemClock)?;
+    Ok(build_payout_wallet_observation(
+        snapshot,
+        observed_at,
+        valid_until,
+    ))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PayoutObservationSnapshot {
+    identity: PayoutWalletIdentity,
+    wallet_spendable_zat: u64,
+    tip: BlockRef,
+}
+
+fn read_payout_observation_snapshot(
+    path: &Path,
+    network: WalletNetwork,
+) -> Result<PayoutObservationSnapshot, WalletServiceError> {
+    let mut wallet = open_existing_wallet_read_only(path, network)?;
+    require_transparent_recovery_complete(&mut wallet)?;
+    let account_ids = wallet.get_account_ids().map_err(database_error)?;
+    let account_id = only_account(&account_ids)?;
+    let summary = wallet_balance_summary(&wallet, public_confirmation_policy())?;
+    if !summary.synchronized
+        || summary.chain_tip_height == 0
+        || summary.fully_scanned_height != summary.chain_tip_height
+    {
+        return Err(WalletServiceError::NotSynchronized);
+    }
+    let account = summary
+        .accounts
+        .iter()
+        .find(|account| account.account_id == account_id.expose_uuid().hyphenated().to_string())
+        .ok_or(WalletServiceError::AuthorityMismatch)?;
+    let tip = expected_chain_ref(&wallet, network, summary.chain_tip_height)?;
+    Ok(PayoutObservationSnapshot {
+        identity: expected_payout_identity(network, account_id.expose_uuid(), true),
+        wallet_spendable_zat: account.ironwood_spendable_zat,
+        tip,
+    })
+}
+
+fn payout_observation_tips_match(
+    stored: BlockRef,
+    live_before: BlockRef,
+    live_at_height: BlockRef,
+    live_after: BlockRef,
+) -> bool {
+    stored == live_before && stored == live_at_height && stored == live_after
+}
+
+fn build_payout_wallet_observation(
+    snapshot: PayoutObservationSnapshot,
+    observed_at: u64,
+    valid_until: u64,
+) -> PayoutWalletObservation {
+    let wallet_state_digest = payout_wallet_state_digest(&snapshot);
+    PayoutWalletObservation {
+        protocol_version: PAYOUT_OBSERVATION_FORMAT_VERSION,
+        network: snapshot.identity.network,
+        genesis_hash: snapshot.identity.genesis_hash,
+        branch_id: snapshot.identity.branch_id,
+        account_id: snapshot.identity.account_id,
+        fund_source: snapshot.identity.fund_source,
+        synchronized: snapshot.identity.synchronized,
+        wallet_state_digest: hex::encode(wallet_state_digest),
+        wallet_spendable_zat: snapshot.wallet_spendable_zat,
+        best_tip_hash: hex::encode(snapshot.tip.hash),
+        best_tip_height: snapshot.tip.height,
+        observed_at,
+        valid_until,
+    }
+}
+
+fn payout_wallet_state_digest(snapshot: &PayoutObservationSnapshot) -> [u8; 32] {
+    let mut state = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"WcashWalletObsV1")
+        .to_state();
+    state.update(&PAYOUT_OBSERVATION_FORMAT_VERSION.to_be_bytes());
+    state.update(&[snapshot.identity.network.domain_byte()]);
+    state.update(&snapshot.identity.network.genesis_hash());
+    state.update(&u32::from(snapshot.identity.network.branch_id()).to_be_bytes());
+    state.update(snapshot.identity.account_id.as_bytes());
+    state.update(&[1]); // Ironwood is the only permitted payout funding pool.
+    state.update(&[u8::from(snapshot.identity.synchronized)]);
+    state.update(&snapshot.wallet_spendable_zat.to_be_bytes());
+    state.update(&snapshot.tip.height.to_be_bytes());
+    state.update(&snapshot.tip.hash);
+    state.finalize().as_bytes().try_into().expect(
+        "the payout observation digest is exactly 32 bytes because the hash output is fixed",
+    )
 }
 
 /// Recovers exact signed bytes for an atomically committed payout batch.
@@ -4030,6 +4203,122 @@ mod tests {
             confirmations: 100,
             max_fee_zat: 100_000,
         }
+    }
+
+    fn test_payout_observation_snapshot() -> PayoutObservationSnapshot {
+        let account_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440010").unwrap();
+        PayoutObservationSnapshot {
+            identity: expected_payout_identity(WalletNetwork::Testnet, account_id, true),
+            wallet_spendable_zat: 625_000_000,
+            tip: block_ref(42, 0x5a),
+        }
+    }
+
+    #[test]
+    fn payout_observation_digest_is_stable_and_binds_every_reconciliation_fact() {
+        let snapshot = test_payout_observation_snapshot();
+        let expected = payout_wallet_state_digest(&snapshot);
+        assert_eq!(payout_wallet_state_digest(&snapshot), expected);
+        assert_ne!(expected, [0; 32]);
+        assert_eq!(
+            hex::encode(expected),
+            "ed6ef64748efce913b3fafdccdfe3fa986b3a5ae09c69630e779b1a7e32a7de1"
+        );
+
+        let first = build_payout_wallet_observation(snapshot.clone(), 1_000, 1_240);
+        let later = build_payout_wallet_observation(snapshot.clone(), 1_100, 1_340);
+        assert_eq!(first.wallet_state_digest, later.wallet_state_digest);
+        assert_ne!(first.observed_at, later.observed_at);
+
+        let mut mutations = Vec::new();
+        let mut changed = snapshot.clone();
+        changed.wallet_spendable_zat += 1;
+        mutations.push(changed);
+        let mut changed = snapshot.clone();
+        changed.tip.height += 1;
+        mutations.push(changed);
+        let mut changed = snapshot.clone();
+        changed.tip.hash[0] ^= 1;
+        mutations.push(changed);
+        let mut changed = snapshot.clone();
+        let changed_account = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440011").unwrap();
+        changed.identity = expected_payout_identity(WalletNetwork::Testnet, changed_account, true);
+        mutations.push(changed);
+        let mut changed = snapshot;
+        changed.identity.synchronized = false;
+        mutations.push(changed);
+
+        for changed in mutations {
+            assert_ne!(payout_wallet_state_digest(&changed), expected);
+        }
+    }
+
+    #[test]
+    fn payout_observation_schema_is_minimal_and_uses_wire_order_tip_hash() {
+        let observation =
+            build_payout_wallet_observation(test_payout_observation_snapshot(), 1_000, 1_240);
+        let encoded = serde_json::to_value(&observation).unwrap();
+        let object = encoded.as_object().unwrap();
+        assert_eq!(object.len(), 13);
+        for field in [
+            "protocol_version",
+            "network",
+            "genesis_hash",
+            "branch_id",
+            "account_id",
+            "fund_source",
+            "synchronized",
+            "wallet_state_digest",
+            "wallet_spendable_zat",
+            "best_tip_hash",
+            "best_tip_height",
+            "observed_at",
+            "valid_until",
+        ] {
+            assert!(object.contains_key(field), "missing {field}");
+        }
+        assert_eq!(encoded["best_tip_hash"], "5a".repeat(32));
+        assert_eq!(encoded["wallet_spendable_zat"], 625_000_000u64);
+        assert_eq!(encoded["fund_source"], "ironwood");
+        assert_eq!(encoded["synchronized"], true);
+        let digest = encoded["wallet_state_digest"].as_str().unwrap();
+        assert_eq!(digest.len(), 64);
+        assert_eq!(digest, digest.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn payout_observation_rejects_every_tip_disagreement() {
+        let expected = block_ref(42, 0x5a);
+        assert!(payout_observation_tips_match(
+            expected, expected, expected, expected
+        ));
+        for position in 0..3 {
+            let mut tips = [expected; 3];
+            tips[position].hash[0] ^= 1;
+            assert!(!payout_observation_tips_match(
+                expected, tips[0], tips[1], tips[2]
+            ));
+        }
+        let mut wrong_height = expected;
+        wrong_height.height += 1;
+        assert!(!payout_observation_tips_match(
+            expected,
+            expected,
+            wrong_height,
+            expected
+        ));
+    }
+
+    #[test]
+    fn payout_observation_refuses_an_unrecovered_wallet() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        create_wallet_accounts(&wallet_path, WalletNetwork::Testnet, 1);
+
+        assert!(matches!(
+            read_payout_observation_snapshot(&wallet_path, WalletNetwork::Testnet),
+            Err(WalletServiceError::TransparentRecoveryIncomplete)
+        ));
     }
 
     #[test]
