@@ -6875,6 +6875,7 @@ dependencies = [
  "tokio",
  "tonic",
  "uuid",
+ "wcash-zcash-aux",
  "zcash_address",
  "zcash_client_backend",
  "zcash_client_sqlite",
