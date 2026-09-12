@@ -14,11 +14,11 @@ use wcash_wallet::{
     broadcast_signed_payout_batch, create_idempotent_payout_batch,
     create_signed_coinbase_shielding, create_signed_transfer, derive_wallet_spending_key,
     encode_orchard_receiver, encode_transparent_coinbase_receiver, initialize_wallet,
-    inspect_signed_payout_batch, payout_wallet_identity, pending_signed_transactions,
-    recover_signed_payout_batch, stored_signed_transaction, synchronize_wallet,
-    validate_wcash_address, wallet_balance, AttestedWcashClient, PayoutBatchInspectionRequest,
-    PayoutBatchLookup, PayoutBatchRequest, TransferRecipient, WalletAddressError, WalletKeyError,
-    WalletNetwork, WalletRpcError, WalletServiceError,
+    inspect_signed_payout_batch, payout_wallet_identity, payout_wallet_observation,
+    pending_signed_transactions, recover_signed_payout_batch, stored_signed_transaction,
+    synchronize_wallet, validate_wcash_address, wallet_balance, AttestedWcashClient,
+    PayoutBatchInspectionRequest, PayoutBatchLookup, PayoutBatchRequest, TransferRecipient,
+    WalletAddressError, WalletKeyError, WalletNetwork, WalletRpcError, WalletServiceError,
 };
 use zcash_protocol::TxId;
 use zeroize::Zeroizing;
@@ -217,6 +217,8 @@ enum Command {
     },
     /// Print the seedless identity required by the native Testnet payout protocol.
     PayoutIdentity,
+    /// Print a short-lived, tip-attested Testnet collector observation.
+    PayoutObserve,
     /// Atomically sign or recover one exact Testnet payout request read from stdin.
     PayoutSign {
         /// Absolute owner-private seed credential file; contents are never printed or logged.
@@ -315,8 +317,13 @@ fn classify_cli_failure(error: &CliError) -> CliFailureCode {
             WalletServiceError::Rpc(_)
             | WalletServiceError::Sqlite(_)
             | WalletServiceError::Database(_)
+            | WalletServiceError::InvalidSystemClock
+            | WalletServiceError::NotSynchronized
+            | WalletServiceError::StaleChain
             | WalletServiceError::Synchronization(_)
-            | WalletServiceError::SynchronizationCancelled,
+            | WalletServiceError::SynchronizationCancelled
+            | WalletServiceError::TransparentRecoveryIncomplete
+            | WalletServiceError::WalletBusy,
         ) => CliFailureCode::Unavailable,
         _ => CliFailureCode::Rejected,
     }
@@ -480,6 +487,13 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             required_database(&cli.db)?,
             network,
         )?),
+        Command::PayoutObserve => {
+            let mut client = connect_required(&cli.lightwalletd, network).await?;
+            print_json(
+                &payout_wallet_observation(&mut client, required_database(&cli.db)?, network)
+                    .await?,
+            )
+        }
         Command::PayoutSign {
             seed_file,
             seed_stdin,
@@ -976,6 +990,33 @@ mod tests {
             "/run/credentials/wcash-collector.ivk",
         ])
         .is_ok());
+        assert!(Cli::try_parse_from([
+            "wcash-wallet",
+            "--network",
+            "testnet",
+            "--db",
+            "/var/lib/wcash/wallet.sqlite",
+            "--lightwalletd",
+            "http://127.0.0.1:38234",
+            "payout-observe",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn transient_observation_failures_are_machine_classified_as_unavailable() {
+        for error in [
+            WalletServiceError::NotSynchronized,
+            WalletServiceError::StaleChain,
+            WalletServiceError::TransparentRecoveryIncomplete,
+            WalletServiceError::WalletBusy,
+            WalletServiceError::InvalidSystemClock,
+        ] {
+            assert_eq!(
+                classify_cli_failure(&CliError::Wallet(error)),
+                CliFailureCode::Unavailable
+            );
+        }
     }
 
     #[derive(Debug, Deserialize, Eq, PartialEq)]
