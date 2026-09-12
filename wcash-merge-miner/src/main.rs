@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use wcash_merge_miner::{
     accounting::{hash_worker_password, read_accounting_snapshot, WorkerCredentialStore},
     mine_zip301_once,
@@ -35,7 +35,7 @@ use wcash_merge_miner::{
     WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config, Zip301LoopbackListener,
     NATIVE_JOB_MAX_AGE_SECONDS,
 };
-use wcash_pool_protocol::{Hex32, JobInvalidationReason, TargetLe};
+use wcash_pool_protocol::{Hex32, JobInvalidationReason, TargetBe, TargetLe};
 use wcash_zcash_aux::{Target, WCASH_AUXILIARY_CHAIN_ID};
 use zcash_address::ZcashAddress;
 use zebra_chain::block::genesis::WCASH_TESTNET_GENESIS_HASH;
@@ -488,7 +488,7 @@ fn run_pool_backend_init(arguments: impl Iterator<Item = String>) -> Result<(), 
             return Err(error.into());
         }
     };
-    let output = json!({
+    let mut output = json!({
         "command": "pool-backend-init",
         "result": result,
         "backend_instance": identity.id(),
@@ -496,9 +496,45 @@ fn run_pool_backend_init(arguments: impl Iterator<Item = String>) -> Result<(), 
         "event_seq": journal.current_event_seq()?,
         "chain_id": journal.chain_id(),
         "listener_workers": runtime.listener_workers,
-        "share_target_ceiling": hex::encode(runtime.target_policy.operator_easiest().as_bytes()),
     });
+    output
+        .as_object_mut()
+        .expect("the backend initialization result is a JSON object")
+        .extend(pool_backend_authority_json_fields(
+            journal.wcash_genesis(),
+            journal.zcash_genesis(),
+            journal.wcash_payout_commitment(),
+            journal.zcash_payout_commitment(),
+            runtime.target_policy.operator_easiest(),
+        ));
     print_json(&output)
+}
+
+/// Returns the public, exact authority fields of an initialized backend.
+///
+/// Genesis hashes use the same raw byte order as the authenticated backend
+/// protocol and durable journal. Payout commitments are uninterpreted SHA-256
+/// bytes. The numeric share target is converted from the backend's explicit
+/// little-endian type into conventional big-endian display order.
+fn pool_backend_authority_json_fields(
+    wcash_genesis: &Hex32,
+    zcash_genesis: &Hex32,
+    wcash_payout_commitment: &Hex32,
+    zcash_payout_commitment: &Hex32,
+    share_target_ceiling: &TargetLe,
+) -> Map<String, Value> {
+    let share_target_ceiling = TargetBe::from(share_target_ceiling).to_string();
+    json!({
+        "wcash_genesis": wcash_genesis,
+        "zcash_genesis": zcash_genesis,
+        "wcash_payout_commitment": wcash_payout_commitment,
+        "zcash_payout_commitment": zcash_payout_commitment,
+        "share_target_ceiling": share_target_ceiling,
+        "share_target_ceiling_byte_order": "big_endian",
+    })
+    .as_object()
+    .expect("the backend authority fields are a JSON object")
+    .clone()
 }
 
 fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
@@ -1974,6 +2010,47 @@ mod tests {
         );
         assert_eq!(display_target(target), display);
         assert!(parse_display_target(&"00".repeat(32), "target").is_err());
+    }
+
+    #[test]
+    fn backend_authority_json_preserves_exact_bindings_and_displays_target_big_endian() {
+        let wcash_genesis = Hex32::new(std::array::from_fn(|index| index as u8 + 1));
+        let zcash_genesis = Hex32::new(std::array::from_fn(|index| index as u8 + 33));
+        let wcash_payout = Hex32::new(std::array::from_fn(|index| index as u8 + 65));
+        let zcash_payout = Hex32::new(std::array::from_fn(|index| index as u8 + 97));
+        let target_display_bytes = std::array::from_fn(|index| index as u8 + 129);
+        let mut target_le_bytes = target_display_bytes;
+        target_le_bytes.reverse();
+
+        let authority = Value::Object(pool_backend_authority_json_fields(
+            &wcash_genesis,
+            &zcash_genesis,
+            &wcash_payout,
+            &zcash_payout,
+            &TargetLe::new(target_le_bytes),
+        ));
+
+        assert_eq!(authority.as_object().unwrap().len(), 6);
+        assert_eq!(authority["wcash_genesis"], wcash_genesis.to_string());
+        assert_eq!(authority["zcash_genesis"], zcash_genesis.to_string());
+        assert_eq!(
+            authority["wcash_payout_commitment"],
+            wcash_payout.to_string()
+        );
+        assert_eq!(
+            authority["zcash_payout_commitment"],
+            zcash_payout.to_string()
+        );
+        assert_eq!(
+            authority["share_target_ceiling"],
+            hex::encode(target_display_bytes)
+        );
+        assert_ne!(
+            authority["share_target_ceiling"],
+            hex::encode(target_le_bytes),
+            "the nonsymmetric target must not leak backend little-endian order"
+        );
+        assert_eq!(authority["share_target_ceiling_byte_order"], "big_endian");
     }
 
     #[test]
