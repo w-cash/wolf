@@ -240,6 +240,17 @@ pub enum WalletServiceError {
         /// Retrieval, serialization, policy, or canonical-chain failure.
         reason: String,
     },
+    /// Refuses to create a replacement while an earlier locally signed
+    /// transaction can still be mined.
+    #[error(
+        "unexpired signed transaction {txid} must settle, be rebroadcast, or reach expiry height {expiry_height} before signing another transaction"
+    )]
+    ActivePendingTransaction {
+        /// Canonical display-order identifier of the transaction to resolve.
+        txid: String,
+        /// Signed expiry height; zero means the transaction does not expire.
+        expiry_height: u32,
+    },
     /// The transfer uses a confirmation policy below the public safety floor.
     #[error("confirmation policy below 100 is allowed only by an explicit Regtest-only override")]
     UnsafeConfirmations,
@@ -404,17 +415,13 @@ pub struct StoredSignedTransaction {
 /// transaction rather than creating a conflicting replacement.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PendingSignedTransactionPage {
+    /// Canonical wallet tip used to classify active rows. This is `None` for
+    /// the unfiltered recovery-history API.
+    pub exact_tip: Option<BlockRef>,
     /// Signed transactions in SQLite row order.
     pub transactions: Vec<StoredSignedTransaction>,
     /// Opaque row cursor for the next page, or `None` when this page is final.
     pub next_after_row_id: Option<u64>,
-}
-
-#[derive(Debug)]
-struct PendingTransactionRow {
-    row_id: i64,
-    txid: zcash_protocol::TxId,
-    raw: Vec<u8>,
 }
 
 struct StoredTransparentCreator {
@@ -682,26 +689,55 @@ fn complete_transparent_recovery(
 fn require_transparent_recovery_complete(
     wallet: &mut WalletDatabase,
 ) -> Result<(), WalletServiceError> {
-    wallet.transactionally_with_extension(|wallet, extension| {
-        let state = read_transparent_sync_state(extension)?;
-        let current_tip =
-            wallet
-                .get_max_height_hash()
-                .map_err(database_error)?
-                .map(|(height, hash)| BlockRef {
-                    height: height.into(),
-                    hash: hash.0,
-                });
-        if state.active_session.is_none()
-            && state
-                .completed_tip
-                .is_some_and(|completed| transparent_tip_matches_wallet(completed, current_tip))
-        {
-            Ok(())
-        } else {
-            Err(WalletServiceError::TransparentRecoveryIncomplete)
+    wallet
+        .transactionally_with_extension(|wallet, extension| {
+            require_transparent_recovery_complete_in_transaction(wallet, extension)
+        })
+        .map(|_| ())
+}
+
+fn require_transparent_recovery_complete_in_transaction<W: WalletRead>(
+    wallet: &W,
+    extension: &ExtensionTransaction<'_>,
+) -> Result<BlockRef, WalletServiceError> {
+    let state = read_transparent_sync_state(extension)?;
+    let current_tip =
+        wallet
+            .get_max_height_hash()
+            .map_err(database_error)?
+            .map(|(height, hash)| BlockRef {
+                height: height.into(),
+                hash: hash.0,
+            });
+    match (state.active_session, state.completed_tip) {
+        (None, Some(completed)) if transparent_tip_matches_wallet(completed, current_tip) => {
+            Ok(completed)
         }
-    })
+        _ => Err(WalletServiceError::TransparentRecoveryIncomplete),
+    }
+}
+
+fn exact_synchronized_recovery_tip_in_transaction<W: WalletRead>(
+    wallet: &W,
+    extension: &ExtensionTransaction<'_>,
+) -> Result<BlockRef, WalletServiceError> {
+    let completed = require_transparent_recovery_complete_in_transaction(wallet, extension)?;
+    let chain_tip_height = wallet
+        .chain_height()
+        .map_err(database_error)?
+        .ok_or(WalletServiceError::NotSynchronized)?;
+    let fully_scanned = wallet
+        .block_fully_scanned()
+        .map_err(database_error)?
+        .ok_or(WalletServiceError::NotSynchronized)?;
+    let fully_scanned_tip = BlockRef {
+        height: fully_scanned.block_height().into(),
+        hash: fully_scanned.block_hash().0,
+    };
+    if u32::from(chain_tip_height) != completed.height || fully_scanned_tip != completed {
+        return Err(WalletServiceError::NotSynchronized);
+    }
+    Ok(completed)
 }
 
 fn read_transparent_sync_state(
@@ -1610,6 +1646,60 @@ pub fn pending_signed_transactions(
     after_row_id: Option<u64>,
     limit: usize,
 ) -> Result<PendingSignedTransactionPage, WalletServiceError> {
+    pending_signed_transactions_inner(
+        path,
+        network,
+        PendingTransactionQuery::All,
+        after_row_id,
+        limit,
+    )
+}
+
+/// Lists a bounded page of locally-created, unmined signed transactions that
+/// remain valid after the wallet's internally attested synchronized tip.
+///
+/// Expired rows remain in SQLite for history and reorganization recovery. A
+/// later call after a rewind can therefore expose them again. Pass the exact
+/// tip returned by the preceding page when continuing pagination; a same-height
+/// reorganization then fails closed instead of changing the result set.
+pub fn active_pending_signed_transactions(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    expected_tip: Option<BlockRef>,
+    after_row_id: Option<u64>,
+    limit: usize,
+) -> Result<PendingSignedTransactionPage, WalletServiceError> {
+    if after_row_id.is_some() && expected_tip.is_none() {
+        return Err(WalletServiceError::InvalidRequest(
+            "active pending continuation requires the preceding page's exact tip".to_owned(),
+        ));
+    }
+    pending_signed_transactions_inner(
+        path,
+        network,
+        PendingTransactionQuery::Active { expected_tip },
+        after_row_id,
+        limit,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PendingTransactionQuery {
+    All,
+    Active {
+        expected_tip: Option<BlockRef>,
+    },
+    #[cfg(test)]
+    ActiveAtAttestedTip(BlockRef),
+}
+
+fn pending_signed_transactions_inner(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    query: PendingTransactionQuery,
+    after_row_id: Option<u64>,
+    limit: usize,
+) -> Result<PendingSignedTransactionPage, WalletServiceError> {
     if limit == 0 || limit > MAX_PENDING_TRANSACTION_PAGE_SIZE {
         return Err(WalletServiceError::InvalidRequest(format!(
             "pending transaction page size must be in 1..={MAX_PENDING_TRANSACTION_PAGE_SIZE}"
@@ -1618,45 +1708,61 @@ pub fn pending_signed_transactions(
     let after_row_id = i64::try_from(after_row_id.unwrap_or(0)).map_err(|_| {
         WalletServiceError::InvalidRequest("pending transaction cursor is too large".to_owned())
     })?;
-    let mut wallet = open_wallet_database(path, network)?;
-    let (rows, next_after_row_id) = pending_transaction_rows(&mut wallet, after_row_id, limit)?;
-    let transactions = rows
-        .into_iter()
-        .map(|row| {
-            let inspected = inspect_signed_transaction(&row.raw, network)?;
-            if inspected.txid() != row.txid {
-                return Err(WalletServiceError::Database(format!(
-                    "persisted transaction {} has mismatched bytes",
-                    row.txid
-                )));
-            }
-            Ok(StoredSignedTransaction {
-                txid: row.txid.to_string(),
-                raw_transaction_hex: hex::encode(row.raw),
-                branch_id: network.branch_id_hex(),
-                expiry_height: inspected.expiry_height().into(),
-            })
-        })
-        .collect::<Result<Vec<_>, WalletServiceError>>()?;
-    Ok(PendingSignedTransactionPage {
-        transactions,
-        next_after_row_id,
-    })
+    let path = path.as_ref();
+    require_existing_wallet_file(path)?;
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Shared)?;
+    let mut wallet = open_existing_wallet_read_only(path, network)?;
+    pending_signed_transaction_page(&mut wallet, network, query, after_row_id, limit)
 }
 
-fn pending_transaction_rows(
+fn pending_signed_transaction_page(
     wallet: &mut WalletDatabase,
+    network: WalletNetwork,
+    query: PendingTransactionQuery,
     after_row_id: i64,
     limit: usize,
-) -> Result<(Vec<PendingTransactionRow>, Option<u64>), WalletServiceError> {
-    wallet.transactionally_with_extension(|_wallet, extension| {
-        let mut rows = Vec::with_capacity(limit);
+) -> Result<PendingSignedTransactionPage, WalletServiceError> {
+    pending_signed_transaction_page_with_inspector(
+        wallet,
+        network,
+        query,
+        after_row_id,
+        limit,
+        |raw| {
+            let inspected = inspect_signed_transaction(raw, network)?;
+            Ok((inspected.txid(), inspected.expiry_height().into()))
+        },
+    )
+}
+
+fn pending_signed_transaction_page_with_inspector<F>(
+    wallet: &mut WalletDatabase,
+    network: WalletNetwork,
+    query: PendingTransactionQuery,
+    after_row_id: i64,
+    limit: usize,
+    mut inspect: F,
+) -> Result<PendingSignedTransactionPage, WalletServiceError>
+where
+    F: FnMut(&[u8]) -> Result<(zcash_protocol::TxId, u32), WalletServiceError>,
+{
+    wallet.transactionally_with_extension(|wallet, extension| {
+        let exact_tip = match query {
+            PendingTransactionQuery::All => None,
+            PendingTransactionQuery::Active { expected_tip } => {
+                let actual_tip = exact_synchronized_recovery_tip_in_transaction(wallet, extension)?;
+                verify_expected_pending_tip(expected_tip, actual_tip)?;
+                Some(actual_tip)
+            }
+            #[cfg(test)]
+            PendingTransactionQuery::ActiveAtAttestedTip(exact_tip) => Some(exact_tip),
+        };
+        let mut transactions = Vec::with_capacity(limit);
         let mut cursor = after_row_id;
-        let mut has_more = false;
-        for _ in 0..=limit {
+        loop {
             let metadata = extension
                 .query_row(
-                    "SELECT id_tx, txid, length(raw)
+                    "SELECT id_tx, txid, expiry_height, length(raw)
                      FROM transactions
                      WHERE id_tx > ?1
                        AND created IS NOT NULL
@@ -1669,18 +1775,19 @@ fn pending_transaction_rows(
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, Vec<u8>>(1)?,
-                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, i64>(3)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((row_id, txid_bytes, raw_len)) = metadata else {
-                break;
+            let Some((row_id, txid_bytes, expiry_height, raw_len)) = metadata else {
+                return Ok(PendingSignedTransactionPage {
+                    exact_tip,
+                    transactions,
+                    next_after_row_id: None,
+                });
             };
-            if rows.len() == limit {
-                has_more = true;
-                break;
-            }
             if row_id <= cursor || raw_len < 0 {
                 return Err(WalletServiceError::Database(
                     "invalid pending transaction row metadata".to_owned(),
@@ -1701,6 +1808,15 @@ fn pending_transaction_rows(
                     "pending transaction row {row_id} has an invalid transaction identifier"
                 ))
             })?);
+            let expiry_height = expiry_height
+                .map(|height| {
+                    u32::try_from(height).map_err(|_| {
+                        WalletServiceError::Database(format!(
+                            "pending transaction row {row_id} has an invalid expiry height"
+                        ))
+                    })
+                })
+                .transpose()?;
             let raw = extension.query_row(
                 "SELECT raw FROM transactions WHERE id_tx = ?1",
                 [row_id],
@@ -1711,23 +1827,72 @@ fn pending_transaction_rows(
                     "pending transaction row {row_id} changed during recovery"
                 )));
             }
-            rows.push(PendingTransactionRow { row_id, txid, raw });
-            cursor = row_id;
-        }
-        let next_after_row_id = if has_more {
-            rows.last()
-                .map(|row| u64::try_from(row.row_id))
-                .transpose()
-                .map_err(|_| {
+            let (inspected_txid, inspected_expiry_height) = inspect(&raw)?;
+            if inspected_txid != txid
+                || expiry_height.is_some_and(|stored| stored != inspected_expiry_height)
+                || (exact_tip.is_some() && expiry_height.is_none())
+            {
+                return Err(WalletServiceError::Database(format!(
+                    "persisted transaction {txid} has mismatched recovery metadata"
+                )));
+            }
+            let is_active = exact_tip.is_none_or(|tip| {
+                inspected_expiry_height == 0 || inspected_expiry_height > tip.height
+            });
+            if is_active && transactions.len() == limit {
+                let next_after_row_id = u64::try_from(cursor).map_err(|_| {
                     WalletServiceError::Database(
                         "pending transaction cursor is not representable".to_owned(),
                     )
-                })?
-        } else {
-            None
-        };
-        Ok((rows, next_after_row_id))
+                })?;
+                return Ok(PendingSignedTransactionPage {
+                    exact_tip,
+                    transactions,
+                    next_after_row_id: Some(next_after_row_id),
+                });
+            }
+            cursor = row_id;
+            if is_active {
+                transactions.push(StoredSignedTransaction {
+                    txid: txid.to_string(),
+                    raw_transaction_hex: hex::encode(raw),
+                    branch_id: network.branch_id_hex(),
+                    expiry_height: inspected_expiry_height,
+                });
+            }
+        }
     })
+}
+
+fn verify_expected_pending_tip(
+    expected_tip: Option<BlockRef>,
+    actual_tip: BlockRef,
+) -> Result<(), WalletServiceError> {
+    if expected_tip.is_none_or(|expected| expected == actual_tip) {
+        Ok(())
+    } else {
+        Err(WalletServiceError::StaleChain)
+    }
+}
+
+fn ensure_no_active_pending_transactions(
+    wallet: &mut WalletDatabase,
+    network: WalletNetwork,
+) -> Result<(), WalletServiceError> {
+    let page = pending_signed_transaction_page(
+        wallet,
+        network,
+        PendingTransactionQuery::Active { expected_tip: None },
+        0,
+        1,
+    )?;
+    match page.transactions.first() {
+        Some(transaction) => Err(WalletServiceError::ActivePendingTransaction {
+            txid: transaction.txid.clone(),
+            expiry_height: transaction.expiry_height,
+        }),
+        None => Ok(()),
+    }
 }
 
 fn wallet_balance_summary(
@@ -1851,6 +2016,7 @@ pub async fn create_signed_transfer(
     let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
     let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
     require_transparent_recovery_complete(&mut wallet)?;
+    ensure_no_active_pending_transactions(&mut wallet, network)?;
     ensure_no_legacy_pool_balances(&wallet)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
@@ -2258,6 +2424,7 @@ pub async fn create_signed_coinbase_shielding(
     let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
     let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
     require_transparent_recovery_complete(&mut wallet)?;
+    ensure_no_active_pending_transactions(&mut wallet, network)?;
     ensure_no_legacy_pool_balances(&wallet)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
@@ -3900,20 +4067,235 @@ mod tests {
         assert!(error.to_string().contains("list-pending"));
     }
 
+    fn fake_pending_raw(txid: [u8; 32], expiry_height: u32) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(36);
+        raw.extend_from_slice(&txid);
+        raw.extend_from_slice(&expiry_height.to_le_bytes());
+        raw
+    }
+
+    fn inspect_fake_pending(raw: &[u8]) -> Result<(zcash_protocol::TxId, u32), WalletServiceError> {
+        let txid: [u8; 32] = raw
+            .get(..32)
+            .ok_or_else(|| {
+                WalletServiceError::Database("fake pending transaction is truncated".to_owned())
+            })?
+            .try_into()
+            .expect("slice length checked");
+        let expiry_height: [u8; 4] = raw
+            .get(32..36)
+            .ok_or_else(|| {
+                WalletServiceError::Database("fake pending transaction is truncated".to_owned())
+            })?
+            .try_into()
+            .expect("slice length checked");
+        Ok((
+            zcash_protocol::TxId::from_bytes(txid),
+            u32::from_le_bytes(expiry_height),
+        ))
+    }
+
+    fn set_synchronized_test_tip(
+        wallet_path: &Path,
+        network: WalletNetwork,
+        tip_height: u32,
+        hash_byte: u8,
+    ) -> BlockRef {
+        let mut connection = rusqlite::Connection::open(wallet_path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute("DELETE FROM blocks", []).unwrap();
+        transaction.execute("DELETE FROM scan_queue", []).unwrap();
+        for height in 1..=tip_height {
+            let hash = if height == tip_height {
+                vec![hash_byte; 32]
+            } else {
+                vec![(height & 0xff) as u8; 32]
+            };
+            transaction
+                .execute(
+                    "INSERT INTO blocks
+                     (height, hash, time, sapling_tree,
+                      sapling_commitment_tree_size, orchard_commitment_tree_size,
+                      sapling_output_count, orchard_action_count,
+                      ironwood_commitment_tree_size, ironwood_action_count)
+                     VALUES (?1, ?2, 0, X'', 0, 0, 0, 0, 0, 0)",
+                    rusqlite::params![height, hash],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute(
+                "INSERT INTO scan_queue (block_range_start, block_range_end, priority)
+                 VALUES (1, ?1, 10)",
+                [tip_height + 1],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let exact_tip = block_ref(tip_height, hash_byte);
+        let operation_lock =
+            acquire_wallet_operation_lock(wallet_path, WalletOperationLockMode::Exclusive).unwrap();
+        let mut wallet = open_wallet_database(wallet_path, network).unwrap();
+        let recovery = begin_transparent_recovery(&mut wallet).unwrap();
+        complete_transparent_recovery(&mut wallet, recovery, exact_tip).unwrap();
+        drop(wallet);
+        drop(operation_lock);
+        exact_tip
+    }
+
+    fn parser_valid_ironwood_raw(
+        network: WalletNetwork,
+        expiry_height: u32,
+        seed: u64,
+    ) -> (zcash_protocol::TxId, Vec<u8>) {
+        let bundle = zebra_chain::transaction::arbitrary::fake_bundle_for_branch(
+            network.branch_id(),
+            orchard::ValuePool::Ironwood,
+            1,
+            seed,
+        )
+        .expect("Ironwood is active for every Wcash wallet network");
+        let transaction = zcash_primitives::transaction::TransactionData::<
+            zcash_primitives::transaction::Authorized,
+        >::from_parts_v6(
+            network.branch_id(),
+            0,
+            BlockHeight::from_u32(expiry_height),
+            None,
+            None,
+            None,
+            Some(bundle),
+        )
+        .freeze()
+        .unwrap();
+        let txid = transaction.txid();
+        let mut raw = Vec::new();
+        transaction.write(&mut raw).unwrap();
+        (txid, raw)
+    }
+
     #[test]
-    fn pending_transaction_rows_survive_restart_and_page_without_replacement() {
+    fn active_pending_public_api_attests_the_exact_wallet_tip() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let network = WalletNetwork::Regtest;
+        create_wallet_accounts(&wallet_path, network, 1);
+        let exact_tip = set_synchronized_test_tip(&wallet_path, network, 100, 0xaa);
+
+        let page = active_pending_signed_transactions(&wallet_path, network, None, None, 1)
+            .expect("the synchronized exact tip is internally attested");
+        assert_eq!(page.exact_tip, Some(exact_tip));
+        assert!(page.transactions.is_empty());
+        assert_eq!(page.next_after_row_id, None);
+
+        assert!(matches!(
+            active_pending_signed_transactions(&wallet_path, network, None, Some(1), 1),
+            Err(WalletServiceError::InvalidRequest(_))
+        ));
+
+        assert!(matches!(
+            active_pending_signed_transactions(
+                &wallet_path,
+                network,
+                Some(block_ref(exact_tip.height, 0xbb)),
+                None,
+                1,
+            ),
+            Err(WalletServiceError::StaleChain)
+        ));
+        assert!(matches!(
+            active_pending_signed_transactions(
+                &wallet_path,
+                network,
+                Some(block_ref(exact_tip.height + 1, 0xaa)),
+                None,
+                1,
+            ),
+            Err(WalletServiceError::StaleChain)
+        ));
+    }
+
+    #[test]
+    fn active_pending_public_api_never_filters_on_mismatched_sqlite_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let network = WalletNetwork::Regtest;
+        create_wallet_accounts(&wallet_path, network, 1);
+        set_synchronized_test_tip(&wallet_path, network, 100, 0xaa);
+        let (txid, raw) = parser_valid_ironwood_raw(network, 101, 7);
+
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO transactions
+                 (txid, created, expiry_height, raw, target_height, min_observed_height)
+                 VALUES (?1, '2026-09-12T00:00:00Z', 100, ?2, 60, 1)",
+                rusqlite::params![txid.as_ref(), raw],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            active_pending_signed_transactions(&wallet_path, network, None, None, 1),
+            Err(WalletServiceError::Database(_))
+        ));
+    }
+
+    #[test]
+    fn signing_guard_rejects_a_parser_valid_active_transaction_under_the_writer_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let network = WalletNetwork::Regtest;
+        create_wallet_accounts(&wallet_path, network, 1);
+        set_synchronized_test_tip(&wallet_path, network, 100, 0xaa);
+        let (expired_txid, expired_raw) = parser_valid_ironwood_raw(network, 100, 8);
+        let (active_txid, active_raw) = parser_valid_ironwood_raw(network, 101, 9);
+
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        for (txid, expiry_height, raw) in [
+            (expired_txid, 100_u32, expired_raw),
+            (active_txid, 101_u32, active_raw),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO transactions
+                     (txid, created, expiry_height, raw, target_height, min_observed_height)
+                     VALUES (?1, '2026-09-12T00:00:00Z', ?2, ?3, 60, 1)",
+                    rusqlite::params![txid.as_ref(), expiry_height, raw],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let _writer =
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Exclusive)
+                .unwrap();
+        let mut wallet = open_wallet_database(&wallet_path, network).unwrap();
+        let error = ensure_no_active_pending_transactions(&mut wallet, network).unwrap_err();
+        assert!(matches!(
+            error,
+            WalletServiceError::ActivePendingTransaction {
+                txid,
+                expiry_height: 101,
+            } if txid == active_txid.to_string()
+        ));
+    }
+
+    #[test]
+    fn pending_transactions_survive_restart_and_page_without_replacement() {
         let directory = tempfile::tempdir().unwrap();
         let wallet_path = directory.path().join("wallet.sqlite");
         drop(open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap());
 
         let connection = rusqlite::Connection::open(&wallet_path).unwrap();
-        for (index, marker) in [1u8, 2, 3].into_iter().enumerate() {
+        for marker in [1u8, 2, 3] {
             connection
                 .execute(
                     "INSERT INTO transactions
                      (txid, created, expiry_height, raw, target_height, min_observed_height)
                      VALUES (?1, '2026-09-09T00:00:00Z', 20, ?2, 10, 1)",
-                    rusqlite::params![vec![marker; 32], vec![marker; index + 1]],
+                    rusqlite::params![vec![marker; 32], fake_pending_raw([marker; 32], 20)],
                 )
                 .unwrap();
         }
@@ -3922,30 +4304,261 @@ mod tests {
                 "INSERT INTO transactions
                  (txid, created, mined_height, expiry_height, raw, target_height, min_observed_height)
                  VALUES (?1, '2026-09-09T00:00:00Z', 11, 20, ?2, 10, 1)",
-                rusqlite::params![vec![9u8; 32], vec![9u8]],
+                rusqlite::params![vec![9u8; 32], fake_pending_raw([9; 32], 20)],
             )
             .unwrap();
         drop(connection);
 
         let mut wallet = open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap();
-        let (first, next) = pending_transaction_rows(&mut wallet, 0, 2).unwrap();
-        assert_eq!(first.len(), 2);
-        assert_eq!(first[0].txid, zcash_protocol::TxId::from_bytes([1; 32]));
-        assert_eq!(first[0].raw, vec![1]);
-        let next = next.expect("a third unmined transaction remains");
+        let first = pending_signed_transaction_page_with_inspector(
+            &mut wallet,
+            WalletNetwork::Regtest,
+            PendingTransactionQuery::All,
+            0,
+            2,
+            inspect_fake_pending,
+        )
+        .unwrap();
+        assert_eq!(first.exact_tip, None);
+        assert_eq!(first.transactions.len(), 2);
+        assert_eq!(
+            first.transactions[0].txid,
+            zcash_protocol::TxId::from_bytes([1; 32]).to_string()
+        );
+        assert_eq!(
+            first.transactions[0].raw_transaction_hex,
+            hex::encode(fake_pending_raw([1; 32], 20))
+        );
+        let next = first
+            .next_after_row_id
+            .expect("a third unmined transaction remains");
         drop(wallet);
 
         let mut reopened = open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap();
-        let (second, next) = pending_transaction_rows(
+        let second = pending_signed_transaction_page_with_inspector(
             &mut reopened,
+            WalletNetwork::Regtest,
+            PendingTransactionQuery::All,
             i64::try_from(next).expect("test cursor fits"),
             2,
+            inspect_fake_pending,
         )
         .unwrap();
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].txid, zcash_protocol::TxId::from_bytes([3; 32]));
-        assert_eq!(second[0].raw, vec![3; 3]);
-        assert_eq!(next, None);
+        assert_eq!(second.transactions.len(), 1);
+        assert_eq!(
+            second.transactions[0].txid,
+            zcash_protocol::TxId::from_bytes([3; 32]).to_string()
+        );
+        assert_eq!(second.next_after_row_id, None);
+    }
+
+    #[test]
+    fn active_pending_transactions_skip_terminal_history_and_reappear_after_a_reorg() {
+        const EXACT_TIP: u32 = 100;
+        const EXPIRED_ROWS: u32 = 2_501;
+
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        drop(open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap());
+
+        let mut connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for index in 0..EXPIRED_ROWS {
+            let mut txid = [0_u8; 32];
+            txid[..4].copy_from_slice(&index.to_le_bytes());
+            transaction
+                .execute(
+                    "INSERT INTO transactions
+                     (txid, created, expiry_height, raw, target_height, min_observed_height)
+                     VALUES (?1, '2026-09-12T00:00:00Z', ?2, ?3, 60, 1)",
+                    rusqlite::params![txid, EXACT_TIP, fake_pending_raw(txid, EXACT_TIP)],
+                )
+                .unwrap();
+        }
+        for (txid, expiry_height) in [
+            ([0xf0_u8; 32], 0_u32),
+            ([0xf1_u8; 32], EXACT_TIP + 1),
+            ([0xf2_u8; 32], EXACT_TIP + 2),
+        ] {
+            transaction
+                .execute(
+                    "INSERT INTO transactions
+                     (txid, created, expiry_height, raw, target_height, min_observed_height)
+                     VALUES (?1, '2026-09-12T00:00:00Z', ?2, ?3, 60, 1)",
+                    rusqlite::params![txid, expiry_height, fake_pending_raw(txid, expiry_height)],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute(
+                "INSERT INTO transactions
+                 (txid, created, mined_height, expiry_height, raw, target_height, min_observed_height)
+                 VALUES (?1, '2026-09-12T00:00:00Z', 80, ?2, ?3, 60, 1)",
+                rusqlite::params![
+                    vec![0xf3_u8; 32],
+                    EXACT_TIP + 1,
+                    fake_pending_raw([0xf3; 32], EXACT_TIP + 1)
+                ],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let exact_tip = block_ref(EXACT_TIP, 0xaa);
+        let mut wallet = open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap();
+        let first = pending_signed_transaction_page_with_inspector(
+            &mut wallet,
+            WalletNetwork::Regtest,
+            PendingTransactionQuery::ActiveAtAttestedTip(exact_tip),
+            0,
+            2,
+            inspect_fake_pending,
+        )
+        .unwrap();
+        assert_eq!(first.exact_tip, Some(exact_tip));
+        assert_eq!(
+            first
+                .transactions
+                .iter()
+                .map(|transaction| transaction.txid.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                zcash_protocol::TxId::from_bytes([0xf0; 32]).to_string(),
+                zcash_protocol::TxId::from_bytes([0xf1; 32]).to_string(),
+            ]
+        );
+        let second = pending_signed_transaction_page_with_inspector(
+            &mut wallet,
+            WalletNetwork::Regtest,
+            PendingTransactionQuery::ActiveAtAttestedTip(exact_tip),
+            i64::try_from(first.next_after_row_id.unwrap()).unwrap(),
+            2,
+            inspect_fake_pending,
+        )
+        .unwrap();
+        assert_eq!(second.transactions.len(), 1);
+        assert_eq!(second.transactions[0].expiry_height, EXACT_TIP + 2);
+        assert_eq!(second.next_after_row_id, None);
+
+        let after_reorg = pending_signed_transaction_page_with_inspector(
+            &mut wallet,
+            WalletNetwork::Regtest,
+            PendingTransactionQuery::ActiveAtAttestedTip(block_ref(EXACT_TIP - 1, 0xbb)),
+            0,
+            1,
+            inspect_fake_pending,
+        )
+        .unwrap();
+        assert_eq!(after_reorg.transactions.len(), 1);
+        assert_eq!(after_reorg.transactions[0].expiry_height, EXACT_TIP);
+    }
+
+    #[test]
+    fn active_pending_transactions_reject_untrusted_expiry_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        drop(open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap());
+
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO transactions
+                 (txid, created, expiry_height, raw, target_height, min_observed_height)
+                 VALUES (?1, '2026-09-12T00:00:00Z', 100, ?2, 60, 1)",
+                rusqlite::params![vec![0x41_u8; 32], fake_pending_raw([0x41; 32], 101)],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut wallet = open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap();
+        let error = pending_signed_transaction_page_with_inspector(
+            &mut wallet,
+            WalletNetwork::Regtest,
+            PendingTransactionQuery::ActiveAtAttestedTip(block_ref(100, 0xaa)),
+            0,
+            1,
+            inspect_fake_pending,
+        )
+        .unwrap_err();
+        assert!(matches!(error, WalletServiceError::Database(_)));
+
+        drop(wallet);
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        connection
+            .execute("UPDATE transactions SET expiry_height = NULL", [])
+            .unwrap();
+        drop(connection);
+        let mut wallet = open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap();
+        let error = pending_signed_transaction_page_with_inspector(
+            &mut wallet,
+            WalletNetwork::Regtest,
+            PendingTransactionQuery::ActiveAtAttestedTip(block_ref(100, 0xaa)),
+            0,
+            1,
+            inspect_fake_pending,
+        )
+        .unwrap_err();
+        assert!(matches!(error, WalletServiceError::Database(_)));
+    }
+
+    #[test]
+    fn pending_transactions_reject_negative_expiry_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        drop(open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap());
+
+        let connection = rusqlite::Connection::open(&wallet_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO transactions
+                 (txid, created, expiry_height, raw, target_height, min_observed_height)
+                 VALUES (?1, '2026-09-12T00:00:00Z', -1, ?2, 60, 1)",
+                rusqlite::params![vec![0x42_u8; 32], fake_pending_raw([0x42; 32], 0)],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut wallet = open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap();
+        let error = pending_signed_transaction_page_with_inspector(
+            &mut wallet,
+            WalletNetwork::Regtest,
+            PendingTransactionQuery::ActiveAtAttestedTip(block_ref(100, 0xaa)),
+            0,
+            1,
+            inspect_fake_pending,
+        )
+        .unwrap_err();
+        assert!(matches!(error, WalletServiceError::Database(_)));
+    }
+
+    #[test]
+    fn active_pending_pagination_binds_height_and_hash() {
+        let actual = block_ref(100, 0xaa);
+        assert!(verify_expected_pending_tip(None, actual).is_ok());
+        assert!(verify_expected_pending_tip(Some(actual), actual).is_ok());
+        assert!(matches!(
+            verify_expected_pending_tip(Some(block_ref(101, 0xaa)), actual),
+            Err(WalletServiceError::StaleChain)
+        ));
+        assert!(matches!(
+            verify_expected_pending_tip(Some(block_ref(100, 0xbb)), actual),
+            Err(WalletServiceError::StaleChain)
+        ));
+    }
+
+    #[test]
+    fn pending_transaction_readers_obey_the_wallet_operation_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        drop(open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap());
+        let _writer =
+            acquire_wallet_operation_lock(&wallet_path, WalletOperationLockMode::Exclusive)
+                .unwrap();
+
+        assert!(matches!(
+            pending_signed_transactions(&wallet_path, WalletNetwork::Regtest, None, 1),
+            Err(WalletServiceError::WalletBusy)
+        ));
     }
 
     #[test]
