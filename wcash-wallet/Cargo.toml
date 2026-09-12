@@ -57,6 +57,7 @@ zip32.workspace = true
 orchard.workspace = true
 zeroize = "1.8"
 uuid = { version = "1", features = ["serde"] }
+wcash-zcash-aux.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["user"] }

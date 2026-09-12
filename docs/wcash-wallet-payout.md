@@ -1,6 +1,6 @@
 # Wcash Testnet payout signer boundary
 
-`wcash-wallet` protocol version 1 is the isolated WEC signing boundary for the
+`wcash-wallet` protocol version 2 is the isolated WEC signing boundary for the
 pool settlement service. It is deliberately enabled only with
 `--network testnet`; Wcash Regtest and the disabled mainnet cannot use these
 commands.
@@ -24,9 +24,12 @@ wcash-wallet \
 ```
 
 The single JSON response contains `protocol_version`, `network`,
-`genesis_hash`, `branch_id`, `account_id`, `fund_source`, `synchronized`,
-`wallet_state_digest`, `wallet_spendable_zat`, `best_tip_hash`,
-`best_tip_height`, `observed_at`, and `valid_until`. `best_tip_hash` is
+`genesis_hash`, `branch_id`, `account_id`, `collector_payout_commitment`,
+`fund_source`, `synchronized`, `wallet_state_digest`, `wallet_spendable_zat`,
+`best_tip_hash`, `best_tip_height`, `observed_at`, and `valid_until`.
+`collector_payout_commitment` is lowercase hex encoding of
+`SHA256("Wcash/Wcash child payout address/v1\0" || canonical Ironwood UA)`;
+the address and viewing keys are not exposed. `best_tip_hash` is
 lowercase hex in compact-block/wire byte order. `wallet_spendable_zat` is only
 confirmed, unlocked Ironwood value; transparent or legacy value is never
 reported as spendable payout authority.
@@ -38,9 +41,9 @@ transparent-recovery marker, zero-height tip, account ambiguity, legacy-pool
 balance, endpoint error, or tip mismatch fails without producing an
 observation. The response is valid for four minutes. Its domain-separated
 BLAKE2b-256 state digest binds the schema version, Wcash network/genesis/branch,
-account UUID, Ironwood funding mode, synchronized flag, spendable value, and
-exact tip; timestamps are deliberately excluded so unchanged state has a
-stable digest.
+account UUID, exact collector commitment, Ironwood funding mode, synchronized
+flag, spendable value, and exact tip; timestamps are deliberately excluded so
+unchanged state has a stable digest.
 
 This is an integrity snapshot, not a remote consensus oracle. Its chain
 authority is the endpoint authenticated and network-attested by
@@ -51,7 +54,7 @@ response field.
 
 The pool commits that identity, an ordered non-empty allocation list, a minimum
 of 100 confirmations, and a maximum fee into its own durable payout intent. It
-then sends one protocol-version-1 JSON request on non-terminal standard input:
+then sends one protocol-version-2 JSON request on non-terminal standard input:
 
 ```console
 wcash-wallet \

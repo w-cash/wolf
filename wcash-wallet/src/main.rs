@@ -1046,11 +1046,12 @@ mod tests {
             "batch_id": "10000000-0000-4000-8000-000000000001",
             "request_commitment": "11".repeat(32),
             "identity": {
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "network": "testnet",
                 "genesis_hash": "22".repeat(32),
                 "branch_id": "b3cfd27e",
                 "account_id": "20000000-0000-4000-8000-000000000002",
+                "collector_payout_commitment": "33".repeat(32),
                 "fund_source": "ironwood",
                 "synchronized": true
             },

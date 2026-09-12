@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+use wcash_zcash_aux::child_payout_address_commitment;
 use zcash_client_backend::{
     data_api::wallet::{
         create_proposed_transactions, decrypt_and_store_transaction,
@@ -73,10 +74,13 @@ use crate::{
 pub const MAX_SYNC_BATCH_SIZE: u32 = crate::cache::MAX_ATTESTED_COMPACT_BLOCKS_PER_RANGE;
 /// Maximum recipients in one experimental shielded transfer.
 pub const MAX_TRANSFER_RECIPIENTS: usize = 100;
-/// Payout batch journal format written alongside the wallet transaction.
-pub const PAYOUT_BATCH_FORMAT_VERSION: u32 = 1;
+/// Native payout request and response protocol version.
+pub const PAYOUT_BATCH_FORMAT_VERSION: u32 = 2;
 /// Machine-readable wallet-observation schema version.
-pub const PAYOUT_OBSERVATION_FORMAT_VERSION: u32 = 1;
+pub const PAYOUT_OBSERVATION_FORMAT_VERSION: u32 = 2;
+/// Durable SQLite payout-table shape; the v2 protocol adds only committed data
+/// inside the existing opaque identity and digest fields.
+const PAYOUT_JOURNAL_SCHEMA_VERSION: i64 = 1;
 /// Maximum lifetime of a payout wallet observation.
 pub const PAYOUT_OBSERVATION_VALIDITY_SECS: u64 = 4 * 60;
 /// Maximum transaction expiry interval accepted by the wallet.
@@ -423,6 +427,9 @@ pub struct PayoutWalletIdentity {
     pub branch_id: String,
     /// UUID of the only wallet account funding the payout.
     pub account_id: String,
+    /// Lowercase SHA-256 commitment to this account's canonical Ironwood collector address,
+    /// separated by [`wcash_zcash_aux::CHILD_PAYOUT_COMMITMENT_DOMAIN`].
+    pub collector_payout_commitment: String,
     /// Must be `ironwood`; legacy pools are not accepted as a funding source.
     pub fund_source: PayoutFundSource,
     /// Must be true when the request is authorized and signed.
@@ -455,6 +462,9 @@ pub struct PayoutWalletObservation {
     pub branch_id: String,
     /// UUID of the only wallet account funding payouts.
     pub account_id: String,
+    /// Lowercase SHA-256 commitment to this account's canonical Ironwood collector address,
+    /// separated by [`wcash_zcash_aux::CHILD_PAYOUT_COMMITMENT_DOMAIN`].
+    pub collector_payout_commitment: String,
     /// Must be `ironwood`; legacy and transparent balances are not spendable by the payout signer.
     pub fund_source: PayoutFundSource,
     /// True only when the wallet's fully scanned tip equals the attested node tip.
@@ -2106,11 +2116,7 @@ pub fn payout_wallet_identity(
         .get_wallet_summary(public_confirmation_policy())
         .map_err(database_error)?
         .ok_or(WalletServiceError::NotSynchronized)?;
-    Ok(expected_payout_identity(
-        network,
-        account_id.expose_uuid(),
-        summary.is_synced(),
-    ))
+    payout_identity_for_account(&wallet, network, account_id, summary.is_synced())
 }
 
 /// Returns one short-lived collector observation bound to an exact live chain tip.
@@ -2185,7 +2191,7 @@ fn read_payout_observation_snapshot(
         .ok_or(WalletServiceError::AuthorityMismatch)?;
     let tip = expected_chain_ref(&wallet, network, summary.chain_tip_height)?;
     Ok(PayoutObservationSnapshot {
-        identity: expected_payout_identity(network, account_id.expose_uuid(), true),
+        identity: payout_identity_for_account(&wallet, network, account_id, true)?,
         wallet_spendable_zat: account.ironwood_spendable_zat,
         tip,
     })
@@ -2212,6 +2218,7 @@ fn build_payout_wallet_observation(
         genesis_hash: snapshot.identity.genesis_hash,
         branch_id: snapshot.identity.branch_id,
         account_id: snapshot.identity.account_id,
+        collector_payout_commitment: snapshot.identity.collector_payout_commitment,
         fund_source: snapshot.identity.fund_source,
         synchronized: snapshot.identity.synchronized,
         wallet_state_digest: hex::encode(wallet_state_digest),
@@ -2226,13 +2233,14 @@ fn build_payout_wallet_observation(
 fn payout_wallet_state_digest(snapshot: &PayoutObservationSnapshot) -> [u8; 32] {
     let mut state = blake2b_simd::Params::new()
         .hash_length(32)
-        .personal(b"WcashWalletObsV1")
+        .personal(b"WcashWalletObsV2")
         .to_state();
     state.update(&PAYOUT_OBSERVATION_FORMAT_VERSION.to_be_bytes());
     state.update(&[snapshot.identity.network.domain_byte()]);
     state.update(&snapshot.identity.network.genesis_hash());
     state.update(&u32::from(snapshot.identity.network.branch_id()).to_be_bytes());
     state.update(snapshot.identity.account_id.as_bytes());
+    state.update(snapshot.identity.collector_payout_commitment.as_bytes());
     state.update(&[1]); // Ironwood is the only permitted payout funding pool.
     state.update(&[u8::from(snapshot.identity.synchronized)]);
     state.update(&snapshot.wallet_spendable_zat.to_be_bytes());
@@ -2255,20 +2263,16 @@ pub fn recover_signed_payout_batch(
     let path = path.as_ref();
     let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
     let mut wallet = open_wallet_database(path, network)?;
-    wallet.transactionally_with_extension(|wallet, extension| {
-        let stored = load_signed_payout_batch(extension, network, batch_id)?;
+    let account_ids = wallet.get_account_ids().map_err(database_error)?;
+    let account_id = only_account(&account_ids)?;
+    let identity = payout_identity_for_account(&wallet, network, account_id, true)?;
+    wallet.transactionally_with_extension(|_wallet, extension| {
+        let stored = load_signed_payout_batch(extension, network, batch_id, &identity)?;
         let Some(stored) = stored else {
             return Ok(None);
         };
         if stored.request_commitment != hex::encode(request_commitment) {
             return Err(WalletServiceError::PayoutBatchConflict {
-                batch_id: batch_id.hyphenated().to_string(),
-            });
-        }
-        let account_ids = wallet.get_account_ids().map_err(database_error)?;
-        let account_id = only_account(&account_ids)?;
-        if stored.identity.account_id != account_id.expose_uuid().hyphenated().to_string() {
-            return Err(WalletServiceError::IncompletePayoutBatch {
                 batch_id: batch_id.hyphenated().to_string(),
             });
         }
@@ -2361,10 +2365,23 @@ pub async fn create_idempotent_payout_batch(
     let mut wallet = open_wallet_database_with_seed(path, network, master_seed)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
-    let prepared = prepare_payout_request(&request, network, account_id.expose_uuid())?;
+    let collector_payout_commitment =
+        collector_payout_commitment_for_account(&wallet, network, account_id)?;
+    let identity = expected_payout_identity(
+        network,
+        account_id.expose_uuid(),
+        collector_payout_commitment,
+        true,
+    );
+    let prepared = prepare_payout_request(
+        &request,
+        network,
+        account_id.expose_uuid(),
+        collector_payout_commitment,
+    )?;
 
     if let Some(stored) = wallet.transactionally_with_extension(|_wallet, extension| {
-        load_signed_payout_batch(extension, network, prepared.batch_id)
+        load_signed_payout_batch(extension, network, prepared.batch_id, &identity)
     })? {
         if stored.request_commitment == hex::encode(prepared.request_commitment)
             && stored.request_facts_digest == hex::encode(prepared.request_facts_digest)
@@ -2422,9 +2439,40 @@ fn require_payout_testnet(network: WalletNetwork) -> Result<(), WalletServiceErr
     }
 }
 
+fn collector_payout_commitment_for_account(
+    wallet: &WalletDatabase,
+    network: WalletNetwork,
+    account_id: AccountUuid,
+) -> Result<[u8; 32], WalletServiceError> {
+    let account = wallet
+        .get_account(account_id)
+        .map_err(database_error)?
+        .ok_or(WalletServiceError::AuthorityMismatch)?;
+    let ufvk = account
+        .ufvk()
+        .ok_or(WalletServiceError::AuthorityMismatch)?;
+    let canonical_collector = encode_orchard_receiver(ufvk, network)?;
+    Ok(child_payout_address_commitment(&canonical_collector))
+}
+
+fn payout_identity_for_account(
+    wallet: &WalletDatabase,
+    network: WalletNetwork,
+    account_id: AccountUuid,
+    synchronized: bool,
+) -> Result<PayoutWalletIdentity, WalletServiceError> {
+    Ok(expected_payout_identity(
+        network,
+        account_id.expose_uuid(),
+        collector_payout_commitment_for_account(wallet, network, account_id)?,
+        synchronized,
+    ))
+}
+
 fn expected_payout_identity(
     network: WalletNetwork,
     account_id: Uuid,
+    collector_payout_commitment: [u8; 32],
     synchronized: bool,
 ) -> PayoutWalletIdentity {
     PayoutWalletIdentity {
@@ -2433,6 +2481,7 @@ fn expected_payout_identity(
         genesis_hash: zebra_chain::block::Hash(network.genesis_hash()).to_string(),
         branch_id: network.branch_id_hex(),
         account_id: account_id.hyphenated().to_string(),
+        collector_payout_commitment: hex::encode(collector_payout_commitment),
         fund_source: PayoutFundSource::Ironwood,
         synchronized,
     }
@@ -2442,8 +2491,10 @@ fn prepare_payout_request(
     request: &PayoutBatchRequest,
     network: WalletNetwork,
     account_id: Uuid,
+    collector_payout_commitment: [u8; 32],
 ) -> Result<PreparedPayoutBatch, WalletServiceError> {
-    let expected_identity = expected_payout_identity(network, account_id, true);
+    let expected_identity =
+        expected_payout_identity(network, account_id, collector_payout_commitment, true);
     if request.identity != expected_identity {
         return Err(WalletServiceError::InvalidRequest(
             "payout wallet identity does not match the synchronized Testnet wallet".to_owned(),
@@ -2572,7 +2623,7 @@ fn payout_request_facts_digest(
 ) -> [u8; 32] {
     let mut state = blake2b_simd::Params::new()
         .hash_length(32)
-        .personal(b"WcashPayFactsV1!")
+        .personal(b"WcashPayFactsV2!")
         .to_state();
     state.update(batch_id.as_bytes());
     state.update(&request_commitment);
@@ -2580,6 +2631,7 @@ fn payout_request_facts_digest(
     update_length_prefixed(&mut state, identity.genesis_hash.as_bytes());
     update_length_prefixed(&mut state, identity.branch_id.as_bytes());
     update_length_prefixed(&mut state, identity.account_id.as_bytes());
+    update_length_prefixed(&mut state, identity.collector_payout_commitment.as_bytes());
     state.update(&confirmations.to_be_bytes());
     state.update(&max_fee_zat.to_be_bytes());
     state.update(&(outputs.len() as u32).to_be_bytes());
@@ -2606,6 +2658,7 @@ fn load_signed_payout_batch(
     extension: &ExtensionTransaction<'_>,
     network: WalletNetwork,
     batch_id: Uuid,
+    identity: &PayoutWalletIdentity,
 ) -> Result<Option<SignedPayoutBatch>, WalletServiceError> {
     let object_types = extension.query_row(
         "SELECT
@@ -2661,7 +2714,7 @@ fn load_signed_payout_batch(
     let malformed = || WalletServiceError::IncompletePayoutBatch {
         batch_id: batch_id.hyphenated().to_string(),
     };
-    if row.format_version != i64::from(PAYOUT_BATCH_FORMAT_VERSION) {
+    if row.format_version != PAYOUT_JOURNAL_SCHEMA_VERSION {
         return Err(malformed());
     }
     let request_commitment: [u8; 32] =
@@ -2671,6 +2724,12 @@ fn load_signed_payout_batch(
         .try_into()
         .map_err(|_| malformed())?;
     let account_uuid = Uuid::from_slice(&row.account_uuid).map_err(|_| malformed())?;
+    if identity.protocol_version != PAYOUT_BATCH_FORMAT_VERSION
+        || identity.network != network
+        || identity.account_id != account_uuid.hyphenated().to_string()
+    {
+        return Err(malformed());
+    }
     let confirmations = u32::try_from(row.confirmations).map_err(|_| malformed())?;
     let max_fee_zat = u64::try_from(row.max_fee_zat).map_err(|_| malformed())?;
     let output_count = usize::try_from(row.output_count).map_err(|_| malformed())?;
@@ -2716,11 +2775,10 @@ fn load_signed_payout_batch(
             memo_hex: hex::encode(memo),
         });
     }
-    let identity = expected_payout_identity(network, account_uuid, true);
     let computed_facts_digest = payout_request_facts_digest(
         batch_id,
         request_commitment,
-        &identity,
+        identity,
         confirmations,
         max_fee_zat,
         &prepared_outputs,
@@ -2791,7 +2849,7 @@ fn load_signed_payout_batch(
         batch_id: batch_id.hyphenated().to_string(),
         request_commitment: hex::encode(request_commitment),
         request_facts_digest: hex::encode(stored_facts_digest),
-        identity,
+        identity: identity.clone(),
         outputs,
         txid: txid.to_string(),
         raw_transaction_hex: hex::encode(raw),
@@ -2817,7 +2875,7 @@ fn insert_payout_batch_intent(
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             batch.batch_id.as_bytes().as_slice(),
-            i64::from(PAYOUT_BATCH_FORMAT_VERSION),
+            PAYOUT_JOURNAL_SCHEMA_VERSION,
             &batch.request_commitment[..],
             &batch.request_facts_digest[..],
             batch.account_uuid.as_bytes().as_slice(),
@@ -4178,12 +4236,24 @@ mod tests {
         }
     }
 
+    fn test_collector_payout_commitment(account: &WalletInfo) -> [u8; 32] {
+        child_payout_address_commitment(&account.address)
+    }
+
+    fn test_payout_identity(account: &WalletInfo, synchronized: bool) -> PayoutWalletIdentity {
+        expected_payout_identity(
+            WalletNetwork::Testnet,
+            Uuid::parse_str(&account.account_id).unwrap(),
+            test_collector_payout_commitment(account),
+            synchronized,
+        )
+    }
+
     fn test_payout_request(account: &WalletInfo) -> PayoutBatchRequest {
-        let account_id = Uuid::parse_str(&account.account_id).unwrap();
         PayoutBatchRequest {
             batch_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
             request_commitment: "11".repeat(32),
-            identity: expected_payout_identity(WalletNetwork::Testnet, account_id, true),
+            identity: test_payout_identity(account, true),
             outputs: vec![
                 PayoutBatchOutput {
                     allocation_id: "550e8400-e29b-41d4-a716-446655440001".to_owned(),
@@ -4208,10 +4278,40 @@ mod tests {
     fn test_payout_observation_snapshot() -> PayoutObservationSnapshot {
         let account_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440010").unwrap();
         PayoutObservationSnapshot {
-            identity: expected_payout_identity(WalletNetwork::Testnet, account_id, true),
+            identity: expected_payout_identity(
+                WalletNetwork::Testnet,
+                account_id,
+                child_payout_address_commitment("wutest1canonical-collector-fixture"),
+                true,
+            ),
             wallet_spendable_zat: 625_000_000,
             tip: block_ref(42, 0x5a),
         }
+    }
+
+    #[test]
+    fn payout_identity_seedlessly_commits_the_exact_canonical_collector() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let account = create_wallet_accounts(&wallet_path, WalletNetwork::Testnet, 1)
+            .pop()
+            .unwrap();
+        let database_before = fs::read(&wallet_path).unwrap();
+        let wallet = open_existing_wallet_read_only(&wallet_path, WalletNetwork::Testnet).unwrap();
+        let account_id = wallet.get_account_ids().unwrap()[0];
+
+        let identity =
+            payout_identity_for_account(&wallet, WalletNetwork::Testnet, account_id, true).unwrap();
+
+        assert_eq!(identity.protocol_version, 2);
+        assert_eq!(
+            identity.collector_payout_commitment,
+            hex::encode(child_payout_address_commitment(&account.address))
+        );
+        let encoded = serde_json::to_string(&identity).unwrap();
+        assert!(!encoded.contains(&account.address));
+        drop(wallet);
+        assert_eq!(fs::read(&wallet_path).unwrap(), database_before);
     }
 
     #[test]
@@ -4222,7 +4322,7 @@ mod tests {
         assert_ne!(expected, [0; 32]);
         assert_eq!(
             hex::encode(expected),
-            "ed6ef64748efce913b3fafdccdfe3fa986b3a5ae09c69630e779b1a7e32a7de1"
+            "a8ad6e22de8424ee0503c5f8d735ed0cb364bbb438748adf24eaabfff80737d1"
         );
 
         let first = build_payout_wallet_observation(snapshot.clone(), 1_000, 1_240);
@@ -4242,7 +4342,15 @@ mod tests {
         mutations.push(changed);
         let mut changed = snapshot.clone();
         let changed_account = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440011").unwrap();
-        changed.identity = expected_payout_identity(WalletNetwork::Testnet, changed_account, true);
+        changed.identity = expected_payout_identity(
+            WalletNetwork::Testnet,
+            changed_account,
+            child_payout_address_commitment("wutest1canonical-collector-fixture"),
+            true,
+        );
+        mutations.push(changed);
+        let mut changed = snapshot.clone();
+        changed.identity.collector_payout_commitment = "a5".repeat(32);
         mutations.push(changed);
         let mut changed = snapshot;
         changed.identity.synchronized = false;
@@ -4259,13 +4367,14 @@ mod tests {
             build_payout_wallet_observation(test_payout_observation_snapshot(), 1_000, 1_240);
         let encoded = serde_json::to_value(&observation).unwrap();
         let object = encoded.as_object().unwrap();
-        assert_eq!(object.len(), 13);
+        assert_eq!(object.len(), 14);
         for field in [
             "protocol_version",
             "network",
             "genesis_hash",
             "branch_id",
             "account_id",
+            "collector_payout_commitment",
             "fund_source",
             "synchronized",
             "wallet_state_digest",
@@ -4281,6 +4390,12 @@ mod tests {
         assert_eq!(encoded["wallet_spendable_zat"], 625_000_000u64);
         assert_eq!(encoded["fund_source"], "ironwood");
         assert_eq!(encoded["synchronized"], true);
+        let collector_commitment = encoded["collector_payout_commitment"].as_str().unwrap();
+        assert_eq!(collector_commitment.len(), 64);
+        assert_eq!(
+            collector_commitment,
+            collector_commitment.to_ascii_lowercase()
+        );
         let digest = encoded["wallet_state_digest"].as_str().unwrap();
         assert_eq!(digest.len(), 64);
         assert_eq!(digest, digest.to_ascii_lowercase());
@@ -4329,13 +4444,20 @@ mod tests {
             .pop()
             .unwrap();
         let account_id = Uuid::parse_str(&account.account_id).unwrap();
+        let collector = test_collector_payout_commitment(&account);
         let request = test_payout_request(&account);
         let expected =
-            prepare_payout_request(&request, WalletNetwork::Testnet, account_id).unwrap();
+            prepare_payout_request(&request, WalletNetwork::Testnet, account_id, collector)
+                .unwrap();
         assert_eq!(
-            prepare_payout_request(&request.clone(), WalletNetwork::Testnet, account_id)
-                .unwrap()
-                .request_facts_digest,
+            prepare_payout_request(
+                &request.clone(),
+                WalletNetwork::Testnet,
+                account_id,
+                collector,
+            )
+            .unwrap()
+            .request_facts_digest,
             expected.request_facts_digest
         );
 
@@ -4364,12 +4486,19 @@ mod tests {
 
         for changed in mutations {
             assert_ne!(
-                prepare_payout_request(&changed, WalletNetwork::Testnet, account_id)
+                prepare_payout_request(&changed, WalletNetwork::Testnet, account_id, collector,)
                     .unwrap()
                     .request_facts_digest,
                 expected.request_facts_digest
             );
         }
+
+        let mut changed = request;
+        changed.identity.collector_payout_commitment = "a5".repeat(32);
+        assert!(
+            prepare_payout_request(&changed, WalletNetwork::Testnet, account_id, collector,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -4380,6 +4509,7 @@ mod tests {
             .pop()
             .unwrap();
         let account_id = Uuid::parse_str(&account.account_id).unwrap();
+        let collector = test_collector_payout_commitment(&account);
         let request = test_payout_request(&account);
 
         assert!(matches!(
@@ -4389,28 +4519,30 @@ mod tests {
         let mut bad = request.clone();
         bad.batch_id.make_ascii_uppercase();
         assert!(matches!(
-            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id),
+            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id, collector),
             Err(WalletServiceError::InvalidRequest(_))
         ));
         let mut bad = request.clone();
         bad.outputs[1].allocation_id = bad.outputs[0].allocation_id.clone();
         assert!(matches!(
-            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id),
+            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id, collector),
             Err(WalletServiceError::InvalidRequest(_))
         ));
         let mut bad = request.clone();
         bad.outputs[0].receiver_kind = crate::WcashReceiverKind::TransparentP2pkh;
         assert!(matches!(
-            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id),
+            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id, collector),
             Err(WalletServiceError::InvalidRequest(_))
         ));
         let mut bad = request.clone();
         bad.outputs[0].canonical_address = account.transparent_coinbase_address;
-        assert!(prepare_payout_request(&bad, WalletNetwork::Testnet, account_id).is_err());
+        assert!(
+            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id, collector).is_err()
+        );
         let mut bad = request;
         bad.identity.synchronized = false;
         assert!(matches!(
-            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id),
+            prepare_payout_request(&bad, WalletNetwork::Testnet, account_id, collector),
             Err(WalletServiceError::InvalidRequest(_))
         ));
     }
@@ -4427,6 +4559,7 @@ mod tests {
             &test_payout_request(&account),
             WalletNetwork::Testnet,
             account_id,
+            test_collector_payout_commitment(&account),
         )
         .unwrap();
         let mut wallet = open_wallet_database(&wallet_path, WalletNetwork::Testnet).unwrap();
@@ -4473,8 +4606,10 @@ mod tests {
             &test_payout_request(&account),
             WalletNetwork::Testnet,
             account_id,
+            test_collector_payout_commitment(&account),
         )
         .unwrap();
+        let identity = test_payout_identity(&account, true);
         let mut wallet = open_wallet_database(&wallet_path, WalletNetwork::Testnet).unwrap();
         wallet
             .transactionally_with_extension::<_, _, WalletServiceError>(|_wallet, extension| {
@@ -4483,7 +4618,12 @@ mod tests {
             .unwrap();
         assert!(matches!(
             wallet.transactionally_with_extension(|_wallet, extension| {
-                load_signed_payout_batch(extension, WalletNetwork::Testnet, prepared.batch_id)
+                load_signed_payout_batch(
+                    extension,
+                    WalletNetwork::Testnet,
+                    prepared.batch_id,
+                    &identity,
+                )
             }),
             Err(WalletServiceError::IncompletePayoutBatch { .. })
         ));
@@ -4501,7 +4641,12 @@ mod tests {
         let mut wallet = open_wallet_database(&wallet_path, WalletNetwork::Testnet).unwrap();
         assert!(matches!(
             wallet.transactionally_with_extension(|_wallet, extension| {
-                load_signed_payout_batch(extension, WalletNetwork::Testnet, prepared.batch_id)
+                load_signed_payout_batch(
+                    extension,
+                    WalletNetwork::Testnet,
+                    prepared.batch_id,
+                    &identity,
+                )
             }),
             Err(WalletServiceError::IncompletePayoutBatch { .. })
         ));
