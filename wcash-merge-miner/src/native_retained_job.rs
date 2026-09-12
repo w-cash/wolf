@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use wcash_pool_protocol::{JobDescriptor, TargetLe};
+use wcash_pool_protocol::{Hex32, JobDescriptor, TargetLe};
 use wcash_zcash_aux::{AuxPowError, Target};
 
 use crate::{
@@ -66,6 +66,22 @@ impl fmt::Debug for NativePoolBackendRetainedJob {
 impl PoolBackendRetainedJob for NativePoolBackendRetainedJob {
     fn descriptor(&self) -> JobDescriptor {
         self.descriptor.clone()
+    }
+
+    fn wcash_payout_commitment(&self) -> Hex32 {
+        Hex32::new(
+            self.coordinator
+                .generation_descriptor()
+                .wcash_payout_commitment(),
+        )
+    }
+
+    fn zcash_payout_commitment(&self) -> Hex32 {
+        Hex32::new(
+            self.coordinator
+                .generation_descriptor()
+                .zcash_payout_commitment(),
+        )
     }
 
     fn remaining_lifetime(&self) -> Option<std::time::Duration> {

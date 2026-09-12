@@ -1,8 +1,10 @@
 //! Permission-restricted Unix listener for the private pool backend.
 
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io,
+    net::Shutdown,
     os::unix::{
         ffi::OsStrExt,
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
@@ -10,8 +12,8 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -313,6 +315,9 @@ pub struct PoolBackendListener {
     socket_device: u64,
     socket_inode: u64,
     active_connections: Arc<AtomicUsize>,
+    accepting: AtomicBool,
+    next_connection_id: AtomicU64,
+    active_streams: Arc<Mutex<HashMap<u64, UnixStream>>>,
 }
 
 impl PoolBackendListener {
@@ -353,12 +358,49 @@ impl PoolBackendListener {
             socket_device: metadata.dev(),
             socket_inode: metadata.ino(),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            accepting: AtomicBool::new(true),
+            next_connection_id: AtomicU64::new(1),
+            active_streams: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     /// Returns the bound filesystem path.
     pub fn socket_path(&self) -> &Path {
         &self.config.socket_path
+    }
+
+    /// Returns whether this listener still admits new connections.
+    pub fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
+    }
+
+    /// Stops admission, interrupts active connections, and wakes accept workers.
+    ///
+    /// `accept_workers` must equal the number of threads currently blocked in
+    /// [`Self::serve_one`]. Each local wake connection is rejected before peer
+    /// authentication or frame allocation. The operation is idempotent.
+    pub fn request_shutdown(&self, accept_workers: usize) -> Result<(), PoolBackendListenerError> {
+        if !(1..=MAXIMUM_CONNECTIONS).contains(&accept_workers) {
+            return Err(PoolBackendListenerError::InvalidConfiguration(
+                "shutdown accept-worker count must be in 1..=64",
+            ));
+        }
+        if !self.accepting.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let active_streams = self.active_streams.lock().map_err(|_| {
+            PoolBackendListenerError::Io(io::Error::other(
+                "active pool backend connection registry is poisoned",
+            ))
+        })?;
+        for stream in active_streams.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        drop(active_streams);
+        for _ in 0..accept_workers {
+            UnixStream::connect(&self.config.socket_path).map_err(PoolBackendListenerError::Io)?;
+        }
+        Ok(())
     }
 
     /// Accepts and serves exactly one connection on the current thread.
@@ -373,6 +415,16 @@ impl PoolBackendListener {
             .listener
             .accept()
             .map_err(PoolBackendListenerError::Io)?;
+        if !self.is_accepting() {
+            return Ok(PoolBackendConnectionOutcome::Served);
+        }
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let _registered =
+            ActiveStreamGuard::register(connection_id, &stream, Arc::clone(&self.active_streams))?;
+        if !self.is_accepting() {
+            let _ = stream.shutdown(Shutdown::Both);
+            return Ok(PoolBackendConnectionOutcome::Served);
+        }
         let peer_uid = peer_uid(&stream)?;
         if peer_uid != self.config.expected_peer_uid {
             return Ok(PoolBackendConnectionOutcome::Unauthorized);
@@ -394,6 +446,40 @@ impl PoolBackendListener {
         };
         serve_authorized_connection(&mut stream, &self.config, handler, &session, &authority)?;
         Ok(PoolBackendConnectionOutcome::Served)
+    }
+}
+struct ActiveStreamGuard {
+    connection_id: u64,
+    active_streams: Arc<Mutex<HashMap<u64, UnixStream>>>,
+}
+
+impl ActiveStreamGuard {
+    fn register(
+        connection_id: u64,
+        stream: &UnixStream,
+        active_streams: Arc<Mutex<HashMap<u64, UnixStream>>>,
+    ) -> Result<Self, PoolBackendListenerError> {
+        let interrupt = stream.try_clone().map_err(PoolBackendListenerError::Io)?;
+        active_streams
+            .lock()
+            .map_err(|_| {
+                PoolBackendListenerError::Io(io::Error::other(
+                    "active pool backend connection registry is poisoned",
+                ))
+            })?
+            .insert(connection_id, interrupt);
+        Ok(Self {
+            connection_id,
+            active_streams,
+        })
+    }
+}
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active_streams) = self.active_streams.lock() {
+            active_streams.remove(&self.connection_id);
+        }
     }
 }
 
@@ -965,6 +1051,52 @@ mod tests {
         let metadata = fs::symlink_metadata(&path).unwrap();
         assert!(metadata.file_type().is_socket());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
+        drop(listener);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn shutdown_wakes_an_idle_acceptor_and_allows_socket_cleanup() {
+        let directory = private_directory();
+        let path = socket_path(&directory);
+        let listener = Arc::new(PoolBackendListener::bind(config(path.clone())).unwrap());
+        let handler = Arc::new(TestHandler::default());
+        let server = {
+            let listener = Arc::clone(&listener);
+            thread::spawn(move || listener.serve_one(handler.as_ref()))
+        };
+
+        listener.request_shutdown(1).unwrap();
+        assert_eq!(
+            server.join().unwrap().unwrap(),
+            PoolBackendConnectionOutcome::Served
+        );
+        assert!(!listener.is_accepting());
+        drop(listener);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn shutdown_interrupts_a_connected_peer_before_hello_timeout() {
+        let directory = private_directory();
+        let path = socket_path(&directory);
+        let listener = Arc::new(PoolBackendListener::bind(config(path.clone())).unwrap());
+        let handler = Arc::new(TestHandler::default());
+        let server = {
+            let listener = Arc::clone(&listener);
+            thread::spawn(move || listener.serve_one(handler.as_ref()))
+        };
+        let _client = UnixStream::connect(&path).unwrap();
+        for _ in 0..100 {
+            if !listener.active_streams.lock().unwrap().is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(listener.active_streams.lock().unwrap().len(), 1);
+
+        listener.request_shutdown(1).unwrap();
+        let _outcome = server.join().unwrap();
         drop(listener);
         assert!(!path.exists());
     }

@@ -26,10 +26,6 @@ pub use crate::{
 /// A native generation could not be represented by the backend-v1 protocol.
 #[derive(Debug, Eq, Error, PartialEq)]
 pub enum PoolBackendAdapterError {
-    /// The Wcash reward recipient was not authenticated exactly.
-    #[error("backend-v1 requires an exactly verified transparent Wcash payout recipient")]
-    UnverifiedWcashPayout,
-
     /// The converted descriptor violated a backend-v1 protocol invariant.
     #[error("native generation is not a valid backend-v1 job descriptor: {0}")]
     InvalidJobDescriptor(#[source] ProtocolError),
@@ -218,16 +214,15 @@ fn target_numeric_cmp(left: &TargetLe, right: &TargetLe) -> Ordering {
 
 /// Converts exact native generation metadata into a validated backend-v1 job.
 ///
-/// This boundary rejects private Wcash payouts because their recipient is
-/// trusted to the template node rather than authenticated from the candidate.
+/// Both supported payout classes have been authenticated exactly: transparent
+/// scripts by direct output matching, and private Ironwood notes by complete
+/// incoming-key trial decryption.
 pub fn job_descriptor_from_native(
     native: &NativeGenerationDescriptor,
 ) -> Result<JobDescriptor, PoolBackendAdapterError> {
     match native.wcash_payout_verification() {
-        NativeWcashPayoutVerification::ExactTransparentRecipient => {}
-        NativeWcashPayoutVerification::TrustedPrivateTemplateNode => {
-            return Err(PoolBackendAdapterError::UnverifiedWcashPayout);
-        }
+        NativeWcashPayoutVerification::ExactTransparentRecipient
+        | NativeWcashPayoutVerification::ExactPrivateRecipient => {}
     }
 
     let descriptor = JobDescriptor {

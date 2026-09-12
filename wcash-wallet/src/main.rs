@@ -1,7 +1,8 @@
 //! Command-line interface for the experimental Wcash wallet.
 
 use std::{
-    io::{self, IsTerminal, Read},
+    fs::{self, File, OpenOptions},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -12,15 +13,16 @@ use thiserror::Error;
 use wcash_wallet::{
     create_signed_coinbase_shielding, create_signed_transfer, derive_wallet_spending_key,
     encode_orchard_receiver, encode_transparent_coinbase_receiver, initialize_wallet,
-    pending_signed_transactions, stored_signed_transaction, synchronize_wallet, wallet_balance,
-    AttestedWcashClient, TransferRecipient, WalletAddressError, WalletKeyError, WalletNetwork,
-    WalletRpcError, WalletServiceError,
+    pending_signed_transactions, stored_signed_transaction, synchronize_wallet,
+    validate_wcash_address, wallet_balance, AttestedWcashClient, TransferRecipient,
+    WalletAddressError, WalletKeyError, WalletNetwork, WalletRpcError, WalletServiceError,
 };
 use zcash_protocol::TxId;
 use zeroize::Zeroizing;
 
 const MAX_SEED_HEX_INPUT: u64 = 506;
 const MAX_RAW_TRANSACTION_HEX_INPUT: u64 = 4_000_002;
+const MAX_WCASH_ADDRESS_INPUT: u64 = 1_024;
 
 #[derive(Debug, Error)]
 enum CliError {
@@ -28,7 +30,7 @@ enum CliError {
     MissingDatabase,
     #[error("--lightwalletd is required for this command")]
     MissingEndpoint,
-    #[error("{0} must be piped through stdin; terminal input is refused to prevent echo")]
+    #[error("{0} must be piped through stdin; terminal input is refused")]
     TerminalInput(&'static str),
     #[error("could not read {field} from stdin: {source}")]
     Stdin {
@@ -39,6 +41,8 @@ enum CliError {
     InputTooLong { field: &'static str },
     #[error("{field} must be exactly one hexadecimal value")]
     InvalidHexInput { field: &'static str },
+    #[error("{field} must be exactly one non-empty value without whitespace")]
+    InvalidSingleLineInput { field: &'static str },
     #[error("{field} is not valid hexadecimal: {source}")]
     Hex {
         field: &'static str,
@@ -46,6 +50,14 @@ enum CliError {
     },
     #[error("transaction identifier must be exactly 64 hexadecimal digits in display order")]
     InvalidTxId,
+    #[error("unsafe private IVK output path: {0}")]
+    UnsafePrivateOutput(String),
+    #[error("could not {operation} private IVK output {path}: {source}")]
+    PrivateOutputIo {
+        operation: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
     #[error(transparent)]
     Address(#[from] WalletAddressError),
     #[error(transparent)]
@@ -98,6 +110,17 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         account: u32,
     },
+    /// Derive collector addresses and exclusively write its read-only Ironwood IVK.
+    DeriveCollector {
+        /// ZIP 32 account index.
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        /// New absolute owner-private file for the raw IVK (never printed).
+        #[arg(long)]
+        ivk_file: PathBuf,
+    },
+    /// Canonically classify one Wcash address read from standard input.
+    ValidateAddress,
     /// Create or verify the single wallet account using a hex seed on stdin.
     Init {
         /// First Wcash block to scan; defaults to a bounded recent birthday.
@@ -182,6 +205,15 @@ struct DerivedAddress {
 }
 
 #[derive(Serialize)]
+struct DerivedCollector {
+    network: WalletNetwork,
+    account: u32,
+    address: String,
+    transparent_coinbase_address: String,
+    ivk_file_written: bool,
+}
+
+#[derive(Serialize)]
 struct StatusOutput {
     txid: String,
     status: wcash_wallet::TransactionStatus,
@@ -215,6 +247,31 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     network,
                 )?,
             })
+        }
+        Command::DeriveCollector { account, ivk_file } => {
+            let seed = read_seed()?;
+            let spending_key = derive_wallet_spending_key(&seed, network, account)?;
+            let viewing_key = spending_key.to_unified_full_viewing_key();
+            let orchard = viewing_key.orchard().ok_or_else(|| {
+                WalletAddressError::Derivation(
+                    "unified full viewing key has no Ironwood component".to_owned(),
+                )
+            })?;
+            let address = encode_orchard_receiver(&viewing_key, network)?;
+            let transparent_coinbase_address =
+                encode_transparent_coinbase_receiver(&viewing_key, network)?;
+            write_private_ivk_file(&ivk_file, orchard.to_ivk(zip32::Scope::External).to_bytes())?;
+            print_json(&DerivedCollector {
+                network,
+                account,
+                address,
+                transparent_coinbase_address,
+                ivk_file_written: true,
+            })
+        }
+        Command::ValidateAddress => {
+            let address = read_address()?;
+            print_json(&validate_wcash_address(&address, network)?)
         }
         Command::Init { birthday } => {
             let mut client = connect_required(&cli.lightwalletd, network).await?;
@@ -370,6 +427,145 @@ fn read_seed() -> Result<SecretVec<u8>, CliError> {
     decode_hex_value("wallet seed", encoded).map(SecretVec::new)
 }
 
+fn read_address() -> Result<String, CliError> {
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        return Err(CliError::TerminalInput("Wcash address"));
+    }
+    let mut encoded = String::new();
+    stdin
+        .take(MAX_WCASH_ADDRESS_INPUT.saturating_add(1))
+        .read_to_string(&mut encoded)
+        .map_err(|source| CliError::Stdin {
+            field: "Wcash address",
+            source,
+        })?;
+    parse_address_input(encoded)
+}
+
+fn parse_address_input(encoded: String) -> Result<String, CliError> {
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_WCASH_ADDRESS_INPUT {
+        return Err(CliError::InputTooLong {
+            field: "Wcash address",
+        });
+    }
+    let encoded = encoded.trim();
+    if encoded.is_empty() || encoded.chars().any(char::is_whitespace) {
+        return Err(CliError::InvalidSingleLineInput {
+            field: "Wcash address",
+        });
+    }
+    Ok(encoded.to_owned())
+}
+
+#[cfg(unix)]
+fn write_private_ivk_file(path: &Path, ivk: [u8; 64]) -> Result<(), CliError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let ivk = Zeroizing::new(ivk);
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        || PathBuf::from_iter(path.components()) != path
+    {
+        return Err(CliError::UnsafePrivateOutput(
+            "path must be absolute and lexically canonical".to_owned(),
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        CliError::UnsafePrivateOutput("path must have a parent directory".to_owned())
+    })?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|source| private_output_io("inspect parent of", path, source))?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|source| private_output_io("canonicalize parent of", path, source))?;
+    if !parent_metadata.is_dir()
+        || parent_metadata.file_type().is_symlink()
+        || canonical_parent != parent
+        || parent_metadata.uid() != nix::unistd::geteuid().as_raw()
+        || parent_metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(CliError::UnsafePrivateOutput(
+            "parent must be an owner-controlled canonical directory without group/other write access"
+                .to_owned(),
+        ));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            return Err(CliError::UnsafePrivateOutput(
+                "output already exists; replacement is forbidden".to_owned(),
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => return Err(private_output_io("inspect", path, source)),
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = options
+        .open(path)
+        .map_err(|source| private_output_io("create", path, source))?;
+    validate_private_ivk_output(&file, path)?;
+    let mut encoded = Zeroizing::new(hex::encode(ivk.as_slice()));
+    encoded.push('\n');
+    file.write_all(encoded.as_bytes())
+        .map_err(|source| private_output_io("write", path, source))?;
+    file.sync_all()
+        .map_err(|source| private_output_io("synchronize", path, source))?;
+    validate_private_ivk_output(&file, path)?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| private_output_io("synchronize parent of", path, source))?;
+    validate_private_ivk_output(&file, path)
+}
+
+#[cfg(unix)]
+fn validate_private_ivk_output(file: &File, path: &Path) -> Result<(), CliError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let opened = file
+        .metadata()
+        .map_err(|source| private_output_io("inspect open", path, source))?;
+    let named = fs::symlink_metadata(path)
+        .map_err(|source| private_output_io("inspect named", path, source))?;
+    if !opened.is_file()
+        || named.file_type().is_symlink()
+        || !named.is_file()
+        || opened.uid() != nix::unistd::geteuid().as_raw()
+        || opened.permissions().mode() & 0o077 != 0
+        || opened.nlink() != 1
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+    {
+        return Err(CliError::UnsafePrivateOutput(
+            "output must remain one owner-private regular file with exactly one hard link"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_ivk_file(_path: &Path, ivk: [u8; 64]) -> Result<(), CliError> {
+    drop(Zeroizing::new(ivk));
+    Err(CliError::UnsafePrivateOutput(
+        "private IVK file creation is currently supported only on Unix".to_owned(),
+    ))
+}
+
+fn private_output_io(operation: &'static str, path: &Path, source: io::Error) -> CliError {
+    CliError::PrivateOutputIo {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
 fn read_hex_stdin(field: &'static str, maximum_bytes: u64) -> Result<Vec<u8>, CliError> {
     let stdin = io::stdin();
     if stdin.is_terminal() {
@@ -426,6 +622,76 @@ mod tests {
             "balance",
         ])
         .is_ok());
+        assert!(
+            Cli::try_parse_from(["wcash-wallet", "--network", "testnet", "validate-address",])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from([
+            "wcash-wallet",
+            "--network",
+            "testnet",
+            "derive-collector",
+            "--ivk-file",
+            "/run/credentials/wcash-collector.ivk",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn address_input_is_bounded_and_exactly_one_value() {
+        assert_eq!(
+            parse_address_input("wutest1fixture\n".to_owned()).unwrap(),
+            "wutest1fixture"
+        );
+        assert!(matches!(
+            parse_address_input("a".repeat(MAX_WCASH_ADDRESS_INPUT as usize + 1)),
+            Err(CliError::InputTooLong {
+                field: "Wcash address"
+            })
+        ));
+        assert!(matches!(
+            parse_address_input("first second".to_owned()),
+            Err(CliError::InvalidSingleLineInput {
+                field: "Wcash address"
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collector_ivk_is_exclusively_written_to_an_owner_private_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temporary_root = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let directory = tempfile::Builder::new().tempdir_in(temporary_root).unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = fs::canonicalize(directory.path())
+            .unwrap()
+            .join("collector.ivk");
+        let spending_key =
+            derive_wallet_spending_key(&SecretVec::new(vec![0x42; 32]), WalletNetwork::Testnet, 0)
+                .unwrap();
+        let viewing_key = spending_key.to_unified_full_viewing_key();
+        let expected = viewing_key
+            .orchard()
+            .expect("derived Wcash keys always have an Ironwood component")
+            .to_ivk(zip32::Scope::External)
+            .to_bytes();
+
+        write_private_ivk_file(&path, expected).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        assert_eq!(
+            hex::decode(fs::read_to_string(&path).unwrap().trim()).unwrap(),
+            expected
+        );
+        assert!(matches!(
+            write_private_ivk_file(&path, [0x24; 64]),
+            Err(CliError::UnsafePrivateOutput(_))
+        ));
     }
 
     #[test]
