@@ -173,7 +173,17 @@ enum PoolBackendPeerRole {
 
 impl PoolBackendPeerRole {
     fn authorizes(self, kind: BackendRequestKind) -> bool {
-        self == Self::Submitter || !matches!(kind, BackendRequestKind::SubmitShare)
+        match (self, kind) {
+            (Self::Submitter, _) => true,
+            (
+                Self::ReadOnly,
+                BackendRequestKind::Hello
+                | BackendRequestKind::ReadEvents
+                | BackendRequestKind::SubscribeJobs
+                | BackendRequestKind::Health,
+            ) => true,
+            (Self::ReadOnly, BackendRequestKind::SubmitShare) => false,
+        }
     }
 }
 
