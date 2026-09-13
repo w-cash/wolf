@@ -10,6 +10,11 @@ homepage.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Local integration only; public wallet builds retain Testnet-only pool payouts.
+regtest-payout = []
+
 [dependencies]
 async-trait = "0.1"
 blake2b_simd.workspace = true

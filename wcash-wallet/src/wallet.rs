@@ -3071,6 +3071,10 @@ pub async fn create_idempotent_payout_batch(
 }
 
 fn require_payout_testnet(network: WalletNetwork) -> Result<(), WalletServiceError> {
+    #[cfg(feature = "regtest-payout")]
+    if network == WalletNetwork::Regtest {
+        return Ok(());
+    }
     if network == WalletNetwork::Testnet {
         Ok(())
     } else {
@@ -3136,7 +3140,7 @@ fn prepare_payout_request(
         expected_payout_identity(network, account_id, collector_payout_commitment, true);
     if request.identity != expected_identity {
         return Err(WalletServiceError::InvalidRequest(
-            "payout wallet identity does not match the synchronized Testnet wallet".to_owned(),
+            "payout wallet identity does not match the synchronized wallet network".to_owned(),
         ));
     }
     if request.confirmations < 100 {
@@ -5663,6 +5667,7 @@ mod tests {
         let collector = test_collector_payout_commitment(&account);
         let request = test_payout_request(&account);
 
+        #[cfg(not(feature = "regtest-payout"))]
         assert!(matches!(
             require_payout_testnet(WalletNetwork::Regtest),
             Err(WalletServiceError::PayoutNetworkUnsupported)
@@ -5696,6 +5701,46 @@ mod tests {
             prepare_payout_request(&bad, WalletNetwork::Testnet, account_id, collector),
             Err(WalletServiceError::InvalidRequest(_))
         ));
+    }
+
+    #[cfg(feature = "regtest-payout")]
+    #[test]
+    fn regtest_payout_requires_its_own_wallet_identity_and_addresses() {
+        require_payout_testnet(WalletNetwork::Regtest).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("regtest-wallet.sqlite");
+        let account = create_wallet_accounts(&wallet_path, WalletNetwork::Regtest, 1)
+            .pop()
+            .unwrap();
+        let account_id = Uuid::parse_str(&account.account_id).unwrap();
+        let wallet = open_wallet_database(&wallet_path, WalletNetwork::Regtest).unwrap();
+        let wallet_account_id = only_account(&wallet.get_account_ids().unwrap()).unwrap();
+        let collector = collector_payout_commitment_for_account(
+            &wallet,
+            WalletNetwork::Regtest,
+            wallet_account_id,
+        )
+        .unwrap();
+        let mut request = test_payout_request(&account);
+        request.identity =
+            expected_payout_identity(WalletNetwork::Regtest, account_id, collector, true);
+        prepare_payout_request(&request, WalletNetwork::Regtest, account_id, collector).unwrap();
+        assert!(
+            prepare_payout_request(&request, WalletNetwork::Testnet, account_id, collector)
+                .is_err()
+        );
+        let testnet_account = create_wallet_accounts(
+            &directory.path().join("testnet-wallet.sqlite"),
+            WalletNetwork::Testnet,
+            1,
+        )
+        .pop()
+        .unwrap();
+        request.outputs[0].canonical_address = testnet_account.address;
+        assert!(
+            prepare_payout_request(&request, WalletNetwork::Regtest, account_id, collector)
+                .is_err()
+        );
     }
 
     #[test]
