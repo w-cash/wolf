@@ -17,13 +17,22 @@ The production-path topology uses three nodes:
 
 1. a Wcash child template/submission node;
 2. a pool-controlled Zcash template/submission node built from this branch;
-3. at least one separately operated, unmodified Zcash proposal validator.
+3. at least one separately operated Zcash proposal validator using ordinary
+   Zcash consensus and the same reviewed native RPC release.
 
 The two template sources must be literal loopback IP endpoints because they
 choose the Wcash and Zcash reward recipients. A proposal validator may be
 remote over HTTPS, but the operator remains responsible for making it a truly
 independent process and failure domain; endpoint inequality cannot prove
 organizational independence.
+
+Both pinned parent nodes must expose the read-only `getblockstatus(hash)` RPC
+from the matching release when running `native-pool-backend`. It distinguishes
+an exact committed side-chain proof from a queued or unknown submission;
+standard `getblockheader` alone does not expose retained side chains in this
+node. Keep all node RPCs private and authenticated. This method requires no
+public listener and carries no spending authority. An older parent node that
+lacks the method fails closed when an unconfirmed winner needs this check.
 
 The coordinator verifies the configured Zcash coinbase recipient and an exact
 transparent Wcash child recipient directly from their serialized coinbases. A
@@ -319,7 +328,25 @@ full history. A Wcash `submitblock` rejection, or rejection by every pinned
 Zcash node, stops the backend unless exact status already proves the block is
 known. Ambiguous or unavailable submission remains durable, immediately makes
 backend health false, and is retried; it is never reported as a healthy
-successful submission. A reorganization entirely above a winner can reduce its
+successful submission. A competing Zcash proof is instead healthy pending work
+only when every pinned parent independently returns `side_chain` with its exact
+hash and coinbase height through `getblockstatus`. The backend appends an explicit
+`winner_side_chain` event once, then polls the retained proof without submitting
+it again. This event is not an observation, maturity, or orphan event and creates
+no reward. Its exact bytes and side-chain state survive journal replay. Later
+node fork eviction or finalization can remove the block from node storage;
+authoritative absence then leaves this already-proven side-chain state intact.
+Later best-chain inclusion still requires ordinary observation and maturity.
+Unknown status without that durable evidence, malformed responses, rejection,
+and unavailable dependencies retain the failure behavior. The required
+`winner_side_chain_v1` capability rejects older pool/backend pairs before mining;
+existing version-2 journal headers and records remain readable unchanged.
+After the first `winner_side_chain` record, older binaries that do not recognize
+the event cannot reopen that journal. Rollback must retain a compatible reader;
+never truncate, reset, or discard the journal to make an old binary start. The
+capability gate protects pool/backend pairing, while the unchanged header allows
+the upgraded reader to replay previously recorded history.
+A reorganization entirely above a winner can reduce its
 confirmations while leaving the exact block canonical. That lower observation is
 durable, and a matured reward that falls below its immutable threshold returns
 to observed so the pool can reverse spendability before acknowledging the

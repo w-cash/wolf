@@ -269,6 +269,11 @@ impl fmt::Debug for PoolBackendWinnerSnapshot {
 /// Exact best-chain result to append for one authority-bound winner snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PoolBackendWinnerTransition {
+    /// Every pinned parent retained this exact Zcash proof off the best chain.
+    SideChain {
+        /// Stable best-chain tip sampled with the noncanonical proof.
+        tip: ChainTip,
+    },
     /// The exact retained block is on the sampled best chain.
     Observed {
         /// Exact best-chain tip used for this observation.
@@ -303,6 +308,7 @@ pub enum PoolBackendWinnerTransition {
 impl From<PoolBackendWinnerTransition> for JournalWinnerTransition {
     fn from(transition: PoolBackendWinnerTransition) -> Self {
         match transition {
+            PoolBackendWinnerTransition::SideChain { tip } => Self::SideChain { tip },
             PoolBackendWinnerTransition::Observed { tip, confirmations } => {
                 Self::Observed { tip, confirmations }
             }
@@ -1318,7 +1324,8 @@ fn replay_projection(
                         ));
                     }
                 }
-                BackendEvent::WinnerObserved { .. }
+                BackendEvent::WinnerSideChain { .. }
+                | BackendEvent::WinnerObserved { .. }
                 | BackendEvent::WinnerOrphaned { .. }
                 | BackendEvent::WinnerQuarantined { .. }
                 | BackendEvent::WinnerRequeued { .. }

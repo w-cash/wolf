@@ -1258,6 +1258,7 @@ fn validate_transparent_wcash_payout(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PoolWinnerObservation {
     Unavailable,
+    SideChain { tip: ChainTip },
     Absent { tip: ChainTip },
     ConflictingWitness { tip: ChainTip },
     Present { tip: ChainTip, confirmations: u32 },
@@ -1315,21 +1316,39 @@ fn reconcile_zcash_pool_winner(
     let winner = snapshot.winner();
     let expected_hash = display_hash(*winner.block_hash_le.as_bytes());
     validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Zcash, &expected_hash)?;
-    if winner_lifecycle_requires_submission(snapshot.lifecycle()) {
+    // Fence the initial all-node exact side-chain proof as well as later
+    // canonical status reads. A submission that advances the tip simply
+    // defers this observation to the next reconciliation pass.
+    let before = zcash.consistent_chain_tip()?;
+    let known_side_chain = if winner_lifecycle_requires_submission(snapshot.lifecycle()) {
         let report =
             zcash.replay_parent_bytes(snapshot.block_bytes(), winner.height, &expected_hash)?;
         require_parent_submission_progress(&report)?;
-    }
+        report.is_known_side_chain()
+    } else {
+        false
+    };
 
-    let before = zcash.consistent_chain_tip()?;
-    let confirmations = zcash.parent_confirmation_depth(winner.height, &expected_hash)?;
+    let confirmations = if known_side_chain
+        || matches!(
+            snapshot.lifecycle(),
+            JournalWinnerLifecycle::SideChain { .. }
+        ) {
+        zcash.parent_confirmation_depth_strict(winner.height, &expected_hash)?
+    } else {
+        zcash.parent_confirmation_depth(winner.height, &expected_hash)?
+    };
     let after = zcash.consistent_chain_tip()?;
     if before != after {
         return Ok(None);
     }
     let tip = pool_chain_tip(before);
     let observation = confirmations.map_or(
-        PoolWinnerObservation::Absent { tip: tip.clone() },
+        if known_side_chain {
+            PoolWinnerObservation::SideChain { tip: tip.clone() }
+        } else {
+            PoolWinnerObservation::Absent { tip: tip.clone() }
+        },
         |confirmations| PoolWinnerObservation::Present { tip, confirmations },
     );
     pool_winner_transition(snapshot.lifecycle(), winner, observation)
@@ -1374,7 +1393,7 @@ fn require_wcash_submission_progress(
 }
 
 fn require_parent_submission_progress(report: &ParentSubmissionReport) -> Result<(), MinerError> {
-    if report.is_confirmed() {
+    if report.is_confirmed() || report.is_known_side_chain() {
         return Ok(());
     }
     if report
@@ -1446,6 +1465,16 @@ fn pool_winner_transition(
     // event. Only an authoritative absence moves the winner to orphaned.
     match observation {
         PoolWinnerObservation::Unavailable => Ok(None),
+        PoolWinnerObservation::SideChain { tip } => {
+            if winner.chain != MergedChain::Zcash
+                || !matches!(lifecycle, JournalWinnerLifecycle::Pending)
+            {
+                return Err(MinerError::RpcProtocol(
+                    "only a pending Zcash proof can enter side-chain monitoring".to_string(),
+                ));
+            }
+            Ok(Some(PoolBackendWinnerTransition::SideChain { tip }))
+        }
         PoolWinnerObservation::Absent { tip } => match lifecycle {
             JournalWinnerLifecycle::Observed { .. } | JournalWinnerLifecycle::Matured { .. } => {
                 Ok(Some(PoolBackendWinnerTransition::Orphaned { tip }))
@@ -1454,6 +1483,7 @@ fn pool_winner_transition(
                 Ok(Some(PoolBackendWinnerTransition::Requeued { tip }))
             }
             JournalWinnerLifecycle::Pending
+            | JournalWinnerLifecycle::SideChain { .. }
             | JournalWinnerLifecycle::Orphaned { .. }
             | JournalWinnerLifecycle::Requeued { .. } => Ok(None),
         },
@@ -1514,6 +1544,7 @@ fn pool_winner_transition(
                     }
                 }
                 JournalWinnerLifecycle::Pending
+                | JournalWinnerLifecycle::SideChain { .. }
                 | JournalWinnerLifecycle::Orphaned { .. }
                 | JournalWinnerLifecycle::Quarantined { .. }
                 | JournalWinnerLifecycle::Requeued { .. } => {
@@ -3684,6 +3715,16 @@ mod tests {
     where
         F: Fn(usize, &serde_json::Value) + Send + 'static,
     {
+        spawn_scripted_rpc_reply_server(results.into_iter().map(Ok).collect(), request_hook)
+    }
+
+    fn spawn_scripted_rpc_reply_server<F>(
+        results: Vec<Result<serde_json::Value, serde_json::Value>>,
+        request_hook: F,
+    ) -> (RpcEndpoint, thread::JoinHandle<Vec<serde_json::Value>>)
+    where
+        F: Fn(usize, &serde_json::Value) + Send + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test RPC server");
         listener
             .set_nonblocking(true)
@@ -3716,11 +3757,10 @@ mod tests {
                 };
                 let request = read_test_rpc_request(&mut stream);
                 request_hook(request_index, &request);
-                let response = serde_json::to_vec(&json!({
-                    "jsonrpc": "2.0",
-                    "id": request["id"],
-                    "result": result,
-                }))
+                let response = serde_json::to_vec(&match result {
+                    Ok(value) => json!({"jsonrpc":"2.0", "id":request["id"], "result":value}),
+                    Err(error) => json!({"jsonrpc":"2.0", "id":request["id"], "error":error}),
+                })
                 .expect("serialize test RPC response");
                 write!(
                     stream,
@@ -4012,6 +4052,79 @@ mod tests {
     }
 
     #[test]
+    fn retained_parent_side_chain_is_healthy_without_canonical_credit() {
+        let block = mainnet_block_one();
+        let bytes = block.zcash_serialize_to_vec().expect("fixture serializes");
+        let hash = display_hash(block.hash().0);
+        let absent_header = json!({"hash":hash,"height":1,"confirmations":0});
+        let side_chain = json!({"state":"side_chain","hash":hash,"height":1});
+        // Both first submission and idempotent retry require independently
+        // verified committed status, never just null/duplicate acknowledgments.
+        for (submission, header) in [
+            (serde_json::Value::Null, Ok(absent_header.clone())),
+            (json!("duplicate"), Ok(absent_header.clone())),
+            (
+                json!("duplicate"),
+                Err(json!({"code":-5,"message":"block not in best chain"})),
+            ),
+        ] {
+            let responses = vec![Ok(submission), header, Ok(side_chain.clone())];
+            let (template, a) = spawn_scripted_rpc_reply_server(responses.clone(), |_, _| {});
+            let (validator, b) = spawn_scripted_rpc_reply_server(responses, |_, _| {});
+            let provider = test_zcash_provider(template, validator);
+            let report = provider.replay_parent_bytes(&bytes, 1, &hash).unwrap();
+            assert!(!report.is_confirmed());
+            assert!(report.is_known_side_chain());
+            assert!(require_parent_submission_progress(&report).is_ok());
+            for requests in [a.join().unwrap(), b.join().unwrap()] {
+                assert_eq!(
+                    requests
+                        .iter()
+                        .map(|request| request["method"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["submitblock", "getblockheader", "getblockstatus"]
+                );
+                assert_eq!(requests[2]["params"], json!([hash]));
+            }
+        }
+        let winner = pool_winner_fixture(MergedChain::Zcash);
+        assert_eq!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Pending,
+                &winner,
+                PoolWinnerObservation::Absent {
+                    tip: pool_tip(winner.height, 0x61)
+                },
+            )
+            .unwrap(),
+            None,
+            "a known competing proof stays pending, with no orphan or reward event",
+        );
+        // A healthy side-chain node cannot hide an unknown or malformed peer.
+        for other in [
+            json!({"state":"unknown"}),
+            json!({"state":"side_chain","hash":"cd".repeat(32),"height":1}),
+        ] {
+            let (template, a) = spawn_scripted_rpc_server(vec![
+                serde_json::Value::Null,
+                absent_header.clone(),
+                side_chain.clone(),
+            ]);
+            let (validator, b) = spawn_scripted_rpc_server(vec![
+                serde_json::Value::Null,
+                absent_header.clone(),
+                other.clone(),
+            ]);
+            let provider = test_zcash_provider(template, validator);
+            let report = provider.replay_parent_bytes(&bytes, 1, &hash).unwrap();
+            assert!(!report.is_known_side_chain());
+            assert!(require_parent_submission_progress(&report).is_err());
+            a.join().unwrap();
+            b.join().unwrap();
+        }
+    }
+
+    #[test]
     fn retained_parent_submission_distinguishes_rejection_from_deferred_propagation() {
         let block = mainnet_block_one();
         let block_bytes = block
@@ -4041,8 +4154,11 @@ mod tests {
 
         let (template, template_server) =
             spawn_scripted_rpc_server(vec![json!("template rejected"), absent_header.clone()]);
-        let (validator, validator_server) =
-            spawn_scripted_rpc_server(vec![serde_json::Value::Null, absent_header]);
+        let (validator, validator_server) = spawn_scripted_rpc_server(vec![
+            serde_json::Value::Null,
+            absent_header,
+            json!({"state":"unknown"}),
+        ]);
         let provider = test_zcash_provider(template, validator);
         let deferred = provider
             .replay_parent_bytes(&block_bytes, 1, &block_hash)
@@ -4278,6 +4394,60 @@ mod tests {
             block_hash_le: Hex32::new([byte; 32]),
             height,
         }
+    }
+
+    #[test]
+    fn side_chain_winner_survives_pruning_without_resubmission_or_credit() {
+        let winner = pool_winner_fixture(MergedChain::Zcash);
+        let tip = pool_tip(winner.height, 0x67);
+        assert_eq!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Pending,
+                &winner,
+                PoolWinnerObservation::SideChain { tip: tip.clone() },
+            )
+            .unwrap(),
+            Some(PoolBackendWinnerTransition::SideChain { tip: tip.clone() })
+        );
+        let retained = JournalWinnerLifecycle::SideChain { tip };
+        assert!(!winner_lifecycle_requires_submission(&retained));
+        // Standard header -5/absent after node fork eviction is interpreted as
+        // absence of a previously validated proof, never as permission to send
+        // its now-obsolete parent again or to create an orphan/reward event.
+        for observation in [
+            PoolWinnerObservation::Absent {
+                tip: pool_tip(winner.height + 1000, 0x68),
+            },
+            PoolWinnerObservation::Unavailable,
+        ] {
+            assert_eq!(
+                pool_winner_transition(&retained, &winner, observation).unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            pool_winner_transition(
+                &retained,
+                &winner,
+                PoolWinnerObservation::Present {
+                    tip: pool_tip(winner.height + 1, 0x69),
+                    confirmations: 2
+                },
+            )
+            .unwrap(),
+            Some(PoolBackendWinnerTransition::Observed {
+                tip: pool_tip(winner.height + 1, 0x69),
+                confirmations: 2,
+            })
+        );
+        assert!(pool_winner_transition(
+            &JournalWinnerLifecycle::Pending,
+            &pool_winner_fixture(MergedChain::Wcash),
+            PoolWinnerObservation::SideChain {
+                tip: pool_tip(10, 0x67)
+            },
+        )
+        .is_err());
     }
 
     #[test]

@@ -114,6 +114,7 @@ mod wcash_aux_block;
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
 use types::{
+    get_block_status::GetBlockStatusResponse,
     get_block_template::{
         constants::{
             DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MEMPOOL_LONG_POLL_INTERVAL,
@@ -614,6 +615,12 @@ pub trait Rpc {
         block_hash: String,
         aux_pow: AuxPowHex,
     ) -> Result<GetAuxBlockStatusResponse>;
+
+    /// Returns exact committed Zcash block membership for a durable mining
+    /// outbox. Unlike `getblockheader`, retained side-chain blocks are visible.
+    /// Wcash callers must use the witness-bound `getauxblockstatus` instead.
+    #[method(name = "getblockstatus")]
+    async fn get_block_status(&self, block_hash: String) -> Result<GetBlockStatusResponse>;
 
     /// Submits block to the node to be validated and committed.
     /// Returns the [`SubmitBlockResponse`] for the operation, as a JSON string.
@@ -3434,6 +3441,58 @@ where
         }
     }
 
+    async fn get_block_status(&self, block_hash: String) -> Result<GetBlockStatusResponse> {
+        if self.network.uses_wcash_consensus() {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InvalidRequest.code(),
+                "Wcash block status requires an exact witness through getauxblockstatus",
+                None,
+            ));
+        }
+        let hash = block::Hash::from_hex(block_hash).map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                format!("invalid Zcash block hash: {error}"),
+                None::<()>,
+            )
+        })?;
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(zebra_state::ReadRequest::BlockAndDepth(hash))
+            .await
+            .map_misc_error()?;
+        let zebra_state::ReadResponse::BlockAndDepth(best) = response else {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "unexpected committed block-and-depth response",
+                None,
+            ));
+        };
+        if let Some((block, depth)) = best {
+            return committed_parent_block_status(&block, hash, Some(depth));
+        }
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(zebra_state::ReadRequest::AnyChainBlock(hash.into()))
+            .await
+            .map_misc_error()?;
+        let zebra_state::ReadResponse::Block(block) = response else {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "unexpected committed any-chain block response",
+                None,
+            ));
+        };
+        // A reorganization between reads can make this block canonical, but
+        // this fallback never advertises confirmations. Callers independently
+        // sample stable-tip canonical membership before crediting any reward.
+        block.map_or(Ok(GetBlockStatusResponse::Unknown {}), |block| {
+            committed_parent_block_status(&block, hash, None)
+        })
+    }
+
     async fn get_aux_block_status(
         &self,
         block_hash: String,
@@ -5966,6 +6025,43 @@ pub struct IronwoodTrees {
 impl IronwoodTrees {
     fn is_empty(&self) -> bool {
         self.size == 0
+    }
+}
+
+/// Constructs membership evidence only from an exact committed block read.
+fn committed_parent_block_status(
+    block: &Block,
+    expected_hash: block::Hash,
+    depth: Option<u32>,
+) -> Result<GetBlockStatusResponse> {
+    if block.hash() != expected_hash {
+        return Err(ErrorObject::borrowed(
+            ErrorCode::InternalError.code(),
+            "committed block status returned a different block hash",
+            None,
+        ));
+    }
+    let height = block.coinbase_height().map(u32::from).ok_or_else(|| {
+        ErrorObject::borrowed(
+            ErrorCode::InternalError.code(),
+            "committed block has no coinbase height",
+            None,
+        )
+    })?;
+    let hash = expected_hash.to_string();
+    match depth {
+        Some(depth) => Ok(GetBlockStatusResponse::BestChain {
+            hash,
+            height,
+            confirmations: depth.checked_add(1).ok_or_else(|| {
+                ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "committed block confirmation count overflowed",
+                    None,
+                )
+            })?,
+        }),
+        None => Ok(GetBlockStatusResponse::SideChain { hash, height }),
     }
 }
 

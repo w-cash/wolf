@@ -102,6 +102,30 @@ struct ParentBlockHeaderStatus {
     height: u32,
 }
 
+/// Exact committed membership supplied by the pinned native Zcash nodes.
+/// An unknown/pending hash is deliberately distinct from a valid side chain.
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+enum ParentBlockStatus {
+    BestChain {
+        hash: String,
+        height: u32,
+        confirmations: u32,
+    },
+    SideChain {
+        hash: String,
+        height: u32,
+    },
+    Unknown {},
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParentCommittedMembership {
+    BestChain,
+    SideChain,
+    Unknown,
+}
+
 /// Standard Zcash parent-network profiles supported by native merged mining.
 ///
 /// Restricting this selection prevents a custom Testnet schedule from being used to calculate a
@@ -520,10 +544,30 @@ impl NativeZcashProvider {
         height: u32,
         expected_hash: &str,
     ) -> Result<Option<u32>, MinerError> {
+        conservative_parent_confirmation_depth(
+            self.parent_confirmation_checks(height, expected_hash),
+        )
+    }
+
+    /// Side-chain evidence and monitoring require responses from every pinned
+    /// node. An absent proof at one node cannot hide another node's RPC error.
+    pub(crate) fn parent_confirmation_depth_strict(
+        &self,
+        height: u32,
+        expected_hash: &str,
+    ) -> Result<Option<u32>, MinerError> {
+        strict_parent_confirmation_depth(self.parent_confirmation_checks(height, expected_hash))
+    }
+
+    fn parent_confirmation_checks(
+        &self,
+        height: u32,
+        expected_hash: &str,
+    ) -> Vec<Result<Option<u32>, MinerError>> {
         let mut nodes = Vec::with_capacity(self.proposal_validators.len() + 1);
         nodes.push(&self.template_node);
         nodes.extend(self.proposal_validators.iter());
-        let checks = thread::scope(|scope| {
+        thread::scope(|scope| {
             nodes
                 .into_iter()
                 .map(|node| {
@@ -541,8 +585,7 @@ impl NativeZcashProvider {
                     })
                 })
                 .collect::<Vec<_>>()
-        });
-        conservative_parent_confirmation_depth(checks)
+        })
     }
 
     /// Returns one exact tip only when every pinned parent node reports the
@@ -1335,6 +1378,16 @@ impl ParentSubmissionReport {
             .iter()
             .any(|outcome| matches!(outcome, ParentNodeOutcome::Accepted { .. }))
     }
+
+    /// All pinned nodes independently retained this exact valid noncanonical
+    /// block. This is healthy outbox monitoring, never confirmation evidence.
+    pub(crate) fn is_known_side_chain(&self) -> bool {
+        !self.outcomes.is_empty()
+            && self
+                .outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, ParentNodeOutcome::KnownSideChain { .. }))
+    }
 }
 
 /// Per-node outcome for a parent winner broadcast.
@@ -1342,6 +1395,12 @@ impl ParentSubmissionReport {
 pub enum ParentNodeOutcome {
     /// Node accepted and confirmed the exact block at the expected height.
     Accepted {
+        /// Credential-free endpoint label.
+        endpoint: String,
+    },
+    /// The exact hash and height are committed to a noncanonical chain.
+    /// This candidate receives no reward and remains independently monitored.
+    KnownSideChain {
         /// Credential-free endpoint label.
         endpoint: String,
     },
@@ -1442,11 +1501,6 @@ fn display_hex(mut raw: [u8; 32]) -> String {
     hex::encode(raw)
 }
 
-fn parent_is_confirmed(node: &ZebraRpcClient, height: u32, expected_hash: &str) -> bool {
-    parent_confirmation_depth_on_node(node, height, expected_hash)
-        .is_ok_and(|depth| depth.is_some())
-}
-
 fn parent_confirmation_depth_on_node(
     node: &ZebraRpcClient,
     height: u32,
@@ -1495,6 +1549,13 @@ fn validate_parent_header_status(
         .map_err(|_| MinerError::RpcProtocol("parent confirmation depth exceeds u32".to_string()))
 }
 
+fn strict_parent_confirmation_depth(
+    checks: impl IntoIterator<Item = Result<Option<u32>, MinerError>>,
+) -> Result<Option<u32>, MinerError> {
+    let successful = checks.into_iter().collect::<Result<Vec<_>, _>>()?;
+    conservative_parent_confirmation_depth(successful.into_iter().map(Ok))
+}
+
 fn conservative_parent_confirmation_depth(
     checks: impl IntoIterator<Item = Result<Option<u32>, MinerError>>,
 ) -> Result<Option<u32>, MinerError> {
@@ -1532,19 +1593,29 @@ fn submit_parent_to_node(
     expected_hash: &str,
 ) -> ParentNodeOutcome {
     let submission = node.call_value("submitblock", json!([hex::encode(block_bytes)]));
-    if parent_is_confirmed(node, height, expected_hash) {
-        return ParentNodeOutcome::Accepted {
-            endpoint: node.label().to_string(),
-        };
-    }
-    match submission {
-        Ok(Value::Null) => ParentNodeOutcome::Unconfirmed {
-            endpoint: node.label().to_string(),
-        },
-        Ok(Value::String(reason)) if submitblock_reason_is_inconclusive(&reason) => {
-            ParentNodeOutcome::Unconfirmed {
+    match parent_confirmation_depth_on_node(node, height, expected_hash) {
+        Ok(Some(_)) => {
+            return ParentNodeOutcome::Accepted {
                 endpoint: node.label().to_string(),
             }
+        }
+        Ok(None) => {}
+        Err(error) if is_transient_parent_rpc_failure(&error) => {
+            return ParentNodeOutcome::Unavailable {
+                endpoint: node.label().to_string(),
+                reason: error.to_string(),
+            }
+        }
+        Err(_) => {
+            return ParentNodeOutcome::InvalidResponse {
+                endpoint: node.label().to_string(),
+            }
+        }
+    }
+    match submission {
+        Ok(Value::Null) => exact_noncanonical_parent_outcome(node, height, expected_hash),
+        Ok(Value::String(reason)) if submitblock_reason_is_inconclusive(&reason) => {
+            exact_noncanonical_parent_outcome(node, height, expected_hash)
         }
         Ok(Value::String(reason)) => ParentNodeOutcome::Rejected {
             endpoint: node.label().to_string(),
@@ -1565,6 +1636,58 @@ fn submit_parent_to_node(
             reason: error.to_string(),
         },
     }
+}
+
+fn exact_noncanonical_parent_outcome(
+    node: &ZebraRpcClient,
+    height: u32,
+    expected_hash: &str,
+) -> ParentNodeOutcome {
+    let membership = node
+        .call("getblockstatus", json!([expected_hash]))
+        .and_then(|status| validate_parent_block_status(status, height, expected_hash));
+    let endpoint = node.label().to_string();
+    match membership {
+        Ok(ParentCommittedMembership::BestChain) => ParentNodeOutcome::Accepted { endpoint },
+        Ok(ParentCommittedMembership::SideChain) => ParentNodeOutcome::KnownSideChain { endpoint },
+        Ok(ParentCommittedMembership::Unknown) => ParentNodeOutcome::Unconfirmed { endpoint },
+        Err(error) if is_transient_parent_rpc_failure(&error) => ParentNodeOutcome::Unavailable {
+            endpoint,
+            reason: error.to_string(),
+        },
+        Err(_) => ParentNodeOutcome::InvalidResponse { endpoint },
+    }
+}
+
+fn validate_parent_block_status(
+    status: ParentBlockStatus,
+    expected_height: u32,
+    expected_hash: &str,
+) -> Result<ParentCommittedMembership, MinerError> {
+    let (hash, height, membership) = match status {
+        ParentBlockStatus::BestChain {
+            hash,
+            height,
+            confirmations,
+        } => {
+            if confirmations == 0 {
+                return Err(MinerError::RpcProtocol(
+                    "getblockstatus returned zero best-chain confirmations".to_string(),
+                ));
+            }
+            (hash, height, ParentCommittedMembership::BestChain)
+        }
+        ParentBlockStatus::SideChain { hash, height } => {
+            (hash, height, ParentCommittedMembership::SideChain)
+        }
+        ParentBlockStatus::Unknown {} => return Ok(ParentCommittedMembership::Unknown),
+    };
+    if !hash.eq_ignore_ascii_case(expected_hash) || height != expected_height {
+        return Err(MinerError::RpcProtocol(
+            "getblockstatus returned a different parent block hash or height".to_string(),
+        ));
+    }
+    Ok(membership)
 }
 
 pub(crate) fn submitblock_reason_is_inconclusive(reason: &str) -> bool {
@@ -2511,6 +2634,64 @@ mod tests {
             "validator",
         )
         .is_err());
+    }
+
+    #[test]
+    fn side_chain_absence_cannot_mask_another_pinned_node_error() {
+        assert_eq!(
+            strict_parent_confirmation_depth([Ok(None), Ok(None)]).unwrap(),
+            None
+        );
+        for error in [
+            MinerError::RpcProtocol("malformed second node response".to_owned()),
+            MinerError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "second node unavailable",
+            )),
+        ] {
+            assert!(strict_parent_confirmation_depth([Ok(None), Err(error)]).is_err());
+        }
+    }
+
+    #[test]
+    fn committed_parent_status_requires_exact_identity_and_explicit_membership() {
+        let hash = "ab".repeat(32);
+        for (value, expected) in [
+            (
+                json!({"state":"side_chain","hash":hash,"height":42}),
+                ParentCommittedMembership::SideChain,
+            ),
+            (
+                json!({"state":"best_chain","hash":hash,"height":42,"confirmations":1}),
+                ParentCommittedMembership::BestChain,
+            ),
+            (
+                json!({"state":"unknown"}),
+                ParentCommittedMembership::Unknown,
+            ),
+        ] {
+            let status = serde_json::from_value(value).expect("strict status shape");
+            assert_eq!(
+                validate_parent_block_status(status, 42, &hash).unwrap(),
+                expected
+            );
+        }
+        for value in [
+            json!({"state":"side_chain","hash":"cd".repeat(32),"height":42}),
+            json!({"state":"side_chain","hash":hash,"height":43}),
+            json!({"state":"best_chain","hash":hash,"height":42,"confirmations":0}),
+        ] {
+            let status = serde_json::from_value(value).expect("known shape, invalid facts");
+            assert!(validate_parent_block_status(status, 42, &hash).is_err());
+        }
+        for value in [
+            json!({"state":"side_chain","hash":hash}),
+            json!({"state":"side_chain","hash":hash,"height":42,"confirmations":100}),
+            json!({"state":"unknown","hash":hash}),
+            json!({"state":"pending"}),
+        ] {
+            assert!(serde_json::from_value::<ParentBlockStatus>(value).is_err());
+        }
     }
 
     #[test]

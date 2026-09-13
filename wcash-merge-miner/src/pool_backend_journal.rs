@@ -568,6 +568,12 @@ pub struct JournalShareCommit {
 pub enum JournalWinnerLifecycle {
     /// Exact bytes are retained for initial submission or reconciliation.
     Pending,
+    /// Every pinned parent proved this exact Zcash block committed off the best
+    /// chain. Status-only monitoring survives side-chain pruning and restart.
+    SideChain {
+        /// Stable best-chain tip sampled with the committed side-chain proof.
+        tip: ChainTip,
+    },
     /// The exact winner is on the sampled best chain.
     Observed {
         /// Tip used for the observation.
@@ -608,6 +614,11 @@ pub enum JournalWinnerLifecycle {
 /// snapshots can authorize a compare-and-swap transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum JournalWinnerTransition {
+    /// Every pinned parent retained this exact Zcash proof off the best chain.
+    SideChain {
+        /// Stable best-chain tip sampled with the noncanonical proof.
+        tip: ChainTip,
+    },
     /// The exact retained block is on the sampled best chain.
     Observed {
         /// Exact best-chain tip used for the observation.
@@ -645,6 +656,13 @@ impl JournalWinnerTransition {
         let job_id = state.job_id.clone();
         let winner = state.winner.clone();
         match self {
+            Self::SideChain { tip } => BackendEvent::WinnerSideChain {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+            },
             Self::Observed { tip, confirmations } => BackendEvent::WinnerObserved {
                 event_seq,
                 share_id,
@@ -1187,7 +1205,8 @@ impl PoolBackendJournal {
         }
         if matches!(
             event,
-            BackendEvent::WinnerObserved { .. }
+            BackendEvent::WinnerSideChain { .. }
+                | BackendEvent::WinnerObserved { .. }
                 | BackendEvent::WinnerOrphaned { .. }
                 | BackendEvent::WinnerQuarantined { .. }
                 | BackendEvent::WinnerRequeued { .. }
@@ -1610,6 +1629,19 @@ fn event_with_sequence(event: BackendEvent, event_seq: u64) -> BackendEvent {
         BackendEvent::ShareCommitted { .. } => {
             unreachable!("share events are rejected before sequence allocation")
         }
+        BackendEvent::WinnerSideChain {
+            share_id,
+            job_id,
+            winner,
+            tip,
+            ..
+        } => BackendEvent::WinnerSideChain {
+            event_seq,
+            share_id,
+            job_id,
+            winner,
+            tip,
+        },
         BackendEvent::WinnerObserved {
             share_id,
             job_id,
@@ -1838,6 +1870,26 @@ impl JournalSemanticState {
                         },
                     );
                 }
+            }
+            BackendEvent::WinnerSideChain {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                ..
+            } => {
+                require_no_private_blocks(&record.winner_blocks, event_seq)?;
+                let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
+                if winner.chain != MergedChain::Zcash
+                    || !matches!(state.lifecycle, JournalWinnerLifecycle::Pending)
+                {
+                    return Err(semantic(
+                        event_seq,
+                        "only a pending Zcash proof can enter side-chain monitoring",
+                    ));
+                }
+                state.lifecycle = JournalWinnerLifecycle::SideChain { tip: tip.clone() };
+                state.revision_event_seq = event_seq;
             }
             BackendEvent::WinnerObserved {
                 share_id,
@@ -3469,6 +3521,13 @@ mod tests {
             height: 1,
         };
         let direct_lifecycle_events = [
+            BackendEvent::WinnerSideChain {
+                event_seq: 0,
+                share_id: commit.receipt.share_id.clone(),
+                job_id: descriptor.job_id.clone(),
+                winner: winner.clone(),
+                tip: replacement_tip.clone(),
+            },
             BackendEvent::WinnerObserved {
                 event_seq: 0,
                 share_id: commit.receipt.share_id.clone(),
@@ -3527,11 +3586,48 @@ mod tests {
                 .revision_event_seq,
             committed_revision
         );
-        let observed = journal
+        // Reopen an existing v2 journal containing only pre-extension records.
+        // Its header and exact winner bytes need no rewrite or migration.
+        drop(journal);
+        let journal = open(&path, &config);
+        let side_chain = journal
             .compare_and_transition_winner(
                 &commit.receipt.share_id,
                 MergedChain::Zcash,
                 committed_revision,
+                JournalWinnerTransition::SideChain {
+                    tip: replacement_tip.clone(),
+                },
+            )
+            .expect("retain proven noncanonical winner through revision CAS");
+        assert!(matches!(side_chain, BackendEvent::WinnerSideChain { .. }));
+        drop(journal);
+        let journal = open(&path, &config);
+        let (_, retained) = journal.next_winner_state(None).unwrap().unwrap();
+        assert_eq!(retained.block_bytes, block_bytes);
+        assert!(matches!(
+            retained.lifecycle,
+            JournalWinnerLifecycle::SideChain { .. }
+        ));
+        assert_eq!(retained.revision_event_seq, side_chain.event_seq());
+        assert!(journal.next_unsettled_winner_state(None).unwrap().is_some());
+        assert!(journal.next_matured_winner_state(None).unwrap().is_none());
+        assert!(matches!(
+            journal.compare_and_transition_winner(
+                &commit.receipt.share_id,
+                MergedChain::Zcash,
+                side_chain.event_seq(),
+                JournalWinnerTransition::Orphaned {
+                    tip: replacement_tip.clone()
+                },
+            ),
+            Err(PoolBackendJournalError::SemanticViolation { .. }),
+        ));
+        let observed = journal
+            .compare_and_transition_winner(
+                &commit.receipt.share_id,
+                MergedChain::Zcash,
+                side_chain.event_seq(),
                 JournalWinnerTransition::Observed {
                     tip: tip.clone(),
                     confirmations: 1,
