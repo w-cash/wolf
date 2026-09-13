@@ -3935,6 +3935,59 @@ mod tests {
         )
     }
 
+    #[test]
+    fn parent_startup_requires_exact_status_capability_on_every_node() {
+        let genesis = Network::new_regtest(Default::default())
+            .genesis_hash()
+            .to_string();
+        let best = json!({
+            "state":"best_chain", "hash":genesis, "height":0, "confirmations":1
+        });
+        let valid = vec![Ok(json!(genesis)), Ok(best.clone())];
+        let (template, a) = spawn_scripted_rpc_reply_server(valid.clone(), |_, _| {});
+        let (validator, b) = spawn_scripted_rpc_reply_server(valid.clone(), |_, _| {});
+        test_zcash_provider(template, validator)
+            .require_network_identity(&genesis)
+            .expect("both parents prove the exact genesis and required status API");
+        for requests in [a.join().unwrap(), b.join().unwrap()] {
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0]["method"], "getblockhash");
+            assert_eq!(requests[0]["params"], json!([0]));
+            assert_eq!(requests[1]["method"], "getblockstatus");
+            assert_eq!(requests[1]["params"], json!([genesis]));
+        }
+
+        for invalid in [
+            Err(json!({"code":-32601,"message":"Method not found"})),
+            Ok(json!({"state":"unknown"})),
+            Ok(json!({"state":"side_chain","hash":genesis,"height":0})),
+            Ok(json!({"state":"best_chain","hash":"ab".repeat(32),"height":0,"confirmations":1})),
+            Ok(json!({"state":"best_chain","hash":genesis,"height":1,"confirmations":1})),
+            Ok(json!({"state":"best_chain","hash":genesis,"height":0,"confirmations":0})),
+        ] {
+            // A correct template node must not mask an incompatible validator;
+            // the inverse also rejects before contacting the other node.
+            for invalid_template in [false, true] {
+                let bad = vec![Ok(json!(genesis)), invalid.clone()];
+                let (template_replies, validator_replies) = if invalid_template {
+                    (bad, vec![])
+                } else {
+                    (valid.clone(), bad)
+                };
+                let (template, a) = spawn_scripted_rpc_reply_server(template_replies, |_, _| {});
+                let (validator, b) = spawn_scripted_rpc_reply_server(validator_replies, |_, _| {});
+                assert!(test_zcash_provider(template, validator)
+                    .require_network_identity(&genesis)
+                    .is_err());
+                assert_eq!(a.join().unwrap().len(), 2);
+                assert_eq!(
+                    b.join().unwrap().len(),
+                    if invalid_template { 0 } else { 2 }
+                );
+            }
+        }
+    }
+
     fn wcash_winner(observed_on_best_chain: bool) -> PendingWinner {
         let mut block = wcash_regtest_genesis_block().as_ref().clone();
         Arc::make_mut(&mut block.header).solution =

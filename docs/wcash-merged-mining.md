@@ -105,7 +105,11 @@ Wcash rejects this method: its status must include the AuxPoW witness through
 `getauxblockstatus`. The native pool backend needs the matching RPC release on
 both the template node and every independent parent validator. Keep these
 endpoints private and authenticated; no public RPC exposure or spending keys
-are needed. All parents must positively identify the same exact committed
+are needed. Each parent must also prove its already identity-checked genesis
+through this status API at startup and subsequent identity checks, with exact
+height zero and positive best-chain confirmations. This rejects missing or
+incompatible APIs before admitting new mining work.
+All parents must positively identify the same exact committed
 noncanonical proof before it can remain healthy pending work. It earns no
 reward until ordinary best-chain observation and maturity checks pass. That
 positive noncanonical evidence is durably recorded as `winner_side_chain`,

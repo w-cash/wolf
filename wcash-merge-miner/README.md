@@ -31,8 +31,10 @@ from the matching release when running `native-pool-backend`. It distinguishes
 an exact committed side-chain proof from a queued or unknown submission;
 standard `getblockheader` alone does not expose retained side chains in this
 node. Keep all node RPCs private and authenticated. This method requires no
-public listener and carries no spending authority. An older parent node that
-lacks the method fails closed when an unconfirmed winner needs this check.
+public listener and carries no spending authority. Startup and network identity
+rechecks require every parent to return this API's exact, positively confirmed
+genesis at height zero. An older parent node that lacks the method therefore
+fails closed before new mining work is admitted.
 
 The coordinator verifies the configured Zcash coinbase recipient and an exact
 transparent Wcash child recipient directly from their serialized coinbases. A

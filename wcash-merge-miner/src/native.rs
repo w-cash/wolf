@@ -695,6 +695,18 @@ impl NativeZcashProvider {
                 actual,
             });
         }
+        // Authenticate the status API before advertising its required backend
+        // capability. Genesis is already identity-bound and must always remain
+        // canonical, even when no ordinary block has been mined yet.
+        let status = node.call("getblockstatus", json!([expected_genesis_hash]))?;
+        if validate_parent_block_status(status, 0, expected_genesis_hash)?
+            != ParentCommittedMembership::BestChain
+        {
+            return Err(MinerError::RpcProtocol(format!(
+                "{} did not prove canonical genesis through getblockstatus",
+                node.label()
+            )));
+        }
         Ok(())
     }
 }
