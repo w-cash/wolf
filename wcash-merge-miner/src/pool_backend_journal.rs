@@ -592,7 +592,8 @@ pub enum JournalWinnerLifecycle {
         tip: ChainTip,
     },
     /// The reward reached its advertised maturity. It remains retained because
-    /// maturity is reversible under a deep reorganization.
+    /// a reorganization can orphan it or reduce its canonical depth below the
+    /// maturity threshold.
     Matured {
         /// Tip used for the maturity decision.
         tip: ChainTip,
@@ -1848,23 +1849,13 @@ impl JournalSemanticState {
             } => {
                 require_no_private_blocks(&record.winner_blocks, event_seq)?;
                 let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
-                if matches!(state.lifecycle, JournalWinnerLifecycle::Matured { .. }) {
+                if matches!(state.lifecycle, JournalWinnerLifecycle::Matured { .. })
+                    && *confirmations >= winner.maturity_confirmations
+                {
                     return Err(semantic(
                         event_seq,
-                        "matured winner cannot be observed again",
+                        "matured winner can return to observed only below its maturity threshold",
                     ));
-                }
-                if let JournalWinnerLifecycle::Observed {
-                    confirmations: previous,
-                    ..
-                } = state.lifecycle
-                {
-                    if *confirmations < previous {
-                        return Err(semantic(
-                            event_seq,
-                            "winner confirmations decreased without an orphan event",
-                        ));
-                    }
                 }
                 state.lifecycle = JournalWinnerLifecycle::Observed {
                     tip: tip.clone(),

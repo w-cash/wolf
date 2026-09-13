@@ -302,8 +302,10 @@ block submission on every generation. A different AuxPoW witness for the same
 Wcash block ID is durably quarantined and reported as
 `quarantined_conflicting_winners`; retries stay status-only while the conflict
 or node uncertainty remains. Exact best-chain observation clears the quarantine.
-An authoritative absence first flushes an orphan transition, then replays the
-original exact bytes so a crash cannot lose or silently replace the winner.
+An authoritative absence flushes an orphan transition and then remains
+status-only; blindly replaying an obsolete branch could turn a normal
+reorganization into a backend outage. Only an explicitly requeued quarantined
+winner is eligible for exact resubmission.
 
 The private `native-pool-backend` authority journal additionally caps one
 stream at 100,000 retained Wcash and Zcash winners. At the theoretical maximum
@@ -317,9 +319,11 @@ full history. A Wcash `submitblock` rejection, or rejection by every pinned
 Zcash node, stops the backend unless exact status already proves the block is
 known. Ambiguous or unavailable submission remains durable, immediately makes
 backend health false, and is retried; it is never reported as a healthy
-successful submission. A confirmation count that regresses while the block is
-still reported canonical is treated as an inconsistent node response and fails
-closed. Only authoritative absence records an orphan transition.
+successful submission. A reorganization entirely above a winner can reduce its
+confirmations while leaving the exact block canonical. That lower observation is
+durable, and a matured reward that falls below its immutable threshold returns
+to observed so the pool can reverse spendability before acknowledging the
+event. Only authoritative absence records an orphan transition.
 
 Ordinary non-winning shares and authenticated worker identities are recorded in
 the same authoritative version-2 journal as winner outbox records. After

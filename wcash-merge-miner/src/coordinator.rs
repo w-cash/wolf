@@ -624,10 +624,13 @@ impl NativeMiningSupervisor {
     /// Reconciles one exact backend winner against its own chain only.
     ///
     /// Exact block bytes are already durable before this method can obtain a
-    /// snapshot. Pending, requeued, and orphaned winners are replayed through
-    /// idempotent node submission; observed and matured winners use status-only
-    /// checks. The caller must durably compare-and-apply the returned transition
-    /// through [`crate::PoolBackendActor`] before treating it as authoritative.
+    /// snapshot. Pending and explicitly requeued winners are replayed through
+    /// idempotent node submission; orphaned, observed, and matured winners use
+    /// status-only checks. An orphan can return to the best chain without a
+    /// submission, while blindly replaying an obsolete branch would turn an
+    /// ordinary reorganization into a permanent backend outage. The caller must
+    /// durably compare-and-apply the returned transition through
+    /// [`crate::PoolBackendActor`] before treating it as authoritative.
     pub fn reconcile_pool_backend_winner(
         &self,
         snapshot: &PoolBackendWinnerSnapshot,
@@ -1419,9 +1422,7 @@ fn validate_pool_winner_material(
 fn winner_lifecycle_requires_submission(lifecycle: &JournalWinnerLifecycle) -> bool {
     matches!(
         lifecycle,
-        JournalWinnerLifecycle::Pending
-            | JournalWinnerLifecycle::Orphaned { .. }
-            | JournalWinnerLifecycle::Requeued { .. }
+        JournalWinnerLifecycle::Pending | JournalWinnerLifecycle::Requeued { .. }
     )
 }
 
@@ -1437,9 +1438,12 @@ fn pool_winner_transition(
     winner: &WinnerDescriptor,
     observation: PoolWinnerObservation,
 ) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
-    // Confirmation regression while a node still claims the block is
-    // canonical is internally inconsistent and stops reconciliation. Only an
-    // authoritative absence can move an observed or matured winner to orphaned.
+    // A reorganization entirely above a winner can shorten the best chain while
+    // leaving that exact block canonical. Persist the resulting confirmation
+    // regression instead of treating it as an RPC inconsistency. In particular,
+    // a matured winner that falls below its immutable threshold must return to
+    // observed so the pool can revoke spendability before acknowledging the
+    // event. Only an authoritative absence moves the winner to orphaned.
     match observation {
         PoolWinnerObservation::Unavailable => Ok(None),
         PoolWinnerObservation::Absent { tip } => match lifecycle {
@@ -1481,28 +1485,20 @@ fn pool_winner_transition(
                 ));
             }
             match lifecycle {
-                JournalWinnerLifecycle::Matured {
-                    confirmations: previous,
-                    ..
-                } => {
-                    if confirmations < *previous || confirmations < winner.maturity_confirmations {
-                        return Err(MinerError::RpcProtocol(
-                            "a matured winner lost confirmations while remaining on the best chain"
-                                .to_string(),
-                        ));
+                JournalWinnerLifecycle::Matured { .. } => {
+                    if confirmations < winner.maturity_confirmations {
+                        Ok(Some(PoolBackendWinnerTransition::Observed {
+                            tip,
+                            confirmations,
+                        }))
+                    } else {
+                        Ok(None)
                     }
-                    Ok(None)
                 }
                 JournalWinnerLifecycle::Observed {
                     tip: previous_tip,
                     confirmations: previous,
                 } => {
-                    if confirmations < *previous {
-                        return Err(MinerError::RpcProtocol(
-                            "an observed winner lost confirmations without leaving the best chain"
-                                .to_string(),
-                        ));
-                    }
                     if confirmations >= winner.maturity_confirmations {
                         Ok(Some(PoolBackendWinnerTransition::Matured {
                             tip,
@@ -4285,6 +4281,54 @@ mod tests {
     }
 
     #[test]
+    fn orphaned_winner_is_status_only_until_it_reappears() {
+        let winner = pool_winner_fixture(MergedChain::Zcash);
+        let orphan_tip = pool_tip(12, 0x42);
+        let orphaned = JournalWinnerLifecycle::Orphaned {
+            tip: orphan_tip.clone(),
+        };
+
+        assert!(winner_lifecycle_requires_submission(
+            &JournalWinnerLifecycle::Pending
+        ));
+        assert!(winner_lifecycle_requires_submission(
+            &JournalWinnerLifecycle::Requeued {
+                tip: orphan_tip.clone(),
+            }
+        ));
+        assert!(!winner_lifecycle_requires_submission(&orphaned));
+
+        assert_eq!(
+            pool_winner_transition(
+                &orphaned,
+                &winner,
+                PoolWinnerObservation::Absent {
+                    tip: pool_tip(13, 0x43),
+                },
+            )
+            .expect("an absent orphan remains durably orphaned"),
+            None,
+        );
+
+        let resurrected_tip = pool_tip(14, 0x44);
+        assert_eq!(
+            pool_winner_transition(
+                &orphaned,
+                &winner,
+                PoolWinnerObservation::Present {
+                    tip: resurrected_tip.clone(),
+                    confirmations: 5,
+                },
+            )
+            .expect("a status observation can resurrect an orphaned winner"),
+            Some(PoolBackendWinnerTransition::Observed {
+                tip: resurrected_tip,
+                confirmations: 5,
+            }),
+        );
+    }
+
+    #[test]
     fn backend_winner_transition_is_independent_idempotent_and_reorg_safe() {
         let wcash = pool_winner_fixture(MergedChain::Wcash);
         let first_tip = pool_tip(10, 0x31);
@@ -4373,6 +4417,86 @@ mod tests {
     }
 
     #[test]
+    fn canonical_depth_regression_dematures_and_can_remature() {
+        let winner = pool_winner_fixture(MergedChain::Zcash);
+        let regressed_tip = pool_tip(107, 0x45);
+        assert_eq!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Observed {
+                    tip: pool_tip(108, 0x44),
+                    confirmations: 99,
+                },
+                &winner,
+                PoolWinnerObservation::Present {
+                    tip: regressed_tip.clone(),
+                    confirmations: 98,
+                },
+            )
+            .expect("a reorganization above an observed winner is valid"),
+            Some(PoolBackendWinnerTransition::Observed {
+                tip: regressed_tip,
+                confirmations: 98,
+            })
+        );
+
+        assert_eq!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Matured {
+                    tip: pool_tip(129, 0x46),
+                    confirmations: 120,
+                },
+                &winner,
+                PoolWinnerObservation::Present {
+                    tip: pool_tip(119, 0x47),
+                    confirmations: 110,
+                },
+            )
+            .expect("a depth regression above the threshold remains mature"),
+            None,
+        );
+
+        let demature_tip = pool_tip(108, 0x48);
+        assert_eq!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Matured {
+                    tip: pool_tip(109, 0x49),
+                    confirmations: 100,
+                },
+                &winner,
+                PoolWinnerObservation::Present {
+                    tip: demature_tip.clone(),
+                    confirmations: 99,
+                },
+            )
+            .expect("a canonical reward below its threshold must demature"),
+            Some(PoolBackendWinnerTransition::Observed {
+                tip: demature_tip,
+                confirmations: 99,
+            })
+        );
+
+        let remature_tip = pool_tip(109, 0x4a);
+        assert_eq!(
+            pool_winner_transition(
+                &JournalWinnerLifecycle::Observed {
+                    tip: pool_tip(108, 0x48),
+                    confirmations: 99,
+                },
+                &winner,
+                PoolWinnerObservation::Present {
+                    tip: remature_tip.clone(),
+                    confirmations: 100,
+                },
+            )
+            .expect("a dematured reward can regain maturity"),
+            Some(PoolBackendWinnerTransition::Matured {
+                tip: remature_tip,
+                confirmations: 100,
+            })
+        );
+    }
+
+    #[test]
     fn backend_winner_transition_rejects_inconsistent_confirmation_snapshots() {
         let winner = pool_winner_fixture(MergedChain::Zcash);
         assert!(matches!(
@@ -4395,7 +4519,7 @@ mod tests {
                 &winner,
                 PoolWinnerObservation::Present {
                     tip: pool_tip(10, 0x31),
-                    confirmations: 1,
+                    confirmations: 2,
                 },
             ),
             Err(MinerError::RpcProtocol(_))
