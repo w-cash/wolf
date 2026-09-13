@@ -3000,7 +3000,7 @@ mod tests {
     }
 
     #[test]
-    fn wcash_winner_cas_covers_quarantine_requeue_maturity_and_restart() {
+    fn wcash_winner_cas_covers_quarantine_requeue_dematurity_and_restart() {
         let directory = private_temp_dir();
         let path = directory.path().join("actor.journal");
         let config = config();
@@ -3125,13 +3125,78 @@ mod tests {
                 confirmations: 2,
             } if tip == &replacement_tip
         ));
+
+        assert!(matches!(
+            recovered.compare_and_apply_winner_transition(
+                &matured,
+                PoolBackendWinnerTransition::Observed {
+                    tip: replacement_tip.clone(),
+                    confirmations: 2,
+                },
+            ),
+            Err(PoolBackendActorError::Journal(
+                PoolBackendJournalError::SemanticViolation { .. }
+            ))
+        ));
+
+        let demature_tip = ChainTip {
+            block_hash_le: winner.block_hash_le.clone(),
+            height: winner.height,
+        };
+        let dematured_event = recovered
+            .compare_and_apply_winner_transition(
+                &matured,
+                PoolBackendWinnerTransition::Observed {
+                    tip: demature_tip.clone(),
+                    confirmations: 1,
+                },
+            )
+            .expect("a canonical depth regression below the threshold dematures the reward");
+        assert!(matches!(
+            dematured_event,
+            BackendEvent::WinnerObserved {
+                event_seq: 9,
+                confirmations: 1,
+                ..
+            }
+        ));
+        drop(recovered);
+
+        let recovered =
+            actor_from_journal(open_journal(&path, &config), Arc::new(TestClock::new()));
+        let dematured = recovered
+            .winner_snapshot(&key)
+            .expect("read dematured winner after restart")
+            .expect("dematured winner remains retained");
+        assert_eq!(dematured.revision_event_seq(), 9);
+        assert!(matches!(
+            dematured.lifecycle(),
+            JournalWinnerLifecycle::Observed {
+                tip,
+                confirmations: 1,
+            } if tip == &demature_tip
+        ));
+        recovered
+            .compare_and_apply_winner_transition(
+                &dematured,
+                PoolBackendWinnerTransition::Matured {
+                    tip: replacement_tip,
+                    confirmations: 2,
+                },
+            )
+            .expect("a dematured winner can regain maturity");
+        let rematured = recovered
+            .winner_snapshot(&key)
+            .expect("refresh rematured winner")
+            .expect("rematured winner remains retained");
+        assert_eq!(rematured.revision_event_seq(), 10);
         let orphan_tip = ChainTip {
             block_hash_le: Hex32::new([0xa2; 32]),
             height: winner.height + 2,
         };
         recovered
             .compare_and_apply_winner_transition(
-                &matured,
+                &rematured,
                 PoolBackendWinnerTransition::Orphaned {
                     tip: orphan_tip.clone(),
                 },
@@ -3141,10 +3206,81 @@ mod tests {
             .winner_snapshot(&key)
             .expect("refresh orphaned winner")
             .expect("orphaned winner remains retained");
-        assert_eq!(orphaned.revision_event_seq(), 9);
+        assert_eq!(orphaned.revision_event_seq(), 11);
         assert!(matches!(
             orphaned.lifecycle(),
             JournalWinnerLifecycle::Orphaned { tip } if tip == &orphan_tip
+        ));
+    }
+
+    #[test]
+    fn observed_winner_depth_regression_is_durable_across_restart() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let (journal, winner, _) = zcash_winner_journal(&path, &config);
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+        let pending = actor
+            .next_winner_snapshot(None)
+            .expect("enumerate winner")
+            .expect("Zcash winner is retained");
+        let deeper_tip = ChainTip {
+            block_hash_le: Hex32::new([0xb0; 32]),
+            height: winner.height + 1,
+        };
+        actor
+            .compare_and_apply_winner_transition(
+                &pending,
+                PoolBackendWinnerTransition::Observed {
+                    tip: deeper_tip,
+                    confirmations: 2,
+                },
+            )
+            .expect("first canonical observation commits");
+        let observed = actor
+            .winner_snapshot(&pending.key())
+            .expect("refresh observed winner")
+            .expect("winner remains retained");
+        let regression_event_seq = observed
+            .revision_event_seq()
+            .checked_add(1)
+            .expect("test event sequence does not overflow");
+        let regressed_tip = ChainTip {
+            block_hash_le: winner.block_hash_le.clone(),
+            height: winner.height,
+        };
+        let event = actor
+            .compare_and_apply_winner_transition(
+                &observed,
+                PoolBackendWinnerTransition::Observed {
+                    tip: regressed_tip.clone(),
+                    confirmations: 1,
+                },
+            )
+            .expect("a reorganization above the winner can reduce its depth");
+        assert!(matches!(
+            event,
+            BackendEvent::WinnerObserved {
+                event_seq,
+                confirmations: 1,
+                ..
+            } if event_seq == regression_event_seq
+        ));
+        drop(actor);
+
+        let recovered =
+            actor_from_journal(open_journal(&path, &config), Arc::new(TestClock::new()));
+        let regressed = recovered
+            .winner_snapshot(&pending.key())
+            .expect("read regressed winner after restart")
+            .expect("regressed winner remains retained");
+        assert_eq!(regressed.revision_event_seq(), regression_event_seq);
+        assert!(matches!(
+            regressed.lifecycle(),
+            JournalWinnerLifecycle::Observed {
+                tip,
+                confirmations: 1,
+            } if tip == &regressed_tip
         ));
     }
 
