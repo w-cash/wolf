@@ -46,7 +46,9 @@ const MAXIMUM_RESPONSE_MESSAGES: usize = MAX_EVENT_PAGE_ITEMS as usize + 1;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolBackendListenerConfig {
     socket_path: PathBuf,
-    expected_peer_uid: u32,
+    submit_peer_uid: u32,
+    projector_peer_uid: Option<u32>,
+    payout_peer_uid: Option<u32>,
     expected_socket_gid: u32,
     maximum_connections: usize,
     hello_timeout: Duration,
@@ -59,12 +61,14 @@ impl PoolBackendListenerConfig {
     /// Creates a conservative local-socket policy.
     pub fn new(
         socket_path: impl Into<PathBuf>,
-        expected_peer_uid: u32,
+        submit_peer_uid: u32,
         expected_socket_gid: u32,
     ) -> Result<Self, PoolBackendListenerError> {
         let config = Self {
             socket_path: socket_path.into(),
-            expected_peer_uid,
+            submit_peer_uid,
+            projector_peer_uid: None,
+            payout_peer_uid: None,
             expected_socket_gid,
             maximum_connections: DEFAULT_MAXIMUM_CONNECTIONS,
             hello_timeout: DEFAULT_HELLO_TIMEOUT,
@@ -74,6 +78,18 @@ impl PoolBackendListenerConfig {
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Authorizes the two non-submitting runtime identities.
+    pub fn with_read_only_peer_uids(
+        mut self,
+        projector_peer_uid: u32,
+        payout_peer_uid: u32,
+    ) -> Result<Self, PoolBackendListenerError> {
+        self.projector_peer_uid = Some(projector_peer_uid);
+        self.payout_peer_uid = Some(payout_peer_uid);
+        self.validate()?;
+        Ok(self)
     }
 
     /// Sets the simultaneous connection cap.
@@ -104,6 +120,20 @@ impl PoolBackendListenerConfig {
 
     fn validate(&self) -> Result<(), PoolBackendListenerError> {
         validate_socket_path(&self.socket_path)?;
+        if let (Some(projector), Some(payout)) = (self.projector_peer_uid, self.payout_peer_uid) {
+            if projector == self.submit_peer_uid
+                || payout == self.submit_peer_uid
+                || projector == payout
+            {
+                return Err(PoolBackendListenerError::InvalidConfiguration(
+                    "submit, projector, and payout peer UIDs must be distinct",
+                ));
+            }
+        } else if self.projector_peer_uid.is_some() || self.payout_peer_uid.is_some() {
+            return Err(PoolBackendListenerError::InvalidConfiguration(
+                "projector and payout peer UIDs must be configured together",
+            ));
+        }
         if !(1..=MAXIMUM_CONNECTIONS).contains(&self.maximum_connections) {
             return Err(PoolBackendListenerError::InvalidConfiguration(
                 "maximum connections must be in 1..=64",
@@ -121,6 +151,40 @@ impl PoolBackendListenerConfig {
         }
         Ok(())
     }
+
+    fn role_for_peer_uid(&self, peer_uid: u32) -> Option<PoolBackendPeerRole> {
+        if peer_uid == self.submit_peer_uid {
+            Some(PoolBackendPeerRole::Submitter)
+        } else if self.projector_peer_uid == Some(peer_uid)
+            || self.payout_peer_uid == Some(peer_uid)
+        {
+            Some(PoolBackendPeerRole::ReadOnly)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PoolBackendPeerRole {
+    Submitter,
+    ReadOnly,
+}
+
+impl PoolBackendPeerRole {
+    fn authorizes(self, kind: BackendRequestKind) -> bool {
+        match (self, kind) {
+            (Self::Submitter, _) => true,
+            (
+                Self::ReadOnly,
+                BackendRequestKind::Hello
+                | BackendRequestKind::ReadEvents
+                | BackendRequestKind::SubscribeJobs
+                | BackendRequestKind::Health,
+            ) => true,
+            (Self::ReadOnly, BackendRequestKind::SubmitShare) => false,
+        }
+    }
 }
 
 /// Stable identities and peer facts for one authorized connection.
@@ -128,6 +192,7 @@ impl PoolBackendListenerConfig {
 pub struct PoolBackendSession {
     backend_session: CanonicalUuid,
     peer_uid: u32,
+    peer_role: PoolBackendPeerRole,
 }
 
 /// Connection-local context supplied to one serialized backend request.
@@ -435,9 +500,9 @@ impl PoolBackendListener {
             return Ok(PoolBackendConnectionOutcome::Served);
         }
         let peer_uid = peer_uid(&stream)?;
-        if peer_uid != self.config.expected_peer_uid {
+        let Some(peer_role) = self.config.role_for_peer_uid(peer_uid) else {
             return Ok(PoolBackendConnectionOutcome::Unauthorized);
-        }
+        };
         let Some(_permit) = ConnectionPermit::acquire(
             Arc::clone(&self.active_connections),
             self.config.maximum_connections,
@@ -452,6 +517,7 @@ impl PoolBackendListener {
                 authority.journal_stream(),
             )?,
             peer_uid,
+            peer_role,
         };
         serve_authorized_connection(&mut stream, &self.config, handler, &session, &authority)?;
         Ok(PoolBackendConnectionOutcome::Served)
@@ -603,6 +669,16 @@ fn serve_authorized_connection(
                 return Ok(());
             }
         };
+        if !session.peer_role.authorizes(kind) {
+            write_error(
+                stream,
+                config.write_timeout,
+                request_id,
+                BackendErrorCode::InvalidRequest,
+                "backend peer is not authorized to submit shares".to_string(),
+            )?;
+            return Ok(());
+        }
 
         let context = PoolBackendRequestContext {
             session,
@@ -1202,6 +1278,137 @@ mod tests {
         assert!(handler.requests.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn exact_runtime_peer_uids_have_separate_submit_authority() {
+        let config = PoolBackendListenerConfig::new("/tmp/backend.sock", 10, 20)
+            .unwrap()
+            .with_read_only_peer_uids(11, 12)
+            .unwrap();
+
+        assert_eq!(
+            config.role_for_peer_uid(10),
+            Some(PoolBackendPeerRole::Submitter)
+        );
+        assert_eq!(
+            config.role_for_peer_uid(11),
+            Some(PoolBackendPeerRole::ReadOnly)
+        );
+        assert_eq!(
+            config.role_for_peer_uid(12),
+            Some(PoolBackendPeerRole::ReadOnly)
+        );
+        assert_eq!(config.role_for_peer_uid(13), None);
+        assert!(PoolBackendPeerRole::Submitter.authorizes(BackendRequestKind::SubmitShare));
+        assert!(!PoolBackendPeerRole::ReadOnly.authorizes(BackendRequestKind::SubmitShare));
+        for kind in [
+            BackendRequestKind::Hello,
+            BackendRequestKind::ReadEvents,
+            BackendRequestKind::SubscribeJobs,
+            BackendRequestKind::Health,
+        ] {
+            assert!(PoolBackendPeerRole::ReadOnly.authorizes(kind));
+        }
+    }
+
+    #[test]
+    fn runtime_peer_uids_must_be_distinct() {
+        for (submit, projector, payout) in [(10, 10, 12), (10, 11, 10), (10, 11, 11)] {
+            assert!(
+                PoolBackendListenerConfig::new("/tmp/backend.sock", submit, 20)
+                    .unwrap()
+                    .with_read_only_peer_uids(projector, payout)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_peer_can_subscribe_but_cannot_submit() {
+        let directory = private_directory();
+        let path = socket_path(&directory);
+        let current_uid = nix::unistd::geteuid().as_raw();
+        let listener = Arc::new(
+            PoolBackendListener::bind(
+                PoolBackendListenerConfig::new(
+                    path.clone(),
+                    current_uid.wrapping_add(1),
+                    nix::unistd::getegid().as_raw(),
+                )
+                .unwrap()
+                .with_read_only_peer_uids(current_uid, current_uid.wrapping_add(2))
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let handler = Arc::new(TestHandler::default());
+        let server = {
+            let listener = Arc::clone(&listener);
+            let handler = Arc::clone(&handler);
+            thread::spawn(move || listener.serve_one(handler.as_ref()).unwrap())
+        };
+
+        let mut stream = UnixStream::connect(&path).unwrap();
+        let hello = BackendRequest::Hello {
+            version: BACKEND_PROTOCOL_VERSION,
+            id: 1,
+            pool_instance: canonical_uuid("f0a56cbd-c01b-4e7e-ab01-51ff7de71695"),
+            last_event_seq: 0,
+        };
+        stream
+            .write_all(&encode_backend_request(&hello).unwrap())
+            .unwrap();
+        assert!(matches!(
+            read_message(&mut stream),
+            BackendMessage::HelloOk { id: 1, .. }
+        ));
+
+        let subscribe = BackendRequest::SubscribeJobs {
+            version: BACKEND_PROTOCOL_VERSION,
+            id: 2,
+            after_event_seq: 0,
+        };
+        stream
+            .write_all(&encode_backend_request(&subscribe).unwrap())
+            .unwrap();
+        assert!(matches!(
+            read_message(&mut stream),
+            BackendMessage::JobSnapshot { id: 2, .. }
+        ));
+
+        let submit = BackendRequest::SubmitShare {
+            version: BACKEND_PROTOCOL_VERSION,
+            id: 3,
+            job_id: Hex32::new([8; 32]),
+            identity: WorkerIdentity {
+                account_id: canonical_uuid("77b9fb5b-2e4e-4ed2-b781-1ecef4d867af"),
+                worker_id: canonical_uuid("643caa33-4b16-4406-b4d9-1c682d442a9e"),
+                label: "rig-1".to_string(),
+            },
+            target_le: TargetLe::new([9; 32]),
+            time: Hex4::new([1, 2, 3, 4]),
+            nonce: Hex32::new([10; 32]),
+            solution: Box::new(Hex1344::new([11; 1344])),
+        };
+        stream
+            .write_all(&encode_backend_request(&submit).unwrap())
+            .unwrap();
+        assert!(matches!(
+            read_message(&mut stream),
+            BackendMessage::Error {
+                id: 3,
+                code: BackendErrorCode::InvalidRequest,
+                ..
+            }
+        ));
+        drop(stream);
+
+        assert_eq!(server.join().unwrap(), PoolBackendConnectionOutcome::Served);
+        assert_eq!(
+            handler.requests.lock().unwrap().as_slice(),
+            &[BackendRequestKind::Hello, BackendRequestKind::SubscribeJobs]
+        );
+    }
+
     fn read_message(stream: &mut UnixStream) -> BackendMessage {
         use std::io::Read;
         let mut prefix = [0; 4];
@@ -1241,28 +1448,35 @@ mod tests {
             request: BackendRequest,
         ) -> Result<Vec<BackendMessage>, PoolBackendHandlerError> {
             self.requests.lock().unwrap().push(kind);
-            let BackendRequest::Hello { id, .. } = request else {
-                return Err(PoolBackendHandlerError::new(
+            match request {
+                BackendRequest::Hello { id, .. } => Ok(vec![BackendMessage::HelloOk {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    backend_session: context.session().backend_session(),
+                    backend_instance: self.backend_instance,
+                    journal_stream: self.journal_stream,
+                    capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
+                    wcash_genesis: Hex32::new([1; 32]),
+                    zcash_genesis: Hex32::new([2; 32]),
+                    wcash_payout_commitment: Hex32::new([3; 32]),
+                    zcash_payout_commitment: Hex32::new([4; 32]),
+                    share_target_ceiling_be: test_share_target_ceiling_be(),
+                    chain_id: 1,
+                    current_event_seq: 0,
+                }]),
+                BackendRequest::SubscribeJobs { id, .. } => Ok(vec![BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 0,
+                    current: None,
+                    recent: Vec::new(),
+                }]),
+                _ => Err(PoolBackendHandlerError::new(
                     BackendErrorCode::InvalidRequest,
-                    "test handler accepts only hello",
+                    "test handler rejects unexpected requests",
                     true,
-                ));
-            };
-            Ok(vec![BackendMessage::HelloOk {
-                version: BACKEND_PROTOCOL_VERSION,
-                id,
-                backend_session: context.session().backend_session(),
-                backend_instance: self.backend_instance,
-                journal_stream: self.journal_stream,
-                capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
-                wcash_genesis: Hex32::new([1; 32]),
-                zcash_genesis: Hex32::new([2; 32]),
-                wcash_payout_commitment: Hex32::new([3; 32]),
-                zcash_payout_commitment: Hex32::new([4; 32]),
-                share_target_ceiling_be: test_share_target_ceiling_be(),
-                chain_id: 1,
-                current_event_seq: 0,
-            }])
+                )),
+            }
         }
     }
 
@@ -1272,6 +1486,7 @@ mod tests {
         let session = PoolBackendSession {
             backend_session: canonical_uuid("599ec097-b4e1-4f6d-a127-ff66e5262a52"),
             peer_uid: nix::unistd::geteuid().as_raw(),
+            peer_role: PoolBackendPeerRole::Submitter,
         };
         let request = BackendRequest::Hello {
             version: BACKEND_PROTOCOL_VERSION,
@@ -1632,6 +1847,7 @@ mod tests {
         let session = PoolBackendSession {
             backend_session: canonical_uuid("599ec097-b4e1-4f6d-a127-ff66e5262a52"),
             peer_uid: nix::unistd::geteuid().as_raw(),
+            peer_role: PoolBackendPeerRole::Submitter,
         };
         let request = BackendRequest::Hello {
             version: BACKEND_PROTOCOL_VERSION,
