@@ -175,7 +175,7 @@ pub fn mine_zip301_once(config: Zip301ClientConfig) -> Result<Zip301AcceptedShar
             "params": [],
         }),
     )?;
-    let extranonce = read_message(&mut reader)?;
+    let extranonce = read_response(&mut reader, 3)?;
     require_unsupported_extension(&extranonce, 3, "mining.extranonce.subscribe")?;
 
     let solved = work.solve(config.start_nonce, config.maximum_nonce_runs)?;
@@ -194,7 +194,7 @@ pub fn mine_zip301_once(config: Zip301ClientConfig) -> Result<Zip301AcceptedShar
             ],
         }),
     )?;
-    let submission = read_message(&mut reader)?;
+    let submission = read_response(&mut reader, 4)?;
     require_boolean_success(&submission, 4, "mining.submit")?;
 
     Ok(Zip301AcceptedShare {
@@ -421,11 +421,13 @@ fn require_unsupported_extension(
     })?;
     let error = object.get("error").and_then(Value::as_array);
     if object.get("id").and_then(Value::as_u64) != Some(expected_id)
-        || object.get("result").and_then(Value::as_bool) != Some(false)
+        || object
+            .get("result")
+            .is_none_or(|result| !result.is_null() && result.as_bool() != Some(false))
         || error.is_none_or(|values| {
             values.len() != 3
                 || values[0].as_i64() != Some(20)
-                || values[1].as_str() != Some("Not supported.")
+                || values[1].as_str().is_none_or(str::is_empty)
                 || !values[2].is_null()
         })
     {
@@ -481,6 +483,31 @@ fn write_request(stream: &mut TcpStream, request: &Value) -> Result<(), MinerErr
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+// Job rotation can interleave notifications with a response, including after a
+// winning submission. Keep testing the exact retained job while awaiting its ID.
+fn read_response(reader: &mut impl BufRead, expected_id: u64) -> Result<Value, MinerError> {
+    for _ in 0..64 {
+        let message = read_message(reader)?;
+        if message["id"].as_u64() == Some(expected_id) {
+            return Ok(message);
+        }
+        if message["id"].is_null()
+            && matches!(
+                message["method"].as_str(),
+                Some("mining.notify" | "mining.set_target")
+            )
+        {
+            continue;
+        }
+        return Err(MinerError::InvalidRequest(
+            "unexpected ZIP-301 response identity".to_owned(),
+        ));
+    }
+    Err(MinerError::InvalidRequest(
+        "too many ZIP-301 notifications before response".to_owned(),
+    ))
 }
 
 fn read_message(reader: &mut impl BufRead) -> Result<Value, MinerError> {
@@ -660,6 +687,11 @@ mod tests {
     fn strict_success_envelopes_do_not_accept_rpc_errors() {
         let success = json!({"id": 2, "result": true, "error": Value::Null});
         require_boolean_success(&success, 2, "mining.authorize").expect("success accepted");
+        let interleaved = b"{\"id\":null,\"method\":\"mining.notify\",\"params\":[]}\n{\"id\":4,\"result\":true,\"error\":null}\n";
+        let mut reader = BufReader::new(std::io::Cursor::new(interleaved));
+        let response =
+            read_response(&mut reader, 4).expect("notification is not the submit response");
+        require_boolean_success(&response, 4, "mining.submit").expect("matching response accepted");
         let error = json!({"id": 2, "result": true, "error": [20, "failure", Value::Null]});
         assert!(require_boolean_success(&error, 2, "mining.authorize").is_err());
         assert!(require_boolean_success(&success, 3, "mining.submit").is_err());
@@ -668,6 +700,21 @@ mod tests {
             json!({"id": 3, "result": false, "error": [20, "Not supported.", Value::Null]});
         require_unsupported_extension(&unsupported, 3, "mining.extranonce.subscribe")
             .expect("explicit unsupported response accepted");
+        let pool_error = json!({"id": 3, "result": Value::Null,
+            "error": [20, "extranonce subscription unsupported", Value::Null]});
+        require_unsupported_extension(&pool_error, 3, "mining.extranonce.subscribe")
+            .expect("pool JSON-RPC error envelope accepted");
+        let false_success = json!({"id": 3, "result": true,
+            "error": [20, "unsupported", Value::Null]});
+        assert!(
+            require_unsupported_extension(&false_success, 3, "mining.extranonce.subscribe")
+                .is_err()
+        );
+        let wrong_error = json!({"id": 3, "result": Value::Null,
+            "error": [24, "unauthorized", Value::Null]});
+        assert!(
+            require_unsupported_extension(&wrong_error, 3, "mining.extranonce.subscribe").is_err()
+        );
     }
 
     #[test]
