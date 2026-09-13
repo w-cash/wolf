@@ -65,7 +65,9 @@ const WCASH_TESTNET_PARENT_TARGET_SAMPLING: &str = "WCASH_TESTNET_PARENT_TARGET_
 const WCASH_POOL_BACKEND_IDENTITY: &str = "WCASH_POOL_BACKEND_IDENTITY";
 const WCASH_POOL_BACKEND_JOURNAL: &str = "WCASH_POOL_BACKEND_JOURNAL";
 const WCASH_POOL_BACKEND_SOCKET: &str = "WCASH_POOL_BACKEND_SOCKET";
-const WCASH_POOL_BACKEND_PEER_UID: &str = "WCASH_POOL_BACKEND_PEER_UID";
+const WCASH_POOL_BACKEND_SUBMIT_UID: &str = "WCASH_POOL_BACKEND_SUBMIT_UID";
+const WCASH_POOL_BACKEND_PROJECTOR_UID: &str = "WCASH_POOL_BACKEND_PROJECTOR_UID";
+const WCASH_POOL_BACKEND_PAYOUT_UID: &str = "WCASH_POOL_BACKEND_PAYOUT_UID";
 const WCASH_POOL_BACKEND_SOCKET_GID: &str = "WCASH_POOL_BACKEND_SOCKET_GID";
 const WCASH_POOL_BACKEND_LISTENERS: &str = "WCASH_POOL_BACKEND_LISTENERS";
 
@@ -136,9 +138,10 @@ payout is rejected. Plaintext payout configuration is omitted from diagnostics,
 but native preflight prints the exact Zcash coinbase.
 pool-backend-init and native-pool-backend additionally require absolute paths in
 WCASH_POOL_BACKEND_IDENTITY, WCASH_POOL_BACKEND_JOURNAL, and
-WCASH_POOL_BACKEND_SOCKET. The serving command authenticates the Unix peer UID
-from WCASH_POOL_BACKEND_PEER_UID and sets the socket GID from
-WCASH_POOL_BACKEND_SOCKET_GID. WCASH_POOL_BACKEND_LISTENERS optionally selects
+WCASH_POOL_BACKEND_SOCKET. The serving command authenticates the submitting,
+projector, and payout Unix peer UIDs from WCASH_POOL_BACKEND_SUBMIT_UID,
+WCASH_POOL_BACKEND_PROJECTOR_UID, and WCASH_POOL_BACKEND_PAYOUT_UID, and sets
+the socket GID from WCASH_POOL_BACKEND_SOCKET_GID. WCASH_POOL_BACKEND_LISTENERS optionally selects
 1..=16 accept workers (default 2). Initialization is explicit and never replaces
 existing identity or journal state.
 WCASH_VALIDATION_LIMIT optionally sets the global concurrent share-validation
@@ -845,7 +848,9 @@ fn pool_backend_runtime_config() -> Result<PoolBackendRuntimeConfig, Box<dyn Err
     let identity_path = required_absolute_path_env(WCASH_POOL_BACKEND_IDENTITY)?;
     let journal_path = required_absolute_path_env(WCASH_POOL_BACKEND_JOURNAL)?;
     let socket_path = required_absolute_path_env(WCASH_POOL_BACKEND_SOCKET)?;
-    let expected_peer_uid = parse_required_u32_env(WCASH_POOL_BACKEND_PEER_UID)?;
+    let submit_peer_uid = parse_required_u32_env(WCASH_POOL_BACKEND_SUBMIT_UID)?;
+    let projector_peer_uid = parse_required_u32_env(WCASH_POOL_BACKEND_PROJECTOR_UID)?;
+    let payout_peer_uid = parse_required_u32_env(WCASH_POOL_BACKEND_PAYOUT_UID)?;
     let expected_socket_gid = parse_required_u32_env(WCASH_POOL_BACKEND_SOCKET_GID)?;
     let listener_workers = parse_optional_usize(
         optional_env(WCASH_POOL_BACKEND_LISTENERS)?,
@@ -864,9 +869,10 @@ fn pool_backend_runtime_config() -> Result<PoolBackendRuntimeConfig, Box<dyn Err
         journal_path,
         listener: PoolBackendListenerConfig::new(
             socket_path,
-            expected_peer_uid,
+            submit_peer_uid,
             expected_socket_gid,
-        )?,
+        )?
+        .with_read_only_peer_uids(projector_peer_uid, payout_peer_uid)?,
         listener_workers,
         target_policy: PoolShareTargetPolicy::new(TargetLe::new(target.to_le_bytes()))?,
     })
