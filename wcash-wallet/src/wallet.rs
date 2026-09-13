@@ -1108,7 +1108,7 @@ fn reject_symlink(path: &Path) -> Result<(), WalletServiceError> {
     }
 }
 
-#[cfg(all(unix, target_os = "android"))]
+#[cfg(all(unix, any(target_os = "android", target_os = "ios")))]
 fn require_private_parent_and_ancestors(path: &Path) -> Result<(), WalletServiceError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -1130,7 +1130,7 @@ fn require_private_parent_and_ancestors(path: &Path) -> Result<(), WalletService
     Ok(())
 }
 
-#[cfg(all(unix, not(target_os = "android")))]
+#[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
 fn require_private_parent_and_ancestors(path: &Path) -> Result<(), WalletServiceError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -5814,7 +5814,7 @@ mod tests {
         ));
     }
 
-    #[cfg(all(unix, not(target_os = "android")))]
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
     #[test]
     fn writable_ancestor_above_private_parent_is_rejected() {
         use std::os::unix::fs::PermissionsExt;
@@ -5837,9 +5837,9 @@ mod tests {
         assert!(!wallet_path.exists());
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     #[test]
-    fn android_accepts_a_private_wallet_directory_inside_the_app_sandbox() {
+    fn mobile_accepts_a_private_wallet_directory_inside_the_app_sandbox() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
