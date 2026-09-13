@@ -3,7 +3,8 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/wcash-testnet-e2e.XXXXXX")"
+runtime_parent="$(cd -- "${TMPDIR:-/tmp}" && pwd -P)"
+runtime_dir="$(mktemp -d "$runtime_parent/wcash-testnet-e2e.XXXXXX")"
 declare -a child_pids=()
 
 wcash_rpc=http://127.0.0.1:38232
@@ -55,6 +56,10 @@ cleanup() {
     fi
     wait "$pid" 2>/dev/null || true
   done
+
+  # The collector IVK is read-only but privacy-sensitive. Never retain it with
+  # diagnostic logs after a failed run.
+  rm -f -- "$runtime_dir/sender-collector.ivk"
 
   if [[ $status -eq 0 ]]; then
     rm -rf -- "$runtime_dir"
@@ -472,13 +477,15 @@ recipient_seed=202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
 expected_sender_address=wuregtest1xryxj7ddyajw4mv7jpelftnfhkwu3v5w03smp88kk6fkmfvlewpzrs26pxqs4wycul43485lg0h9ry8zzxkj9q8gvh7dmg0uh5e2t28k
 sender_db="$runtime_dir/sender.sqlite"
 recipient_db="$runtime_dir/recipient.sqlite"
+sender_ivk_file="$runtime_dir/sender-collector.ivk"
 
 # Coordinator variables use the same WCASH_ namespace that Zebra's config
 # loader inspects. Clear the completed Testnet mining phase before starting a
 # second node, otherwise coordinator-only keys are rejected as unknown Zebra
 # configuration fields.
 unset WCASH_EXPECTED_GENESIS_HASH ZCASH_EXPECTED_GENESIS_HASH ZCASH_NETWORK \
-  WCASH_SHARE_JOURNAL WCASH_PAYOUT_ADDRESS ZCASH_PAYOUT_ADDRESS \
+  WCASH_SHARE_JOURNAL WCASH_PAYOUT_ADDRESS WCASH_PAYOUT_IVK_FILE \
+  ZCASH_PAYOUT_ADDRESS \
   WCASH_SHARE_TARGET WCASH_VALIDATION_LIMIT WCASH_AUTHENTICATION_LIMIT \
   WCASH_WORKER_CREDENTIALS WCASH_STRATUM_PASSWORD
 
@@ -489,7 +496,8 @@ wallet_with_seed() {
 }
 
 sender_address="$(
-  wallet_with_seed "$sender_seed" --network regtest derive-address |
+  wallet_with_seed "$sender_seed" --network regtest derive-collector \
+    --ivk-file "$sender_ivk_file" |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["address"])'
 )"
 recipient_address="$(
@@ -538,6 +546,7 @@ export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f
 export ZCASH_NETWORK=regtest
 export WCASH_SHARE_JOURNAL="$runtime_dir/wallet-spend-journal.jsonl"
 export WCASH_PAYOUT_ADDRESS="$sender_address"
+export WCASH_PAYOUT_IVK_FILE="$sender_ivk_file"
 export ZCASH_PAYOUT_ADDRESS="$zcash_payout_address"
 
 wallet_native_args=(
@@ -546,6 +555,15 @@ wallet_native_args=(
   "$zcash_validator_rpc"
   -
 )
+if env -u WCASH_PAYOUT_IVK_FILE \
+  "$repo_root/target/release/wcash-merge-miner" native-job \
+    "${wallet_native_args[@]}" \
+    >"$runtime_dir/rejected-private-without-ivk.log" 2>&1; then
+  echo "private payout was accepted without its read-only incoming key" >&2
+  exit 1
+fi
+grep --quiet 'requires its read-only incoming viewing key' \
+  "$runtime_dir/rejected-private-without-ivk.log"
 parent_start_height="$(rpc_result "$zcash_template_rpc" getblockcount)"
 if [[ ! "$parent_start_height" =~ ^[0-9]+$ ]]; then
   echo "invalid starting Zcash parent height: $parent_start_height" >&2
@@ -842,7 +860,8 @@ fi
 wait "$private_wallet_node_pid" 2>/dev/null || true
 
 unset WCASH_EXPECTED_GENESIS_HASH ZCASH_EXPECTED_GENESIS_HASH ZCASH_NETWORK \
-  WCASH_SHARE_JOURNAL WCASH_PAYOUT_ADDRESS ZCASH_PAYOUT_ADDRESS
+  WCASH_SHARE_JOURNAL WCASH_PAYOUT_ADDRESS WCASH_PAYOUT_IVK_FILE \
+  ZCASH_PAYOUT_ADDRESS
 
 transparent_sender_db="$runtime_dir/transparent-sender.sqlite"
 sender_transparent_address="$(

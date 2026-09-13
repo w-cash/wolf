@@ -270,6 +270,20 @@ pub struct NativeZcashProvider {
     expected_parent_payout_address: ZcashAddress,
 }
 
+/// Exact chain tip sampled from one or more pinned consensus nodes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeChainTip {
+    pub(crate) block_hash_le: [u8; 32],
+    pub(crate) height: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BlockchainInfoTip {
+    blocks: u32,
+    #[serde(rename = "bestblockhash")]
+    best_block_hash: String,
+}
+
 impl NativeZcashProvider {
     /// Connects the configured native parent-node set.
     pub fn new(config: NativeZcashConfig) -> Result<Self, MinerError> {
@@ -428,6 +442,23 @@ impl NativeZcashProvider {
         height: u32,
         expected_hash: &str,
     ) -> Result<ParentSubmissionReport, MinerError> {
+        let report = self.replay_parent_bytes(block_bytes, height, expected_hash)?;
+        if !report.is_confirmed() {
+            return Err(MinerError::InvalidParentTemplate(
+                "no parent node confirmed the submitted block on its best chain".to_string(),
+            ));
+        }
+        Ok(report)
+    }
+
+    /// Validates and idempotently replays exact retained parent bytes to every
+    /// pinned node, even when none confirms the block during this attempt.
+    pub(crate) fn replay_parent_bytes(
+        &self,
+        block_bytes: &[u8],
+        height: u32,
+        expected_hash: &str,
+    ) -> Result<ParentSubmissionReport, MinerError> {
         if block_bytes.len() > PARENT_BLOCK_LIMIT {
             return Err(MinerError::InvalidParentTemplate(
                 "solved parent block exceeds the consensus size limit".to_string(),
@@ -478,14 +509,7 @@ impl NativeZcashProvider {
                 })
                 .collect::<Vec<_>>()
         });
-
-        let report = ParentSubmissionReport { outcomes };
-        if !report.is_confirmed() {
-            return Err(MinerError::InvalidParentTemplate(
-                "no parent node confirmed the submitted block on its best chain".to_string(),
-            ));
-        }
-        Ok(report)
+        Ok(ParentSubmissionReport { outcomes })
     }
 
     /// Returns the conservative best-chain confirmation depth reported for an
@@ -519,6 +543,46 @@ impl NativeZcashProvider {
                 .collect::<Vec<_>>()
         });
         conservative_parent_confirmation_depth(checks)
+    }
+
+    /// Returns one exact tip only when every pinned parent node reports the
+    /// same atomic blockchain snapshot.
+    pub(crate) fn consistent_chain_tip(&self) -> Result<NativeChainTip, MinerError> {
+        let mut nodes = Vec::with_capacity(self.proposal_validators.len() + 1);
+        nodes.push(&self.template_node);
+        nodes.extend(self.proposal_validators.iter());
+        let tips = thread::scope(|scope| {
+            nodes
+                .into_iter()
+                .map(|node| scope.spawn(move || native_chain_tip_on_node(node)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|worker| {
+                    worker.join().unwrap_or_else(|_| {
+                        Err(MinerError::RpcProtocol(
+                            "parent tip-snapshot worker panicked".to_string(),
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        let Some(expected) = tips.first().copied() else {
+            return Err(MinerError::RpcProtocol(
+                "no pinned parent node reported a chain tip".to_string(),
+            ));
+        };
+        if tips.iter().any(|tip| *tip != expected) {
+            return Err(MinerError::ParentTipMismatch {
+                expected: format!(
+                    "{} at height {}",
+                    display_hex(expected.block_hash_le),
+                    expected.height
+                ),
+                endpoint: "pinned parent node set".to_string(),
+                actual: "nodes reported different atomic chain tips".to_string(),
+            });
+        }
+        Ok(expected)
     }
 
     /// Requires every configured parent node to remain on the exact job tip.
@@ -592,6 +656,18 @@ impl NativeZcashProvider {
     }
 }
 
+pub(crate) fn native_chain_tip_on_node(
+    node: &ZebraRpcClient,
+) -> Result<NativeChainTip, MinerError> {
+    let response: BlockchainInfoTip = node.call("getblockchaininfo", json!([]))?;
+    let hash: block::Hash =
+        parse_template_hex(&response.best_block_hash, "bestblockhash chain tip")?;
+    Ok(NativeChainTip {
+        block_hash_le: hash.0,
+        height: response.blocks,
+    })
+}
+
 /// One frozen native Zcash template that passed local and proposal checks.
 #[derive(Clone, Debug)]
 pub struct NativePreparedJob {
@@ -610,9 +686,16 @@ pub struct NativePreparedJob {
 pub enum NativeWcashPayoutVerification {
     /// Every output was matched to the configured transparent recipient.
     ExactTransparentRecipient,
-    /// The encrypted value and privacy shape were checked, but the recipient is trusted to the
-    /// private loopback template node because a payment address cannot decrypt its ciphertext.
-    TrustedPrivateTemplateNode,
+    /// Every Ironwood action was trial-decrypted with the configured read-only
+    /// incoming capability and matched to the configured private recipient.
+    ExactPrivateRecipient,
+}
+
+/// Domain-separated recipient commitments bound to one dual-chain generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativePayoutCommitments {
+    pub(crate) wcash: [u8; 32],
+    pub(crate) zcash: [u8; 32],
 }
 
 /// Exact proposal-validated metadata for one native merged-mining generation.
@@ -641,6 +724,8 @@ pub struct NativeGenerationDescriptor {
     zcash_maturity_confirmations: u32,
     max_age_milliseconds: u32,
     wcash_payout_verification: NativeWcashPayoutVerification,
+    wcash_payout_commitment: [u8; 32],
+    zcash_payout_commitment: [u8; 32],
 }
 
 impl NativeGenerationDescriptor {
@@ -655,6 +740,8 @@ impl NativeGenerationDescriptor {
         wcash_height: u32,
         wcash_reward_zatoshis: u64,
         wcash_payout_verification: NativeWcashPayoutVerification,
+        wcash_payout_commitment: [u8; 32],
+        zcash_payout_commitment: [u8; 32],
     ) -> Self {
         let mut zcash_previous_hash_le = [0; 32];
         zcash_previous_hash_le.copy_from_slice(&parent_job.parent_header_input()[4..36]);
@@ -677,6 +764,8 @@ impl NativeGenerationDescriptor {
             zcash_maturity_confirmations: NATIVE_COINBASE_MATURITY_CONFIRMATIONS,
             max_age_milliseconds: NATIVE_JOB_MAX_AGE_MILLISECONDS,
             wcash_payout_verification,
+            wcash_payout_commitment,
+            zcash_payout_commitment,
         }
     }
 
@@ -766,6 +855,16 @@ impl NativeGenerationDescriptor {
     /// Returns how strongly the configured Wcash reward recipient was authenticated.
     pub const fn wcash_payout_verification(&self) -> NativeWcashPayoutVerification {
         self.wcash_payout_verification
+    }
+
+    /// Returns the domain-separated configured Wcash reward-recipient commitment.
+    pub const fn wcash_payout_commitment(&self) -> [u8; 32] {
+        self.wcash_payout_commitment
+    }
+
+    /// Returns the domain-separated configured Zcash reward-recipient commitment.
+    pub const fn zcash_payout_commitment(&self) -> [u8; 32] {
+        self.zcash_payout_commitment
     }
 }
 
@@ -1046,6 +1145,7 @@ impl NativePreparedJob {
         wcash_height: u32,
         wcash_reward_zatoshis: u64,
         wcash_payout_verification: NativeWcashPayoutVerification,
+        payout_commitments: NativePayoutCommitments,
     ) -> NativeGenerationDescriptor {
         NativeGenerationDescriptor::from_validated_parts(
             &self.job,
@@ -1057,6 +1157,8 @@ impl NativePreparedJob {
             wcash_height,
             wcash_reward_zatoshis,
             wcash_payout_verification,
+            payout_commitments.wcash,
+            payout_commitments.zcash,
         )
     }
 
@@ -1255,12 +1357,18 @@ pub enum ParentNodeOutcome {
         /// Node-provided rejection reason.
         reason: String,
     },
-    /// Node could not be reached or returned invalid RPC framing.
+    /// Node could not be reached because of a transient dependency failure.
     Unavailable {
         /// Credential-free endpoint label.
         endpoint: String,
         /// Sanitized failure reason.
         reason: String,
+    },
+    /// Node returned a permanent RPC or response-shape failure rather than an
+    /// authoritative block verdict.
+    InvalidResponse {
+        /// Credential-free endpoint label.
+        endpoint: String,
     },
 }
 
@@ -1433,19 +1541,37 @@ fn submit_parent_to_node(
         Ok(Value::Null) => ParentNodeOutcome::Unconfirmed {
             endpoint: node.label().to_string(),
         },
+        Ok(Value::String(reason)) if submitblock_reason_is_inconclusive(&reason) => {
+            ParentNodeOutcome::Unconfirmed {
+                endpoint: node.label().to_string(),
+            }
+        }
         Ok(Value::String(reason)) => ParentNodeOutcome::Rejected {
             endpoint: node.label().to_string(),
             reason,
         },
-        Ok(other) => ParentNodeOutcome::Rejected {
+        Ok(_) => ParentNodeOutcome::InvalidResponse {
             endpoint: node.label().to_string(),
-            reason: format!("unexpected submitblock result {other}"),
+        },
+        Err(
+            MinerError::RpcProtocol(_)
+            | MinerError::RpcResponseTooLarge(_)
+            | MinerError::RpcConfiguration(_),
+        ) => ParentNodeOutcome::InvalidResponse {
+            endpoint: node.label().to_string(),
         },
         Err(error) => ParentNodeOutcome::Unavailable {
             endpoint: node.label().to_string(),
             reason: error.to_string(),
         },
     }
+}
+
+pub(crate) fn submitblock_reason_is_inconclusive(reason: &str) -> bool {
+    matches!(
+        reason,
+        "duplicate" | "duplicate-inconclusive" | "inconclusive"
+    )
 }
 
 fn decode_template_coinbase(template: &TransactionTemplate) -> Result<Transaction, MinerError> {
@@ -1790,6 +1916,8 @@ mod tests {
             91,
             625_000_000,
             payout_verification,
+            [0x41; 32],
+            [0x42; 32],
         )
     }
 
@@ -1872,16 +2000,14 @@ mod tests {
     }
 
     #[test]
-    fn pool_backend_adapter_rejects_private_wcash_payouts() {
+    fn pool_backend_adapter_accepts_exact_private_wcash_payouts() {
         let native = pool_backend_descriptor_fixture(
             4,
-            NativeWcashPayoutVerification::TrustedPrivateTemplateNode,
+            NativeWcashPayoutVerification::ExactPrivateRecipient,
         );
 
-        assert_eq!(
-            job_descriptor_from_native(&native),
-            Err(PoolBackendAdapterError::UnverifiedWcashPayout)
-        );
+        job_descriptor_from_native(&native)
+            .expect("an exactly trial-decrypted private payout is pool-safe");
     }
 
     #[test]
@@ -1912,6 +2038,8 @@ mod tests {
             91,
             625_000_000,
             NativeWcashPayoutVerification::ExactTransparentRecipient,
+            [0x45; 32],
+            [0x46; 32],
         );
 
         assert_eq!(descriptor.job_id(), parent_job.job_id_bytes());
@@ -1956,6 +2084,8 @@ mod tests {
             descriptor.wcash_payout_verification(),
             NativeWcashPayoutVerification::ExactTransparentRecipient
         );
+        assert_eq!(descriptor.wcash_payout_commitment(), [0x45; 32]);
+        assert_eq!(descriptor.zcash_payout_commitment(), [0x46; 32]);
     }
 
     #[test]

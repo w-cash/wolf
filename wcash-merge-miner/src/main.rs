@@ -5,17 +5,24 @@ use std::{
     error::Error,
     io::{self, Write},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use wcash_merge_miner::{
     accounting::{hash_worker_password, read_accounting_snapshot, WorkerCredentialStore},
     mine_zip301_once,
+    pool_backend::{
+        PoolBackendIdentity, PoolBackendIdentityError, PoolBackendJournal, PoolBackendJournalError,
+        PoolBackendListener, PoolBackendListenerConfig, PoolShareTargetPolicy,
+    },
     protocol::serve_loopback,
     rpc::RpcEndpoint,
     zip301::{
@@ -23,10 +30,13 @@ use wcash_merge_miner::{
         DEFAULT_ZIP301_VALIDATION_LIMIT,
     },
     CoordinatorConfig, GenerationRetirement, JobConfig, MinerError, NativeMiningCoordinator,
-    NativeMiningSupervisor, NativeZcashConfig, NativeZcashNetwork, PreparedJob, ShareProcessor,
-    Zip301ClientConfig, Zip301Config, Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
+    NativeMiningSupervisor, NativePoolBackendRetainedJob, NativeZcashConfig, NativeZcashNetwork,
+    PoolBackendActor, PoolBackendActorError, PoolBackendRetainedJob, PreparedJob, ShareProcessor,
+    WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config, Zip301LoopbackListener,
+    NATIVE_JOB_MAX_AGE_SECONDS,
 };
-use wcash_zcash_aux::Target;
+use wcash_pool_protocol::{Hex32, JobInvalidationReason, TargetBe, TargetLe};
+use wcash_zcash_aux::{Target, WCASH_AUXILIARY_CHAIN_ID};
 use zcash_address::ZcashAddress;
 use zebra_chain::block::genesis::WCASH_TESTNET_GENESIS_HASH;
 
@@ -44,6 +54,7 @@ const WCASH_WORKER_CREDENTIALS: &str = "WCASH_WORKER_CREDENTIALS";
 const WCASH_SHARE_TARGET: &str = "WCASH_SHARE_TARGET";
 const WCASH_SHARE_JOURNAL: &str = "WCASH_SHARE_JOURNAL";
 const WCASH_PAYOUT_ADDRESS: &str = "WCASH_PAYOUT_ADDRESS";
+const WCASH_PAYOUT_IVK_FILE: &str = "WCASH_PAYOUT_IVK_FILE";
 const ZCASH_PAYOUT_ADDRESS: &str = "ZCASH_PAYOUT_ADDRESS";
 const WCASH_VALIDATION_LIMIT: &str = "WCASH_VALIDATION_LIMIT";
 const WCASH_AUTHENTICATION_LIMIT: &str = "WCASH_AUTHENTICATION_LIMIT";
@@ -51,6 +62,12 @@ const WCASH_EXPECTED_GENESIS_HASH: &str = "WCASH_EXPECTED_GENESIS_HASH";
 const ZCASH_EXPECTED_GENESIS_HASH: &str = "ZCASH_EXPECTED_GENESIS_HASH";
 const ZCASH_NETWORK: &str = "ZCASH_NETWORK";
 const WCASH_TESTNET_PARENT_TARGET_SAMPLING: &str = "WCASH_TESTNET_PARENT_TARGET_SAMPLING";
+const WCASH_POOL_BACKEND_IDENTITY: &str = "WCASH_POOL_BACKEND_IDENTITY";
+const WCASH_POOL_BACKEND_JOURNAL: &str = "WCASH_POOL_BACKEND_JOURNAL";
+const WCASH_POOL_BACKEND_SOCKET: &str = "WCASH_POOL_BACKEND_SOCKET";
+const WCASH_POOL_BACKEND_PEER_UID: &str = "WCASH_POOL_BACKEND_PEER_UID";
+const WCASH_POOL_BACKEND_SOCKET_GID: &str = "WCASH_POOL_BACKEND_SOCKET_GID";
+const WCASH_POOL_BACKEND_LISTENERS: &str = "WCASH_POOL_BACKEND_LISTENERS";
 
 const USAGE: &str = r#"Wcash/Zcash merged-mining operator CLI
 
@@ -66,6 +83,8 @@ ZIP-301 reference miner:
 Pool administration:
   wcash-merge-miner worker-password-hash
   wcash-merge-miner accounting-report <share-journal-path>
+  wcash-merge-miner pool-backend-init <wcash-rpc-url> <zcash-template-rpc-url>
+    <zcash-validator-rpc-url> <wcash-address> [auxiliary-nonce]
 
 Native node pipeline:
   wcash-merge-miner native-job <wcash-rpc-url> <zcash-template-rpc-url>
@@ -78,6 +97,8 @@ Native node pipeline:
   wcash-merge-miner native-serve <wcash-rpc-url> <zcash-template-rpc-url>
     <zcash-validator-rpc-url> <wcash-address> [127.0.0.1:port]
     [max-clients] [auxiliary-nonce]
+  wcash-merge-miner native-pool-backend <wcash-rpc-url> <zcash-template-rpc-url>
+    <zcash-validator-rpc-url> <wcash-address> [auxiliary-nonce]
 
 The Wcash and Zcash template URLs must be loopback endpoints because those nodes
 choose the block-reward recipients. The distinct Zcash proposal validator may be
@@ -104,11 +125,22 @@ the parent template node and every proposal validator. Transparent addresses
 are the normal pool-integration default on both chains; a Wcash Unified Address
 with an Orchard receiver explicitly selects private Ironwood payout. The
 coordinator checks a domain-separated private-GBT commitment and verifies the
-configured payout in the exact Zcash coinbases. It also verifies an exact
-transparent Wcash recipient, or the private-only shape and value of an Ironwood
-reward. A private Wcash recipient remains a trust boundary at the loopback
-template node. Plaintext payout configuration is omitted from diagnostics, but
-native preflight prints the exact Zcash coinbase.
+configured payout in the exact Zcash coinbases. It verifies an exact transparent
+Wcash recipient, or trial-decrypts every private Ironwood reward action with the
+configured read-only incoming capability. Private payout requires
+WCASH_PAYOUT_IVK_FILE, an absolute owner-private credential path containing the
+64-byte raw Orchard incoming viewing key as 128 hexadecimal characters. Never
+put the key itself in arguments or environment variables; systemd
+`LoadCredential=` is recommended. Supplying the credential with a transparent
+payout is rejected. Plaintext payout configuration is omitted from diagnostics,
+but native preflight prints the exact Zcash coinbase.
+pool-backend-init and native-pool-backend additionally require absolute paths in
+WCASH_POOL_BACKEND_IDENTITY, WCASH_POOL_BACKEND_JOURNAL, and
+WCASH_POOL_BACKEND_SOCKET. The serving command authenticates the Unix peer UID
+from WCASH_POOL_BACKEND_PEER_UID and sets the socket GID from
+WCASH_POOL_BACKEND_SOCKET_GID. WCASH_POOL_BACKEND_LISTENERS optionally selects
+1..=16 accept workers (default 2). Initialization is explicit and never replaces
+existing identity or journal state.
 WCASH_VALIDATION_LIMIT optionally sets the global concurrent share-validation
 limit (default 4, maximum 1024). WCASH_AUTHENTICATION_LIMIT optionally sets the
 global concurrent Argon2id verification limit (default 4, maximum 256).
@@ -165,6 +197,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         "zip301-mine" => run_zip301_mine(arguments),
         "worker-password-hash" => run_worker_password_hash(arguments),
         "accounting-report" => run_accounting_report(arguments),
+        "pool-backend-init" => run_pool_backend_init(arguments),
+        "native-pool-backend" => run_native_pool_backend(arguments),
         _ => Err(MinerError::InvalidRequest(format!("unknown command {command:?}")).into()),
     }
 }
@@ -184,6 +218,691 @@ fn run_accounting_report(
     ensure_no_more(arguments)?;
     let snapshot = read_accounting_snapshot(ledger_path)?;
     print_json(&serde_json::to_value(snapshot)?)
+}
+
+struct PoolBackendRuntimeConfig {
+    identity_path: PathBuf,
+    journal_path: PathBuf,
+    listener: PoolBackendListenerConfig,
+    listener_workers: usize,
+    target_policy: PoolShareTargetPolicy,
+}
+
+struct PoolBackendAuthorityFacts {
+    wcash_genesis: Hex32,
+    zcash_genesis: Hex32,
+    wcash_payout_commitment: Hex32,
+    zcash_payout_commitment: Hex32,
+}
+
+enum PoolBackendGenerationControl {
+    Rotate,
+    Shutdown,
+    ServiceFailure(String),
+}
+
+struct PoolBackendListenerWorkers {
+    listener: Arc<PoolBackendListener>,
+    threads: Vec<thread::JoinHandle<()>>,
+}
+
+struct PoolBackendWinnerWorker {
+    shutdown: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PoolBackendWinnerWorker {
+    fn spawn(
+        supervisor: Arc<NativeMiningSupervisor>,
+        actor: Arc<PoolBackendActor>,
+        shutdown: Arc<AtomicBool>,
+        failure: mpsc::Sender<String>,
+    ) -> Result<Self, io::Error> {
+        let worker_shutdown = Arc::clone(&shutdown);
+        let thread = thread::Builder::new()
+            .name("wcash-winner-reconciliation".to_string())
+            .spawn(move || {
+                let mut unsettled_after = None;
+                let mut matured_after = None;
+                let mut pass_healthy = true;
+                loop {
+                    if worker_shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let (snapshot, completes_pass) =
+                        match actor.next_unsettled_winner_snapshot(unsettled_after.as_ref()) {
+                            Ok(Some(snapshot)) => (snapshot, false),
+                            Ok(None) => {
+                                unsettled_after = None;
+                                match actor.next_matured_winner_snapshot(matured_after.as_ref()) {
+                                    Ok(Some(snapshot)) => (snapshot, true),
+                                    Ok(None) => {
+                                        matured_after = None;
+                                        actor.set_winner_reconciliation_health(pass_healthy);
+                                        pass_healthy = true;
+                                        if sleep_until_shutdown(
+                                            Duration::from_secs(1),
+                                            &worker_shutdown,
+                                        ) {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        actor.set_winner_reconciliation_health(false);
+                                        let _ = failure.send(format!(
+                                            "mature winner journal enumeration failed: {error}"
+                                        ));
+                                        break;
+                                    }
+                                }
+                            },
+                            Err(error) => {
+                                actor.set_winner_reconciliation_health(false);
+                                let _ = failure.send(format!(
+                                    "unsettled winner journal enumeration failed: {error}"
+                                ));
+                                break;
+                            }
+                        };
+                    let key = snapshot.key();
+                    match supervisor.reconcile_pool_backend_winner(&snapshot) {
+                        Ok(Some(transition)) => {
+                            match actor.compare_and_apply_winner_transition(&snapshot, transition) {
+                                Ok(_) | Err(PoolBackendActorError::WinnerRevisionConflict) => {}
+                                Err(error) => {
+                                    actor.set_winner_reconciliation_health(false);
+                                    let _ = failure.send(format!(
+                                        "winner lifecycle persistence failed: {error}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) if is_retryable_winner_reconciliation_error(&error) => {
+                            pass_healthy = false;
+                            actor.set_winner_reconciliation_health(false);
+                            eprintln!(
+                                "winner reconciliation dependency unavailable; exact bytes remain durable: {error}"
+                            );
+                        }
+                        Err(error) => {
+                            actor.set_winner_reconciliation_health(false);
+                            let _ = failure.send(format!(
+                                "winner reconciliation failed closed: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                    if completes_pass {
+                        matured_after = Some(key);
+                        actor.set_winner_reconciliation_health(pass_healthy);
+                        pass_healthy = true;
+                        if sleep_until_shutdown(Duration::from_secs(1), &worker_shutdown) {
+                            break;
+                        }
+                    } else {
+                        unsettled_after = Some(key);
+                        // Bound local-node RPC pressure while preserving fair
+                        // journal-order progress across every unsettled winner.
+                        if sleep_until_shutdown(Duration::from_millis(100), &worker_shutdown) {
+                            break;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            shutdown,
+            thread: Some(thread),
+        })
+    }
+
+    fn request_shutdown(&mut self) -> Result<(), io::Error> {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(worker) = self.thread.take() {
+            worker.join().map_err(|_| {
+                io::Error::other("winner reconciliation worker panicked during shutdown")
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PoolBackendWinnerWorker {
+    fn drop(&mut self) {
+        let _ = self.request_shutdown();
+    }
+}
+
+impl PoolBackendListenerWorkers {
+    fn spawn(
+        listener: Arc<PoolBackendListener>,
+        actor: Arc<PoolBackendActor>,
+        worker_count: usize,
+        failure: mpsc::Sender<String>,
+    ) -> Result<Self, io::Error> {
+        let mut workers = Self {
+            listener,
+            threads: Vec::with_capacity(worker_count),
+        };
+        for worker in 0..worker_count {
+            let actor = Arc::clone(&actor);
+            let listener = Arc::clone(&workers.listener);
+            let failure = failure.clone();
+            let thread = thread::Builder::new()
+                .name(format!("wcash-pool-backend-{worker}"))
+                .spawn(move || loop {
+                    if !listener.is_accepting() {
+                        break;
+                    }
+                    if let Err(error) = listener.serve_one(actor.as_ref()) {
+                        if listener.is_accepting() {
+                            let _ = failure.send(error.to_string());
+                        }
+                        break;
+                    }
+                })?;
+            workers.threads.push(thread);
+        }
+        Ok(workers)
+    }
+
+    fn socket_path(&self) -> &Path {
+        self.listener.socket_path()
+    }
+
+    fn request_shutdown(&self) -> Result<(), Box<dyn Error>> {
+        if self.threads.is_empty() {
+            return Ok(());
+        }
+        self.listener.request_shutdown(self.threads.len())?;
+        Ok(())
+    }
+}
+
+impl Drop for PoolBackendListenerWorkers {
+    fn drop(&mut self) {
+        if self.threads.is_empty() {
+            return;
+        }
+        if self.listener.request_shutdown(self.threads.len()).is_err() {
+            return;
+        }
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn run_pool_backend_init(arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let arguments = parse_native_job_arguments(arguments)?;
+    let configured = configure_native(&arguments.connection)?;
+    let runtime = pool_backend_runtime_config()?;
+    let facts = pool_backend_authority_facts(&configured)?;
+
+    // A rerun can resume an exclusively-created identity after journal setup
+    // failed, but never replaces either durable object.
+    let (identity, resumed_identity) = match PoolBackendIdentity::initialize(&runtime.identity_path)
+    {
+        Ok(identity) => (identity, false),
+        Err(PoolBackendIdentityError::AlreadyExists { .. }) => {
+            (PoolBackendIdentity::open(&runtime.identity_path)?, true)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let created = PoolBackendJournal::create_new(
+        &runtime.journal_path,
+        identity.id(),
+        facts.wcash_genesis.clone(),
+        facts.zcash_genesis.clone(),
+        facts.wcash_payout_commitment.clone(),
+        facts.zcash_payout_commitment.clone(),
+        WCASH_AUXILIARY_CHAIN_ID,
+    );
+    let (journal, result) = match created {
+        Ok(journal) => (
+            journal,
+            if resumed_identity {
+                "resumed_identity"
+            } else {
+                "initialized"
+            },
+        ),
+        Err(PoolBackendJournalError::AlreadyExists { .. }) if resumed_identity => (
+            PoolBackendJournal::open_existing(
+                &runtime.journal_path,
+                identity.id(),
+                facts.wcash_genesis,
+                facts.zcash_genesis,
+                facts.wcash_payout_commitment,
+                facts.zcash_payout_commitment,
+                WCASH_AUXILIARY_CHAIN_ID,
+            )?,
+            "already_initialized",
+        ),
+        Err(error) => {
+            eprintln!(
+                "pool backend identity remains durable; correct the journal path or permissions and rerun pool-backend-init to resume safely"
+            );
+            return Err(error.into());
+        }
+    };
+    let mut output = json!({
+        "command": "pool-backend-init",
+        "result": result,
+        "backend_instance": identity.id(),
+        "journal_stream": journal.journal_stream(),
+        "event_seq": journal.current_event_seq()?,
+        "chain_id": journal.chain_id(),
+        "listener_workers": runtime.listener_workers,
+    });
+    output
+        .as_object_mut()
+        .expect("the backend initialization result is a JSON object")
+        .extend(pool_backend_authority_json_fields(
+            journal.wcash_genesis(),
+            journal.zcash_genesis(),
+            journal.wcash_payout_commitment(),
+            journal.zcash_payout_commitment(),
+            runtime.target_policy.operator_easiest(),
+        ));
+    print_json(&output)
+}
+
+/// Returns the public, exact authority fields of an initialized backend.
+///
+/// Genesis hashes use the same raw byte order as the authenticated backend
+/// protocol and durable journal. Payout commitments are uninterpreted SHA-256
+/// bytes. The numeric share target is converted from the backend's explicit
+/// little-endian type into conventional big-endian display order.
+fn pool_backend_authority_json_fields(
+    wcash_genesis: &Hex32,
+    zcash_genesis: &Hex32,
+    wcash_payout_commitment: &Hex32,
+    zcash_payout_commitment: &Hex32,
+    share_target_ceiling: &TargetLe,
+) -> Map<String, Value> {
+    let share_target_ceiling = TargetBe::from(share_target_ceiling).to_string();
+    json!({
+        "wcash_genesis": wcash_genesis,
+        "zcash_genesis": zcash_genesis,
+        "wcash_payout_commitment": wcash_payout_commitment,
+        "zcash_payout_commitment": zcash_payout_commitment,
+        "share_target_ceiling": share_target_ceiling,
+        "share_target_ceiling_byte_order": "big_endian",
+    })
+    .as_object()
+    .expect("the backend authority fields are a JSON object")
+    .clone()
+}
+
+fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let arguments = parse_native_job_arguments(arguments)?;
+    let configured = configure_native(&arguments.connection)?;
+    let runtime = pool_backend_runtime_config()?;
+    let facts = pool_backend_authority_facts(&configured)?;
+
+    // Retain the identity lock for the entire service lifetime. Opening the
+    // journal then proves it belongs to this exact installation and payout.
+    let identity = PoolBackendIdentity::open(&runtime.identity_path)?;
+    let journal = PoolBackendJournal::open_existing(
+        &runtime.journal_path,
+        identity.id(),
+        facts.wcash_genesis,
+        facts.zcash_genesis,
+        facts.wcash_payout_commitment,
+        facts.zcash_payout_commitment,
+        WCASH_AUXILIARY_CHAIN_ID,
+    )?;
+    let actor = Arc::new(PoolBackendActor::new(journal, runtime.target_policy)?);
+    let share_journal = share_journal_path()?;
+    let supervisor = Arc::new(NativeMiningSupervisor::open(
+        configured.config,
+        share_journal,
+    )?);
+    let listener = Arc::new(PoolBackendListener::bind(runtime.listener)?);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
+    let (listener_failure_tx, listener_failure_rx) = mpsc::channel::<String>();
+    let mut winner_worker = PoolBackendWinnerWorker::spawn(
+        Arc::clone(&supervisor),
+        Arc::clone(&actor),
+        Arc::clone(&shutdown),
+        listener_failure_tx.clone(),
+    )?;
+    let listeners = PoolBackendListenerWorkers::spawn(
+        listener,
+        Arc::clone(&actor),
+        runtime.listener_workers,
+        listener_failure_tx.clone(),
+    )?;
+    drop(listener_failure_tx);
+
+    let mut preparation_backoff = Duration::from_secs(1);
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            listeners.request_shutdown()?;
+            winner_worker.request_shutdown()?;
+            return print_json(&json!({
+                "command": "native-pool-backend",
+                "result": "stopped",
+            }));
+        }
+        match listener_failure_rx.try_recv() {
+            Ok(error) => {
+                listeners.request_shutdown()?;
+                winner_worker.request_shutdown()?;
+                return Err(MinerError::InvalidRequest(format!(
+                    "private pool backend service stopped: {error}"
+                ))
+                .into());
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                listeners.request_shutdown()?;
+                winner_worker.request_shutdown()?;
+                return Err(MinerError::InvalidRequest(
+                    "every private backend service worker stopped".to_string(),
+                )
+                .into());
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let coordinator = match supervisor.prepare_generation() {
+            Ok(coordinator) => {
+                preparation_backoff = Duration::from_secs(1);
+                coordinator
+            }
+            Err(error) if is_retryable_native_preparation_error(&error) => {
+                eprintln!(
+                    "transient native backend preparation failure: {error}; retrying in {} second(s)",
+                    preparation_backoff.as_secs()
+                );
+                match wait_for_pool_backend_retry(
+                    preparation_backoff,
+                    shutdown.as_ref(),
+                    &listener_failure_rx,
+                ) {
+                    PoolBackendGenerationControl::Rotate => {}
+                    PoolBackendGenerationControl::Shutdown => {
+                        listeners.request_shutdown()?;
+                        winner_worker.request_shutdown()?;
+                        return print_json(&json!({
+                            "command": "native-pool-backend",
+                            "result": "stopped",
+                        }));
+                    }
+                    PoolBackendGenerationControl::ServiceFailure(error) => {
+                        listeners.request_shutdown()?;
+                        winner_worker.request_shutdown()?;
+                        return Err(MinerError::InvalidRequest(format!(
+                            "private pool backend service stopped: {error}"
+                        ))
+                        .into());
+                    }
+                }
+                preparation_backoff = (preparation_backoff * 2).min(Duration::from_secs(60));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let retained = Arc::new(NativePoolBackendRetainedJob::new(coordinator)?);
+        let descriptor = retained.descriptor();
+        let job_id = descriptor.job_id.clone();
+        if let Err(error) = actor.activate_job(retained.clone(), Duration::ZERO) {
+            let mut retained = Arc::try_unwrap(retained).map_err(|_| {
+                MinerError::InvalidRequest(
+                    "private backend retained a generation after failed activation".to_string(),
+                )
+            })?;
+            if let Err(retirement) = retire_pool_backend_generation(&mut retained) {
+                eprintln!(
+                    "backend activation also failed to retire its child candidate: {retirement}"
+                );
+            }
+            return Err(error.into());
+        }
+        let activation_output = print_json(&json!({
+            "command": "native-pool-backend",
+            "result": "job_activated",
+            "job_id": job_id,
+            "wcash_height": descriptor.wcash_height,
+            "zcash_height": descriptor.zcash_height,
+            "max_age_ms": descriptor.max_age_ms,
+            "socket": listeners.socket_path(),
+        }));
+        if let Err(error) = activation_output {
+            listeners.request_shutdown()?;
+            retire_active_pool_backend_generation(actor.as_ref(), &job_id, retained)?;
+            return Err(error);
+        }
+
+        // Rotate before the native 45-second admission lease expires, leaving
+        // margin for node health RPCs and a share already inside validation.
+        let rotation_deadline = Instant::now()
+            .checked_add(Duration::from_secs(
+                NATIVE_JOB_MAX_AGE_SECONDS.saturating_sub(15),
+            ))
+            .ok_or_else(|| {
+                MinerError::InvalidRequest("native backend rotation deadline overflow".to_string())
+            })?;
+        let control = loop {
+            if shutdown.load(Ordering::Acquire) {
+                break PoolBackendGenerationControl::Shutdown;
+            }
+            match listener_failure_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(error) => break PoolBackendGenerationControl::ServiceFailure(error),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break PoolBackendGenerationControl::ServiceFailure(
+                        "every private backend service worker stopped".to_string(),
+                    )
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if Instant::now() >= rotation_deadline || !retained.is_healthy() {
+                break PoolBackendGenerationControl::Rotate;
+            }
+        };
+
+        if !matches!(control, PoolBackendGenerationControl::Rotate) {
+            listeners.request_shutdown()?;
+        }
+        retire_active_pool_backend_generation(actor.as_ref(), &job_id, retained)?;
+
+        match control {
+            PoolBackendGenerationControl::Rotate => {}
+            PoolBackendGenerationControl::Shutdown => {
+                winner_worker.request_shutdown()?;
+                return print_json(&json!({
+                    "command": "native-pool-backend",
+                    "result": "stopped",
+                }));
+            }
+            PoolBackendGenerationControl::ServiceFailure(error) => {
+                winner_worker.request_shutdown()?;
+                return Err(MinerError::InvalidRequest(format!(
+                    "private pool backend service stopped: {error}"
+                ))
+                .into());
+            }
+        }
+    }
+}
+
+fn wait_for_pool_backend_retry(
+    duration: Duration,
+    shutdown: &AtomicBool,
+    failures: &mpsc::Receiver<String>,
+) -> PoolBackendGenerationControl {
+    let Some(deadline) = Instant::now().checked_add(duration) else {
+        return PoolBackendGenerationControl::Rotate;
+    };
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return PoolBackendGenerationControl::Shutdown;
+        }
+        match failures.try_recv() {
+            Ok(error) => return PoolBackendGenerationControl::ServiceFailure(error),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return PoolBackendGenerationControl::ServiceFailure(
+                    "every private backend service worker stopped".to_string(),
+                )
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return PoolBackendGenerationControl::Rotate;
+        };
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
+fn is_retryable_winner_reconciliation_error(error: &MinerError) -> bool {
+    matches!(error, MinerError::WinnerSubmissionDeferred { .. })
+        || is_retryable_native_preparation_error(error)
+}
+
+fn sleep_until_shutdown(duration: Duration, shutdown: &AtomicBool) -> bool {
+    let Some(deadline) = Instant::now().checked_add(duration) else {
+        return false;
+    };
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
+fn retire_active_pool_backend_generation(
+    actor: &PoolBackendActor,
+    job_id: &Hex32,
+    retained: Arc<NativePoolBackendRetainedJob>,
+) -> Result<GenerationRetirement, Box<dyn Error>> {
+    actor.invalidate_job(job_id, JobInvalidationReason::Age, Duration::ZERO)?;
+    let mut retained = Arc::try_unwrap(retained).map_err(|_| {
+        MinerError::InvalidRequest(
+            "private backend retained a native generation after durable closure".to_string(),
+        )
+    })?;
+    Ok(retire_pool_backend_generation(&mut retained)?)
+}
+
+fn retire_pool_backend_generation(
+    retained: &mut NativePoolBackendRetainedJob,
+) -> Result<GenerationRetirement, MinerError> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .ok_or_else(|| {
+            MinerError::InvalidRequest("native backend retirement deadline overflow".to_string())
+        })?;
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match retained.retire_generation() {
+            Ok(retirement) => return Ok(retirement),
+            Err(error) if is_retryable_native_preparation_error(&error) => {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Err(error);
+                };
+                eprintln!(
+                    "transient native backend candidate-retirement failure: {error}; retrying in {} second(s)",
+                    backoff.min(remaining).as_secs()
+                );
+                thread::sleep(backoff.min(remaining));
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn pool_backend_authority_facts(
+    configured: &ConfiguredNative,
+) -> Result<PoolBackendAuthorityFacts, MinerError> {
+    let wcash_genesis = parse_display_hex32(
+        &configured.config.expected_wcash_genesis_hash,
+        WCASH_EXPECTED_GENESIS_HASH,
+    )?;
+    let zcash_genesis = parse_display_hex32(
+        &required_display_hash_env(ZCASH_EXPECTED_GENESIS_HASH)?,
+        ZCASH_EXPECTED_GENESIS_HASH,
+    )?;
+    Ok(PoolBackendAuthorityFacts {
+        wcash_genesis,
+        zcash_genesis,
+        wcash_payout_commitment: Hex32::new(configured.config.validated_wcash_payout_commitment()?),
+        zcash_payout_commitment: Hex32::new(
+            configured.config.zcash.expected_parent_payout_commitment(),
+        ),
+    })
+}
+
+fn pool_backend_runtime_config() -> Result<PoolBackendRuntimeConfig, Box<dyn Error>> {
+    let identity_path = required_absolute_path_env(WCASH_POOL_BACKEND_IDENTITY)?;
+    let journal_path = required_absolute_path_env(WCASH_POOL_BACKEND_JOURNAL)?;
+    let socket_path = required_absolute_path_env(WCASH_POOL_BACKEND_SOCKET)?;
+    let expected_peer_uid = parse_required_u32_env(WCASH_POOL_BACKEND_PEER_UID)?;
+    let expected_socket_gid = parse_required_u32_env(WCASH_POOL_BACKEND_SOCKET_GID)?;
+    let listener_workers = parse_optional_usize(
+        optional_env(WCASH_POOL_BACKEND_LISTENERS)?,
+        2,
+        WCASH_POOL_BACKEND_LISTENERS,
+    )?;
+    if !(1..=16).contains(&listener_workers) {
+        return Err(MinerError::InvalidRequest(format!(
+            "environment variable {WCASH_POOL_BACKEND_LISTENERS} must be in 1..=16"
+        ))
+        .into());
+    }
+    let target = parse_display_target(&required_env(WCASH_SHARE_TARGET)?, WCASH_SHARE_TARGET)?;
+    Ok(PoolBackendRuntimeConfig {
+        identity_path,
+        journal_path,
+        listener: PoolBackendListenerConfig::new(
+            socket_path,
+            expected_peer_uid,
+            expected_socket_gid,
+        )?,
+        listener_workers,
+        target_policy: PoolShareTargetPolicy::new(TargetLe::new(target.to_le_bytes()))?,
+    })
+}
+
+fn parse_display_hex32(encoded: &str, field: &'static str) -> Result<Hex32, MinerError> {
+    let mut bytes = parse_hash(encoded.to_string(), field)?;
+    bytes.reverse();
+    Ok(Hex32::new(bytes))
+}
+
+fn parse_required_u32_env(name: &'static str) -> Result<u32, MinerError> {
+    required_env(name)?.parse::<u32>().map_err(|error| {
+        MinerError::InvalidRequest(format!(
+            "environment variable {name} is not a canonical u32: {error}"
+        ))
+    })
+}
+
+fn required_absolute_path_env(name: &'static str) -> Result<PathBuf, MinerError> {
+    let path = PathBuf::from(required_env(name)?);
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        || PathBuf::from_iter(path.components()) != path
+    {
+        return Err(MinerError::InvalidRequest(format!(
+            "environment variable {name} must be an absolute lexically canonical file path"
+        )));
+    }
+    Ok(path)
 }
 
 fn run_zip301_mine(mut arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
@@ -727,6 +1446,10 @@ struct EndpointSummary {
 
 fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredNative, MinerError> {
     let wcash_payout_address = required_payout_address_env(WCASH_PAYOUT_ADDRESS)?;
+    let wcash_payout_incoming_viewing_key = optional_env(WCASH_PAYOUT_IVK_FILE)?
+        .map(PathBuf::from)
+        .map(WcashIncomingViewingKey::read_private_file)
+        .transpose()?;
     let zcash_payout_address = required_payout_address_env(ZCASH_PAYOUT_ADDRESS)?;
     let expected_parent_payout_address: ZcashAddress =
         zcash_payout_address.parse().map_err(|error| {
@@ -778,6 +1501,7 @@ fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredN
             expected_wcash_genesis_hash,
             zcash,
             wcash_payout_address,
+            wcash_payout_incoming_viewing_key,
             auxiliary_nonce: arguments.auxiliary_nonce,
         },
         summary,
@@ -1289,6 +2013,47 @@ mod tests {
     }
 
     #[test]
+    fn backend_authority_json_preserves_exact_bindings_and_displays_target_big_endian() {
+        let wcash_genesis = Hex32::new(std::array::from_fn(|index| index as u8 + 1));
+        let zcash_genesis = Hex32::new(std::array::from_fn(|index| index as u8 + 33));
+        let wcash_payout = Hex32::new(std::array::from_fn(|index| index as u8 + 65));
+        let zcash_payout = Hex32::new(std::array::from_fn(|index| index as u8 + 97));
+        let target_display_bytes = std::array::from_fn(|index| index as u8 + 129);
+        let mut target_le_bytes = target_display_bytes;
+        target_le_bytes.reverse();
+
+        let authority = Value::Object(pool_backend_authority_json_fields(
+            &wcash_genesis,
+            &zcash_genesis,
+            &wcash_payout,
+            &zcash_payout,
+            &TargetLe::new(target_le_bytes),
+        ));
+
+        assert_eq!(authority.as_object().unwrap().len(), 6);
+        assert_eq!(authority["wcash_genesis"], wcash_genesis.to_string());
+        assert_eq!(authority["zcash_genesis"], zcash_genesis.to_string());
+        assert_eq!(
+            authority["wcash_payout_commitment"],
+            wcash_payout.to_string()
+        );
+        assert_eq!(
+            authority["zcash_payout_commitment"],
+            zcash_payout.to_string()
+        );
+        assert_eq!(
+            authority["share_target_ceiling"],
+            hex::encode(target_display_bytes)
+        );
+        assert_ne!(
+            authority["share_target_ceiling"],
+            hex::encode(target_le_bytes),
+            "the nonsymmetric target must not leak backend little-endian order"
+        );
+        assert_eq!(authority["share_target_ceiling_byte_order"], "big_endian");
+    }
+
+    #[test]
     fn parent_target_sampling_requires_exact_testnet_opt_in() {
         let wcash_testnet_genesis = WCASH_TESTNET_GENESIS_HASH;
         for network in [
@@ -1402,7 +2167,40 @@ mod tests {
     }
 
     #[test]
+    fn pool_backend_retry_wait_wakes_for_shutdown_and_worker_failure() {
+        let shutdown = AtomicBool::new(true);
+        let (_failure_sender, failures) = mpsc::channel();
+        assert!(matches!(
+            wait_for_pool_backend_retry(Duration::from_secs(1), &shutdown, &failures),
+            PoolBackendGenerationControl::Shutdown
+        ));
+
+        let shutdown = AtomicBool::new(false);
+        let (failure_sender, failures) = mpsc::channel();
+        failure_sender
+            .send("durable winner journal failed".to_string())
+            .expect("failure channel remains open");
+        assert!(matches!(
+            wait_for_pool_backend_retry(Duration::from_secs(1), &shutdown, &failures),
+            PoolBackendGenerationControl::ServiceFailure(error)
+                if error == "durable winner journal failed"
+        ));
+
+        let (_failure_sender, failures) = mpsc::channel();
+        assert!(matches!(
+            wait_for_pool_backend_retry(Duration::ZERO, &shutdown, &failures),
+            PoolBackendGenerationControl::Rotate
+        ));
+    }
+
+    #[test]
     fn preparation_retry_accepts_only_explicit_transient_http_and_rpc_failures() {
+        assert!(is_retryable_winner_reconciliation_error(
+            &MinerError::WinnerSubmissionDeferred { chain: "Wcash" }
+        ));
+        assert!(!is_retryable_winner_reconciliation_error(
+            &MinerError::InvalidParentTemplate("authoritative winner rejection".to_string())
+        ));
         for status in [408, 425, 429, 500, 502, 503, 504] {
             let status = reqwest::StatusCode::from_u16(status).expect("valid HTTP status");
             assert!(

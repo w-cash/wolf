@@ -16,7 +16,7 @@ mod wallet;
 
 pub use address::{
     decode_recipient, encode_orchard_receiver, encode_transparent_coinbase_receiver,
-    WalletAddressError,
+    validate_wcash_address, ValidatedWcashAddress, WalletAddressError, WcashReceiverKind,
 };
 pub use cache::{MemoryBlockCache, MemoryBlockCacheError};
 pub use identity::WalletDatabaseIdentityError;
@@ -51,4 +51,12 @@ pub use wallet::{
     MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE, MAX_EXPIRY_DELTA, MAX_LOCK_FOR_BLOCKS,
     MAX_PENDING_TRANSACTION_PAGE_SIZE, MAX_SYNC_BATCH_SIZE, MAX_TRANSFER_RECIPIENTS,
     TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT,
+};
+pub use wallet::{
+    broadcast_signed_payout_batch, create_idempotent_payout_batch, inspect_signed_payout_batch,
+    payout_wallet_identity, payout_wallet_observation, recover_signed_payout_batch,
+    PayoutBatchInspectionRequest, PayoutBatchLookup, PayoutBatchOutput, PayoutBatchRequest,
+    PayoutBroadcastOutcome, PayoutBroadcastResult, PayoutFundSource, PayoutWalletIdentity,
+    PayoutWalletObservation, SignedPayoutBatch, PAYOUT_BATCH_FORMAT_VERSION,
+    PAYOUT_OBSERVATION_FORMAT_VERSION, PAYOUT_OBSERVATION_VALIDITY_SECS,
 };

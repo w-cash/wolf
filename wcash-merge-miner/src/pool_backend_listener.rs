@@ -1,8 +1,10 @@
 //! Permission-restricted Unix listener for the private pool backend.
 
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io,
+    net::Shutdown,
     os::unix::{
         ffi::OsStrExt,
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
@@ -10,8 +12,8 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -20,7 +22,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use wcash_pool_protocol::{
     canonical_attribution_id, canonical_share_id, BackendErrorCode, BackendEvent, BackendMessage,
-    BackendRequest, CanonicalUuid, BACKEND_PROTOCOL_VERSION, MAX_EVENT_PAGE_ITEMS,
+    BackendRequest, CanonicalUuid, TargetBe, BACKEND_PROTOCOL_VERSION, MAX_EVENT_PAGE_ITEMS,
 };
 
 use crate::{
@@ -163,6 +165,7 @@ pub struct PoolBackendAuthority {
     zcash_genesis: wcash_pool_protocol::Hex32,
     wcash_payout_commitment: wcash_pool_protocol::Hex32,
     zcash_payout_commitment: wcash_pool_protocol::Hex32,
+    share_target_ceiling_be: TargetBe,
     chain_id: u32,
 }
 
@@ -176,6 +179,7 @@ impl PoolBackendAuthority {
         zcash_genesis: wcash_pool_protocol::Hex32,
         wcash_payout_commitment: wcash_pool_protocol::Hex32,
         zcash_payout_commitment: wcash_pool_protocol::Hex32,
+        share_target_ceiling_be: TargetBe,
         chain_id: u32,
     ) -> Result<Self, PoolBackendListenerError> {
         if backend_instance.is_nil()
@@ -185,10 +189,11 @@ impl PoolBackendAuthority {
             || zcash_genesis.is_zero()
             || wcash_payout_commitment.is_zero()
             || zcash_payout_commitment.is_zero()
+            || share_target_ceiling_be.is_zero()
             || chain_id == 0
         {
             return Err(PoolBackendListenerError::InvalidConfiguration(
-                "backend authority identities, chains, and payout commitments must be nonzero and distinct where required",
+                "backend authority identities, chains, payout commitments, and share target ceiling must be nonzero and distinct where required",
             ));
         }
         Ok(Self {
@@ -198,6 +203,7 @@ impl PoolBackendAuthority {
             zcash_genesis,
             wcash_payout_commitment,
             zcash_payout_commitment,
+            share_target_ceiling_be,
             chain_id,
         })
     }
@@ -210,6 +216,11 @@ impl PoolBackendAuthority {
     /// Returns the stable journal sequence namespace.
     pub const fn journal_stream(&self) -> CanonicalUuid {
         self.journal_stream
+    }
+
+    /// Returns the immutable easiest share target in big-endian ZIP-301 order.
+    pub const fn share_target_ceiling_be(&self) -> &TargetBe {
+        &self.share_target_ceiling_be
     }
 }
 
@@ -313,6 +324,9 @@ pub struct PoolBackendListener {
     socket_device: u64,
     socket_inode: u64,
     active_connections: Arc<AtomicUsize>,
+    accepting: AtomicBool,
+    next_connection_id: AtomicU64,
+    active_streams: Arc<Mutex<HashMap<u64, UnixStream>>>,
 }
 
 impl PoolBackendListener {
@@ -353,12 +367,49 @@ impl PoolBackendListener {
             socket_device: metadata.dev(),
             socket_inode: metadata.ino(),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            accepting: AtomicBool::new(true),
+            next_connection_id: AtomicU64::new(1),
+            active_streams: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     /// Returns the bound filesystem path.
     pub fn socket_path(&self) -> &Path {
         &self.config.socket_path
+    }
+
+    /// Returns whether this listener still admits new connections.
+    pub fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
+    }
+
+    /// Stops admission, interrupts active connections, and wakes accept workers.
+    ///
+    /// `accept_workers` must equal the number of threads currently blocked in
+    /// [`Self::serve_one`]. Each local wake connection is rejected before peer
+    /// authentication or frame allocation. The operation is idempotent.
+    pub fn request_shutdown(&self, accept_workers: usize) -> Result<(), PoolBackendListenerError> {
+        if !(1..=MAXIMUM_CONNECTIONS).contains(&accept_workers) {
+            return Err(PoolBackendListenerError::InvalidConfiguration(
+                "shutdown accept-worker count must be in 1..=64",
+            ));
+        }
+        if !self.accepting.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let active_streams = self.active_streams.lock().map_err(|_| {
+            PoolBackendListenerError::Io(io::Error::other(
+                "active pool backend connection registry is poisoned",
+            ))
+        })?;
+        for stream in active_streams.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        drop(active_streams);
+        for _ in 0..accept_workers {
+            UnixStream::connect(&self.config.socket_path).map_err(PoolBackendListenerError::Io)?;
+        }
+        Ok(())
     }
 
     /// Accepts and serves exactly one connection on the current thread.
@@ -373,6 +424,16 @@ impl PoolBackendListener {
             .listener
             .accept()
             .map_err(PoolBackendListenerError::Io)?;
+        if !self.is_accepting() {
+            return Ok(PoolBackendConnectionOutcome::Served);
+        }
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let _registered =
+            ActiveStreamGuard::register(connection_id, &stream, Arc::clone(&self.active_streams))?;
+        if !self.is_accepting() {
+            let _ = stream.shutdown(Shutdown::Both);
+            return Ok(PoolBackendConnectionOutcome::Served);
+        }
         let peer_uid = peer_uid(&stream)?;
         if peer_uid != self.config.expected_peer_uid {
             return Ok(PoolBackendConnectionOutcome::Unauthorized);
@@ -394,6 +455,40 @@ impl PoolBackendListener {
         };
         serve_authorized_connection(&mut stream, &self.config, handler, &session, &authority)?;
         Ok(PoolBackendConnectionOutcome::Served)
+    }
+}
+struct ActiveStreamGuard {
+    connection_id: u64,
+    active_streams: Arc<Mutex<HashMap<u64, UnixStream>>>,
+}
+
+impl ActiveStreamGuard {
+    fn register(
+        connection_id: u64,
+        stream: &UnixStream,
+        active_streams: Arc<Mutex<HashMap<u64, UnixStream>>>,
+    ) -> Result<Self, PoolBackendListenerError> {
+        let interrupt = stream.try_clone().map_err(PoolBackendListenerError::Io)?;
+        active_streams
+            .lock()
+            .map_err(|_| {
+                PoolBackendListenerError::Io(io::Error::other(
+                    "active pool backend connection registry is poisoned",
+                ))
+            })?
+            .insert(connection_id, interrupt);
+        Ok(Self {
+            connection_id,
+            active_streams,
+        })
+    }
+}
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active_streams) = self.active_streams.lock() {
+            active_streams.remove(&self.connection_id);
+        }
     }
 }
 
@@ -621,6 +716,7 @@ fn validate_handler_messages(
                 zcash_genesis,
                 wcash_payout_commitment,
                 zcash_payout_commitment,
+                share_target_ceiling_be,
                 chain_id,
                 current_event_seq,
                 ..
@@ -632,6 +728,7 @@ fn validate_handler_messages(
             && *zcash_genesis == authority.zcash_genesis
             && *wcash_payout_commitment == authority.wcash_payout_commitment
             && *zcash_payout_commitment == authority.zcash_payout_commitment
+            && *share_target_ceiling_be == authority.share_target_ceiling_be
             && *chain_id == authority.chain_id
             && *current_event_seq >= *last_event_seq =>
         {
@@ -970,6 +1067,52 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_wakes_an_idle_acceptor_and_allows_socket_cleanup() {
+        let directory = private_directory();
+        let path = socket_path(&directory);
+        let listener = Arc::new(PoolBackendListener::bind(config(path.clone())).unwrap());
+        let handler = Arc::new(TestHandler::default());
+        let server = {
+            let listener = Arc::clone(&listener);
+            thread::spawn(move || listener.serve_one(handler.as_ref()))
+        };
+
+        listener.request_shutdown(1).unwrap();
+        assert_eq!(
+            server.join().unwrap().unwrap(),
+            PoolBackendConnectionOutcome::Served
+        );
+        assert!(!listener.is_accepting());
+        drop(listener);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn shutdown_interrupts_a_connected_peer_before_hello_timeout() {
+        let directory = private_directory();
+        let path = socket_path(&directory);
+        let listener = Arc::new(PoolBackendListener::bind(config(path.clone())).unwrap());
+        let handler = Arc::new(TestHandler::default());
+        let server = {
+            let listener = Arc::clone(&listener);
+            thread::spawn(move || listener.serve_one(handler.as_ref()))
+        };
+        let _client = UnixStream::connect(&path).unwrap();
+        for _ in 0..100 {
+            if !listener.active_streams.lock().unwrap().is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(listener.active_streams.lock().unwrap().len(), 1);
+
+        listener.request_shutdown(1).unwrap();
+        let _outcome = server.join().unwrap();
+        drop(listener);
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn failed_post_bind_validation_removes_only_the_new_socket() {
         let directory = private_directory();
         let path = socket_path(&directory);
@@ -1116,6 +1259,7 @@ mod tests {
                 zcash_genesis: Hex32::new([2; 32]),
                 wcash_payout_commitment: Hex32::new([3; 32]),
                 zcash_payout_commitment: Hex32::new([4; 32]),
+                share_target_ceiling_be: test_share_target_ceiling_be(),
                 chain_id: 1,
                 current_event_seq: 0,
             }])
@@ -1154,6 +1298,23 @@ mod tests {
             &[wrong],
         )
         .is_err());
+    }
+
+    #[test]
+    fn backend_authority_rejects_a_zero_share_target_ceiling() {
+        assert!(matches!(
+            PoolBackendAuthority::new(
+                canonical_uuid("90bd8da9-9b49-4114-9aa8-2ca35aee013e"),
+                canonical_uuid("c4756682-e84b-4b0b-927f-0af145ae9826"),
+                Hex32::new([1; 32]),
+                Hex32::new([2; 32]),
+                Hex32::new([3; 32]),
+                Hex32::new([4; 32]),
+                TargetBe::new([0; 32]),
+                1,
+            ),
+            Err(PoolBackendListenerError::InvalidConfiguration(_))
+        ));
     }
 
     #[test]
@@ -1226,6 +1387,7 @@ mod tests {
             zcash_genesis,
             wcash_payout_commitment,
             zcash_payout_commitment,
+            share_target_ceiling_be,
             chain_id,
             current_event_seq,
             ..
@@ -1244,6 +1406,7 @@ mod tests {
             zcash_genesis,
             wcash_payout_commitment,
             zcash_payout_commitment,
+            share_target_ceiling_be,
             chain_id,
             current_event_seq,
         };
@@ -1255,6 +1418,28 @@ mod tests {
             &handler.persistent_authority(),
             None,
             &[wrong_session],
+        )
+        .is_err());
+
+        let mut wrong_target = hello_response(&handler, &session, request.id(), 7);
+        let BackendMessage::HelloOk {
+            share_target_ceiling_be,
+            ..
+        } = &mut wrong_target
+        else {
+            unreachable!("test helper returns hello_ok");
+        };
+        let mut changed = *share_target_ceiling_be.as_bytes();
+        changed[0] ^= 0x80;
+        *share_target_ceiling_be = TargetBe::new(changed);
+        assert!(validate_handler_messages(
+            BackendRequestKind::Hello,
+            BackendConnectionRole::Negotiated,
+            &request,
+            &session,
+            &handler.persistent_authority(),
+            None,
+            &[wrong_target],
         )
         .is_err());
     }
@@ -1472,6 +1657,7 @@ mod tests {
             Hex32::new([2; 32]),
             Hex32::new([3; 32]),
             Hex32::new([4; 32]),
+            test_share_target_ceiling_be(),
             1,
         )
         .expect("valid test authority")
@@ -1494,8 +1680,17 @@ mod tests {
             zcash_genesis: Hex32::new([2; 32]),
             wcash_payout_commitment: Hex32::new([3; 32]),
             zcash_payout_commitment: Hex32::new([4; 32]),
+            share_target_ceiling_be: test_share_target_ceiling_be(),
             chain_id: 1,
             current_event_seq,
         }
+    }
+
+    fn test_share_target_ceiling_be() -> TargetBe {
+        TargetBe::new([
+            0x00, 0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3,
+            0xd2, 0xe1, 0xf0, 0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x9a, 0xab,
+            0xbc, 0xcd, 0xde, 0xef,
+        ])
     }
 }
