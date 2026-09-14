@@ -5,16 +5,7 @@
 //! from a genuine Zcash `getblocktemplate`, checked locally, and submitted in
 //! proposal mode to every configured validation node before miners can see it.
 
-use std::{
-    collections::HashSet,
-    fmt,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
-    time::Duration,
-};
+use std::{collections::HashSet, fmt, sync::Arc, thread, time::Duration};
 
 use hex::FromHex;
 use serde_json::{json, Value};
@@ -275,7 +266,6 @@ impl NativeZcashConfig {
 pub struct NativeZcashProvider {
     template_node: ZebraRpcClient,
     proposal_validators: Vec<ZebraRpcClient>,
-    coinbase_prewarm_in_flight: Arc<Vec<AtomicBool>>,
     parent_network: NativeZcashNetwork,
     expected_parent_network: Network,
     expected_parent_payout_commitment: [u8; 32],
@@ -306,15 +296,9 @@ impl NativeZcashProvider {
             .into_iter()
             .map(|endpoint| ZebraRpcClient::new(endpoint, config.rpc_timeout))
             .collect::<Result<Vec<_>, _>>()?;
-        let coinbase_prewarm_in_flight = Arc::new(
-            (0..=proposal_validators.len())
-                .map(|_| AtomicBool::new(false))
-                .collect(),
-        );
         Ok(Self {
             template_node,
             proposal_validators,
-            coinbase_prewarm_in_flight,
             parent_network,
             expected_parent_network,
             expected_parent_payout_commitment,
@@ -493,17 +477,11 @@ impl NativeZcashProvider {
         }) else {
             return;
         };
-        let Some(in_flight) = self.coinbase_prewarm_in_flight.get(index) else {
-            return;
-        };
-        if in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-
-        let gates = Arc::clone(&self.coinbase_prewarm_in_flight);
+        // Start one bounded prewarm for every admitted generation. Brief
+        // overlap is intentional: when a tip change wakes the previous long
+        // poll, the replacement generation can arm its own poll without
+        // racing a shared in-flight gate. The 45-second job lifetime and four
+        // 15-second attempts bound overlap even if a parent endpoint stalls.
         let spawn_result = thread::Builder::new()
             .name(format!("parent-coinbase-prewarm-{index}"))
             .spawn(move || {
@@ -524,10 +502,9 @@ impl NativeZcashProvider {
                         Err(_) => break,
                     }
                 }
-                gates[index].store(false, Ordering::Release);
             });
-        if spawn_result.is_err() {
-            self.coinbase_prewarm_in_flight[index].store(false, Ordering::Release);
+        if let Err(error) = spawn_result {
+            eprintln!("could not start parent coinbase prewarm worker {index}: {error}");
         }
     }
 
