@@ -3417,6 +3417,7 @@ where
             target,
             bits,
             height.0,
+            template.long_poll_id,
         ))
     }
 

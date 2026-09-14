@@ -524,6 +524,8 @@ impl NativeMiningSupervisor {
             parent_height: job.parent_height(),
             child_candidate_bytes: Arc::clone(&child_candidate_bytes),
         })?;
+        // Parent workers use indices 0 and 1 in the current two-node layout.
+        wcash_node.prewarm_next_coinbase(2, child.long_poll_id.clone());
         let candidate_created_at = Instant::now();
 
         let coordinator = NativeMiningCoordinator {
@@ -1380,6 +1382,8 @@ struct ChildTemplate {
     #[serde(rename = "previousblockhash")]
     previous_block_hash: String,
     bits: String,
+    #[serde(rename = "longpollid", default)]
+    long_poll_id: Option<String>,
     #[allow(dead_code)]
     #[serde(rename = "coinbasevalue")]
     coinbase_value: i64,
@@ -4163,12 +4167,14 @@ mod tests {
             "target": "ff".repeat(32),
             "bits": "207fffff",
             "height": 1,
+            "longpollid": "010203",
         });
         let parsed: ChildTemplate =
             serde_json::from_value(response).expect("exact RPC response decodes");
         assert_eq!(parsed.chain_id, WCASH_AUXILIARY_CHAIN_ID);
         assert_eq!(parsed.coinbase_value, 1_000_000_000);
         assert_eq!(parsed.retire_token, "33".repeat(32));
+        assert_eq!(parsed.long_poll_id.as_deref(), Some("010203"));
     }
 
     #[test]

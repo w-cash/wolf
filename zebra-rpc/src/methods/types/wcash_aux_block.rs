@@ -13,6 +13,8 @@ use zebra_chain::{
 
 use wcash_zcash_aux::{MAX_PROOF_BYTES, WCASH_AUXILIARY_CHAIN_ID};
 
+use super::long_poll::LongPollId;
+
 /// An unguessable, fixed-size capability for retiring one cached candidate.
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RetireToken(
@@ -197,10 +199,16 @@ pub struct CreateAuxBlockResponse {
     /// Height encoded in the cached candidate's coinbase transaction.
     #[getter(copy)]
     height: u32,
+
+    /// Current template identity used to precompute the next shielded coinbase.
+    #[serde(rename = "longpollid")]
+    #[getter(copy)]
+    long_poll_id: LongPollId,
 }
 
 impl CreateAuxBlockResponse {
     /// Constructs a response for one exact cached Wcash candidate.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         candidate_lease: (block::Hash, RetireToken),
         data: Vec<u8>,
@@ -209,6 +217,7 @@ impl CreateAuxBlockResponse {
         target: ExpandedDifficulty,
         bits: CompactDifficulty,
         height: u32,
+        long_poll_id: LongPollId,
     ) -> Self {
         let (hash, retire_token) = candidate_lease;
         Self {
@@ -221,6 +230,7 @@ impl CreateAuxBlockResponse {
             target,
             bits,
             height,
+            long_poll_id,
         }
     }
 }
@@ -327,6 +337,7 @@ mod tests {
             target,
             bits,
             42,
+            LongPollId::new(42, 0x44, 100, 0, 0x55),
         );
 
         assert_eq!(response.hash(), hash);
@@ -338,6 +349,7 @@ mod tests {
         assert_eq!(response.target(), target);
         assert_eq!(response.bits(), bits);
         assert_eq!(response.height(), 42);
+        assert_eq!(response.long_poll_id().tip_height(), 42);
 
         let json = serde_json::to_value(response).expect("response serializes");
         assert_eq!(json["hash"], "11".repeat(32));
@@ -347,6 +359,7 @@ mod tests {
         assert_eq!(json["coinbasevalue"], 1_000_000_000i64);
         assert_eq!(json["bits"], "1f07ffff");
         assert_eq!(json["height"], 42);
+        assert!(json["longpollid"].is_string());
         assert_eq!(json["target"], target.to_string());
     }
 

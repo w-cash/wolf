@@ -472,40 +472,10 @@ impl NativeZcashProvider {
         client: ZebraRpcClient,
         long_poll_id: Option<String>,
     ) {
-        let Some(long_poll_id) = long_poll_id.filter(|id| {
-            !id.is_empty() && id.len() <= 1_024 && !id.bytes().any(|byte| byte.is_ascii_control())
-        }) else {
-            return;
-        };
-        // Start one bounded prewarm for every admitted generation. Brief
-        // overlap is intentional: when a tip change wakes the previous long
-        // poll, the replacement generation can arm its own poll without
-        // racing a shared in-flight gate. The 45-second job lifetime and four
-        // 15-second attempts bound overlap even if a parent endpoint stalls.
-        let spawn_result = thread::Builder::new()
-            .name(format!("parent-coinbase-prewarm-{index}"))
-            .spawn(move || {
-                // The ordinary RPC client has a 15-second deadline. Renew the
-                // same long poll for up to one minute, which covers the active
-                // generation and bounds detached work during an outage.
-                for _ in 0..4 {
-                    match client.call_value(
-                        "getblocktemplate",
-                        json!([{
-                            "mode": "template",
-                            "capabilities": ["coinbasetxn"],
-                            "longpollid": long_poll_id,
-                        }]),
-                    ) {
-                        Ok(_) => break,
-                        Err(MinerError::RpcTransport(error)) if error.is_timeout() => continue,
-                        Err(_) => break,
-                    }
-                }
-            });
-        if let Err(error) = spawn_result {
-            eprintln!("could not start parent coinbase prewarm worker {index}: {error}");
-        }
+        // One bounded prewarm is started for every admitted generation. Brief
+        // overlap is intentional so a replacement generation never races a
+        // shared in-flight gate after a tip change.
+        client.prewarm_next_coinbase(index, long_poll_id);
     }
 
     /// Submits a parent-target winner byte-for-byte to every configured node.

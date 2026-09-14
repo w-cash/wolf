@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    thread,
     time::Duration,
 };
 
@@ -210,6 +211,41 @@ impl ZebraRpcClient {
         let status = response.status();
         let response = read_bounded_response(response)?;
         classify_http_rpc_response(status, &response, id, self.label())
+    }
+
+    /// Starts a bounded ordinary GBT long poll so Zebra can prove and cache
+    /// the next height's shielded coinbase before the current tip changes.
+    pub fn prewarm_next_coinbase(&self, worker_index: usize, long_poll_id: Option<String>) {
+        let Some(long_poll_id) = long_poll_id.filter(|id| {
+            !id.is_empty() && id.len() <= 1_024 && !id.bytes().any(|byte| byte.is_ascii_control())
+        }) else {
+            return;
+        };
+        let client = self.clone();
+        let spawn_result = thread::Builder::new()
+            .name(format!("coinbase-prewarm-{worker_index}"))
+            .spawn(move || {
+                // The ordinary client has a 15-second deadline. Renew the same
+                // long poll for up to one minute. The 45-second generation
+                // lifetime starts another bounded worker before coverage ends.
+                for _ in 0..4 {
+                    match client.call_value(
+                        "getblocktemplate",
+                        json!([{
+                            "mode": "template",
+                            "capabilities": ["coinbasetxn"],
+                            "longpollid": long_poll_id,
+                        }]),
+                    ) {
+                        Ok(_) => break,
+                        Err(MinerError::RpcTransport(error)) if error.is_timeout() => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+        if let Err(error) = spawn_result {
+            eprintln!("could not start coinbase prewarm worker {worker_index}: {error}");
+        }
     }
 }
 
