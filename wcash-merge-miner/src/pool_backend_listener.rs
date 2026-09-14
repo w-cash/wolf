@@ -1,8 +1,10 @@
 //! Permission-restricted Unix listener for the private pool backend.
 
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io,
+    net::Shutdown,
     os::unix::{
         ffi::OsStrExt,
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
@@ -10,8 +12,8 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -20,7 +22,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use wcash_pool_protocol::{
     canonical_attribution_id, canonical_share_id, BackendErrorCode, BackendEvent, BackendMessage,
-    BackendRequest, CanonicalUuid, BACKEND_PROTOCOL_VERSION, MAX_EVENT_PAGE_ITEMS,
+    BackendRequest, CanonicalUuid, TargetBe, BACKEND_PROTOCOL_VERSION, MAX_EVENT_PAGE_ITEMS,
 };
 
 use crate::{
@@ -44,7 +46,9 @@ const MAXIMUM_RESPONSE_MESSAGES: usize = MAX_EVENT_PAGE_ITEMS as usize + 1;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolBackendListenerConfig {
     socket_path: PathBuf,
-    expected_peer_uid: u32,
+    submit_peer_uid: u32,
+    projector_peer_uid: Option<u32>,
+    payout_peer_uid: Option<u32>,
     expected_socket_gid: u32,
     maximum_connections: usize,
     hello_timeout: Duration,
@@ -57,12 +61,14 @@ impl PoolBackendListenerConfig {
     /// Creates a conservative local-socket policy.
     pub fn new(
         socket_path: impl Into<PathBuf>,
-        expected_peer_uid: u32,
+        submit_peer_uid: u32,
         expected_socket_gid: u32,
     ) -> Result<Self, PoolBackendListenerError> {
         let config = Self {
             socket_path: socket_path.into(),
-            expected_peer_uid,
+            submit_peer_uid,
+            projector_peer_uid: None,
+            payout_peer_uid: None,
             expected_socket_gid,
             maximum_connections: DEFAULT_MAXIMUM_CONNECTIONS,
             hello_timeout: DEFAULT_HELLO_TIMEOUT,
@@ -72,6 +78,18 @@ impl PoolBackendListenerConfig {
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Authorizes the two non-submitting runtime identities.
+    pub fn with_read_only_peer_uids(
+        mut self,
+        projector_peer_uid: u32,
+        payout_peer_uid: u32,
+    ) -> Result<Self, PoolBackendListenerError> {
+        self.projector_peer_uid = Some(projector_peer_uid);
+        self.payout_peer_uid = Some(payout_peer_uid);
+        self.validate()?;
+        Ok(self)
     }
 
     /// Sets the simultaneous connection cap.
@@ -102,6 +120,20 @@ impl PoolBackendListenerConfig {
 
     fn validate(&self) -> Result<(), PoolBackendListenerError> {
         validate_socket_path(&self.socket_path)?;
+        if let (Some(projector), Some(payout)) = (self.projector_peer_uid, self.payout_peer_uid) {
+            if projector == self.submit_peer_uid
+                || payout == self.submit_peer_uid
+                || projector == payout
+            {
+                return Err(PoolBackendListenerError::InvalidConfiguration(
+                    "submit, projector, and payout peer UIDs must be distinct",
+                ));
+            }
+        } else if self.projector_peer_uid.is_some() || self.payout_peer_uid.is_some() {
+            return Err(PoolBackendListenerError::InvalidConfiguration(
+                "projector and payout peer UIDs must be configured together",
+            ));
+        }
         if !(1..=MAXIMUM_CONNECTIONS).contains(&self.maximum_connections) {
             return Err(PoolBackendListenerError::InvalidConfiguration(
                 "maximum connections must be in 1..=64",
@@ -119,6 +151,40 @@ impl PoolBackendListenerConfig {
         }
         Ok(())
     }
+
+    fn role_for_peer_uid(&self, peer_uid: u32) -> Option<PoolBackendPeerRole> {
+        if peer_uid == self.submit_peer_uid {
+            Some(PoolBackendPeerRole::Submitter)
+        } else if self.projector_peer_uid == Some(peer_uid)
+            || self.payout_peer_uid == Some(peer_uid)
+        {
+            Some(PoolBackendPeerRole::ReadOnly)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PoolBackendPeerRole {
+    Submitter,
+    ReadOnly,
+}
+
+impl PoolBackendPeerRole {
+    fn authorizes(self, kind: BackendRequestKind) -> bool {
+        match (self, kind) {
+            (Self::Submitter, _) => true,
+            (
+                Self::ReadOnly,
+                BackendRequestKind::Hello
+                | BackendRequestKind::ReadEvents
+                | BackendRequestKind::SubscribeJobs
+                | BackendRequestKind::Health,
+            ) => true,
+            (Self::ReadOnly, BackendRequestKind::SubmitShare) => false,
+        }
+    }
 }
 
 /// Stable identities and peer facts for one authorized connection.
@@ -126,6 +192,7 @@ impl PoolBackendListenerConfig {
 pub struct PoolBackendSession {
     backend_session: CanonicalUuid,
     peer_uid: u32,
+    peer_role: PoolBackendPeerRole,
 }
 
 /// Connection-local context supplied to one serialized backend request.
@@ -163,6 +230,7 @@ pub struct PoolBackendAuthority {
     zcash_genesis: wcash_pool_protocol::Hex32,
     wcash_payout_commitment: wcash_pool_protocol::Hex32,
     zcash_payout_commitment: wcash_pool_protocol::Hex32,
+    share_target_ceiling_be: TargetBe,
     chain_id: u32,
 }
 
@@ -176,6 +244,7 @@ impl PoolBackendAuthority {
         zcash_genesis: wcash_pool_protocol::Hex32,
         wcash_payout_commitment: wcash_pool_protocol::Hex32,
         zcash_payout_commitment: wcash_pool_protocol::Hex32,
+        share_target_ceiling_be: TargetBe,
         chain_id: u32,
     ) -> Result<Self, PoolBackendListenerError> {
         if backend_instance.is_nil()
@@ -185,10 +254,11 @@ impl PoolBackendAuthority {
             || zcash_genesis.is_zero()
             || wcash_payout_commitment.is_zero()
             || zcash_payout_commitment.is_zero()
+            || share_target_ceiling_be.is_zero()
             || chain_id == 0
         {
             return Err(PoolBackendListenerError::InvalidConfiguration(
-                "backend authority identities, chains, and payout commitments must be nonzero and distinct where required",
+                "backend authority identities, chains, payout commitments, and share target ceiling must be nonzero and distinct where required",
             ));
         }
         Ok(Self {
@@ -198,6 +268,7 @@ impl PoolBackendAuthority {
             zcash_genesis,
             wcash_payout_commitment,
             zcash_payout_commitment,
+            share_target_ceiling_be,
             chain_id,
         })
     }
@@ -210,6 +281,11 @@ impl PoolBackendAuthority {
     /// Returns the stable journal sequence namespace.
     pub const fn journal_stream(&self) -> CanonicalUuid {
         self.journal_stream
+    }
+
+    /// Returns the immutable easiest share target in big-endian ZIP-301 order.
+    pub const fn share_target_ceiling_be(&self) -> &TargetBe {
+        &self.share_target_ceiling_be
     }
 }
 
@@ -268,6 +344,11 @@ pub trait PoolBackendRequestHandler: Send + Sync {
 pub enum PoolBackendConnectionOutcome {
     /// An authorized connection closed cleanly or after a bounded protocol error.
     Served,
+    /// A peer transport fault closed only this connection, without replaying it.
+    Closed {
+        /// Fixed, payload-free diagnostic identifying the failure boundary.
+        reason: &'static str,
+    },
     /// The peer UID did not match the configured pool service account.
     Unauthorized,
     /// The connection cap was reached before any frame buffer was allocated.
@@ -295,15 +376,60 @@ pub enum PoolBackendListenerError {
     /// Safe operating-system peer credential lookup failed.
     #[error("could not authenticate pool backend peer credentials")]
     PeerCredentials(#[source] nix::Error),
-    /// The connection violated framing or a finite transport deadline.
-    #[error("pool backend connection transport failed")]
+    /// Encoding or delivering the backend's response failed.
+    #[error("pool backend response transport failed")]
     Transport(#[from] BackendTransportError),
+    /// Reading the peer's request failed before handler dispatch.
+    #[error("pool backend request transport failed")]
+    RequestTransport(#[source] BackendTransportError),
     /// The handler returned invalid ordering or an invalid message.
     #[error("pool backend handler violated its response contract")]
     InvalidHandlerResponse,
     /// A fresh session UUID could not be represented safely.
     #[error("could not create a pool backend session identity")]
     SessionIdentity,
+}
+
+impl PoolBackendListenerError {
+    fn connection_close_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::RequestTransport(BackendTransportError::TruncatedFrame) => {
+                Some("incomplete request frame")
+            }
+            Self::RequestTransport(BackendTransportError::InvalidFrameLength(_)) => {
+                Some("invalid request frame length")
+            }
+            Self::RequestTransport(BackendTransportError::InvalidFrame(_)) => {
+                Some("invalid request frame")
+            }
+            Self::RequestTransport(BackendTransportError::Timeout) => {
+                Some("request deadline expired")
+            }
+            Self::Transport(BackendTransportError::Timeout) => Some("response deadline expired"),
+            Self::Transport(BackendTransportError::TruncatedFrame) => Some("response peer closed"),
+            Self::RequestTransport(BackendTransportError::Io(error))
+                if peer_disconnected(error) =>
+            {
+                Some("request peer disconnected")
+            }
+            Self::Transport(BackendTransportError::Io(error)) if peer_disconnected(error) => {
+                Some("response peer disconnected")
+            }
+            // In particular, InvalidFrame while encoding a response is a local
+            // invariant failure, not evidence that the peer sent a bad frame.
+            _ => None,
+        }
+    }
+}
+
+fn peer_disconnected(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
 }
 
 /// Bound private Unix listener with inode-safe cleanup.
@@ -313,6 +439,9 @@ pub struct PoolBackendListener {
     socket_device: u64,
     socket_inode: u64,
     active_connections: Arc<AtomicUsize>,
+    accepting: AtomicBool,
+    next_connection_id: AtomicU64,
+    active_streams: Arc<Mutex<HashMap<u64, UnixStream>>>,
 }
 
 impl PoolBackendListener {
@@ -353,12 +482,49 @@ impl PoolBackendListener {
             socket_device: metadata.dev(),
             socket_inode: metadata.ino(),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            accepting: AtomicBool::new(true),
+            next_connection_id: AtomicU64::new(1),
+            active_streams: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     /// Returns the bound filesystem path.
     pub fn socket_path(&self) -> &Path {
         &self.config.socket_path
+    }
+
+    /// Returns whether this listener still admits new connections.
+    pub fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
+    }
+
+    /// Stops admission, interrupts active connections, and wakes accept workers.
+    ///
+    /// `accept_workers` must equal the number of threads currently blocked in
+    /// [`Self::serve_one`]. Each local wake connection is rejected before peer
+    /// authentication or frame allocation. The operation is idempotent.
+    pub fn request_shutdown(&self, accept_workers: usize) -> Result<(), PoolBackendListenerError> {
+        if !(1..=MAXIMUM_CONNECTIONS).contains(&accept_workers) {
+            return Err(PoolBackendListenerError::InvalidConfiguration(
+                "shutdown accept-worker count must be in 1..=64",
+            ));
+        }
+        if !self.accepting.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let active_streams = self.active_streams.lock().map_err(|_| {
+            PoolBackendListenerError::Io(io::Error::other(
+                "active pool backend connection registry is poisoned",
+            ))
+        })?;
+        for stream in active_streams.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        drop(active_streams);
+        for _ in 0..accept_workers {
+            UnixStream::connect(&self.config.socket_path).map_err(PoolBackendListenerError::Io)?;
+        }
+        Ok(())
     }
 
     /// Accepts and serves exactly one connection on the current thread.
@@ -373,10 +539,20 @@ impl PoolBackendListener {
             .listener
             .accept()
             .map_err(PoolBackendListenerError::Io)?;
-        let peer_uid = peer_uid(&stream)?;
-        if peer_uid != self.config.expected_peer_uid {
-            return Ok(PoolBackendConnectionOutcome::Unauthorized);
+        if !self.is_accepting() {
+            return Ok(PoolBackendConnectionOutcome::Served);
         }
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let _registered =
+            ActiveStreamGuard::register(connection_id, &stream, Arc::clone(&self.active_streams))?;
+        if !self.is_accepting() {
+            let _ = stream.shutdown(Shutdown::Both);
+            return Ok(PoolBackendConnectionOutcome::Served);
+        }
+        let peer_uid = peer_uid(&stream)?;
+        let Some(peer_role) = self.config.role_for_peer_uid(peer_uid) else {
+            return Ok(PoolBackendConnectionOutcome::Unauthorized);
+        };
         let Some(_permit) = ConnectionPermit::acquire(
             Arc::clone(&self.active_connections),
             self.config.maximum_connections,
@@ -391,9 +567,50 @@ impl PoolBackendListener {
                 authority.journal_stream(),
             )?,
             peer_uid,
+            peer_role,
         };
-        serve_authorized_connection(&mut stream, &self.config, handler, &session, &authority)?;
-        Ok(PoolBackendConnectionOutcome::Served)
+        match serve_authorized_connection(&mut stream, &self.config, handler, &session, &authority)
+        {
+            Ok(()) => Ok(PoolBackendConnectionOutcome::Served),
+            Err(error) => match error.connection_close_reason() {
+                Some(reason) => Ok(PoolBackendConnectionOutcome::Closed { reason }),
+                None => Err(error),
+            },
+        }
+    }
+}
+struct ActiveStreamGuard {
+    connection_id: u64,
+    active_streams: Arc<Mutex<HashMap<u64, UnixStream>>>,
+}
+
+impl ActiveStreamGuard {
+    fn register(
+        connection_id: u64,
+        stream: &UnixStream,
+        active_streams: Arc<Mutex<HashMap<u64, UnixStream>>>,
+    ) -> Result<Self, PoolBackendListenerError> {
+        let interrupt = stream.try_clone().map_err(PoolBackendListenerError::Io)?;
+        active_streams
+            .lock()
+            .map_err(|_| {
+                PoolBackendListenerError::Io(io::Error::other(
+                    "active pool backend connection registry is poisoned",
+                ))
+            })?
+            .insert(connection_id, interrupt);
+        Ok(Self {
+            connection_id,
+            active_streams,
+        })
+    }
+}
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active_streams) = self.active_streams.lock() {
+            active_streams.remove(&self.connection_id);
+        }
     }
 }
 
@@ -489,7 +706,9 @@ fn serve_authorized_connection(
         } else {
             config.idle_timeout
         };
-        let request = match read_unix_backend_request(stream, idle_timeout, config.frame_timeout)? {
+        let request = match read_unix_backend_request(stream, idle_timeout, config.frame_timeout)
+            .map_err(PoolBackendListenerError::RequestTransport)?
+        {
             Some(request) => request,
             None => return Ok(()),
         };
@@ -508,6 +727,16 @@ fn serve_authorized_connection(
                 return Ok(());
             }
         };
+        if !session.peer_role.authorizes(kind) {
+            write_error(
+                stream,
+                config.write_timeout,
+                request_id,
+                BackendErrorCode::InvalidRequest,
+                "backend peer is not authorized to submit shares".to_string(),
+            )?;
+            return Ok(());
+        }
 
         let context = PoolBackendRequestContext {
             session,
@@ -621,6 +850,7 @@ fn validate_handler_messages(
                 zcash_genesis,
                 wcash_payout_commitment,
                 zcash_payout_commitment,
+                share_target_ceiling_be,
                 chain_id,
                 current_event_seq,
                 ..
@@ -632,6 +862,7 @@ fn validate_handler_messages(
             && *zcash_genesis == authority.zcash_genesis
             && *wcash_payout_commitment == authority.wcash_payout_commitment
             && *zcash_payout_commitment == authority.zcash_payout_commitment
+            && *share_target_ceiling_be == authority.share_target_ceiling_be
             && *chain_id == authority.chain_id
             && *current_event_seq >= *last_event_seq =>
         {
@@ -899,7 +1130,12 @@ fn sync_parent_directory(path: &Path) -> Result<(), PoolBackendListenerError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, os::unix::net::UnixStream, sync::Mutex, thread};
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        sync::{mpsc, Mutex},
+        thread,
+    };
 
     use serde_json::json;
     use wcash_pool_protocol::{
@@ -942,6 +1178,259 @@ mod tests {
         .unwrap()
     }
 
+    fn test_hello() -> BackendRequest {
+        BackendRequest::Hello {
+            version: BACKEND_PROTOCOL_VERSION,
+            id: 1,
+            pool_instance: canonical_uuid("f0a56cbd-c01b-4e7e-ab01-51ff7de71695"),
+            last_event_seq: 0,
+        }
+    }
+
+    fn healthy_following_connection(path: &Path) {
+        let mut client = UnixStream::connect(path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(&encode_backend_request(&test_hello()).unwrap())
+            .unwrap();
+        assert!(matches!(
+            read_message(&mut client),
+            BackendMessage::HelloOk { id: 1, .. }
+        ));
+        client
+            .write_all(
+                &encode_backend_request(&BackendRequest::SubscribeJobs {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id: 2,
+                    after_event_seq: 0,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            read_message(&mut client),
+            BackendMessage::JobSnapshot { id: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn peer_read_faults_close_only_the_session_and_next_authorized_client_works() {
+        for fault in 0..6 {
+            let directory = private_directory();
+            let path = socket_path(&directory);
+            let quick = Duration::from_millis(150);
+            let listener = Arc::new(
+                PoolBackendListener::bind(
+                    config(path.clone())
+                        .with_timeouts(quick, quick, quick, quick)
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+            let handler = Arc::new(TestHandler::default());
+            let (outcome_tx, outcome_rx) = mpsc::channel();
+            let server = {
+                let listener = Arc::clone(&listener);
+                let handler = Arc::clone(&handler);
+                thread::spawn(move || {
+                    for _ in 0..2 {
+                        let outcome = listener.serve_one(handler.as_ref());
+                        let terminal = outcome.is_err();
+                        outcome_tx.send(outcome).unwrap();
+                        if terminal {
+                            break;
+                        }
+                    }
+                })
+            };
+            let mut client = UnixStream::connect(&path).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let expected_reason = match fault {
+                0 => {
+                    client.write_all(&[0]).unwrap();
+                    client.shutdown(Shutdown::Write).unwrap();
+                    "incomplete request frame"
+                }
+                1 => "request deadline expired", // No Hello arrives.
+                2 => {
+                    client
+                        .write_all(&encode_backend_request(&test_hello()).unwrap())
+                        .unwrap();
+                    assert!(matches!(
+                        read_message(&mut client),
+                        BackendMessage::HelloOk { .. }
+                    ));
+                    "request deadline expired" // Negotiated client goes idle.
+                }
+                3 => {
+                    client.write_all(&[0; 4]).unwrap();
+                    "invalid request frame length"
+                }
+                4 => {
+                    client.write_all(&[0, 0, 0, 1, b'{']).unwrap();
+                    "invalid request frame"
+                }
+                5 => {
+                    client.write_all(&[0]).unwrap();
+                    "request deadline expired" // A frame starts but never completes.
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                outcome_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap(),
+                PoolBackendConnectionOutcome::Closed {
+                    reason: expected_reason
+                },
+            );
+            assert_eq!(
+                client.read(&mut [0]).unwrap(),
+                0,
+                "failed session is closed"
+            );
+            assert!(listener.is_accepting());
+            assert_eq!(listener.active_connections.load(Ordering::Acquire), 0);
+            assert!(listener.active_streams.lock().unwrap().is_empty());
+            healthy_following_connection(&path);
+            assert_eq!(
+                outcome_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap(),
+                PoolBackendConnectionOutcome::Served,
+            );
+            server.join().unwrap();
+            let expected_calls = if fault == 2 { 3 } else { 2 };
+            assert_eq!(handler.requests.lock().unwrap().len(), expected_calls);
+        }
+    }
+
+    #[test]
+    fn closed_peer_response_and_error_writes_preserve_platform_failure_boundary() {
+        for ordinary_response in [true, false] {
+            // Start with an established socket and a fully received request;
+            // closing a not-yet-accepted socket is platform dependent.
+            let (mut stream, mut peer) = UnixStream::pair().unwrap();
+            peer.write_all(&[1]).unwrap();
+            stream.read_exact(&mut [0]).unwrap();
+            drop(peer);
+            let error = if ordinary_response {
+                let response = BackendMessage::HealthStatus {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id: 1,
+                    event_seq: 0,
+                    healthy: true,
+                    pending_wcash: 0,
+                    quarantined_wcash: 0,
+                    pending_zcash: 0,
+                };
+                PoolBackendListenerError::Transport(
+                    write_unix_backend_messages(&mut stream, &[response], Duration::from_secs(1))
+                        .expect_err("closed peer cannot receive a response"),
+                )
+            } else {
+                write_error(
+                    &mut stream,
+                    Duration::from_secs(1),
+                    1,
+                    BackendErrorCode::InvalidRequest,
+                    "test request rejected".to_string(),
+                )
+                .expect_err("closed peer cannot receive a protocol error")
+            };
+            #[cfg(target_os = "macos")]
+            {
+                // Darwin rejects SO_SNDTIMEO after peer close before write can
+                // return EPIPE. Unexpected EINVAL deliberately remains fatal.
+                assert!(matches!(&error, PoolBackendListenerError::Transport(
+                    BackendTransportError::Io(source)) if source.kind() == io::ErrorKind::InvalidInput));
+                assert_eq!(error.connection_close_reason(), None);
+            }
+            #[cfg(not(target_os = "macos"))]
+            assert_eq!(
+                error.connection_close_reason(),
+                Some("response peer disconnected")
+            );
+        }
+    }
+
+    #[test]
+    fn outgoing_encoding_and_unexpected_io_remain_service_failures() {
+        let (mut stream, _peer) = UnixStream::pair().unwrap();
+        let invalid = BackendMessage::Error {
+            version: 0,
+            id: 1,
+            code: BackendErrorCode::InvalidRequest,
+            message: "invalid output fixture".to_string(),
+        };
+        let error = PoolBackendListenerError::Transport(
+            write_unix_backend_messages(&mut stream, &[invalid], Duration::from_secs(1))
+                .expect_err("local invalid response must not be encoded"),
+        );
+        assert!(matches!(
+            &error,
+            PoolBackendListenerError::Transport(BackendTransportError::InvalidFrame(_))
+        ));
+        assert_eq!(error.connection_close_reason(), None);
+        for error in [
+            PoolBackendListenerError::InvalidHandlerResponse,
+            PoolBackendListenerError::SessionIdentity,
+            PoolBackendListenerError::Io(io::Error::from(io::ErrorKind::PermissionDenied)),
+            PoolBackendListenerError::RequestTransport(BackendTransportError::Io(io::Error::from(
+                io::ErrorKind::InvalidInput,
+            ))),
+            PoolBackendListenerError::Transport(BackendTransportError::Io(io::Error::from(
+                io::ErrorKind::OutOfMemory,
+            ))),
+        ] {
+            assert_eq!(error.connection_close_reason(), None);
+        }
+    }
+
+    #[test]
+    fn invalid_handler_authority_remains_fatal_even_if_peer_disconnected() {
+        struct InvalidAuthorityHandler(TestHandler);
+        impl PoolBackendRequestHandler for InvalidAuthorityHandler {
+            fn persistent_authority(&self) -> PoolBackendAuthority {
+                self.0.persistent_authority()
+            }
+
+            fn handle(
+                &self,
+                context: PoolBackendRequestContext<'_>,
+                kind: BackendRequestKind,
+                request: BackendRequest,
+            ) -> Result<Vec<BackendMessage>, PoolBackendHandlerError> {
+                let mut messages = self.0.handle(context, kind, request)?;
+                let BackendMessage::HelloOk { wcash_genesis, .. } = &mut messages[0] else {
+                    unreachable!();
+                };
+                *wcash_genesis = Hex32::new([99; 32]);
+                Ok(messages)
+            }
+        }
+        let directory = private_directory();
+        let path = socket_path(&directory);
+        let listener = PoolBackendListener::bind(config(path.clone())).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .write_all(&encode_backend_request(&test_hello()).unwrap())
+            .unwrap();
+        client.shutdown(Shutdown::Both).unwrap();
+        assert!(matches!(
+            listener.serve_one(&InvalidAuthorityHandler(TestHandler::default())),
+            Err(PoolBackendListenerError::InvalidHandlerResponse),
+        ));
+        assert_eq!(listener.active_connections.load(Ordering::Acquire), 0);
+        assert!(listener.active_streams.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn rejects_relative_existing_and_unsafe_parent_paths() {
         assert!(PoolBackendListenerConfig::new("relative.sock", 1, 1).is_err());
@@ -965,6 +1454,52 @@ mod tests {
         let metadata = fs::symlink_metadata(&path).unwrap();
         assert!(metadata.file_type().is_socket());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
+        drop(listener);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn shutdown_wakes_an_idle_acceptor_and_allows_socket_cleanup() {
+        let directory = private_directory();
+        let path = socket_path(&directory);
+        let listener = Arc::new(PoolBackendListener::bind(config(path.clone())).unwrap());
+        let handler = Arc::new(TestHandler::default());
+        let server = {
+            let listener = Arc::clone(&listener);
+            thread::spawn(move || listener.serve_one(handler.as_ref()))
+        };
+
+        listener.request_shutdown(1).unwrap();
+        assert_eq!(
+            server.join().unwrap().unwrap(),
+            PoolBackendConnectionOutcome::Served
+        );
+        assert!(!listener.is_accepting());
+        drop(listener);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn shutdown_interrupts_a_connected_peer_before_hello_timeout() {
+        let directory = private_directory();
+        let path = socket_path(&directory);
+        let listener = Arc::new(PoolBackendListener::bind(config(path.clone())).unwrap());
+        let handler = Arc::new(TestHandler::default());
+        let server = {
+            let listener = Arc::clone(&listener);
+            thread::spawn(move || listener.serve_one(handler.as_ref()))
+        };
+        let _client = UnixStream::connect(&path).unwrap();
+        for _ in 0..100 {
+            if !listener.active_streams.lock().unwrap().is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(listener.active_streams.lock().unwrap().len(), 1);
+
+        listener.request_shutdown(1).unwrap();
+        let _outcome = server.join().unwrap();
         drop(listener);
         assert!(!path.exists());
     }
@@ -1059,6 +1594,137 @@ mod tests {
         assert!(handler.requests.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn exact_runtime_peer_uids_have_separate_submit_authority() {
+        let config = PoolBackendListenerConfig::new("/tmp/backend.sock", 10, 20)
+            .unwrap()
+            .with_read_only_peer_uids(11, 12)
+            .unwrap();
+
+        assert_eq!(
+            config.role_for_peer_uid(10),
+            Some(PoolBackendPeerRole::Submitter)
+        );
+        assert_eq!(
+            config.role_for_peer_uid(11),
+            Some(PoolBackendPeerRole::ReadOnly)
+        );
+        assert_eq!(
+            config.role_for_peer_uid(12),
+            Some(PoolBackendPeerRole::ReadOnly)
+        );
+        assert_eq!(config.role_for_peer_uid(13), None);
+        assert!(PoolBackendPeerRole::Submitter.authorizes(BackendRequestKind::SubmitShare));
+        assert!(!PoolBackendPeerRole::ReadOnly.authorizes(BackendRequestKind::SubmitShare));
+        for kind in [
+            BackendRequestKind::Hello,
+            BackendRequestKind::ReadEvents,
+            BackendRequestKind::SubscribeJobs,
+            BackendRequestKind::Health,
+        ] {
+            assert!(PoolBackendPeerRole::ReadOnly.authorizes(kind));
+        }
+    }
+
+    #[test]
+    fn runtime_peer_uids_must_be_distinct() {
+        for (submit, projector, payout) in [(10, 10, 12), (10, 11, 10), (10, 11, 11)] {
+            assert!(
+                PoolBackendListenerConfig::new("/tmp/backend.sock", submit, 20)
+                    .unwrap()
+                    .with_read_only_peer_uids(projector, payout)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_peer_can_subscribe_but_cannot_submit() {
+        let directory = private_directory();
+        let path = socket_path(&directory);
+        let current_uid = nix::unistd::geteuid().as_raw();
+        let listener = Arc::new(
+            PoolBackendListener::bind(
+                PoolBackendListenerConfig::new(
+                    path.clone(),
+                    current_uid.wrapping_add(1),
+                    nix::unistd::getegid().as_raw(),
+                )
+                .unwrap()
+                .with_read_only_peer_uids(current_uid, current_uid.wrapping_add(2))
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let handler = Arc::new(TestHandler::default());
+        let server = {
+            let listener = Arc::clone(&listener);
+            let handler = Arc::clone(&handler);
+            thread::spawn(move || listener.serve_one(handler.as_ref()).unwrap())
+        };
+
+        let mut stream = UnixStream::connect(&path).unwrap();
+        let hello = BackendRequest::Hello {
+            version: BACKEND_PROTOCOL_VERSION,
+            id: 1,
+            pool_instance: canonical_uuid("f0a56cbd-c01b-4e7e-ab01-51ff7de71695"),
+            last_event_seq: 0,
+        };
+        stream
+            .write_all(&encode_backend_request(&hello).unwrap())
+            .unwrap();
+        assert!(matches!(
+            read_message(&mut stream),
+            BackendMessage::HelloOk { id: 1, .. }
+        ));
+
+        let subscribe = BackendRequest::SubscribeJobs {
+            version: BACKEND_PROTOCOL_VERSION,
+            id: 2,
+            after_event_seq: 0,
+        };
+        stream
+            .write_all(&encode_backend_request(&subscribe).unwrap())
+            .unwrap();
+        assert!(matches!(
+            read_message(&mut stream),
+            BackendMessage::JobSnapshot { id: 2, .. }
+        ));
+
+        let submit = BackendRequest::SubmitShare {
+            version: BACKEND_PROTOCOL_VERSION,
+            id: 3,
+            job_id: Hex32::new([8; 32]),
+            identity: WorkerIdentity {
+                account_id: canonical_uuid("77b9fb5b-2e4e-4ed2-b781-1ecef4d867af"),
+                worker_id: canonical_uuid("643caa33-4b16-4406-b4d9-1c682d442a9e"),
+                label: "rig-1".to_string(),
+            },
+            target_le: TargetLe::new([9; 32]),
+            time: Hex4::new([1, 2, 3, 4]),
+            nonce: Hex32::new([10; 32]),
+            solution: Box::new(Hex1344::new([11; 1344])),
+        };
+        stream
+            .write_all(&encode_backend_request(&submit).unwrap())
+            .unwrap();
+        assert!(matches!(
+            read_message(&mut stream),
+            BackendMessage::Error {
+                id: 3,
+                code: BackendErrorCode::InvalidRequest,
+                ..
+            }
+        ));
+        drop(stream);
+
+        assert_eq!(server.join().unwrap(), PoolBackendConnectionOutcome::Served);
+        assert_eq!(
+            handler.requests.lock().unwrap().as_slice(),
+            &[BackendRequestKind::Hello, BackendRequestKind::SubscribeJobs]
+        );
+    }
+
     fn read_message(stream: &mut UnixStream) -> BackendMessage {
         use std::io::Read;
         let mut prefix = [0; 4];
@@ -1098,27 +1764,35 @@ mod tests {
             request: BackendRequest,
         ) -> Result<Vec<BackendMessage>, PoolBackendHandlerError> {
             self.requests.lock().unwrap().push(kind);
-            let BackendRequest::Hello { id, .. } = request else {
-                return Err(PoolBackendHandlerError::new(
+            match request {
+                BackendRequest::Hello { id, .. } => Ok(vec![BackendMessage::HelloOk {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    backend_session: context.session().backend_session(),
+                    backend_instance: self.backend_instance,
+                    journal_stream: self.journal_stream,
+                    capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
+                    wcash_genesis: Hex32::new([1; 32]),
+                    zcash_genesis: Hex32::new([2; 32]),
+                    wcash_payout_commitment: Hex32::new([3; 32]),
+                    zcash_payout_commitment: Hex32::new([4; 32]),
+                    share_target_ceiling_be: test_share_target_ceiling_be(),
+                    chain_id: 1,
+                    current_event_seq: 0,
+                }]),
+                BackendRequest::SubscribeJobs { id, .. } => Ok(vec![BackendMessage::JobSnapshot {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id,
+                    event_seq: 0,
+                    current: None,
+                    recent: Vec::new(),
+                }]),
+                _ => Err(PoolBackendHandlerError::new(
                     BackendErrorCode::InvalidRequest,
-                    "test handler accepts only hello",
+                    "test handler rejects unexpected requests",
                     true,
-                ));
-            };
-            Ok(vec![BackendMessage::HelloOk {
-                version: BACKEND_PROTOCOL_VERSION,
-                id,
-                backend_session: context.session().backend_session(),
-                backend_instance: self.backend_instance,
-                journal_stream: self.journal_stream,
-                capabilities: REQUIRED_BACKEND_CAPABILITIES.to_vec(),
-                wcash_genesis: Hex32::new([1; 32]),
-                zcash_genesis: Hex32::new([2; 32]),
-                wcash_payout_commitment: Hex32::new([3; 32]),
-                zcash_payout_commitment: Hex32::new([4; 32]),
-                chain_id: 1,
-                current_event_seq: 0,
-            }])
+                )),
+            }
         }
     }
 
@@ -1128,6 +1802,7 @@ mod tests {
         let session = PoolBackendSession {
             backend_session: canonical_uuid("599ec097-b4e1-4f6d-a127-ff66e5262a52"),
             peer_uid: nix::unistd::geteuid().as_raw(),
+            peer_role: PoolBackendPeerRole::Submitter,
         };
         let request = BackendRequest::Hello {
             version: BACKEND_PROTOCOL_VERSION,
@@ -1154,6 +1829,23 @@ mod tests {
             &[wrong],
         )
         .is_err());
+    }
+
+    #[test]
+    fn backend_authority_rejects_a_zero_share_target_ceiling() {
+        assert!(matches!(
+            PoolBackendAuthority::new(
+                canonical_uuid("90bd8da9-9b49-4114-9aa8-2ca35aee013e"),
+                canonical_uuid("c4756682-e84b-4b0b-927f-0af145ae9826"),
+                Hex32::new([1; 32]),
+                Hex32::new([2; 32]),
+                Hex32::new([3; 32]),
+                Hex32::new([4; 32]),
+                TargetBe::new([0; 32]),
+                1,
+            ),
+            Err(PoolBackendListenerError::InvalidConfiguration(_))
+        ));
     }
 
     #[test]
@@ -1226,6 +1918,7 @@ mod tests {
             zcash_genesis,
             wcash_payout_commitment,
             zcash_payout_commitment,
+            share_target_ceiling_be,
             chain_id,
             current_event_seq,
             ..
@@ -1244,6 +1937,7 @@ mod tests {
             zcash_genesis,
             wcash_payout_commitment,
             zcash_payout_commitment,
+            share_target_ceiling_be,
             chain_id,
             current_event_seq,
         };
@@ -1255,6 +1949,28 @@ mod tests {
             &handler.persistent_authority(),
             None,
             &[wrong_session],
+        )
+        .is_err());
+
+        let mut wrong_target = hello_response(&handler, &session, request.id(), 7);
+        let BackendMessage::HelloOk {
+            share_target_ceiling_be,
+            ..
+        } = &mut wrong_target
+        else {
+            unreachable!("test helper returns hello_ok");
+        };
+        let mut changed = *share_target_ceiling_be.as_bytes();
+        changed[0] ^= 0x80;
+        *share_target_ceiling_be = TargetBe::new(changed);
+        assert!(validate_handler_messages(
+            BackendRequestKind::Hello,
+            BackendConnectionRole::Negotiated,
+            &request,
+            &session,
+            &handler.persistent_authority(),
+            None,
+            &[wrong_target],
         )
         .is_err());
     }
@@ -1447,6 +2163,7 @@ mod tests {
         let session = PoolBackendSession {
             backend_session: canonical_uuid("599ec097-b4e1-4f6d-a127-ff66e5262a52"),
             peer_uid: nix::unistd::geteuid().as_raw(),
+            peer_role: PoolBackendPeerRole::Submitter,
         };
         let request = BackendRequest::Hello {
             version: BACKEND_PROTOCOL_VERSION,
@@ -1472,6 +2189,7 @@ mod tests {
             Hex32::new([2; 32]),
             Hex32::new([3; 32]),
             Hex32::new([4; 32]),
+            test_share_target_ceiling_be(),
             1,
         )
         .expect("valid test authority")
@@ -1494,8 +2212,17 @@ mod tests {
             zcash_genesis: Hex32::new([2; 32]),
             wcash_payout_commitment: Hex32::new([3; 32]),
             zcash_payout_commitment: Hex32::new([4; 32]),
+            share_target_ceiling_be: test_share_target_ceiling_be(),
             chain_id: 1,
             current_event_seq,
         }
+    }
+
+    fn test_share_target_ceiling_be() -> TargetBe {
+        TargetBe::new([
+            0x00, 0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3,
+            0xd2, 0xe1, 0xf0, 0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x9a, 0xab,
+            0xbc, 0xcd, 0xde, 0xef,
+        ])
     }
 }

@@ -1,0 +1,2 @@
+kind: Security
+body: "Require TLS for remote Wcash compact-wallet endpoints, allow plaintext only on literal loopback addresses, and attest the exact Wcash chain name, active consensus branch, and genesis before wallet RPC use."

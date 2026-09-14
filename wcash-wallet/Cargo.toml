@@ -10,23 +10,28 @@ homepage.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Local integration only; public wallet builds retain Testnet-only pool payouts.
+regtest-payout = []
+
 [dependencies]
 async-trait = "0.1"
 blake2b_simd.workspace = true
-bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
 futures-util.workspace = true
+fs2 = "0.4"
 hex.workspace = true
-http-body-util.workspace = true
 prost.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 rusqlite = "0.37"
 secrecy = "0.8"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tonic = { workspace = true, features = ["transport"] }
+tonic = { workspace = true, features = ["tls-ring", "transport"] }
 zcash_address.workspace = true
 zcash_client_backend = { version = "0.24.0", features = [
   "lightwalletd-tonic-tls-webpki-roots",
@@ -44,6 +49,7 @@ zcash_keys = { workspace = true, features = [
   "sapling",
   "transparent-inputs",
 ] }
+zcash_note_encryption.workspace = true
 zcash_primitives = { workspace = true, features = [
   "circuits",
   "transparent-inputs",
@@ -55,10 +61,16 @@ zebra-chain = { path = "../zebra-chain", version = "12.0.0" }
 zip32.workspace = true
 orchard.workspace = true
 zeroize = "1.8"
+uuid = { version = "1", features = ["serde"] }
+wcash-zcash-aux.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["user"] }
 
 [dev-dependencies]
 pczt = "0.9.3"
 tempfile.workspace = true
+zebra-chain = { path = "../zebra-chain", version = "12.0.0", features = ["proptest-impl"] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -9,7 +9,10 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::{Duration, Instant},
 };
 
@@ -18,7 +21,7 @@ use wcash_pool_protocol::{
     canonical_attribution_id, canonical_parent_header_hash_le, canonical_share_id, AcceptableJob,
     BackendErrorCode, BackendEvent, BackendMessage, BackendRequest, CanonicalUuid, ChainTip,
     Hex1344, Hex32, Hex4, JobDescriptor, JobInvalidationReason, MergedChain, ProtocolError,
-    ShareReceipt, TargetLe, WinnerDescriptor, WorkerIdentity, BACKEND_PROTOCOL_VERSION,
+    ShareReceipt, TargetBe, TargetLe, WinnerDescriptor, WorkerIdentity, BACKEND_PROTOCOL_VERSION,
     MAX_EVENT_PAGE_ITEMS, REQUIRED_BACKEND_CAPABILITIES,
 };
 
@@ -48,6 +51,12 @@ const MAX_SUPERSEDED_GRACE: Duration = Duration::from_secs(60);
 pub trait PoolBackendRetainedJob: Send + Sync {
     /// Returns the exact proposal-validated descriptor retained by this job.
     fn descriptor(&self) -> JobDescriptor;
+
+    /// Returns the configured Wcash payout commitment authenticated for this job.
+    fn wcash_payout_commitment(&self) -> Hex32;
+
+    /// Returns the configured Zcash payout commitment authenticated for this job.
+    fn zcash_payout_commitment(&self) -> Hex32;
 
     /// Returns the remaining native admission lifetime at the instant sampled.
     ///
@@ -181,6 +190,122 @@ impl PoolBackendWinnerKey {
     }
 }
 
+/// Fair selection for the single native winner-reconciliation worker.
+///
+/// A cursor over durable winner order gives each pending proof one prompt
+/// first attempt. Historical reconciliation follows every priority attempt
+/// and remains responsible for bounded retries and lifecycle monitoring.
+/// Restart reconstructs pending work from the journal; no new durable format
+/// or in-memory-only submission queue is introduced.
+#[derive(Debug, Default)]
+pub struct PoolBackendWinnerScheduler {
+    journal_stream: Option<CanonicalUuid>,
+    first_attempt_next: usize,
+    historical_due: bool,
+    last_first_attempt: Option<PoolBackendWinnerKey>,
+    unsettled_after: Option<PoolBackendWinnerKey>,
+    matured_after: Option<PoolBackendWinnerKey>,
+}
+
+/// One bounded reconciliation step, including the existing audit cadence.
+#[derive(Debug)]
+pub struct PoolBackendWinnerWork {
+    snapshot: Option<PoolBackendWinnerSnapshot>,
+    completes_pass: bool,
+    delay: Duration,
+}
+
+impl PoolBackendWinnerWork {
+    /// Returns the exact CAS snapshot to reconcile outside the actor mutex.
+    pub fn snapshot(&self) -> Option<&PoolBackendWinnerSnapshot> {
+        self.snapshot.as_ref()
+    }
+
+    /// True at the historical audit boundary used to publish dependency health.
+    pub const fn completes_pass(&self) -> bool {
+        self.completes_pass
+    }
+
+    /// Required delay after this step; first attempts alone have no delay.
+    pub const fn delay(&self) -> Duration {
+        self.delay
+    }
+}
+
+impl PoolBackendWinnerScheduler {
+    /// Selects at most one first attempt before the next historical step.
+    ///
+    /// Selection advances the cursor before the caller can perform RPC, so a
+    /// failed pending winner cannot monopolize priority. Each tail check scans
+    /// at most 256 entries and advances over inspected non-pending entries.
+    pub fn next(
+        &mut self,
+        actor: &PoolBackendActor,
+    ) -> Result<PoolBackendWinnerWork, PoolBackendActorError> {
+        let journal_stream = actor.authority_fields.journal_stream;
+        if self
+            .journal_stream
+            .is_some_and(|bound| bound != journal_stream)
+        {
+            return Err(PoolBackendActorError::WinnerAuthorityMismatch);
+        }
+        self.journal_stream = Some(journal_stream);
+        if !self.historical_due {
+            self.historical_due = true;
+            let first = {
+                let state = actor.lock_state()?;
+                state
+                    .journal
+                    .next_first_attempt_winner_state(&mut self.first_attempt_next)?
+            };
+            if let Some((winner_ordinal, state)) = first {
+                let snapshot = PoolBackendWinnerSnapshot {
+                    journal_stream,
+                    winner_ordinal,
+                    state,
+                };
+                self.last_first_attempt = Some(snapshot.key());
+                return Ok(PoolBackendWinnerWork {
+                    snapshot: Some(snapshot),
+                    completes_pass: false,
+                    delay: Duration::ZERO,
+                });
+            }
+        }
+
+        self.historical_due = false;
+        let (mut snapshot, completes_pass, delay) = match actor
+            .next_unsettled_winner_snapshot(self.unsettled_after.as_ref())?
+        {
+            Some(snapshot) => {
+                self.unsettled_after = Some(snapshot.key());
+                (Some(snapshot), false, Duration::from_millis(100))
+            }
+            None => {
+                self.unsettled_after = None;
+                let snapshot = actor.next_matured_winner_snapshot(self.matured_after.as_ref())?;
+                self.matured_after = snapshot.as_ref().map(PoolBackendWinnerSnapshot::key);
+                (snapshot, true, Duration::from_secs(1))
+            }
+        };
+        if let Some(just_attempted) = self.last_first_attempt.take() {
+            if snapshot
+                .as_ref()
+                .is_some_and(|value| value.key() == just_attempted)
+            {
+                // Advance the historical cursor and retain its delay without
+                // submitting the same failed proof twice back-to-back.
+                snapshot = None;
+            }
+        }
+        Ok(PoolBackendWinnerWork {
+            snapshot,
+            completes_pass,
+            delay,
+        })
+    }
+}
+
 /// One exact, bounded winner snapshot returned by the serialized actor.
 ///
 /// The snapshot is also the compare-and-swap token for an external
@@ -260,6 +385,11 @@ impl fmt::Debug for PoolBackendWinnerSnapshot {
 /// Exact best-chain result to append for one authority-bound winner snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PoolBackendWinnerTransition {
+    /// Every pinned parent retained this exact Zcash proof off the best chain.
+    SideChain {
+        /// Stable best-chain tip sampled with the noncanonical proof.
+        tip: ChainTip,
+    },
     /// The exact retained block is on the sampled best chain.
     Observed {
         /// Exact best-chain tip used for this observation.
@@ -294,6 +424,7 @@ pub enum PoolBackendWinnerTransition {
 impl From<PoolBackendWinnerTransition> for JournalWinnerTransition {
     fn from(transition: PoolBackendWinnerTransition) -> Self {
         match transition {
+            PoolBackendWinnerTransition::SideChain { tip } => Self::SideChain { tip },
             PoolBackendWinnerTransition::Observed { tip, confirmations } => {
                 Self::Observed { tip, confirmations }
             }
@@ -394,6 +525,10 @@ pub enum PoolBackendActorError {
     #[error("retained pool job is not healthy")]
     RetainedJobUnhealthy,
 
+    /// The retained native job was prepared for another collector authority.
+    #[error("retained pool job payout commitments do not match this backend journal")]
+    PayoutAuthorityMismatch,
+
     /// A winner key or snapshot belongs to another journal sequence namespace.
     #[error("winner reconciliation authority does not match this backend journal")]
     WinnerAuthorityMismatch,
@@ -431,6 +566,7 @@ struct AuthorityFields {
     zcash_genesis: Hex32,
     wcash_payout_commitment: Hex32,
     zcash_payout_commitment: Hex32,
+    share_target_ceiling_be: TargetBe,
     chain_id: u32,
 }
 
@@ -501,6 +637,7 @@ pub struct PoolBackendActor {
     authority: PoolBackendAuthority,
     authority_fields: AuthorityFields,
     clock: Arc<dyn ActorClock>,
+    winner_reconciliation_healthy: AtomicBool,
     state: Mutex<ActorState>,
 }
 
@@ -519,6 +656,7 @@ impl PoolBackendActor {
         target_policy: PoolShareTargetPolicy,
         clock: Arc<dyn ActorClock>,
     ) -> Result<Self, PoolBackendActorError> {
+        let share_target_ceiling_be = TargetBe::from(target_policy.operator_easiest());
         let authority_fields = AuthorityFields {
             backend_instance: journal.backend_instance(),
             journal_stream: journal.journal_stream(),
@@ -526,6 +664,7 @@ impl PoolBackendActor {
             zcash_genesis: journal.zcash_genesis().clone(),
             wcash_payout_commitment: journal.wcash_payout_commitment().clone(),
             zcash_payout_commitment: journal.zcash_payout_commitment().clone(),
+            share_target_ceiling_be,
             chain_id: journal.chain_id(),
         };
         let authority = PoolBackendAuthority::new(
@@ -535,6 +674,7 @@ impl PoolBackendActor {
             authority_fields.zcash_genesis.clone(),
             authority_fields.wcash_payout_commitment.clone(),
             authority_fields.zcash_payout_commitment.clone(),
+            authority_fields.share_target_ceiling_be.clone(),
             authority_fields.chain_id,
         )
         .map_err(PoolBackendActorError::Authority)?;
@@ -555,8 +695,18 @@ impl PoolBackendActor {
             authority,
             authority_fields,
             clock,
+            winner_reconciliation_healthy: AtomicBool::new(true),
             state: Mutex::new(state),
         })
+    }
+
+    /// Updates the live status of the sole winner-reconciliation worker.
+    ///
+    /// This flag affects only health reporting. Exact winners remain durable
+    /// and share validation remains consensus-authoritative during an outage.
+    pub fn set_winner_reconciliation_health(&self, healthy: bool) {
+        self.winner_reconciliation_healthy
+            .store(healthy, Ordering::Release);
     }
 
     /// Durably advertises a healthy exact job, superseding the current job
@@ -574,6 +724,11 @@ impl PoolBackendActor {
         descriptor
             .validate()
             .map_err(PoolBackendActorError::InvalidJob)?;
+        if validator.wcash_payout_commitment() != self.authority_fields.wcash_payout_commitment
+            || validator.zcash_payout_commitment() != self.authority_fields.zcash_payout_commitment
+        {
+            return Err(PoolBackendActorError::PayoutAuthorityMismatch);
+        }
         if !validator.is_healthy() {
             return Err(PoolBackendActorError::RetainedJobUnhealthy);
         }
@@ -734,14 +889,43 @@ impl PoolBackendActor {
         &self,
         after: Option<&PoolBackendWinnerKey>,
     ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        self.next_winner_snapshot_with(after, PoolBackendJournal::next_winner_state)
+    }
+
+    /// Returns the next non-matured winner in durable journal order.
+    ///
+    /// Runtime reconciliation uses this tier for frequent submission and
+    /// confirmation checks. Reversible matured entries are sampled separately
+    /// so historical winners cannot create unbounded node RPC load.
+    pub fn next_unsettled_winner_snapshot(
+        &self,
+        after: Option<&PoolBackendWinnerKey>,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        self.next_winner_snapshot_with(after, PoolBackendJournal::next_unsettled_winner_state)
+    }
+
+    /// Returns the next matured winner in durable order for low-rate audits.
+    pub fn next_matured_winner_snapshot(
+        &self,
+        after: Option<&PoolBackendWinnerKey>,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        self.next_winner_snapshot_with(after, PoolBackendJournal::next_matured_winner_state)
+    }
+
+    fn next_winner_snapshot_with(
+        &self,
+        after: Option<&PoolBackendWinnerKey>,
+        select: fn(
+            &PoolBackendJournal,
+            Option<usize>,
+        ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError>,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
         if after.is_some_and(|key| key.journal_stream != self.authority_fields.journal_stream) {
             return Err(PoolBackendActorError::WinnerAuthorityMismatch);
         }
         let state = self.lock_state()?;
         let after_ordinal = after.map(|key| key.winner_ordinal);
-        state
-            .journal
-            .next_winner_state(after_ordinal)
+        select(&state.journal, after_ordinal)
             .map(|winner| {
                 winner.map(|(winner_ordinal, state)| PoolBackendWinnerSnapshot {
                     journal_stream: self.authority_fields.journal_stream,
@@ -894,6 +1078,7 @@ impl PoolBackendActor {
             zcash_genesis: self.authority_fields.zcash_genesis.clone(),
             wcash_payout_commitment: self.authority_fields.wcash_payout_commitment.clone(),
             zcash_payout_commitment: self.authority_fields.zcash_payout_commitment.clone(),
+            share_target_ceiling_be: self.authority_fields.share_target_ceiling_be.clone(),
             chain_id: self.authority_fields.chain_id,
             current_event_seq: current,
         }])
@@ -1118,7 +1303,9 @@ impl PoolBackendActor {
                 .get(job_id)
                 .is_some_and(|job| job.validator.is_healthy() && acceptable_job(job, now).is_some())
         });
-        let healthy = current_healthy && recent_healthy;
+        let healthy = current_healthy
+            && recent_healthy
+            && self.winner_reconciliation_healthy.load(Ordering::Acquire);
         let response = BackendMessage::HealthStatus {
             version: BACKEND_PROTOCOL_VERSION,
             id,
@@ -1253,7 +1440,8 @@ fn replay_projection(
                         ));
                     }
                 }
-                BackendEvent::WinnerObserved { .. }
+                BackendEvent::WinnerSideChain { .. }
+                | BackendEvent::WinnerObserved { .. }
                 | BackendEvent::WinnerOrphaned { .. }
                 | BackendEvent::WinnerQuarantined { .. }
                 | BackendEvent::WinnerRequeued { .. }
@@ -1704,6 +1892,8 @@ mod tests {
 
     struct TestRetainedJob {
         descriptor: JobDescriptor,
+        wcash_payout_commitment: Hex32,
+        zcash_payout_commitment: Hex32,
         healthy: AtomicBool,
         remaining_lifetime: Mutex<Option<Duration>>,
         validated: Mutex<PoolBackendValidatedShare>,
@@ -1715,6 +1905,8 @@ mod tests {
             let remaining_lifetime = Some(Duration::from_millis(u64::from(descriptor.max_age_ms)));
             Self {
                 descriptor,
+                wcash_payout_commitment: Hex32::new([0x33; 32]),
+                zcash_payout_commitment: Hex32::new([0x44; 32]),
                 healthy: AtomicBool::new(true),
                 remaining_lifetime: Mutex::new(remaining_lifetime),
                 validated: Mutex::new(PoolBackendValidatedShare::ordinary()),
@@ -1735,11 +1927,25 @@ mod tests {
                 .lock()
                 .expect("test validation mutex is not poisoned") = validated;
         }
+
+        fn with_payout_commitments(mut self, wcash: Hex32, zcash: Hex32) -> Self {
+            self.wcash_payout_commitment = wcash;
+            self.zcash_payout_commitment = zcash;
+            self
+        }
     }
 
     impl PoolBackendRetainedJob for TestRetainedJob {
         fn descriptor(&self) -> JobDescriptor {
             self.descriptor.clone()
+        }
+
+        fn wcash_payout_commitment(&self) -> Hex32 {
+            self.wcash_payout_commitment.clone()
+        }
+
+        fn zcash_payout_commitment(&self) -> Hex32 {
+            self.zcash_payout_commitment.clone()
         }
 
         fn remaining_lifetime(&self) -> Option<Duration> {
@@ -2021,6 +2227,255 @@ mod tests {
         (winner, block_bytes)
     }
 
+    fn append_scheduler_pending(journal: &PoolBackendJournal, ordinal: u32) -> Hex32 {
+        let (_, original) = journal.next_winner_state(None).unwrap().unwrap();
+        let active_job = journal
+            .job_descriptors()
+            .unwrap()
+            .into_iter()
+            .find(|(_, closed)| !closed)
+            .expect("fixture has an active job")
+            .0;
+        let mut id = [0; 32];
+        id[..4].copy_from_slice(&ordinal.to_le_bytes());
+        let share_id = Hex32::new(id);
+        journal
+            .append_share_committed(
+                active_job.job_id,
+                share_id.clone(),
+                original.parent_hash_le,
+                vec![original.winner],
+                identity(),
+                TargetLe::new([0xff; 32]),
+                JournalWinnerBlocks {
+                    wcash: None,
+                    zcash: Some(original.block_bytes),
+                },
+            )
+            .expect("append durable pending proof fixture");
+        share_id
+    }
+
+    fn append_scheduler_after_restore(actor: &PoolBackendActor, ordinal: u32) -> Hex32 {
+        let mut descriptor = {
+            let state = actor.lock_state().unwrap();
+            state.journal.job_descriptors().unwrap()[0].0.clone()
+        };
+        let mut job_id = [0x95; 32];
+        job_id[..4].copy_from_slice(&ordinal.to_le_bytes());
+        descriptor.job_id = Hex32::new(job_id);
+        actor
+            .activate_job(Arc::new(TestRetainedJob::new(descriptor)), Duration::ZERO)
+            .expect("activate fresh job after actor restoration retired the original");
+        let state = actor.lock_state().unwrap();
+        append_scheduler_pending(&state.journal, ordinal)
+    }
+
+    fn scheduler_journal(
+        path: &Path,
+        config: &TestJournalConfig,
+        observed: u32,
+    ) -> (PoolBackendJournal, Vec<Hex32>) {
+        let (journal, winner, _) = zcash_winner_journal(path, config);
+        let mut shares = vec![Hex32::new([0x82; 32])];
+        for ordinal in 1..observed.max(1) {
+            shares.push(append_scheduler_pending(&journal, ordinal));
+        }
+        for share in shares.iter().take(observed as usize) {
+            let pending = journal
+                .winner_state(share, MergedChain::Zcash)
+                .unwrap()
+                .unwrap();
+            journal
+                .compare_and_transition_winner(
+                    share,
+                    MergedChain::Zcash,
+                    pending.revision_event_seq,
+                    JournalWinnerTransition::Observed {
+                        tip: ChainTip {
+                            block_hash_le: winner.block_hash_le.clone(),
+                            height: winner.height,
+                        },
+                        confirmations: 1,
+                    },
+                )
+                .expect("observe historical proof fixture");
+        }
+        (journal, shares)
+    }
+
+    #[test]
+    fn winner_scheduler_prioritizes_new_proofs_without_starving_two_hundred_observed() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("scheduler.jsonl");
+        let config = config();
+        let (journal, historical) = scheduler_journal(&path, &config, 200);
+        let first = append_scheduler_pending(&journal, 201);
+        let second = append_scheduler_pending(&journal, 202);
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+        let mut scheduler = PoolBackendWinnerScheduler::default();
+
+        let work = scheduler.next(&actor).unwrap();
+        assert_eq!(work.snapshot().unwrap().share_id(), &first);
+        assert_eq!(work.delay(), Duration::ZERO);
+        assert_eq!(scheduler.first_attempt_next, 201);
+        // Simulate a failed first submission: leave its durable Pending state
+        // unchanged. The next step must still advance historical monitoring.
+        let work = scheduler.next(&actor).unwrap();
+        assert_eq!(work.snapshot().unwrap().share_id(), &historical[0]);
+        assert_eq!(work.delay(), Duration::from_millis(100));
+        let work = scheduler.next(&actor).unwrap();
+        assert_eq!(work.snapshot().unwrap().share_id(), &second);
+        assert_eq!(work.delay(), Duration::ZERO);
+        assert_eq!(scheduler.first_attempt_next, 202);
+        let work = scheduler.next(&actor).unwrap();
+        assert_eq!(work.snapshot().unwrap().share_id(), &historical[1]);
+        assert_eq!(work.delay(), Duration::from_millis(100));
+        let work = scheduler.next(&actor).unwrap();
+        assert_eq!(work.snapshot().unwrap().share_id(), &historical[2]);
+        assert_eq!(work.delay(), Duration::from_millis(100));
+
+        // A later durable append remains visible after the tail was exhausted.
+        let third = append_scheduler_after_restore(&actor, 203);
+        let work = scheduler.next(&actor).unwrap();
+        assert_eq!(work.snapshot().unwrap().share_id(), &third);
+        assert_eq!(work.delay(), Duration::ZERO);
+        assert_eq!(
+            scheduler
+                .next(&actor)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .share_id(),
+            &historical[3]
+        );
+
+        drop(actor);
+        let restored = actor_from_journal(open_journal(&path, &config), Arc::new(TestClock::new()));
+        let mut recovered_schedule = PoolBackendWinnerScheduler::default();
+        let work = recovered_schedule.next(&restored).unwrap();
+        assert_eq!(work.snapshot().unwrap().share_id(), &first);
+        assert!(matches!(
+            work.snapshot().unwrap().lifecycle(),
+            JournalWinnerLifecycle::Pending
+        ));
+        assert!(scheduler.next(&restored).is_ok());
+    }
+
+    #[test]
+    fn winner_scheduler_advances_bounded_tail_even_without_pending_proofs() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("scheduler-tail.jsonl");
+        let config = config();
+        let (journal, historical) = scheduler_journal(&path, &config, 300);
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+        let mut scheduler = PoolBackendWinnerScheduler::default();
+        for (expected_cursor, expected_share) in [
+            (256, &historical[0]),
+            (300, &historical[1]),
+            (300, &historical[2]),
+        ] {
+            let work = scheduler.next(&actor).unwrap();
+            assert_eq!(scheduler.first_attempt_next, expected_cursor);
+            assert_eq!(work.snapshot().unwrap().share_id(), expected_share);
+            assert_eq!(work.delay(), Duration::from_millis(100));
+        }
+        let new = append_scheduler_after_restore(&actor, 301);
+        let work = scheduler.next(&actor).unwrap();
+        assert_eq!(work.snapshot().unwrap().share_id(), &new);
+        assert_eq!(scheduler.first_attempt_next, 301);
+        assert_eq!(
+            scheduler
+                .next(&actor)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .share_id(),
+            &historical[3]
+        );
+    }
+
+    #[test]
+    fn winner_scheduler_failed_first_attempt_cannot_hot_loop_or_cross_journals() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("scheduler-pending.jsonl");
+        let config = config();
+        let (journal, shares) = scheduler_journal(&path, &config, 0);
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+        let mut scheduler = PoolBackendWinnerScheduler::default();
+        assert_eq!(
+            scheduler
+                .next(&actor)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .share_id(),
+            &shares[0]
+        );
+        let duplicate = scheduler.next(&actor).unwrap();
+        assert!(duplicate.snapshot().is_none());
+        assert_eq!(duplicate.delay(), Duration::from_millis(100));
+        let end = scheduler.next(&actor).unwrap();
+        assert!(end.snapshot().is_none());
+        assert!(end.completes_pass());
+        assert_eq!(end.delay(), Duration::from_secs(1));
+        for _ in 0..8 {
+            let work = scheduler.next(&actor).unwrap();
+            assert!(!work.delay().is_zero());
+            if let Some(snapshot) = work.snapshot() {
+                assert_eq!(snapshot.share_id(), &shares[0]);
+            }
+        }
+        let other_path = directory.path().join("other.jsonl");
+        let (other, _) = scheduler_journal(&other_path, &config, 0);
+        let other = actor_from_journal(other, Arc::new(TestClock::new()));
+        assert!(matches!(
+            scheduler.next(&other),
+            Err(PoolBackendActorError::WinnerAuthorityMismatch)
+        ));
+    }
+
+    #[test]
+    fn winner_scheduler_preserves_matured_audit_and_health_pass_cadence() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("scheduler-matured.jsonl");
+        let config = config();
+        let (journal, shares) = scheduler_journal(&path, &config, 2);
+        let observed = journal
+            .winner_state(&shares[1], MergedChain::Zcash)
+            .unwrap()
+            .unwrap();
+        journal
+            .compare_and_transition_winner(
+                &shares[1],
+                MergedChain::Zcash,
+                observed.revision_event_seq,
+                JournalWinnerTransition::Matured {
+                    tip: ChainTip {
+                        block_hash_le: Hex32::new([0x91; 32]),
+                        height: observed.winner.height + 1,
+                    },
+                    confirmations: 2,
+                },
+            )
+            .unwrap();
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+        let mut scheduler = PoolBackendWinnerScheduler::default();
+        for expected_matured in [Some(&shares[1]), None, Some(&shares[1])] {
+            let unsettled = scheduler.next(&actor).unwrap();
+            assert_eq!(unsettled.snapshot().unwrap().share_id(), &shares[0]);
+            assert!(!unsettled.completes_pass());
+            assert_eq!(unsettled.delay(), Duration::from_millis(100));
+            let audit = scheduler.next(&actor).unwrap();
+            assert_eq!(
+                audit.snapshot().map(PoolBackendWinnerSnapshot::share_id),
+                expected_matured
+            );
+            assert!(audit.completes_pass());
+            assert_eq!(audit.delay(), Duration::from_secs(1));
+        }
+    }
+
     fn identity() -> WorkerIdentity {
         WorkerIdentity {
             account_id: uuid(10),
@@ -2115,6 +2570,54 @@ mod tests {
             .expect("snapshot succeeds")
             .pop()
             .expect("snapshot response exists")
+    }
+
+    #[test]
+    fn hello_reconnects_publish_the_exact_asymmetric_target_authority() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("target-authority.journal");
+        let config = config();
+        let clock = Arc::new(TestClock::new());
+        let target_le_bytes = std::array::from_fn(|index| index as u8 + 1);
+        let target_policy = PoolShareTargetPolicy::new(TargetLe::new(target_le_bytes))
+            .expect("asymmetric test target is nonzero");
+        let expected_target = TargetBe::from(target_policy.operator_easiest());
+        let actor =
+            PoolBackendActor::new_with_clock(create_journal(&path, &config), target_policy, clock)
+                .expect("construct actor");
+
+        assert_eq!(
+            actor.persistent_authority().share_target_ceiling_be(),
+            &expected_target
+        );
+        assert_ne!(
+            expected_target.as_bytes(),
+            &target_le_bytes,
+            "the fixture must detect a missing byte-order conversion"
+        );
+
+        for (request_id, backend_session) in [(1, uuid(20)), (2, uuid(22))] {
+            let hello = actor
+                .dispatch(
+                    backend_session,
+                    None,
+                    BackendRequestKind::Hello,
+                    BackendRequest::Hello {
+                        version: BACKEND_PROTOCOL_VERSION,
+                        id: request_id,
+                        pool_instance: uuid(21),
+                        last_event_seq: 0,
+                    },
+                )
+                .expect("hello succeeds");
+            assert!(matches!(
+                hello.as_slice(),
+                [BackendMessage::HelloOk {
+                    share_target_ceiling_be,
+                    ..
+                }] if share_target_ceiling_be == &expected_target
+            ));
+        }
     }
 
     #[test]
@@ -2294,6 +2797,32 @@ mod tests {
     }
 
     #[test]
+    fn activation_rejects_a_job_for_another_payout_authority_without_journal_mutation() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let actor = actor(&path, &config, Arc::new(TestClock::new()));
+        let retained = Arc::new(TestRetainedJob::new(job(1)).with_payout_commitments(
+            Hex32::new([0x99; 32]),
+            config.zcash_payout_commitment.clone(),
+        ));
+
+        assert!(matches!(
+            actor.activate_job(retained, Duration::from_secs(5)),
+            Err(PoolBackendActorError::PayoutAuthorityMismatch)
+        ));
+        assert_eq!(
+            actor
+                .lock_state()
+                .expect("actor mutex")
+                .journal
+                .current_event_seq()
+                .expect("journal watermark"),
+            0
+        );
+    }
+
+    #[test]
     fn exhausted_native_lifetime_cannot_mutate_the_journal() {
         for remaining in [None, Some(Duration::from_micros(999))] {
             let directory = private_temp_dir();
@@ -2381,6 +2910,37 @@ mod tests {
                     BackendRequest::Health {
                         version: BACKEND_PROTOCOL_VERSION,
                         id: 3,
+                    },
+                )
+                .expect("health response succeeds")
+                .as_slice(),
+            [BackendMessage::HealthStatus { healthy: false, .. }]
+        ));
+    }
+
+    #[test]
+    fn winner_reconciliation_outage_is_visible_in_backend_health() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let actor = actor(&path, &config, Arc::new(TestClock::new()));
+        actor
+            .activate_job(
+                Arc::new(TestRetainedJob::new(job(1))),
+                Duration::from_secs(5),
+            )
+            .expect("activate healthy job");
+        actor.set_winner_reconciliation_health(false);
+
+        assert!(matches!(
+            actor
+                .dispatch(
+                    uuid(20),
+                    None,
+                    BackendRequestKind::Health,
+                    BackendRequest::Health {
+                        version: BACKEND_PROTOCOL_VERSION,
+                        id: 2,
                     },
                 )
                 .expect("health response succeeds")
@@ -2747,6 +3307,238 @@ mod tests {
     }
 
     #[test]
+    fn lost_share_response_recovers_one_durable_receipt_on_explicit_new_connection() {
+        use crate::pool_backend_listener::{
+            PoolBackendConnectionOutcome, PoolBackendListener, PoolBackendListenerConfig,
+        };
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixStream,
+            sync::mpsc,
+        };
+        use wcash_pool_protocol::{
+            decode_backend_message, encode_backend_request, MAX_BACKEND_PAYLOAD_BYTES,
+        };
+
+        struct CommitBeforeResponse {
+            actor: Arc<PoolBackendActor>,
+            committed: mpsc::SyncSender<ShareReceipt>,
+            release_response: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl PoolBackendRequestHandler for CommitBeforeResponse {
+            fn persistent_authority(&self) -> PoolBackendAuthority {
+                self.actor.persistent_authority()
+            }
+
+            fn handle(
+                &self,
+                context: PoolBackendRequestContext<'_>,
+                kind: BackendRequestKind,
+                request: BackendRequest,
+            ) -> Result<Vec<BackendMessage>, PoolBackendHandlerError> {
+                // Delegate the complete operation to the real actor and durable
+                // journal, then hold its response until the client disconnects.
+                let messages = self.actor.handle(context, kind, request)?;
+                if kind == BackendRequestKind::SubmitShare {
+                    let Some(BackendMessage::ShareCommitted {
+                        receipt,
+                        replayed: false,
+                        ..
+                    }) = messages.last()
+                    else {
+                        panic!("original request must commit a fresh receipt");
+                    };
+                    self.committed.send(receipt.clone()).unwrap();
+                    self.release_response
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("client closes after commit and before response");
+                }
+                Ok(messages)
+            }
+        }
+
+        fn exchange(stream: &mut UnixStream, request: BackendRequest) -> BackendMessage {
+            stream
+                .write_all(&encode_backend_request(&request).unwrap())
+                .unwrap();
+            let mut prefix = [0; 4];
+            stream.read_exact(&mut prefix).unwrap();
+            let length = u32::from_be_bytes(prefix) as usize;
+            assert!(length <= MAX_BACKEND_PAYLOAD_BYTES);
+            let mut frame = Vec::from(prefix);
+            frame.resize(4 + length, 0);
+            stream.read_exact(&mut frame[4..]).unwrap();
+            decode_backend_message(&frame).unwrap()
+        }
+
+        fn connect(path: &Path) -> UnixStream {
+            let stream = UnixStream::connect(path).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+        }
+
+        fn hello() -> BackendRequest {
+            BackendRequest::Hello {
+                version: BACKEND_PROTOCOL_VERSION,
+                id: 1,
+                pool_instance: uuid(20),
+                last_event_seq: 0,
+            }
+        }
+
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let socket = directory.path().join("backend.sock");
+        let config = config();
+        let actor = Arc::new(actor(&path, &config, Arc::new(TestClock::new())));
+        let descriptor = job(1);
+        let retained = Arc::new(TestRetainedJob::new(descriptor.clone()));
+        actor
+            .activate_job(retained.clone(), Duration::from_secs(5))
+            .unwrap();
+        let listener = Arc::new(
+            PoolBackendListener::bind(
+                PoolBackendListenerConfig::new(
+                    socket.clone(),
+                    nix::unistd::geteuid().as_raw(),
+                    nix::unistd::getegid().as_raw(),
+                )
+                .unwrap()
+                .with_maximum_connections(1)
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let (committed_tx, committed_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let server = {
+            let listener = Arc::clone(&listener);
+            let actor = Arc::clone(&actor);
+            thread::spawn(move || {
+                listener.serve_one(&CommitBeforeResponse {
+                    actor,
+                    committed: committed_tx,
+                    release_response: Mutex::new(release_rx),
+                })
+            })
+        };
+        let mut client = connect(&socket);
+        let BackendMessage::HelloOk {
+            backend_session: first_session,
+            backend_instance: first_instance,
+            journal_stream: first_stream,
+            current_event_seq: 1,
+            ..
+        } = exchange(&mut client, hello())
+        else {
+            panic!("first Hello binds the activated journal");
+        };
+        assert!(matches!(
+            exchange(
+                &mut client,
+                BackendRequest::SubscribeJobs {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id: 2,
+                    after_event_seq: 0,
+                }
+            ),
+            BackendMessage::JobSnapshot { event_seq: 1, .. }
+        ));
+        client
+            .write_all(&encode_backend_request(&submit_request(3, &descriptor)).unwrap())
+            .unwrap();
+        let receipt = committed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(client);
+        release_tx.send(()).unwrap();
+        let outcome = server.join().unwrap();
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        assert_eq!(
+            outcome.unwrap(),
+            PoolBackendConnectionOutcome::Closed {
+                reason: "response peer disconnected",
+            }
+        );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert!(matches!(
+            outcome,
+            Err(crate::pool_backend_listener::PoolBackendListenerError::Transport(
+                crate::pool_backend_transport::BackendTransportError::Io(error)
+            )) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert!(listener.is_accepting());
+
+        // A fresh connection must fit the one-connection cap. Recovery reads
+        // authoritative events only: it never resends SubmitShare.
+        // Darwin rejects timeout setsockopt on the disconnected socket with
+        // EINVAL, which deliberately remains terminal. Its explicit next serve
+        // proves journal recovery, not supervisor continuity. Linux reaches
+        // EPIPE on write and must keep the listener worker alive instead.
+        let server = {
+            let listener = Arc::clone(&listener);
+            let actor = Arc::clone(&actor);
+            thread::spawn(move || listener.serve_one(actor.as_ref()))
+        };
+        let mut client = connect(&socket);
+        let BackendMessage::HelloOk {
+            backend_session,
+            backend_instance,
+            journal_stream,
+            current_event_seq: 2,
+            ..
+        } = exchange(&mut client, hello())
+        else {
+            panic!("new Hello exposes the committed journal watermark");
+        };
+        assert_ne!(backend_session, first_session);
+        assert_eq!(backend_instance, first_instance);
+        assert_eq!(journal_stream, first_stream);
+        let BackendMessage::EventsPage {
+            after_event_seq: 0,
+            next_event_seq: 2,
+            complete: true,
+            events,
+            ..
+        } = exchange(
+            &mut client,
+            BackendRequest::ReadEvents {
+                version: BACKEND_PROTOCOL_VERSION,
+                id: 2,
+                after_event_seq: 0,
+                limit: 10,
+            },
+        )
+        else {
+            panic!("explicit replay reaches the exact durable watermark");
+        };
+        assert!(
+            matches!(events.as_slice(), [BackendEvent::JobActivated { event_seq: 1, .. },
+            BackendEvent::ShareCommitted { receipt: replayed, .. }] if replayed == &receipt)
+        );
+        drop(client);
+        assert_eq!(
+            server.join().unwrap().unwrap(),
+            PoolBackendConnectionOutcome::Served
+        );
+        assert_eq!(retained.validations.load(Ordering::Acquire), 1);
+        assert_eq!(actor.lock_state().unwrap().shares.len(), 1);
+        drop(actor);
+
+        // Reopen the actual journal, independently of the actor's in-memory
+        // projection. The uncertain response never duplicated the commit.
+        let recovered = open_journal(&path, &config);
+        assert_eq!(recovered.current_event_seq().unwrap(), 2);
+        assert_eq!(recovered.read_events(0, 10).unwrap().events, events);
+    }
+
+    #[test]
     fn concurrent_identical_share_is_validated_and_committed_once() {
         let directory = private_temp_dir();
         let path: PathBuf = directory.path().join("actor.journal");
@@ -2812,7 +3604,7 @@ mod tests {
     }
 
     #[test]
-    fn wcash_winner_cas_covers_quarantine_requeue_maturity_and_restart() {
+    fn wcash_winner_cas_covers_quarantine_requeue_dematurity_and_restart() {
         let directory = private_temp_dir();
         let path = directory.path().join("actor.journal");
         let config = config();
@@ -2937,13 +3729,78 @@ mod tests {
                 confirmations: 2,
             } if tip == &replacement_tip
         ));
+
+        assert!(matches!(
+            recovered.compare_and_apply_winner_transition(
+                &matured,
+                PoolBackendWinnerTransition::Observed {
+                    tip: replacement_tip.clone(),
+                    confirmations: 2,
+                },
+            ),
+            Err(PoolBackendActorError::Journal(
+                PoolBackendJournalError::SemanticViolation { .. }
+            ))
+        ));
+
+        let demature_tip = ChainTip {
+            block_hash_le: winner.block_hash_le.clone(),
+            height: winner.height,
+        };
+        let dematured_event = recovered
+            .compare_and_apply_winner_transition(
+                &matured,
+                PoolBackendWinnerTransition::Observed {
+                    tip: demature_tip.clone(),
+                    confirmations: 1,
+                },
+            )
+            .expect("a canonical depth regression below the threshold dematures the reward");
+        assert!(matches!(
+            dematured_event,
+            BackendEvent::WinnerObserved {
+                event_seq: 9,
+                confirmations: 1,
+                ..
+            }
+        ));
+        drop(recovered);
+
+        let recovered =
+            actor_from_journal(open_journal(&path, &config), Arc::new(TestClock::new()));
+        let dematured = recovered
+            .winner_snapshot(&key)
+            .expect("read dematured winner after restart")
+            .expect("dematured winner remains retained");
+        assert_eq!(dematured.revision_event_seq(), 9);
+        assert!(matches!(
+            dematured.lifecycle(),
+            JournalWinnerLifecycle::Observed {
+                tip,
+                confirmations: 1,
+            } if tip == &demature_tip
+        ));
+        recovered
+            .compare_and_apply_winner_transition(
+                &dematured,
+                PoolBackendWinnerTransition::Matured {
+                    tip: replacement_tip,
+                    confirmations: 2,
+                },
+            )
+            .expect("a dematured winner can regain maturity");
+        let rematured = recovered
+            .winner_snapshot(&key)
+            .expect("refresh rematured winner")
+            .expect("rematured winner remains retained");
+        assert_eq!(rematured.revision_event_seq(), 10);
         let orphan_tip = ChainTip {
             block_hash_le: Hex32::new([0xa2; 32]),
             height: winner.height + 2,
         };
         recovered
             .compare_and_apply_winner_transition(
-                &matured,
+                &rematured,
                 PoolBackendWinnerTransition::Orphaned {
                     tip: orphan_tip.clone(),
                 },
@@ -2953,10 +3810,146 @@ mod tests {
             .winner_snapshot(&key)
             .expect("refresh orphaned winner")
             .expect("orphaned winner remains retained");
-        assert_eq!(orphaned.revision_event_seq(), 9);
+        assert_eq!(orphaned.revision_event_seq(), 11);
         assert!(matches!(
             orphaned.lifecycle(),
             JournalWinnerLifecycle::Orphaned { tip } if tip == &orphan_tip
+        ));
+    }
+
+    #[test]
+    fn observed_winner_depth_regression_is_durable_across_restart() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let (journal, winner, _) = zcash_winner_journal(&path, &config);
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+        let pending = actor
+            .next_winner_snapshot(None)
+            .expect("enumerate winner")
+            .expect("Zcash winner is retained");
+        let deeper_tip = ChainTip {
+            block_hash_le: Hex32::new([0xb0; 32]),
+            height: winner.height + 1,
+        };
+        actor
+            .compare_and_apply_winner_transition(
+                &pending,
+                PoolBackendWinnerTransition::Observed {
+                    tip: deeper_tip,
+                    confirmations: 2,
+                },
+            )
+            .expect("first canonical observation commits");
+        let observed = actor
+            .winner_snapshot(&pending.key())
+            .expect("refresh observed winner")
+            .expect("winner remains retained");
+        let regression_event_seq = observed
+            .revision_event_seq()
+            .checked_add(1)
+            .expect("test event sequence does not overflow");
+        let regressed_tip = ChainTip {
+            block_hash_le: winner.block_hash_le.clone(),
+            height: winner.height,
+        };
+        let event = actor
+            .compare_and_apply_winner_transition(
+                &observed,
+                PoolBackendWinnerTransition::Observed {
+                    tip: regressed_tip.clone(),
+                    confirmations: 1,
+                },
+            )
+            .expect("a reorganization above the winner can reduce its depth");
+        assert!(matches!(
+            event,
+            BackendEvent::WinnerObserved {
+                event_seq,
+                confirmations: 1,
+                ..
+            } if event_seq == regression_event_seq
+        ));
+        drop(actor);
+
+        let recovered =
+            actor_from_journal(open_journal(&path, &config), Arc::new(TestClock::new()));
+        let regressed = recovered
+            .winner_snapshot(&pending.key())
+            .expect("read regressed winner after restart")
+            .expect("regressed winner remains retained");
+        assert_eq!(regressed.revision_event_seq(), regression_event_seq);
+        assert!(matches!(
+            regressed.lifecycle(),
+            JournalWinnerLifecycle::Observed {
+                tip,
+                confirmations: 1,
+            } if tip == &regressed_tip
+        ));
+    }
+
+    #[test]
+    fn conflicting_wcash_witness_revokes_a_matured_lifecycle() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let (journal, winner, _) = wcash_winner_journal(&path, &config);
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+        let pending = actor
+            .next_winner_snapshot(None)
+            .expect("enumerate winner")
+            .expect("Wcash winner is retained");
+        actor
+            .compare_and_apply_winner_transition(
+                &pending,
+                PoolBackendWinnerTransition::Observed {
+                    tip: ChainTip {
+                        block_hash_le: winner.block_hash_le.clone(),
+                        height: winner.height,
+                    },
+                    confirmations: 1,
+                },
+            )
+            .expect("observe exact Wcash winner");
+        let observed = actor
+            .winner_snapshot(&pending.key())
+            .expect("refresh winner")
+            .expect("winner remains retained");
+        actor
+            .compare_and_apply_winner_transition(
+                &observed,
+                PoolBackendWinnerTransition::Matured {
+                    tip: ChainTip {
+                        block_hash_le: Hex32::new([0xd1; 32]),
+                        height: winner.height + 1,
+                    },
+                    confirmations: 2,
+                },
+            )
+            .expect("mature exact Wcash winner");
+        let matured = actor
+            .winner_snapshot(&pending.key())
+            .expect("refresh matured winner")
+            .expect("matured winner remains retained");
+        let conflict_tip = ChainTip {
+            block_hash_le: Hex32::new([0xd2; 32]),
+            height: winner.height + 2,
+        };
+        actor
+            .compare_and_apply_winner_transition(
+                &matured,
+                PoolBackendWinnerTransition::Quarantined {
+                    tip: conflict_tip.clone(),
+                },
+            )
+            .expect("a different AuxPoW witness revokes matured status");
+        assert!(matches!(
+            actor
+                .winner_snapshot(&pending.key())
+                .expect("refresh quarantined winner")
+                .expect("quarantined winner remains retained")
+                .lifecycle(),
+            JournalWinnerLifecycle::Quarantined { tip } if tip == &conflict_tip
         ));
     }
 

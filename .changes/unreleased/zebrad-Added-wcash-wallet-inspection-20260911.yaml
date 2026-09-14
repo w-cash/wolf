@@ -1,0 +1,4 @@
+project: zebrad
+kind: Added
+body: "Add a seedless, offline Wcash wallet inspection API that opens existing databases read-only under the shared operation lock, verifies the exact chain identity, requires one account, and returns only public account metadata and receiving addresses. Missing, empty, foreign-network, malformed, and incompatible databases now have explicit fail-closed inspection outcomes."
+time: 2026-09-11T21:00:00.000000000Z

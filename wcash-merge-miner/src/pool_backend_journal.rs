@@ -1,4 +1,4 @@
-//! Durable, append-only journal for backend protocol-v1 events.
+//! Durable, append-only journal for versioned backend protocol events.
 //!
 //! The first line is a versioned header that binds this file to one backend
 //! installation, one journal sequence namespace, and one exact pair of chains.
@@ -47,6 +47,14 @@ pub const MAX_JOURNAL_RECORD_BYTES: usize = 10 * 1024 * 1024;
 
 /// Maximum decoded size of one exact Wcash or Zcash winner block.
 pub const MAX_WINNER_BLOCK_BYTES: usize = 2_000_000;
+
+/// Maximum number of dual-chain winner records retained by one journal.
+///
+/// This explicit Testnet operational bound prevents winner indexes and the
+/// reconciliation working set from growing with chain history forever. At the
+/// theoretical maximum of two winners every 75-second Wcash block, it provides
+/// more than 43 days for a planned, externally checkpointed journal rollover.
+pub const MAX_RETAINED_WINNERS: usize = 100_000;
 
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const HEADER_DIGEST_DOMAIN: &[u8] = b"wcash-pool/backend-journal-header/v2\0";
@@ -287,6 +295,15 @@ pub enum PoolBackendJournalError {
         maximum: usize,
     },
 
+    /// The exact winner outbox reached its explicit operational bound.
+    #[error(
+        "pool backend journal reached the {maximum}-winner safety limit; complete a planned journal rollover before admitting more winning shares"
+    )]
+    WinnerCapacity {
+        /// Maximum number of retained Wcash and Zcash winners combined.
+        maximum: usize,
+    },
+
     /// A record or length computation overflowed.
     #[error("pool backend journal length or sequence overflowed")]
     Overflow,
@@ -429,7 +446,7 @@ pub enum PoolBackendJournalError {
     InvalidPageLimit {
         /// Page limit supplied by the caller.
         actual: u16,
-        /// Maximum page-item limit allowed by protocol v1.
+        /// Maximum page-item limit allowed by the active protocol.
         maximum: u16,
     },
 
@@ -551,6 +568,12 @@ pub struct JournalShareCommit {
 pub enum JournalWinnerLifecycle {
     /// Exact bytes are retained for initial submission or reconciliation.
     Pending,
+    /// Every pinned parent proved this exact Zcash block committed off the best
+    /// chain. Status-only monitoring survives side-chain pruning and restart.
+    SideChain {
+        /// Stable best-chain tip sampled with the committed side-chain proof.
+        tip: ChainTip,
+    },
     /// The exact winner is on the sampled best chain.
     Observed {
         /// Tip used for the observation.
@@ -575,7 +598,8 @@ pub enum JournalWinnerLifecycle {
         tip: ChainTip,
     },
     /// The reward reached its advertised maturity. It remains retained because
-    /// maturity is reversible under a deep reorganization.
+    /// a reorganization can orphan it or reduce its canonical depth below the
+    /// maturity threshold.
     Matured {
         /// Tip used for the maturity decision.
         tip: ChainTip,
@@ -590,6 +614,11 @@ pub enum JournalWinnerLifecycle {
 /// snapshots can authorize a compare-and-swap transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum JournalWinnerTransition {
+    /// Every pinned parent retained this exact Zcash proof off the best chain.
+    SideChain {
+        /// Stable best-chain tip sampled with the noncanonical proof.
+        tip: ChainTip,
+    },
     /// The exact retained block is on the sampled best chain.
     Observed {
         /// Exact best-chain tip used for the observation.
@@ -627,6 +656,13 @@ impl JournalWinnerTransition {
         let job_id = state.job_id.clone();
         let winner = state.winner.clone();
         match self {
+            Self::SideChain { tip } => BackendEvent::WinnerSideChain {
+                event_seq,
+                share_id,
+                job_id,
+                winner,
+                tip,
+            },
             Self::Observed { tip, confirmations } => BackendEvent::WinnerObserved {
                 event_seq,
                 share_id,
@@ -778,11 +814,11 @@ pub struct JournalEventPage {
     pub next_event_seq: u64,
     /// True when this page reaches the current durable journal end.
     pub complete: bool,
-    /// Strictly contiguous protocol-v1 events.
+    /// Strictly contiguous versioned protocol events.
     pub events: Vec<BackendEvent>,
 }
 
-/// Locked, durable protocol-v1 backend journal.
+/// Locked, durable versioned backend journal.
 pub struct PoolBackendJournal {
     path: PathBuf,
     header: JournalHeader,
@@ -1169,7 +1205,8 @@ impl PoolBackendJournal {
         }
         if matches!(
             event,
-            BackendEvent::WinnerObserved { .. }
+            BackendEvent::WinnerSideChain { .. }
+                | BackendEvent::WinnerObserved { .. }
                 | BackendEvent::WinnerOrphaned { .. }
                 | BackendEvent::WinnerQuarantined { .. }
                 | BackendEvent::WinnerRequeued { .. }
@@ -1268,23 +1305,83 @@ impl PoolBackendJournal {
         &self,
         after_ordinal: Option<usize>,
     ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
+        self.next_winner_state_by_maturity(after_ordinal, None)
+    }
+
+    /// Returns the next winner that has not reached reversible maturity.
+    pub(crate) fn next_unsettled_winner_state(
+        &self,
+        after_ordinal: Option<usize>,
+    ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
+        self.next_winner_state_by_maturity(after_ordinal, Some(false))
+    }
+
+    /// Inspects a bounded slice of newly retained winners for a first attempt.
+    ///
+    /// Advance over every inspected entry, including non-pending entries and
+    /// the returned winner, before external RPC. A failed first attempt is
+    /// retried by the normal reconciliation scan, not by this tail cursor.
+    pub(crate) fn next_first_attempt_winner_state(
+        &self,
+        next_ordinal: &mut usize,
+    ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
+        const MAX_INSPECTED_WINNERS: usize = 256;
         let state = self.lock_state()?;
         ensure_usable(&state)?;
-        let index = match after_ordinal {
+        let event_seq = next_event_seq(&state)?;
+        for (index, key) in state
+            .semantic
+            .winner_order
+            .iter()
+            .enumerate()
+            .skip(*next_ordinal)
+            .take(MAX_INSPECTED_WINNERS)
+        {
+            let winner = state.semantic.winners.get(key).ok_or_else(|| {
+                semantic(event_seq, "winner index references absent private state")
+            })?;
+            *next_ordinal = index
+                .checked_add(1)
+                .ok_or(PoolBackendJournalError::Overflow)?;
+            if matches!(winner.lifecycle, JournalWinnerLifecycle::Pending) {
+                return Ok(Some((index, winner.clone())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns the next reversibly matured winner for low-rate reorg audits.
+    pub(crate) fn next_matured_winner_state(
+        &self,
+        after_ordinal: Option<usize>,
+    ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
+        self.next_winner_state_by_maturity(after_ordinal, Some(true))
+    }
+
+    fn next_winner_state_by_maturity(
+        &self,
+        after_ordinal: Option<usize>,
+        matured: Option<bool>,
+    ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
+        let state = self.lock_state()?;
+        ensure_usable(&state)?;
+        let start = match after_ordinal {
             Some(ordinal) => ordinal
                 .checked_add(1)
                 .ok_or(PoolBackendJournalError::Overflow)?,
             None => 0,
         };
-        let Some(key) = state.semantic.winner_order.get(index) else {
-            return Ok(None);
-        };
-        let event_seq = next_event_seq(&state)?;
-        let winner =
-            state.semantic.winners.get(key).ok_or_else(|| {
+        for (index, key) in state.semantic.winner_order.iter().enumerate().skip(start) {
+            let event_seq = next_event_seq(&state)?;
+            let winner = state.semantic.winners.get(key).ok_or_else(|| {
                 semantic(event_seq, "winner index references absent private state")
             })?;
-        Ok(Some((index, winner.clone())))
+            let is_matured = matches!(winner.lifecycle, JournalWinnerLifecycle::Matured { .. });
+            if matured.is_none_or(|required| required == is_matured) {
+                return Ok(Some((index, winner.clone())));
+            }
+        }
+        Ok(None)
     }
 
     /// Returns one exact retained winner without materializing the outbox.
@@ -1566,6 +1663,19 @@ fn event_with_sequence(event: BackendEvent, event_seq: u64) -> BackendEvent {
         BackendEvent::ShareCommitted { .. } => {
             unreachable!("share events are rejected before sequence allocation")
         }
+        BackendEvent::WinnerSideChain {
+            share_id,
+            job_id,
+            winner,
+            tip,
+            ..
+        } => BackendEvent::WinnerSideChain {
+            event_seq,
+            share_id,
+            job_id,
+            winner,
+            tip,
+        },
         BackendEvent::WinnerObserved {
             share_id,
             job_id,
@@ -1646,6 +1756,7 @@ impl JournalSemanticState {
                 .try_reserve(1)
                 .map_err(PoolBackendJournalError::Allocation),
             BackendEvent::ShareCommitted { receipt, .. } => {
+                checked_winner_capacity(self.winner_order.len(), receipt.winners.len())?;
                 self.shares
                     .try_reserve(1)
                     .map_err(PoolBackendJournalError::Allocation)?;
@@ -1720,6 +1831,7 @@ impl JournalSemanticState {
                 identity,
                 target_le,
             } => {
+                checked_winner_capacity(self.winner_order.len(), receipt.winners.len())?;
                 let job = self
                     .jobs
                     .get(job_id)
@@ -1793,6 +1905,26 @@ impl JournalSemanticState {
                     );
                 }
             }
+            BackendEvent::WinnerSideChain {
+                share_id,
+                job_id,
+                winner,
+                tip,
+                ..
+            } => {
+                require_no_private_blocks(&record.winner_blocks, event_seq)?;
+                let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
+                if winner.chain != MergedChain::Zcash
+                    || !matches!(state.lifecycle, JournalWinnerLifecycle::Pending)
+                {
+                    return Err(semantic(
+                        event_seq,
+                        "only a pending Zcash proof can enter side-chain monitoring",
+                    ));
+                }
+                state.lifecycle = JournalWinnerLifecycle::SideChain { tip: tip.clone() };
+                state.revision_event_seq = event_seq;
+            }
             BackendEvent::WinnerObserved {
                 share_id,
                 job_id,
@@ -1803,23 +1935,13 @@ impl JournalSemanticState {
             } => {
                 require_no_private_blocks(&record.winner_blocks, event_seq)?;
                 let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
-                if matches!(state.lifecycle, JournalWinnerLifecycle::Matured { .. }) {
+                if matches!(state.lifecycle, JournalWinnerLifecycle::Matured { .. })
+                    && *confirmations >= winner.maturity_confirmations
+                {
                     return Err(semantic(
                         event_seq,
-                        "matured winner cannot be observed again",
+                        "matured winner can return to observed only below its maturity threshold",
                     ));
-                }
-                if let JournalWinnerLifecycle::Observed {
-                    confirmations: previous,
-                    ..
-                } = state.lifecycle
-                {
-                    if *confirmations < previous {
-                        return Err(semantic(
-                            event_seq,
-                            "winner confirmations decreased without an orphan event",
-                        ));
-                    }
                 }
                 state.lifecycle = JournalWinnerLifecycle::Observed {
                     tip: tip.clone(),
@@ -1858,11 +1980,7 @@ impl JournalSemanticState {
             } => {
                 require_no_private_blocks(&record.winner_blocks, event_seq)?;
                 let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
-                if matches!(
-                    state.lifecycle,
-                    JournalWinnerLifecycle::Quarantined { .. }
-                        | JournalWinnerLifecycle::Matured { .. }
-                ) {
+                if matches!(state.lifecycle, JournalWinnerLifecycle::Quarantined { .. }) {
                     return Err(semantic(
                         event_seq,
                         "winner cannot enter quarantine from its current state",
@@ -2511,6 +2629,21 @@ fn checked_append_limits(
         });
     }
     Ok(new_length)
+}
+
+fn checked_winner_capacity(
+    current_winners: usize,
+    additional_winners: usize,
+) -> Result<usize, PoolBackendJournalError> {
+    let total = current_winners
+        .checked_add(additional_winners)
+        .ok_or(PoolBackendJournalError::Overflow)?;
+    if total > MAX_RETAINED_WINNERS {
+        return Err(PoolBackendJournalError::WinnerCapacity {
+            maximum: MAX_RETAINED_WINNERS,
+        });
+    }
+    Ok(total)
 }
 
 fn ensure_usable(state: &JournalState) -> Result<(), PoolBackendJournalError> {
@@ -3422,6 +3555,13 @@ mod tests {
             height: 1,
         };
         let direct_lifecycle_events = [
+            BackendEvent::WinnerSideChain {
+                event_seq: 0,
+                share_id: commit.receipt.share_id.clone(),
+                job_id: descriptor.job_id.clone(),
+                winner: winner.clone(),
+                tip: replacement_tip.clone(),
+            },
             BackendEvent::WinnerObserved {
                 event_seq: 0,
                 share_id: commit.receipt.share_id.clone(),
@@ -3480,11 +3620,48 @@ mod tests {
                 .revision_event_seq,
             committed_revision
         );
-        let observed = journal
+        // Reopen an existing v2 journal containing only pre-extension records.
+        // Its header and exact winner bytes need no rewrite or migration.
+        drop(journal);
+        let journal = open(&path, &config);
+        let side_chain = journal
             .compare_and_transition_winner(
                 &commit.receipt.share_id,
                 MergedChain::Zcash,
                 committed_revision,
+                JournalWinnerTransition::SideChain {
+                    tip: replacement_tip.clone(),
+                },
+            )
+            .expect("retain proven noncanonical winner through revision CAS");
+        assert!(matches!(side_chain, BackendEvent::WinnerSideChain { .. }));
+        drop(journal);
+        let journal = open(&path, &config);
+        let (_, retained) = journal.next_winner_state(None).unwrap().unwrap();
+        assert_eq!(retained.block_bytes, block_bytes);
+        assert!(matches!(
+            retained.lifecycle,
+            JournalWinnerLifecycle::SideChain { .. }
+        ));
+        assert_eq!(retained.revision_event_seq, side_chain.event_seq());
+        assert!(journal.next_unsettled_winner_state(None).unwrap().is_some());
+        assert!(journal.next_matured_winner_state(None).unwrap().is_none());
+        assert!(matches!(
+            journal.compare_and_transition_winner(
+                &commit.receipt.share_id,
+                MergedChain::Zcash,
+                side_chain.event_seq(),
+                JournalWinnerTransition::Orphaned {
+                    tip: replacement_tip.clone()
+                },
+            ),
+            Err(PoolBackendJournalError::SemanticViolation { .. }),
+        ));
+        let observed = journal
+            .compare_and_transition_winner(
+                &commit.receipt.share_id,
+                MergedChain::Zcash,
+                side_chain.event_seq(),
                 JournalWinnerTransition::Observed {
                     tip: tip.clone(),
                     confirmations: 1,
@@ -3511,6 +3688,14 @@ mod tests {
             retained.lifecycle,
             JournalWinnerLifecycle::Matured { .. }
         ));
+        assert!(journal
+            .next_unsettled_winner_state(None)
+            .expect("unsettled tier remains readable")
+            .is_none());
+        assert!(journal
+            .next_matured_winner_state(None)
+            .expect("matured audit tier remains readable")
+            .is_some());
         assert_eq!(
             journal.winner_summary().expect("matured summary"),
             JournalWinnerSummary::default()
@@ -3546,6 +3731,14 @@ mod tests {
             retained.lifecycle,
             JournalWinnerLifecycle::Orphaned { .. }
         ));
+        assert!(reopened
+            .next_unsettled_winner_state(None)
+            .expect("orphaned winner returns to unsettled tier")
+            .is_some());
+        assert!(reopened
+            .next_matured_winner_state(None)
+            .expect("matured tier remains readable after reorg")
+            .is_none());
         assert_eq!(
             reopened.winner_summary().expect("orphaned summary"),
             JournalWinnerSummary {
@@ -3975,6 +4168,21 @@ mod tests {
             checked_append_limits(0, MAX_JOURNAL_BYTES, 1),
             Err(PoolBackendJournalError::JournalTooLarge { .. })
         ));
+        assert_eq!(
+            checked_winner_capacity(MAX_RETAINED_WINNERS - 1, 1)
+                .expect("the exact winner bound is admissible"),
+            MAX_RETAINED_WINNERS
+        );
+        assert!(matches!(
+            checked_winner_capacity(MAX_RETAINED_WINNERS, 1),
+            Err(PoolBackendJournalError::WinnerCapacity {
+                maximum: MAX_RETAINED_WINNERS
+            })
+        ));
+        assert!(matches!(
+            checked_winner_capacity(usize::MAX, 1),
+            Err(PoolBackendJournalError::Overflow)
+        ));
         assert!(matches!(
             check_record_size(MAX_JOURNAL_RECORD_BYTES + 1, 2),
             Err(PoolBackendJournalError::RecordTooLarge { .. })
@@ -3982,5 +4190,49 @@ mod tests {
         journal
             .append_event(event(1, 1))
             .expect("preflight cap errors do not poison the journal");
+    }
+
+    #[test]
+    fn winner_capacity_fails_during_preappend_reservation() {
+        let key = WinnerKey {
+            share_id: Hex32::new([0x71; 32]),
+            chain: MergedChain::Wcash,
+        };
+        let mut semantic = JournalSemanticState::default();
+        semantic
+            .winner_order
+            .try_reserve_exact(MAX_RETAINED_WINNERS)
+            .expect("bounded winner fixture allocation succeeds");
+        semantic.winner_order.resize(MAX_RETAINED_WINNERS, key);
+        let descriptor = job(7);
+        let event = BackendEvent::ShareCommitted {
+            receipt: ShareReceipt {
+                event_seq: 2,
+                job_id: descriptor.job_id.clone(),
+                share_id: Hex32::new([0x72; 32]),
+                attribution_id: Hex32::new([0x73; 32]),
+                parent_hash_le: Hex32::new([0x74; 32]),
+                winners: vec![WinnerDescriptor {
+                    chain: MergedChain::Wcash,
+                    block_hash_le: Hex32::new([0x75; 32]),
+                    height: descriptor.wcash_height,
+                    coinbase_txid_le: descriptor.wcash_coinbase_txid_le.clone(),
+                    reward_zat: descriptor.wcash_reward_zat,
+                    maturity_confirmations: descriptor.wcash_maturity_confirmations,
+                }],
+            },
+            job_id: descriptor.job_id,
+            identity: identity(7),
+            target_le: TargetLe::new([0xff; 32]),
+        };
+
+        assert!(matches!(
+            semantic.reserve_for(&event),
+            Err(PoolBackendJournalError::WinnerCapacity {
+                maximum: MAX_RETAINED_WINNERS
+            })
+        ));
+        assert!(semantic.shares.is_empty());
+        assert!(semantic.winners.is_empty());
     }
 }

@@ -10,6 +10,12 @@ use crate::WalletNetwork;
 const SEED_PERSONALIZATION: &[u8; 16] = b"WcashSeedV1_____";
 const DERIVATION_LABEL: &[u8] = b"Wcash wallet seed derivation version 1";
 
+/// Persistent identifier for the exact seed KDF implemented by this module.
+///
+/// This value must be incremented whenever the personalization, derivation
+/// label, input framing, network domain, or genesis binding changes.
+pub(crate) const WALLET_SEED_KDF_VERSION: u32 = 1;
+
 /// Errors returned while deriving Wcash wallet keys.
 #[derive(Debug, Error)]
 pub enum WalletKeyError {
@@ -84,6 +90,17 @@ mod tests {
         assert_ne!(first.expose_secret(), regtest.expose_secret());
         assert_ne!(first.expose_secret(), master.expose_secret());
         assert_eq!(first.expose_secret().len(), 64);
+    }
+
+    #[test]
+    fn testnet_v5_seed_domain_has_a_stable_vector() {
+        let master = SecretVec::new((0u8..32).collect());
+        let derived = derive_wallet_seed(&master, WalletNetwork::Testnet).unwrap();
+
+        assert_eq!(
+            hex::encode(derived.expose_secret()),
+            "92dc36b870456da70d67656db7730a849c4921e77d80cf525f8f82001d0c43b547cc6b5c96813175927bd0985bd21e5f3f2bc0e3bac790d046e9dc5062e6e158"
+        );
     }
 
     #[test]

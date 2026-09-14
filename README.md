@@ -74,8 +74,13 @@ derives a private Wcash Unified Address and a transparent P2PKH coinbase address
 from the same seed, scans both histories into local SQLite, and can build a
 bounded transaction that shields only mature, fully classified coinbase outputs
 into its own Ironwood receiver. It also signs Wcash-domain V6 Ironwood transfers
-and broadcasts exact signed bytes. It is a controlled, single-writer tool, not a
-pool payout or durable settlement system. Its current full local Regtest gate
+and broadcasts exact signed bytes. For public Testnet it also exposes a
+versioned, batch-idempotent pool signer: the complete ordered request binding
+and exact transaction bytes commit atomically in the wallet SQLite database,
+and uncertain broadcasts are retried only with those bytes. Seed input remains
+isolated in an owner-private credential file. This is a controlled single-writer
+signing boundary, not the pool ledger or reorg-safe settlement engine; see
+[`docs/wcash-wallet-payout.md`](docs/wcash-wallet-payout.md). Its current full local Regtest gate
 has mined three private coinbases, scanned and spent one TWC under the Wcash
 V6 domain, included the exact transaction in the mempool and block template,
 mined it through AuxPoW, and rescanned the recipient and private change. A

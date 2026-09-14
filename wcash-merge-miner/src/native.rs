@@ -104,6 +104,30 @@ struct ParentBlockHeaderStatus {
     height: u32,
 }
 
+/// Exact committed membership supplied by the pinned native Zcash nodes.
+/// An unknown/pending hash is deliberately distinct from a valid side chain.
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+enum ParentBlockStatus {
+    BestChain {
+        hash: String,
+        height: u32,
+        confirmations: u32,
+    },
+    SideChain {
+        hash: String,
+        height: u32,
+    },
+    Unknown {},
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParentCommittedMembership {
+    BestChain,
+    SideChain,
+    Unknown,
+}
+
 /// Standard Zcash parent-network profiles supported by native merged mining.
 ///
 /// Restricting this selection prevents a custom Testnet schedule from being used to calculate a
@@ -272,6 +296,20 @@ pub struct NativeZcashProvider {
     expected_parent_payout_address: ZcashAddress,
 }
 
+/// Exact chain tip sampled from one or more pinned consensus nodes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeChainTip {
+    pub(crate) block_hash_le: [u8; 32],
+    pub(crate) height: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BlockchainInfoTip {
+    blocks: u32,
+    #[serde(rename = "bestblockhash")]
+    best_block_hash: String,
+}
+
 impl NativeZcashProvider {
     /// Connects the configured native parent-node set.
     pub fn new(config: NativeZcashConfig) -> Result<Self, MinerError> {
@@ -401,18 +439,17 @@ impl NativeZcashProvider {
         )?;
 
         // Check the same predecessor on every node before proposal validation.
-        self.assert_current(&prepared)?;
+        self.require_tip(&self.template_node, &prepared)?;
         for (validator, payout_template) in self
             .proposal_validators
             .iter()
             .zip(validator_payout_templates)
         {
-            validate_independent_parent_payout_template(
+            self.require_tip(validator, &prepared)?;
+            self.validate_current_independent_payout_template(
+                validator,
                 &prepared,
                 &payout_template,
-                &self.expected_parent_payout_address,
-                &self.expected_parent_network,
-                validator.label(),
             )?;
             let result = validator.call_value(
                 "getblocktemplate",
@@ -424,10 +461,7 @@ impl NativeZcashProvider {
             match result {
                 Value::Null => {}
                 Value::String(reason) => {
-                    return Err(MinerError::ParentProposalRejected {
-                        endpoint: validator.label().to_string(),
-                        reason,
-                    })
+                    return Err(self.recheck_parent_proposal_rejection(validator, &prepared, reason))
                 }
                 other => {
                     return Err(MinerError::RpcProtocol(format!(
@@ -484,6 +518,70 @@ impl NativeZcashProvider {
         client.prewarm_next_coinbase(index, template_height, long_poll_id);
     }
 
+    fn validate_current_independent_payout_template(
+        &self,
+        validator: &ZebraRpcClient,
+        prepared: &NativePreparedJob,
+        template: &BlockTemplateResponse,
+    ) -> Result<(), MinerError> {
+        // The independent template may have advanced after its preceding tip
+        // check. Establish that race before interpreting a changed predecessor
+        // or height as invalid template content.
+        self.require_atomic_tip(validator, prepared)?;
+        validate_independent_parent_payout_template(
+            prepared,
+            template,
+            &self.expected_parent_payout_address,
+            &self.expected_parent_network,
+            validator.label(),
+        )
+    }
+
+    fn recheck_parent_proposal_rejection(
+        &self,
+        validator: &ZebraRpcClient,
+        prepared: &NativePreparedJob,
+        reason: String,
+    ) -> MinerError {
+        // A proposal can lose its predecessor while the validator checks it.
+        // Only a fresh, strictly decoded snapshot proves that retry is safe.
+        // Failed rechecks and unchanged tips retain the original rejection.
+        if let Err(error @ MinerError::ParentTipMismatch { .. }) =
+            self.require_atomic_tip(validator, prepared)
+        {
+            return error;
+        }
+        MinerError::ParentProposalRejected {
+            endpoint: validator.label().to_string(),
+            reason,
+        }
+    }
+
+    fn require_atomic_tip(
+        &self,
+        node: &ZebraRpcClient,
+        job: &NativePreparedJob,
+    ) -> Result<(), MinerError> {
+        let expected_height = job.parent_height().checked_sub(1).ok_or_else(|| {
+            MinerError::InvalidParentTemplate("parent height must be positive".to_string())
+        })?;
+        let actual = native_chain_tip_on_node(node)?;
+        if actual.height != expected_height
+            || actual.block_hash_le != job.parent_proposal.header.previous_block_hash.0
+        {
+            return Err(MinerError::ParentTipMismatch {
+                expected: format!("{} at height {expected_height}", job.parent_tip_display()),
+                endpoint: node.label().to_string(),
+                actual: format!(
+                    "{} at height {}",
+                    display_hex(actual.block_hash_le),
+                    actual.height
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Submits a parent-target winner byte-for-byte to every configured node.
     ///
     /// Success requires at least one node to both accept the submission and
@@ -505,6 +603,23 @@ impl NativeZcashProvider {
 
     /// Replays exact parent block bytes from the durable winner outbox.
     pub(crate) fn submit_parent_bytes(
+        &self,
+        block_bytes: &[u8],
+        height: u32,
+        expected_hash: &str,
+    ) -> Result<ParentSubmissionReport, MinerError> {
+        let report = self.replay_parent_bytes(block_bytes, height, expected_hash)?;
+        if !report.is_confirmed() {
+            return Err(MinerError::InvalidParentTemplate(
+                "no parent node confirmed the submitted block on its best chain".to_string(),
+            ));
+        }
+        Ok(report)
+    }
+
+    /// Validates and idempotently replays exact retained parent bytes to every
+    /// pinned node, even when none confirms the block during this attempt.
+    pub(crate) fn replay_parent_bytes(
         &self,
         block_bytes: &[u8],
         height: u32,
@@ -560,14 +675,7 @@ impl NativeZcashProvider {
                 })
                 .collect::<Vec<_>>()
         });
-
-        let report = ParentSubmissionReport { outcomes };
-        if !report.is_confirmed() {
-            return Err(MinerError::InvalidParentTemplate(
-                "no parent node confirmed the submitted block on its best chain".to_string(),
-            ));
-        }
-        Ok(report)
+        Ok(ParentSubmissionReport { outcomes })
     }
 
     /// Returns the conservative best-chain confirmation depth reported for an
@@ -578,10 +686,30 @@ impl NativeZcashProvider {
         height: u32,
         expected_hash: &str,
     ) -> Result<Option<u32>, MinerError> {
+        conservative_parent_confirmation_depth(
+            self.parent_confirmation_checks(height, expected_hash),
+        )
+    }
+
+    /// Side-chain evidence and monitoring require responses from every pinned
+    /// node. An absent proof at one node cannot hide another node's RPC error.
+    pub(crate) fn parent_confirmation_depth_strict(
+        &self,
+        height: u32,
+        expected_hash: &str,
+    ) -> Result<Option<u32>, MinerError> {
+        strict_parent_confirmation_depth(self.parent_confirmation_checks(height, expected_hash))
+    }
+
+    fn parent_confirmation_checks(
+        &self,
+        height: u32,
+        expected_hash: &str,
+    ) -> Vec<Result<Option<u32>, MinerError>> {
         let mut nodes = Vec::with_capacity(self.proposal_validators.len() + 1);
         nodes.push(&self.template_node);
         nodes.extend(self.proposal_validators.iter());
-        let checks = thread::scope(|scope| {
+        thread::scope(|scope| {
             nodes
                 .into_iter()
                 .map(|node| {
@@ -599,8 +727,47 @@ impl NativeZcashProvider {
                     })
                 })
                 .collect::<Vec<_>>()
-        });
-        conservative_parent_confirmation_depth(checks)
+        })
+    }
+
+    /// Returns one exact tip only when every pinned parent node reports the
+    /// same atomic blockchain snapshot.
+    pub(crate) fn consistent_chain_tip(&self) -> Result<NativeChainTip, MinerError> {
+        let mut nodes = Vec::with_capacity(self.proposal_validators.len() + 1);
+        nodes.push(&self.template_node);
+        nodes.extend(self.proposal_validators.iter());
+        let tips = thread::scope(|scope| {
+            nodes
+                .into_iter()
+                .map(|node| scope.spawn(move || native_chain_tip_on_node(node)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|worker| {
+                    worker.join().unwrap_or_else(|_| {
+                        Err(MinerError::RpcProtocol(
+                            "parent tip-snapshot worker panicked".to_string(),
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        let Some(expected) = tips.first().copied() else {
+            return Err(MinerError::RpcProtocol(
+                "no pinned parent node reported a chain tip".to_string(),
+            ));
+        };
+        if tips.iter().any(|tip| *tip != expected) {
+            return Err(MinerError::ParentTipMismatch {
+                expected: format!(
+                    "{} at height {}",
+                    display_hex(expected.block_hash_le),
+                    expected.height
+                ),
+                endpoint: "pinned parent node set".to_string(),
+                actual: "nodes reported different atomic chain tips".to_string(),
+            });
+        }
+        Ok(expected)
     }
 
     /// Requires every configured parent node to remain on the exact job tip.
@@ -670,8 +837,32 @@ impl NativeZcashProvider {
                 actual,
             });
         }
+        // Authenticate the status API before advertising its required backend
+        // capability. Genesis is already identity-bound and must always remain
+        // canonical, even when no ordinary block has been mined yet.
+        let status = node.call("getblockstatus", json!([expected_genesis_hash]))?;
+        if validate_parent_block_status(status, 0, expected_genesis_hash)?
+            != ParentCommittedMembership::BestChain
+        {
+            return Err(MinerError::RpcProtocol(format!(
+                "{} did not prove canonical genesis through getblockstatus",
+                node.label()
+            )));
+        }
         Ok(())
     }
+}
+
+pub(crate) fn native_chain_tip_on_node(
+    node: &ZebraRpcClient,
+) -> Result<NativeChainTip, MinerError> {
+    let response: BlockchainInfoTip = node.call("getblockchaininfo", json!([]))?;
+    let hash: block::Hash =
+        parse_template_hex(&response.best_block_hash, "bestblockhash chain tip")?;
+    Ok(NativeChainTip {
+        block_hash_le: hash.0,
+        height: response.blocks,
+    })
 }
 
 /// One frozen native Zcash template that passed local and proposal checks.
@@ -692,9 +883,16 @@ pub struct NativePreparedJob {
 pub enum NativeWcashPayoutVerification {
     /// Every output was matched to the configured transparent recipient.
     ExactTransparentRecipient,
-    /// The encrypted value and privacy shape were checked, but the recipient is trusted to the
-    /// private loopback template node because a payment address cannot decrypt its ciphertext.
-    TrustedPrivateTemplateNode,
+    /// Every Ironwood action was trial-decrypted with the configured read-only
+    /// incoming capability and matched to the configured private recipient.
+    ExactPrivateRecipient,
+}
+
+/// Domain-separated recipient commitments bound to one dual-chain generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativePayoutCommitments {
+    pub(crate) wcash: [u8; 32],
+    pub(crate) zcash: [u8; 32],
 }
 
 /// Exact proposal-validated metadata for one native merged-mining generation.
@@ -723,6 +921,8 @@ pub struct NativeGenerationDescriptor {
     zcash_maturity_confirmations: u32,
     max_age_milliseconds: u32,
     wcash_payout_verification: NativeWcashPayoutVerification,
+    wcash_payout_commitment: [u8; 32],
+    zcash_payout_commitment: [u8; 32],
 }
 
 impl NativeGenerationDescriptor {
@@ -737,6 +937,8 @@ impl NativeGenerationDescriptor {
         wcash_height: u32,
         wcash_reward_zatoshis: u64,
         wcash_payout_verification: NativeWcashPayoutVerification,
+        wcash_payout_commitment: [u8; 32],
+        zcash_payout_commitment: [u8; 32],
     ) -> Self {
         let mut zcash_previous_hash_le = [0; 32];
         zcash_previous_hash_le.copy_from_slice(&parent_job.parent_header_input()[4..36]);
@@ -759,6 +961,8 @@ impl NativeGenerationDescriptor {
             zcash_maturity_confirmations: NATIVE_COINBASE_MATURITY_CONFIRMATIONS,
             max_age_milliseconds: NATIVE_JOB_MAX_AGE_MILLISECONDS,
             wcash_payout_verification,
+            wcash_payout_commitment,
+            zcash_payout_commitment,
         }
     }
 
@@ -848,6 +1052,16 @@ impl NativeGenerationDescriptor {
     /// Returns how strongly the configured Wcash reward recipient was authenticated.
     pub const fn wcash_payout_verification(&self) -> NativeWcashPayoutVerification {
         self.wcash_payout_verification
+    }
+
+    /// Returns the domain-separated configured Wcash reward-recipient commitment.
+    pub const fn wcash_payout_commitment(&self) -> [u8; 32] {
+        self.wcash_payout_commitment
+    }
+
+    /// Returns the domain-separated configured Zcash reward-recipient commitment.
+    pub const fn zcash_payout_commitment(&self) -> [u8; 32] {
+        self.zcash_payout_commitment
     }
 }
 
@@ -1128,6 +1342,7 @@ impl NativePreparedJob {
         wcash_height: u32,
         wcash_reward_zatoshis: u64,
         wcash_payout_verification: NativeWcashPayoutVerification,
+        payout_commitments: NativePayoutCommitments,
     ) -> NativeGenerationDescriptor {
         NativeGenerationDescriptor::from_validated_parts(
             &self.job,
@@ -1139,6 +1354,8 @@ impl NativePreparedJob {
             wcash_height,
             wcash_reward_zatoshis,
             wcash_payout_verification,
+            payout_commitments.wcash,
+            payout_commitments.zcash,
         )
     }
 
@@ -1315,6 +1532,16 @@ impl ParentSubmissionReport {
             .iter()
             .any(|outcome| matches!(outcome, ParentNodeOutcome::Accepted { .. }))
     }
+
+    /// All pinned nodes independently retained this exact valid noncanonical
+    /// block. This is healthy outbox monitoring, never confirmation evidence.
+    pub(crate) fn is_known_side_chain(&self) -> bool {
+        !self.outcomes.is_empty()
+            && self
+                .outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, ParentNodeOutcome::KnownSideChain { .. }))
+    }
 }
 
 /// Per-node outcome for a parent winner broadcast.
@@ -1322,6 +1549,12 @@ impl ParentSubmissionReport {
 pub enum ParentNodeOutcome {
     /// Node accepted and confirmed the exact block at the expected height.
     Accepted {
+        /// Credential-free endpoint label.
+        endpoint: String,
+    },
+    /// The exact hash and height are committed to a noncanonical chain.
+    /// This candidate receives no reward and remains independently monitored.
+    KnownSideChain {
         /// Credential-free endpoint label.
         endpoint: String,
     },
@@ -1337,12 +1570,18 @@ pub enum ParentNodeOutcome {
         /// Node-provided rejection reason.
         reason: String,
     },
-    /// Node could not be reached or returned invalid RPC framing.
+    /// Node could not be reached because of a transient dependency failure.
     Unavailable {
         /// Credential-free endpoint label.
         endpoint: String,
         /// Sanitized failure reason.
         reason: String,
+    },
+    /// Node returned a permanent RPC or response-shape failure rather than an
+    /// authoritative block verdict.
+    InvalidResponse {
+        /// Credential-free endpoint label.
+        endpoint: String,
     },
 }
 
@@ -1416,11 +1655,6 @@ fn display_hex(mut raw: [u8; 32]) -> String {
     hex::encode(raw)
 }
 
-fn parent_is_confirmed(node: &ZebraRpcClient, height: u32, expected_hash: &str) -> bool {
-    parent_confirmation_depth_on_node(node, height, expected_hash)
-        .is_ok_and(|depth| depth.is_some())
-}
-
 fn parent_confirmation_depth_on_node(
     node: &ZebraRpcClient,
     height: u32,
@@ -1469,6 +1703,13 @@ fn validate_parent_header_status(
         .map_err(|_| MinerError::RpcProtocol("parent confirmation depth exceeds u32".to_string()))
 }
 
+fn strict_parent_confirmation_depth(
+    checks: impl IntoIterator<Item = Result<Option<u32>, MinerError>>,
+) -> Result<Option<u32>, MinerError> {
+    let successful = checks.into_iter().collect::<Result<Vec<_>, _>>()?;
+    conservative_parent_confirmation_depth(successful.into_iter().map(Ok))
+}
+
 fn conservative_parent_confirmation_depth(
     checks: impl IntoIterator<Item = Result<Option<u32>, MinerError>>,
 ) -> Result<Option<u32>, MinerError> {
@@ -1506,28 +1747,108 @@ fn submit_parent_to_node(
     expected_hash: &str,
 ) -> ParentNodeOutcome {
     let submission = node.call_value("submitblock", json!([hex::encode(block_bytes)]));
-    if parent_is_confirmed(node, height, expected_hash) {
-        return ParentNodeOutcome::Accepted {
-            endpoint: node.label().to_string(),
-        };
+    match parent_confirmation_depth_on_node(node, height, expected_hash) {
+        Ok(Some(_)) => {
+            return ParentNodeOutcome::Accepted {
+                endpoint: node.label().to_string(),
+            }
+        }
+        Ok(None) => {}
+        Err(error) if is_transient_parent_rpc_failure(&error) => {
+            return ParentNodeOutcome::Unavailable {
+                endpoint: node.label().to_string(),
+                reason: error.to_string(),
+            }
+        }
+        Err(_) => {
+            return ParentNodeOutcome::InvalidResponse {
+                endpoint: node.label().to_string(),
+            }
+        }
     }
     match submission {
-        Ok(Value::Null) => ParentNodeOutcome::Unconfirmed {
-            endpoint: node.label().to_string(),
-        },
+        Ok(Value::Null) => exact_noncanonical_parent_outcome(node, height, expected_hash),
+        Ok(Value::String(reason)) if submitblock_reason_is_inconclusive(&reason) => {
+            exact_noncanonical_parent_outcome(node, height, expected_hash)
+        }
         Ok(Value::String(reason)) => ParentNodeOutcome::Rejected {
             endpoint: node.label().to_string(),
             reason,
         },
-        Ok(other) => ParentNodeOutcome::Rejected {
+        Ok(_) => ParentNodeOutcome::InvalidResponse {
             endpoint: node.label().to_string(),
-            reason: format!("unexpected submitblock result {other}"),
+        },
+        Err(
+            MinerError::RpcProtocol(_)
+            | MinerError::RpcResponseTooLarge(_)
+            | MinerError::RpcConfiguration(_),
+        ) => ParentNodeOutcome::InvalidResponse {
+            endpoint: node.label().to_string(),
         },
         Err(error) => ParentNodeOutcome::Unavailable {
             endpoint: node.label().to_string(),
             reason: error.to_string(),
         },
     }
+}
+
+fn exact_noncanonical_parent_outcome(
+    node: &ZebraRpcClient,
+    height: u32,
+    expected_hash: &str,
+) -> ParentNodeOutcome {
+    let membership = node
+        .call("getblockstatus", json!([expected_hash]))
+        .and_then(|status| validate_parent_block_status(status, height, expected_hash));
+    let endpoint = node.label().to_string();
+    match membership {
+        Ok(ParentCommittedMembership::BestChain) => ParentNodeOutcome::Accepted { endpoint },
+        Ok(ParentCommittedMembership::SideChain) => ParentNodeOutcome::KnownSideChain { endpoint },
+        Ok(ParentCommittedMembership::Unknown) => ParentNodeOutcome::Unconfirmed { endpoint },
+        Err(error) if is_transient_parent_rpc_failure(&error) => ParentNodeOutcome::Unavailable {
+            endpoint,
+            reason: error.to_string(),
+        },
+        Err(_) => ParentNodeOutcome::InvalidResponse { endpoint },
+    }
+}
+
+fn validate_parent_block_status(
+    status: ParentBlockStatus,
+    expected_height: u32,
+    expected_hash: &str,
+) -> Result<ParentCommittedMembership, MinerError> {
+    let (hash, height, membership) = match status {
+        ParentBlockStatus::BestChain {
+            hash,
+            height,
+            confirmations,
+        } => {
+            if confirmations == 0 {
+                return Err(MinerError::RpcProtocol(
+                    "getblockstatus returned zero best-chain confirmations".to_string(),
+                ));
+            }
+            (hash, height, ParentCommittedMembership::BestChain)
+        }
+        ParentBlockStatus::SideChain { hash, height } => {
+            (hash, height, ParentCommittedMembership::SideChain)
+        }
+        ParentBlockStatus::Unknown {} => return Ok(ParentCommittedMembership::Unknown),
+    };
+    if !hash.eq_ignore_ascii_case(expected_hash) || height != expected_height {
+        return Err(MinerError::RpcProtocol(
+            "getblockstatus returned a different parent block hash or height".to_string(),
+        ));
+    }
+    Ok(membership)
+}
+
+pub(crate) fn submitblock_reason_is_inconclusive(reason: &str) -> bool {
+    matches!(
+        reason,
+        "duplicate" | "duplicate-inconclusive" | "inconclusive"
+    )
 }
 
 fn decode_template_coinbase(template: &TransactionTemplate) -> Result<Transaction, MinerError> {
@@ -1811,6 +2132,12 @@ fn decode_template_bytes(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        time::Instant,
+    };
+
     use wcash_pool_protocol::ProtocolError;
     use wcash_zcash_aux::{auth_data_merkle_root, PROOF_VERSION};
     use zcash_address::ToAddress;
@@ -1826,6 +2153,218 @@ mod tests {
         pool_backend::{job_descriptor_from_native, PoolBackendAdapterError},
         JobConfig, NATIVE_JOB_MAX_AGE_SECONDS,
     };
+
+    fn proposal_race_fixture() -> (NativePreparedJob, BlockTemplateResponse) {
+        let template: BlockTemplateResponse = serde_json::from_str(include_str!(
+            "../../zebra-rpc/tests/vectors/getblocktemplate_response_template.json"
+        ))
+        .expect("standard template fixture");
+        let previous: block::Hash =
+            parse_template_hex(&template.previous_block_hash, "fixture predecessor")
+                .expect("canonical fixture hash");
+        let job = PreparedJob::new(
+            [0x41; 32],
+            Target::MAX,
+            JobConfig {
+                parent_height: template.height,
+                previous_block_hash: previous.0,
+                ..JobConfig::default()
+            },
+        )
+        .expect("valid prepared header");
+        let mut parent_proposal = zebra_chain::block::genesis::wcash_regtest_genesis_block()
+            .as_ref()
+            .clone();
+        Arc::make_mut(&mut parent_proposal.header).previous_block_hash = previous;
+        (
+            NativePreparedJob {
+                job,
+                parent_proposal,
+                proposal_bytes: Vec::new(),
+                parent_network: NativeZcashNetwork::Regtest,
+                parent_target: Target::MAX,
+                parent_tip_display: template.previous_block_hash.clone(),
+                parent_height: template.height,
+                parent_reward_zatoshis: 0,
+            },
+            template,
+        )
+    }
+
+    fn parent_tip_recheck_server(
+        reply: Option<Result<Value, Value>>,
+    ) -> (NativeZcashProvider, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tip recheck fixture");
+        listener.set_nonblocking(true).expect("bounded accept");
+        let endpoint = RpcEndpoint::new(
+            format!("http://{}/", listener.local_addr().unwrap()),
+            None,
+            None,
+        )
+        .expect("loopback fixture");
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "tip recheck was not requested");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("tip recheck accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bounded request read");
+            let mut reader = BufReader::new(&mut stream);
+            let mut content_length = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+            }
+            let length = content_length.expect("RPC body length");
+            assert!(length < 4096);
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).expect("RPC body");
+            let request: Value = serde_json::from_slice(&body).expect("RPC JSON");
+            assert_eq!(request["method"], "getblockchaininfo");
+            assert_eq!(request["params"], json!([]));
+            let Some(reply) = reply else {
+                return; // An unavailable recheck must not turn rejection into retry.
+            };
+            let response = serde_json::to_vec(&match reply {
+                Ok(result) => json!({"jsonrpc":"2.0", "id":request["id"], "result":result}),
+                Err(error) => json!({"jsonrpc":"2.0", "id":request["id"], "error":error}),
+            })
+            .unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+            stream.write_all(&response).unwrap();
+        });
+        let network = NativeZcashNetwork::Regtest;
+        let config = NativeZcashConfig::new(
+            RpcEndpoint::new("http://127.0.0.1:1/", None, None).unwrap(),
+            vec![endpoint],
+            network,
+            network.consensus_parameters().genesis_hash().to_string(),
+            "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV".parse().unwrap(),
+        )
+        .unwrap();
+        (NativeZcashProvider::connect(config).unwrap(), server)
+    }
+
+    #[test]
+    fn proposal_rejection_retries_only_a_proven_atomic_tip_change() {
+        let (prepared, _) = proposal_race_fixture();
+        let old_height = prepared.parent_height - 1;
+        let changed_hash = "42".repeat(32);
+        for height in [old_height, old_height + 1] {
+            let (provider, server) = parent_tip_recheck_server(Some(Ok(json!({
+                "blocks": height, "bestblockhash": changed_hash,
+            }))));
+            let error = provider.recheck_parent_proposal_rejection(
+                &provider.proposal_validators[0],
+                &prepared,
+                "proposal-is-not-based-on-the-current-best-chain-tip".to_string(),
+            );
+            assert!(
+                matches!(error, MinerError::ParentTipMismatch { actual, .. }
+                if actual == format!("{changed_hash} at height {height}")),
+                "height advance and same-height reorganization both require a fresh job"
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn proposal_rejection_stays_fatal_without_proven_tip_change() {
+        let (prepared, _) = proposal_race_fixture();
+        let old_height = prepared.parent_height - 1;
+        let reason = "proposal-is-not-based-on-the-current-best-chain-tip";
+        for reply in [
+            Some(Ok(
+                json!({"blocks":old_height, "bestblockhash":prepared.parent_tip_display}),
+            )),
+            Some(Ok(
+                json!({"blocks":old_height + 1, "bestblockhash":"malformed"}),
+            )),
+            Some(Ok(json!({"blocks":-1, "bestblockhash":"42".repeat(32)}))),
+            Some(Ok(json!({"blocks":old_height}))),
+            Some(Err(
+                json!({"code":-28, "message":"node temporarily unavailable"}),
+            )),
+            None,
+        ] {
+            let (provider, server) = parent_tip_recheck_server(reply);
+            let error = provider.recheck_parent_proposal_rejection(
+                &provider.proposal_validators[0],
+                &prepared,
+                reason.to_string(),
+            );
+            assert!(
+                matches!(error, MinerError::ParentProposalRejected { reason: actual, .. }
+                if actual == reason),
+                "reason text alone is never evidence of a tip change"
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn independent_template_rollover_is_checked_before_content_validation() {
+        let (prepared, mut template) = proposal_race_fixture();
+        template.height += 1;
+        template.previous_block_hash = "42".repeat(32);
+        let (provider, server) = parent_tip_recheck_server(Some(Ok(json!({
+            "blocks":template.height - 1, "bestblockhash":template.previous_block_hash,
+        }))));
+        assert!(matches!(
+            provider.validate_current_independent_payout_template(
+                &provider.proposal_validators[0],
+                &prepared,
+                &template,
+            ),
+            Err(MinerError::ParentTipMismatch { .. })
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn independent_template_stable_tip_preserves_content_rejections() {
+        for mutation in 0..4 {
+            let (prepared, mut template) = proposal_race_fixture();
+            match mutation {
+                0 => template.version = 5,
+                1 => template.height += 1,
+                2 => template.previous_block_hash = "42".repeat(32),
+                3 => template.coinbase_txn.data.clear(),
+                _ => unreachable!(),
+            }
+            let (provider, server) = parent_tip_recheck_server(Some(Ok(json!({
+                "blocks":prepared.parent_height - 1, "bestblockhash":prepared.parent_tip_display,
+            }))));
+            assert!(
+                matches!(
+                    provider.validate_current_independent_payout_template(
+                        &provider.proposal_validators[0],
+                        &prepared,
+                        &template,
+                    ),
+                    Err(MinerError::InvalidParentTemplate(_))
+                ),
+                "stable-tip bad version, height, predecessor, or coinbase remains fatal"
+            );
+            server.join().unwrap();
+        }
+    }
 
     fn pool_backend_descriptor_fixture(
         parent_version: u32,
@@ -1872,6 +2411,8 @@ mod tests {
             91,
             625_000_000,
             payout_verification,
+            [0x41; 32],
+            [0x42; 32],
         )
     }
 
@@ -1954,16 +2495,14 @@ mod tests {
     }
 
     #[test]
-    fn pool_backend_adapter_rejects_private_wcash_payouts() {
+    fn pool_backend_adapter_accepts_exact_private_wcash_payouts() {
         let native = pool_backend_descriptor_fixture(
             4,
-            NativeWcashPayoutVerification::TrustedPrivateTemplateNode,
+            NativeWcashPayoutVerification::ExactPrivateRecipient,
         );
 
-        assert_eq!(
-            job_descriptor_from_native(&native),
-            Err(PoolBackendAdapterError::UnverifiedWcashPayout)
-        );
+        job_descriptor_from_native(&native)
+            .expect("an exactly trial-decrypted private payout is pool-safe");
     }
 
     #[test]
@@ -1994,6 +2533,8 @@ mod tests {
             91,
             625_000_000,
             NativeWcashPayoutVerification::ExactTransparentRecipient,
+            [0x45; 32],
+            [0x46; 32],
         );
 
         assert_eq!(descriptor.job_id(), parent_job.job_id_bytes());
@@ -2038,6 +2579,8 @@ mod tests {
             descriptor.wcash_payout_verification(),
             NativeWcashPayoutVerification::ExactTransparentRecipient
         );
+        assert_eq!(descriptor.wcash_payout_commitment(), [0x45; 32]);
+        assert_eq!(descriptor.zcash_payout_commitment(), [0x46; 32]);
     }
 
     #[test]
@@ -2463,6 +3006,64 @@ mod tests {
             "validator",
         )
         .is_err());
+    }
+
+    #[test]
+    fn side_chain_absence_cannot_mask_another_pinned_node_error() {
+        assert_eq!(
+            strict_parent_confirmation_depth([Ok(None), Ok(None)]).unwrap(),
+            None
+        );
+        for error in [
+            MinerError::RpcProtocol("malformed second node response".to_owned()),
+            MinerError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "second node unavailable",
+            )),
+        ] {
+            assert!(strict_parent_confirmation_depth([Ok(None), Err(error)]).is_err());
+        }
+    }
+
+    #[test]
+    fn committed_parent_status_requires_exact_identity_and_explicit_membership() {
+        let hash = "ab".repeat(32);
+        for (value, expected) in [
+            (
+                json!({"state":"side_chain","hash":hash,"height":42}),
+                ParentCommittedMembership::SideChain,
+            ),
+            (
+                json!({"state":"best_chain","hash":hash,"height":42,"confirmations":1}),
+                ParentCommittedMembership::BestChain,
+            ),
+            (
+                json!({"state":"unknown"}),
+                ParentCommittedMembership::Unknown,
+            ),
+        ] {
+            let status = serde_json::from_value(value).expect("strict status shape");
+            assert_eq!(
+                validate_parent_block_status(status, 42, &hash).unwrap(),
+                expected
+            );
+        }
+        for value in [
+            json!({"state":"side_chain","hash":"cd".repeat(32),"height":42}),
+            json!({"state":"side_chain","hash":hash,"height":43}),
+            json!({"state":"best_chain","hash":hash,"height":42,"confirmations":0}),
+        ] {
+            let status = serde_json::from_value(value).expect("known shape, invalid facts");
+            assert!(validate_parent_block_status(status, 42, &hash).is_err());
+        }
+        for value in [
+            json!({"state":"side_chain","hash":hash}),
+            json!({"state":"side_chain","hash":hash,"height":42,"confirmations":100}),
+            json!({"state":"unknown","hash":hash}),
+            json!({"state":"pending"}),
+        ] {
+            assert!(serde_json::from_value::<ParentBlockStatus>(value).is_err());
+        }
     }
 
     #[test]

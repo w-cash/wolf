@@ -1,0 +1,4 @@
+project: zebrad
+kind: Security
+body: "Replace generic light-wallet synchronization with a Wcash-owned, bounded compact-block boundary that attests exact ranges, predecessor hashes and Ironwood tree state, accepts only canonical Ironwood subtree roots, preserves bounded reorganization recovery, and rejects disabled legacy-pool balances."
+time: 2026-09-11T20:00:00.000000000Z

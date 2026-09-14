@@ -46,7 +46,7 @@ pub const NATIVE_COINBASE_MATURITY_CONFIRMATIONS: u32 =
 pub use coinbase::{build_parent_coinbase, ParentOutput};
 pub use coordinator::{
     CoordinatorConfig, GenerationRetirement, NativeMiningCoordinator, NativeMiningSupervisor,
-    NativeWinnerBlock, NativeWinnerMaterial, WinnerOutboxStatus,
+    NativeWinnerBlock, NativeWinnerMaterial, WcashIncomingViewingKey, WinnerOutboxStatus,
 };
 pub use error::MinerError;
 pub use job::{JobConfig, PreparedJob, SolvedAuxPow, EQUIHASH_SOLUTION_BYTES};
@@ -59,7 +59,8 @@ pub use native_retained_job::NativePoolBackendRetainedJob;
 pub use pool_backend_actor::{
     PoolBackendActor, PoolBackendActorError, PoolBackendRetainedJob, PoolBackendShareRequest,
     PoolBackendShareValidationError, PoolBackendValidatedShare, PoolBackendWinnerKey,
-    PoolBackendWinnerSnapshot, PoolBackendWinnerTransition,
+    PoolBackendWinnerScheduler, PoolBackendWinnerSnapshot, PoolBackendWinnerTransition,
+    PoolBackendWinnerWork,
 };
 pub use zip301::{serve_zip301_loopback, ShareProcessor, Zip301Config, Zip301LoopbackListener};
 pub use zip301_client::{mine_zip301_once, Zip301AcceptedShare, Zip301ClientConfig};

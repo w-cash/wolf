@@ -97,6 +97,32 @@ the confirmation count read from the same state snapshot as the exact
 witness-bearing block. This distinction is consensus-significant because two
 different AuxPoW witnesses intentionally have the same Wcash block ID.
 
+The private Zcash parent RPC `getblockstatus("<display-order block hash>")`
+returns `best_chain` with exact hash, coinbase height, and atomic confirmations;
+`side_chain` with exact hash and coinbase height from committed any-chain state;
+or `unknown`. Queued or remembered hashes are never treated as committed.
+Wcash rejects this method: its status must include the AuxPoW witness through
+`getauxblockstatus`. The native pool backend needs the matching RPC release on
+both the template node and every independent parent validator. Keep these
+endpoints private and authenticated; no public RPC exposure or spending keys
+are needed. Each parent must also prove its already identity-checked genesis
+through this status API at startup and subsequent identity checks, with exact
+height zero and positive best-chain confirmations. This rejects missing or
+incompatible APIs before admitting new mining work.
+All parents must positively identify the same exact committed
+noncanonical proof before it can remain healthy pending work. It earns no
+reward until ordinary best-chain observation and maturity checks pass. That
+positive noncanonical evidence is durably recorded as `winner_side_chain`,
+guarded by the required `winner_side_chain_v1` backend capability. Subsequent
+monitoring is status-only: pruning or finalization of the losing fork cannot
+trigger obsolete submissions or poison mining health. Absence alone never
+establishes this state, and transport/protocol errors remain errors. The native
+version-2 journal header stays unchanged and old records reopen without rewrite.
+Once this new event is written, rollback requires a binary that understands it.
+An older reader cannot reopen the extended journal; never truncate or reset
+accounting history to force compatibility. The capability protects the live
+pool/backend protocol, not backward readability of new journal records.
+
 The Zcash parent template node accepts one private GBT extension:
 
 ```json
@@ -120,7 +146,9 @@ returns an ordinary complete template. Requests without `wcashaux` retain
 standard Zebra behavior and an unmodified transaction-selection budget.
 
 Independent proposal validators do not need this extension. They receive an
-ordinary exact Zcash block proposal and can be unmodified Zebra nodes.
+ordinary exact Zcash block proposal and retain ordinary Zcash consensus. For
+the durable native pool backend they also need the read-only `getblockstatus`
+method described above; this does not require the private GBT extension.
 
 ## Pool safety rules
 
@@ -276,12 +304,11 @@ No public Wcash Testnet or community pool is deployed. A community-facing pool
 still needs project-operated seeds, an independently reviewed consensus
 specification, multi-node soak and reorg tests, vendor ASIC interoperability,
 and an operated TLS/variable-difficulty edge with durable accounting, payouts,
-and reorg-safe shielded settlement. The experimental one-shot wallet in this
-workspace can derive a transparent coinbase address and construct a bounded
-mature-coinbase shielding transaction, but it requires one exclusive writer per
-database and is not that operated payout system. After an ambiguous post-sign
-outcome, operators must recover the paginated persisted record and rebroadcast
-the exact signed bytes rather than create a replacement. Wcash mainnet remains
-disabled.
+and reorg-safe shielded settlement. The wallet provides an isolated,
+Testnet-only, crash-idempotent batch signing and exact-byte broadcast boundary,
+but it requires one exclusive writer per database and is not that operated pool
+ledger. After an ambiguous post-sign outcome, operators must recover the exact
+batch and rebroadcast the same bytes rather than create a replacement. Wcash
+mainnet remains disabled.
 Do not call this engineering profile production-ready or use it with funds of
 real value.

@@ -51,6 +51,72 @@ use config::mining;
 use types::long_poll::LONG_POLL_ID_LENGTH;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rpc_getblockstatus_distinguishes_committed_side_chain_from_unknown() {
+    let _init_guard = zebra_test::init();
+    let block: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+    for state_name in ["best_chain", "side_chain", "unknown"] {
+        let request_rpc = rpc.clone();
+        let request =
+            tokio::spawn(async move { request_rpc.get_block_status(hash.to_string()).await });
+        read_state
+            .expect_request(ReadRequest::BlockAndDepth(hash))
+            .await
+            .respond(ReadResponse::BlockAndDepth(
+                (state_name == "best_chain").then_some((block.clone(), 4)),
+            ));
+        if state_name != "best_chain" {
+            read_state
+                .expect_request(ReadRequest::AnyChainBlock(hash.into()))
+                .await
+                .respond(ReadResponse::Block(
+                    (state_name == "side_chain").then_some(block.clone()),
+                ));
+        }
+        let response = request.await.unwrap().unwrap();
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(response["state"], state_name);
+        if state_name == "unknown" {
+            assert_eq!(response, serde_json::json!({"state":"unknown"}));
+        } else {
+            assert_eq!(response["hash"], hash.to_string());
+            assert_eq!(response["height"], 0);
+            assert_eq!(
+                response.get("confirmations"),
+                (state_name == "best_chain").then_some(&serde_json::json!(5))
+            );
+        }
+    }
+    assert!(committed_parent_block_status(&block, Hash([0x91; 32]), None).is_err());
+    assert!(committed_parent_block_status(&block, hash, Some(u32::MAX)).is_err());
+    // A queued or merely remembered hash must never be accepted as a commit.
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getinfo() {
     let _init_guard = zebra_test::init();
 

@@ -1,5 +1,6 @@
 //! Wcash address conversion at the wallet boundary.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zcash_keys::{
     address::UnifiedAddress,
@@ -9,6 +10,31 @@ use zcash_transparent::{address::TransparentAddress, keys::IncomingViewingKey};
 use zebra_chain::primitives::{WcashAddress, WcashAddressKind, WcashAddressParseError};
 
 use crate::WalletNetwork;
+
+/// Canonical receiver class returned by authoritative Wcash address validation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WcashReceiverKind {
+    /// Unified Address containing the active private Ironwood receiver.
+    Ironwood,
+    /// Transparent pay-to-public-key-hash receiver.
+    TransparentP2pkh,
+    /// Transparent pay-to-script-hash receiver.
+    TransparentP2sh,
+    /// Transparent-source-only receiver, which is not a coinbase destination.
+    Tex,
+}
+
+/// Secret-free result of parsing a Wcash address for one exact network.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ValidatedWcashAddress {
+    /// Wcash network encoded by the address and required by the caller.
+    pub network: WalletNetwork,
+    /// Exact receiver class encoded by the address.
+    pub receiver_kind: WcashReceiverKind,
+    /// Canonical Wcash encoding suitable for exact storage and comparison.
+    pub canonical: String,
+}
 
 /// Errors returned while encoding or decoding wallet addresses.
 #[derive(Debug, Error)]
@@ -117,6 +143,37 @@ pub fn decode_recipient(
     Ok(address)
 }
 
+/// Parses and canonically classifies one Wcash address for `network`.
+///
+/// Zcash addresses and Wcash addresses from another network are rejected. This
+/// is the authoritative pool-portal seam; callers should not classify address
+/// prefixes with regular expressions.
+pub fn validate_wcash_address(
+    encoded: &str,
+    network: WalletNetwork,
+) -> Result<ValidatedWcashAddress, WalletAddressError> {
+    let address = WcashAddress::try_from_encoded(encoded)?;
+    if address.network() != network.address_network() {
+        return Err(WalletAddressError::WrongNetwork);
+    }
+    let receiver_kind = match address.kind() {
+        WcashAddressKind::Unified(_) => {
+            // Keep classification pinned to the same Orchard/Ironwood-only
+            // recipient conversion used by the transaction builder.
+            let _recipient = decode_recipient(encoded, network)?;
+            WcashReceiverKind::Ironwood
+        }
+        WcashAddressKind::P2pkh(_) => WcashReceiverKind::TransparentP2pkh,
+        WcashAddressKind::P2sh(_) => WcashReceiverKind::TransparentP2sh,
+        WcashAddressKind::Tex(_) => WcashReceiverKind::Tex,
+    };
+    Ok(ValidatedWcashAddress {
+        network,
+        receiver_kind,
+        canonical: address.encode(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use secrecy::SecretVec;
@@ -178,6 +235,58 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_validation_classifies_canonical_wcash_receivers() {
+        let network = WalletNetwork::Testnet;
+        let ufvk = test_ufvk(network);
+        let ironwood = encode_orchard_receiver(&ufvk, network).unwrap();
+        let transparent = encode_transparent_coinbase_receiver(&ufvk, network).unwrap();
+
+        assert_eq!(
+            validate_wcash_address(&ironwood, network).unwrap(),
+            ValidatedWcashAddress {
+                network,
+                receiver_kind: WcashReceiverKind::Ironwood,
+                canonical: ironwood,
+            }
+        );
+        assert_eq!(
+            validate_wcash_address(&transparent, network)
+                .unwrap()
+                .receiver_kind,
+            WcashReceiverKind::TransparentP2pkh
+        );
+        let p2sh = WcashAddress::from_transparent_p2sh(network.address_network(), [0x55; 20]);
+        assert_eq!(
+            validate_wcash_address(&p2sh.encode(), network)
+                .unwrap()
+                .receiver_kind,
+            WcashReceiverKind::TransparentP2sh
+        );
+        let tex = WcashAddress::from_tex(network.address_network(), [0x66; 20]);
+        assert_eq!(
+            validate_wcash_address(&tex.encode(), network)
+                .unwrap()
+                .receiver_kind,
+            WcashReceiverKind::Tex
+        );
+        assert!(matches!(
+            validate_wcash_address(
+                &encode_orchard_receiver(&ufvk, network).unwrap(),
+                WalletNetwork::Regtest,
+            ),
+            Err(WalletAddressError::WrongNetwork)
+        ));
+
+        let (zcash, _) = ufvk
+            .default_address(UnifiedAddressRequest::ORCHARD)
+            .unwrap();
+        assert!(matches!(
+            validate_wcash_address(&zcash.encode(&network.parameters()), network),
+            Err(WalletAddressError::Parse(WcashAddressParseError::NotWcash))
+        ));
+    }
+
+    #[test]
     fn fixed_master_seed_has_stable_wcash_addresses() {
         let master_seed = SecretVec::new((0u8..32).collect());
         let testnet = derive_wallet_spending_key(&master_seed, WalletNetwork::Testnet, 0)
@@ -189,7 +298,7 @@ mod tests {
 
         assert_eq!(
             encode_orchard_receiver(&testnet, WalletNetwork::Testnet).unwrap(),
-            "wutest1y8vqv8yds0dsh0fd8q8nm37q84fkjf33vy8e4cwyx29yl55avhq4udaevvtygde7ae5pvav8y02yqrggm36gnmphazpaqerxj5ja8grr"
+            "wutest17mvne4ygv9v8rkjf6yxnrveceejh8nutee8svp8swkgj7s7ac9ga36u2av8hgpc28cc42u474ypjq2jsdt64utcxtztm2jr6guvaryhh"
         );
         assert_eq!(
             encode_orchard_receiver(&regtest, WalletNetwork::Regtest).unwrap(),
@@ -197,7 +306,7 @@ mod tests {
         );
         assert_eq!(
             encode_transparent_coinbase_receiver(&testnet, WalletNetwork::Testnet).unwrap(),
-            "WTES2x4gFzRan36RGCoc2ZNb9SwFMQf2Pbg"
+            "WTNjqDPXEGEgKHS1YPtfEgdrqk6egFRULDz"
         );
         assert_eq!(
             encode_transparent_coinbase_receiver(&regtest, WalletNetwork::Regtest).unwrap(),

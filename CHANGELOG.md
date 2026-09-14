@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Refreshed the deterministic Wcash Testnet wallet vectors after the prelaunch
+  v5 genesis rotation, and pinned the genesis-bound seed KDF output directly.
+
 ### Added
 
 - Added the isolated Wcash regtest consensus flavor, deterministic
