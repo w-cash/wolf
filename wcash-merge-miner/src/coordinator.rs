@@ -349,42 +349,38 @@ impl NativeMiningSupervisor {
         let journal = Arc::clone(&self.journal);
         let expected_zcash_genesis_hash = config.zcash.expected_genesis_hash().to_string();
 
-        // Replay each chain independently before asking either node to create
-        // fresh work. A template/proposal outage must never strand an already
-        // durable winner for the other chain.
+        // Replay each chain independently once after startup. Live winners are
+        // submitted by their own generation below, while older unresolved
+        // entries move through bounded background maintenance. A stale
+        // historical winner must never block every fresh job rotation.
         let wcash_identity =
             require_wcash_network_identity(&wcash_node, &config.expected_wcash_genesis_hash);
         let zcash_identity = zcash.require_network_identity(&expected_zcash_genesis_hash);
-        let pending = journal.all_pending()?;
         let initial_outbox_recovery = !self
             .initial_outbox_recovery_complete
             .load(Ordering::Acquire);
-        if wcash_identity.is_ok() {
+        if initial_outbox_recovery && wcash_identity.is_ok() {
+            let pending = journal.all_pending()?;
             retry_pending_winners_with(
                 &wcash_node,
                 &zcash,
                 &journal,
                 pending
                     .iter()
-                    .filter(|winner| {
-                        winner.key.chain == WinnerChain::Wcash
-                            && (initial_outbox_recovery || winner_requires_urgent_retry(winner))
-                    })
+                    .filter(|winner| winner.key.chain == WinnerChain::Wcash)
                     .cloned()
                     .collect(),
             )?;
         }
-        if zcash_identity.is_ok() {
+        if initial_outbox_recovery && zcash_identity.is_ok() {
+            let pending = journal.all_pending()?;
             retry_pending_winners_with(
                 &wcash_node,
                 &zcash,
                 &journal,
                 pending
                     .into_iter()
-                    .filter(|winner| {
-                        winner.key.chain == WinnerChain::Zcash
-                            && (initial_outbox_recovery || winner_requires_urgent_retry(winner))
-                    })
+                    .filter(|winner| winner.key.chain == WinnerChain::Zcash)
                     .collect(),
             )?;
         }
@@ -773,6 +769,7 @@ impl NativeMiningCoordinator {
             .fetch_add(OUTBOX_MAINTENANCE_BATCH_SIZE, Ordering::Relaxed);
         let winners = pending_winners_for_retry(
             self.journal.all_pending()?,
+            retry_requested.then_some(self.job.job().job_id()),
             maintenance_due,
             maintenance_cursor,
         );
@@ -1521,11 +1518,14 @@ fn winner_requires_urgent_retry(winner: &PendingWinner) -> bool {
 
 fn pending_winners_for_retry(
     pending: Vec<PendingWinner>,
+    urgent_job_id: Option<&str>,
     include_maintenance: bool,
     maintenance_cursor: usize,
 ) -> Vec<PendingWinner> {
-    let (mut urgent, mut maintenance): (Vec<_>, Vec<_>) =
-        pending.into_iter().partition(winner_requires_urgent_retry);
+    let (mut urgent, mut maintenance): (Vec<_>, Vec<_>) = pending.into_iter().partition(|winner| {
+        urgent_job_id
+            .is_some_and(|job_id| winner.job_id == job_id && winner_requires_urgent_retry(winner))
+    });
     if !include_maintenance || maintenance.is_empty() {
         return urgent;
     }
@@ -3340,6 +3340,11 @@ mod tests {
         let mut urgent = wcash_winner(false);
         urgent.key.share_id = [0x10; 32];
 
+        let mut historical_unobserved = wcash_winner(false);
+        historical_unobserved.key.share_id = [0x15; 32];
+        historical_unobserved.job_id = "99".repeat(32);
+        historical_unobserved.height = 10;
+
         let mut first_observed = wcash_winner(true);
         first_observed.key.share_id = [0x20; 32];
         first_observed.height = 20;
@@ -3356,27 +3361,31 @@ mod tests {
         let pending = vec![
             second_observed.clone(),
             conflicting.clone(),
+            historical_unobserved.clone(),
             urgent.clone(),
             first_observed.clone(),
         ];
         assert_eq!(
-            pending_winners_for_retry(pending.clone(), false, 0),
+            pending_winners_for_retry(pending.clone(), Some(&urgent.job_id), false, 0),
             vec![urgent.clone()],
-            "a winner-triggered retry must submit only unobserved, non-conflicting entries"
+            "a winner-triggered retry must submit only this generation's winner"
         );
+        assert!(pending_winners_for_retry(pending.clone(), None, false, 0).is_empty());
 
-        let first_maintenance = pending_winners_for_retry(pending.clone(), true, 0);
+        let first_maintenance =
+            pending_winners_for_retry(pending.clone(), Some(&urgent.job_id), true, 0);
         assert_eq!(first_maintenance.len(), 3);
         assert!(first_maintenance.contains(&urgent));
+        assert!(first_maintenance.contains(&historical_unobserved));
         assert!(first_maintenance.contains(&first_observed));
-        assert!(first_maintenance.contains(&second_observed));
+        assert!(!first_maintenance.contains(&second_observed));
         assert!(!first_maintenance.contains(&conflicting));
 
-        let second_maintenance = pending_winners_for_retry(pending, true, 2);
+        let second_maintenance = pending_winners_for_retry(pending, Some(&urgent.job_id), true, 2);
         assert_eq!(second_maintenance.len(), 3);
         assert!(second_maintenance.contains(&urgent));
         assert!(second_maintenance.contains(&conflicting));
-        assert!(second_maintenance.contains(&first_observed));
+        assert!(second_maintenance.contains(&second_observed));
     }
 
     #[test]

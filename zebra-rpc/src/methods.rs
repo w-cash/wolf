@@ -3179,11 +3179,22 @@ where
             )
         })?;
 
-        // Reuse the production template path with an isolated miner-address
-        // override. Its coinbase cache is detached by set_miner_params, while
-        // the exact AuxPoW candidate cache remains shared by RpcImpl clones.
+        // Reuse the production template path. When the caller requests the
+        // configured payout address, keep the shared coinbase cache: private
+        // coinbase proving is expensive and the proof-complete transaction can
+        // be reused at the same height and fee total. A different caller
+        // address still gets an isolated cache so payout data cannot cross
+        // address boundaries.
         let mut candidate_rpc = self.clone();
-        candidate_rpc.gbt.set_miner_params(miner_params);
+        let uses_configured_payout = candidate_rpc
+            .gbt
+            .miner_params()
+            .ok()
+            .flatten()
+            .is_some_and(|configured| configured.addr() == miner_params.addr());
+        if !uses_configured_payout {
+            candidate_rpc.gbt.set_miner_params(miner_params);
+        }
         let template = candidate_rpc
             .get_block_template(None)
             .await?
