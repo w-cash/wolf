@@ -400,12 +400,10 @@ impl NativeZcashProvider {
                     "capabilities": ["coinbasetxn"],
                 }]),
             )?;
-            validate_independent_parent_payout_template(
+            self.validate_current_independent_payout_template(
+                validator,
                 &prepared,
                 &payout_template,
-                &self.expected_parent_payout_address,
-                &self.expected_parent_network,
-                validator.label(),
             )?;
             let result = validator.call_value(
                 "getblocktemplate",
@@ -417,10 +415,7 @@ impl NativeZcashProvider {
             match result {
                 Value::Null => {}
                 Value::String(reason) => {
-                    return Err(MinerError::ParentProposalRejected {
-                        endpoint: validator.label().to_string(),
-                        reason,
-                    })
+                    return Err(self.recheck_parent_proposal_rejection(validator, &prepared, reason))
                 }
                 other => {
                     return Err(MinerError::RpcProtocol(format!(
@@ -438,6 +433,70 @@ impl NativeZcashProvider {
         }
 
         Ok(prepared)
+    }
+
+    fn validate_current_independent_payout_template(
+        &self,
+        validator: &ZebraRpcClient,
+        prepared: &NativePreparedJob,
+        template: &BlockTemplateResponse,
+    ) -> Result<(), MinerError> {
+        // The independent template may have advanced after its preceding tip
+        // check. Establish that race before interpreting a changed predecessor
+        // or height as invalid template content.
+        self.require_atomic_tip(validator, prepared)?;
+        validate_independent_parent_payout_template(
+            prepared,
+            template,
+            &self.expected_parent_payout_address,
+            &self.expected_parent_network,
+            validator.label(),
+        )
+    }
+
+    fn recheck_parent_proposal_rejection(
+        &self,
+        validator: &ZebraRpcClient,
+        prepared: &NativePreparedJob,
+        reason: String,
+    ) -> MinerError {
+        // A proposal can lose its predecessor while the validator checks it.
+        // Only a fresh, strictly decoded snapshot proves that retry is safe.
+        // Failed rechecks and unchanged tips retain the original rejection.
+        if let Err(error @ MinerError::ParentTipMismatch { .. }) =
+            self.require_atomic_tip(validator, prepared)
+        {
+            return error;
+        }
+        MinerError::ParentProposalRejected {
+            endpoint: validator.label().to_string(),
+            reason,
+        }
+    }
+
+    fn require_atomic_tip(
+        &self,
+        node: &ZebraRpcClient,
+        job: &NativePreparedJob,
+    ) -> Result<(), MinerError> {
+        let expected_height = job.parent_height().checked_sub(1).ok_or_else(|| {
+            MinerError::InvalidParentTemplate("parent height must be positive".to_string())
+        })?;
+        let actual = native_chain_tip_on_node(node)?;
+        if actual.height != expected_height
+            || actual.block_hash_le != job.parent_proposal.header.previous_block_hash.0
+        {
+            return Err(MinerError::ParentTipMismatch {
+                expected: format!("{} at height {expected_height}", job.parent_tip_display()),
+                endpoint: node.label().to_string(),
+                actual: format!(
+                    "{} at height {}",
+                    display_hex(actual.block_hash_le),
+                    actual.height
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Submits a parent-target winner byte-for-byte to every configured node.
@@ -1990,6 +2049,12 @@ fn decode_template_bytes(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        time::Instant,
+    };
+
     use wcash_pool_protocol::ProtocolError;
     use wcash_zcash_aux::{auth_data_merkle_root, PROOF_VERSION};
     use zcash_address::ToAddress;
@@ -2005,6 +2070,218 @@ mod tests {
         pool_backend::{job_descriptor_from_native, PoolBackendAdapterError},
         JobConfig, NATIVE_JOB_MAX_AGE_SECONDS,
     };
+
+    fn proposal_race_fixture() -> (NativePreparedJob, BlockTemplateResponse) {
+        let template: BlockTemplateResponse = serde_json::from_str(include_str!(
+            "../../zebra-rpc/tests/vectors/getblocktemplate_response_template.json"
+        ))
+        .expect("standard template fixture");
+        let previous: block::Hash =
+            parse_template_hex(&template.previous_block_hash, "fixture predecessor")
+                .expect("canonical fixture hash");
+        let job = PreparedJob::new(
+            [0x41; 32],
+            Target::MAX,
+            JobConfig {
+                parent_height: template.height,
+                previous_block_hash: previous.0,
+                ..JobConfig::default()
+            },
+        )
+        .expect("valid prepared header");
+        let mut parent_proposal = zebra_chain::block::genesis::wcash_regtest_genesis_block()
+            .as_ref()
+            .clone();
+        Arc::make_mut(&mut parent_proposal.header).previous_block_hash = previous;
+        (
+            NativePreparedJob {
+                job,
+                parent_proposal,
+                proposal_bytes: Vec::new(),
+                parent_network: NativeZcashNetwork::Regtest,
+                parent_target: Target::MAX,
+                parent_tip_display: template.previous_block_hash.clone(),
+                parent_height: template.height,
+                parent_reward_zatoshis: 0,
+            },
+            template,
+        )
+    }
+
+    fn parent_tip_recheck_server(
+        reply: Option<Result<Value, Value>>,
+    ) -> (NativeZcashProvider, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tip recheck fixture");
+        listener.set_nonblocking(true).expect("bounded accept");
+        let endpoint = RpcEndpoint::new(
+            format!("http://{}/", listener.local_addr().unwrap()),
+            None,
+            None,
+        )
+        .expect("loopback fixture");
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "tip recheck was not requested");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("tip recheck accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bounded request read");
+            let mut reader = BufReader::new(&mut stream);
+            let mut content_length = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+            }
+            let length = content_length.expect("RPC body length");
+            assert!(length < 4096);
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).expect("RPC body");
+            let request: Value = serde_json::from_slice(&body).expect("RPC JSON");
+            assert_eq!(request["method"], "getblockchaininfo");
+            assert_eq!(request["params"], json!([]));
+            let Some(reply) = reply else {
+                return; // An unavailable recheck must not turn rejection into retry.
+            };
+            let response = serde_json::to_vec(&match reply {
+                Ok(result) => json!({"jsonrpc":"2.0", "id":request["id"], "result":result}),
+                Err(error) => json!({"jsonrpc":"2.0", "id":request["id"], "error":error}),
+            })
+            .unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+            stream.write_all(&response).unwrap();
+        });
+        let network = NativeZcashNetwork::Regtest;
+        let config = NativeZcashConfig::new(
+            RpcEndpoint::new("http://127.0.0.1:1/", None, None).unwrap(),
+            vec![endpoint],
+            network,
+            network.consensus_parameters().genesis_hash().to_string(),
+            "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV".parse().unwrap(),
+        )
+        .unwrap();
+        (NativeZcashProvider::connect(config).unwrap(), server)
+    }
+
+    #[test]
+    fn proposal_rejection_retries_only_a_proven_atomic_tip_change() {
+        let (prepared, _) = proposal_race_fixture();
+        let old_height = prepared.parent_height - 1;
+        let changed_hash = "42".repeat(32);
+        for height in [old_height, old_height + 1] {
+            let (provider, server) = parent_tip_recheck_server(Some(Ok(json!({
+                "blocks": height, "bestblockhash": changed_hash,
+            }))));
+            let error = provider.recheck_parent_proposal_rejection(
+                &provider.proposal_validators[0],
+                &prepared,
+                "proposal-is-not-based-on-the-current-best-chain-tip".to_string(),
+            );
+            assert!(
+                matches!(error, MinerError::ParentTipMismatch { actual, .. }
+                if actual == format!("{changed_hash} at height {height}")),
+                "height advance and same-height reorganization both require a fresh job"
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn proposal_rejection_stays_fatal_without_proven_tip_change() {
+        let (prepared, _) = proposal_race_fixture();
+        let old_height = prepared.parent_height - 1;
+        let reason = "proposal-is-not-based-on-the-current-best-chain-tip";
+        for reply in [
+            Some(Ok(
+                json!({"blocks":old_height, "bestblockhash":prepared.parent_tip_display}),
+            )),
+            Some(Ok(
+                json!({"blocks":old_height + 1, "bestblockhash":"malformed"}),
+            )),
+            Some(Ok(json!({"blocks":-1, "bestblockhash":"42".repeat(32)}))),
+            Some(Ok(json!({"blocks":old_height}))),
+            Some(Err(
+                json!({"code":-28, "message":"node temporarily unavailable"}),
+            )),
+            None,
+        ] {
+            let (provider, server) = parent_tip_recheck_server(reply);
+            let error = provider.recheck_parent_proposal_rejection(
+                &provider.proposal_validators[0],
+                &prepared,
+                reason.to_string(),
+            );
+            assert!(
+                matches!(error, MinerError::ParentProposalRejected { reason: actual, .. }
+                if actual == reason),
+                "reason text alone is never evidence of a tip change"
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn independent_template_rollover_is_checked_before_content_validation() {
+        let (prepared, mut template) = proposal_race_fixture();
+        template.height += 1;
+        template.previous_block_hash = "42".repeat(32);
+        let (provider, server) = parent_tip_recheck_server(Some(Ok(json!({
+            "blocks":template.height - 1, "bestblockhash":template.previous_block_hash,
+        }))));
+        assert!(matches!(
+            provider.validate_current_independent_payout_template(
+                &provider.proposal_validators[0],
+                &prepared,
+                &template,
+            ),
+            Err(MinerError::ParentTipMismatch { .. })
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn independent_template_stable_tip_preserves_content_rejections() {
+        for mutation in 0..4 {
+            let (prepared, mut template) = proposal_race_fixture();
+            match mutation {
+                0 => template.version = 5,
+                1 => template.height += 1,
+                2 => template.previous_block_hash = "42".repeat(32),
+                3 => template.coinbase_txn.data.clear(),
+                _ => unreachable!(),
+            }
+            let (provider, server) = parent_tip_recheck_server(Some(Ok(json!({
+                "blocks":prepared.parent_height - 1, "bestblockhash":prepared.parent_tip_display,
+            }))));
+            assert!(
+                matches!(
+                    provider.validate_current_independent_payout_template(
+                        &provider.proposal_validators[0],
+                        &prepared,
+                        &template,
+                    ),
+                    Err(MinerError::InvalidParentTemplate(_))
+                ),
+                "stable-tip bad version, height, predecessor, or coinbase remains fatal"
+            );
+            server.join().unwrap();
+        }
+    }
 
     fn pool_backend_descriptor_fixture(
         parent_version: u32,
