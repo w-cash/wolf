@@ -142,7 +142,9 @@ WCASH_POOL_BACKEND_SOCKET. The serving command authenticates the submitting,
 projector, and payout Unix peer UIDs from WCASH_POOL_BACKEND_SUBMIT_UID,
 WCASH_POOL_BACKEND_PROJECTOR_UID, and WCASH_POOL_BACKEND_PAYOUT_UID, and sets
 the socket GID from WCASH_POOL_BACKEND_SOCKET_GID. WCASH_POOL_BACKEND_LISTENERS optionally selects
-1..=16 accept workers (default 2). Initialization is explicit and never replaces
+1..=16 accept workers (default 4). Each persistent Unix session occupies one worker;
+the complete pool reserves four for public, projector, and concurrent payout bootstrap sessions.
+Initialization is explicit and never replaces
 existing identity or journal state.
 WCASH_VALIDATION_LIMIT optionally sets the global concurrent share-validation
 limit (default 4, maximum 1024). WCASH_AUTHENTICATION_LIMIT optionally sets the
@@ -852,17 +854,8 @@ fn pool_backend_runtime_config() -> Result<PoolBackendRuntimeConfig, Box<dyn Err
     let projector_peer_uid = parse_required_u32_env(WCASH_POOL_BACKEND_PROJECTOR_UID)?;
     let payout_peer_uid = parse_required_u32_env(WCASH_POOL_BACKEND_PAYOUT_UID)?;
     let expected_socket_gid = parse_required_u32_env(WCASH_POOL_BACKEND_SOCKET_GID)?;
-    let listener_workers = parse_optional_usize(
-        optional_env(WCASH_POOL_BACKEND_LISTENERS)?,
-        2,
-        WCASH_POOL_BACKEND_LISTENERS,
-    )?;
-    if !(1..=16).contains(&listener_workers) {
-        return Err(MinerError::InvalidRequest(format!(
-            "environment variable {WCASH_POOL_BACKEND_LISTENERS} must be in 1..=16"
-        ))
-        .into());
-    }
+    let listener_workers =
+        parse_pool_backend_listener_workers(optional_env(WCASH_POOL_BACKEND_LISTENERS)?)?;
     let target = parse_display_target(&required_env(WCASH_SHARE_TARGET)?, WCASH_SHARE_TARGET)?;
     Ok(PoolBackendRuntimeConfig {
         identity_path,
@@ -876,6 +869,16 @@ fn pool_backend_runtime_config() -> Result<PoolBackendRuntimeConfig, Box<dyn Err
         listener_workers,
         target_policy: PoolShareTargetPolicy::new(TargetLe::new(target.to_le_bytes()))?,
     })
+}
+
+fn parse_pool_backend_listener_workers(value: Option<String>) -> Result<usize, MinerError> {
+    let workers = parse_optional_usize(value, 4, WCASH_POOL_BACKEND_LISTENERS)?;
+    if !(1..=16).contains(&workers) {
+        return Err(MinerError::InvalidRequest(format!(
+            "environment variable {WCASH_POOL_BACKEND_LISTENERS} must be in 1..=16"
+        )));
+    }
+    Ok(workers)
 }
 
 fn parse_display_hex32(encoded: &str, field: &'static str) -> Result<Hex32, MinerError> {
@@ -2016,6 +2019,20 @@ mod tests {
         );
         assert_eq!(display_target(target), display);
         assert!(parse_display_target(&"00".repeat(32), "target").is_err());
+    }
+
+    #[test]
+    fn backend_listener_default_reserves_full_pool_bootstrap_capacity() {
+        assert_eq!(parse_pool_backend_listener_workers(None).unwrap(), 4);
+        for workers in [1, 2, 3, 4, 16] {
+            assert_eq!(
+                parse_pool_backend_listener_workers(Some(workers.to_string())).unwrap(),
+                workers
+            );
+        }
+        for value in ["0", "17", "", "-1", "four"] {
+            assert!(parse_pool_backend_listener_workers(Some(value.to_string())).is_err());
+        }
     }
 
     #[test]

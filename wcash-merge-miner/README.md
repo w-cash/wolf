@@ -36,6 +36,12 @@ rechecks require every parent to return this API's exact, positively confirmed
 genesis at height zero. An older parent node that lacks the method therefore
 fails closed before new mining work is admitted.
 
+`WCASH_POOL_BACKEND_LISTENERS` defaults to four workers. Each persistent Unix
+session occupies a worker, so the complete pool needs four for its public
+service, accounting projector, and concurrent payout bootstrap sessions. An
+explicit override from one to sixteen remains available for standalone uses;
+reserve all required sessions before starting the corresponding pool services.
+
 The coordinator verifies the configured Zcash coinbase recipient and an exact
 transparent Wcash child recipient directly from their serialized coinbases. A
 Wcash Unified Address with an Orchard receiver explicitly selects a private
