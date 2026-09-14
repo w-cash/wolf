@@ -61,21 +61,21 @@ If `miner_address` is a Unified Address with more than one receiver, Zebra sends
 
 [#extra-coinbase-data]: #extra-coinbase-data
 
-Zebra prepends a `🦓` marker to the coinbase input of every block it builds. Setting `extra_coinbase_data` adds your own tag (such as a pool name) after it, separated by `": "`:
+Wolf prepends a `🐺 Wolf` marker to the coinbase input of every block it builds. Testnet defaults to `🐺 Wolf: W.cash testnet`. Setting `extra_coinbase_data` replaces the default Testnet label with your own tag after the marker, separated by `": "`:
 
 ```toml
 [mining]
 miner_address = 't3dvVE3SQEi7kqNzwrfNePxZ1d4hUyztBA1'
-extra_coinbase_data = "/MyPoolName/"
+extra_coinbase_data = "W.cash testnet"
 ```
 
 How it's used:
 
-- Inserted into the coinbase input script, after the block height, `🦓` marker, and `": "` separator.
-- Limited to 86 bytes. If exceeded, Zebra refuses to start.
-- Optional. If unset, the block still carries the `🦓` marker, just no extra data.
+- Inserted into the coinbase input script after the block height and `🐺 Wolf: ` marker.
+- Limited to the remaining coinbase-data budget. If exceeded, Wolf refuses to start.
+- Optional. If unset, Testnet uses `W.cash testnet`; Mainnet carries only the Wolf marker.
 
-You can confirm the marker is applied by calling `getblocktemplate` and checking the `coinbasetxn.data` field (see [Testing the setup](#testing-the-setup)): after the height bytes you'll see the `🦓` marker (`f0 9f a6 93`), then — if `extra_coinbase_data` is set — the `": "` separator (`3a 20`) and your text.
+You can confirm the marker by calling `getblocktemplate` and checking the `coinbasetxn.data` field (see [Testing the setup](#testing-the-setup)).
 
 ### Miner memo
 

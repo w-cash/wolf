@@ -300,14 +300,14 @@ fn coinbase() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The Zebra marker is always prepended, and `extra_coinbase_data` can't exceed the limit.
+/// The Wolf marker is always prepended, and `extra_coinbase_data` can't exceed the limit.
 #[test]
 fn coinbase_tag_and_limit() {
     use zcash_address::ZcashAddress;
 
     use crate::config::mining::{
-        Config, ExtraCoinbaseData, MAX_USER_COINBASE_DATA_LEN, ZEBRA_COINBASE_MARKER,
-        ZEBRA_COINBASE_SEPARATOR,
+        Config, ExtraCoinbaseData, MAX_USER_COINBASE_DATA_LEN, WCASH_TESTNET_COINBASE_TAG,
+        WOLF_COINBASE_MARKER, WOLF_COINBASE_SEPARATOR,
     };
 
     // `ExtraCoinbaseData` accepts data up to the limit and rejects one byte over. Its `Deserialize`
@@ -332,14 +332,10 @@ fn coinbase_tag_and_limit() {
         )
     };
 
-    // The marker is prepended whether or not `extra_coinbase_data` is set, so every block Zebra
-    // builds is tagged. Without extra data, the coinbase data is exactly the marker.
+    // Mainnet has the Wolf marker but no default network tag.
     let untagged = params(None).expect("valid config");
     let untagged = untagged.data().as_ref().expect("marker is always present");
-    assert_eq!(
-        untagged.value().as_slice(),
-        ZEBRA_COINBASE_MARKER.as_bytes()
-    );
+    assert_eq!(untagged.value().as_slice(), WOLF_COINBASE_MARKER.as_bytes());
 
     // With extra data, the marker and separator precede it.
     let tag = ExtraCoinbaseData::try_from("/pool/".to_string()).expect("within the limit");
@@ -347,9 +343,34 @@ fn coinbase_tag_and_limit() {
     let tagged = tagged.data().as_ref().expect("marker is always present");
     assert_eq!(
         tagged.value().as_slice(),
-        [ZEBRA_COINBASE_MARKER, ZEBRA_COINBASE_SEPARATOR, "/pool/"]
+        [WOLF_COINBASE_MARKER, WOLF_COINBASE_SEPARATOR, "/pool/"]
             .concat()
             .as_bytes()
+    );
+
+    // Testnet carries the W.cash tag even when the operator does not configure extra data.
+    let testnet = Network::new_default_testnet();
+    let testnet_addr: ZcashAddress =
+        default_miner_address(testnet.kind(), &MinerAddressType::Transparent)
+            .parse()
+            .expect("default Testnet miner address parses");
+    let testnet_params = MinerParams::new(
+        &testnet,
+        Config {
+            miner_address: Some(testnet_addr.into()),
+            ..Default::default()
+        },
+    )
+    .expect("valid Testnet config");
+    assert_eq!(
+        testnet_params.data().as_ref().unwrap().value().as_slice(),
+        [
+            WOLF_COINBASE_MARKER,
+            WOLF_COINBASE_SEPARATOR,
+            WCASH_TESTNET_COINBASE_TAG,
+        ]
+        .concat()
+        .as_bytes()
     );
 }
 

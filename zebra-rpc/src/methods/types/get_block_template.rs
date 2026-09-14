@@ -33,7 +33,7 @@ use zebra_chain::{
     },
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
-    parameters::Network,
+    parameters::{Network, NetworkKind},
     serialization::{DateTime32, ZcashDeserializeInto},
     transaction::VerifiedUnminedTx,
     work::{
@@ -54,7 +54,7 @@ use zebra_state::GetBlockTemplateChainInfo;
 use crate::{
     config::{
         self,
-        mining::{ZEBRA_COINBASE_MARKER, ZEBRA_COINBASE_SEPARATOR},
+        mining::{WCASH_TESTNET_COINBASE_TAG, WOLF_COINBASE_MARKER, WOLF_COINBASE_SEPARATOR},
     },
     methods::types::{
         default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
@@ -539,12 +539,12 @@ impl fmt::Debug for MinerParams {
     }
 }
 
-/// Builds the coinbase input data for a block Zebra constructs: the [`ZEBRA_COINBASE_MARKER`],
-/// followed by the [`ZEBRA_COINBASE_SEPARATOR`] and `extra` when `extra` is non-empty.
+/// Builds the coinbase input data for a block Wolf constructs: the [`WOLF_COINBASE_MARKER`],
+/// followed by the [`WOLF_COINBASE_SEPARATOR`] and `extra` when `extra` is non-empty.
 fn coinbase_data(extra: &[u8]) -> Vec<u8> {
-    let mut bytes = ZEBRA_COINBASE_MARKER.as_bytes().to_vec();
+    let mut bytes = WOLF_COINBASE_MARKER.as_bytes().to_vec();
     if !extra.is_empty() {
-        bytes.extend_from_slice(ZEBRA_COINBASE_SEPARATOR.as_bytes());
+        bytes.extend_from_slice(WOLF_COINBASE_SEPARATOR.as_bytes());
         bytes.extend_from_slice(extra);
     }
     bytes
@@ -589,11 +589,15 @@ impl MinerParams {
             return Err(MinerParamsError::WcashUnsupportedPayoutAddress);
         }
 
-        // Always tag the coinbase with the Zebra marker, even without configured
-        // `extra_coinbase_data`, so every block Zebra builds is identifiable. The type of
-        // `extra_coinbase_data` bounds its length, so the marker, separator, and data always fit in
-        // a single push.
-        let user_data = conf.extra_coinbase_data.as_deref().unwrap_or_default();
+        // Every Wolf-built block is identifiable. Testnet also carries the W.cash network tag by
+        // default, while an explicit operator tag still takes precedence.
+        let user_data = conf.extra_coinbase_data.as_deref().unwrap_or_else(|| {
+            if net.kind() == NetworkKind::Testnet {
+                WCASH_TESTNET_COINBASE_TAG
+            } else {
+                ""
+            }
+        });
         let data = Some(
             push_value(&coinbase_data(user_data.as_bytes()))
                 .expect("coinbase data fits in a push: extra_coinbase_data is length-validated"),
@@ -640,7 +644,7 @@ impl MinerParams {
         self.memo = Some(MemoBytes::from_bytes(&random).unwrap());
     }
 
-    /// Randomizes the miner data, keeping the `🦓` marker prefix and separator.
+    /// Randomizes the miner data, keeping the `🐺 Wolf` marker prefix and separator.
     pub fn randomize_data(&mut self) {
         let mut random = [0u8; 32];
         OsRng.fill_bytes(&mut random);

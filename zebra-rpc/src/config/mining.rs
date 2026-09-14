@@ -16,13 +16,14 @@ use zebra_chain::{
 /// The maximum length of the optional, arbitrary data in the script sig field of a coinbase tx.
 pub(crate) const MAX_MINER_DATA_LEN: usize = MAX_COINBASE_SCRIPT_LEN - MAX_COINBASE_HEIGHT_LEN;
 
-/// The marker Zebra prepends to the coinbase input of every block it builds.
-///
-/// The zebra emoji (`U+1F993`), 4 UTF-8 bytes.
-pub(crate) const ZEBRA_COINBASE_MARKER: &str = "🦓";
+/// The W.cash Wolf marker prepended to every coinbase input this fork builds.
+pub(crate) const WOLF_COINBASE_MARKER: &str = "🐺 Wolf";
 
-/// Separates [`ZEBRA_COINBASE_MARKER`] from `extra_coinbase_data`. Present only when that is set.
-pub(crate) const ZEBRA_COINBASE_SEPARATOR: &str = ": ";
+/// Separates [`WOLF_COINBASE_MARKER`] from the configured or default coinbase tag.
+pub(crate) const WOLF_COINBASE_SEPARATOR: &str = ": ";
+
+/// The default public coinbase tag for Testnet blocks built by Wolf.
+pub(crate) const WCASH_TESTNET_COINBASE_TAG: &str = "W.cash testnet";
 
 /// The maximum length of the user-configurable `extra_coinbase_data`.
 ///
@@ -30,7 +31,7 @@ pub(crate) const ZEBRA_COINBASE_SEPARATOR: &str = ": ";
 /// portion is [`MAX_MINER_DATA_LEN`] minus the marker, separator, and the 2-byte `OP_PUSHDATA1`
 /// opcode (for pushes over 75 bytes).
 pub(crate) const MAX_USER_COINBASE_DATA_LEN: usize =
-    MAX_MINER_DATA_LEN - ZEBRA_COINBASE_MARKER.len() - ZEBRA_COINBASE_SEPARATOR.len() - 2;
+    MAX_MINER_DATA_LEN - WOLF_COINBASE_MARKER.len() - WOLF_COINBASE_SEPARATOR.len() - 2;
 
 /// A miner payment address in either the Zcash or Wcash textual namespace.
 ///
@@ -104,8 +105,8 @@ pub struct Config {
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub miner_address: Option<MinerAddress>,
 
-    /// Optional tag that Zebra appends to the coinbase input of every block it builds, after the
-    /// Zebra `🦓` marker and a `: ` separator.
+    /// Optional tag that Wolf appends after the `🐺 Wolf: ` coinbase marker.
+    /// Testnet defaults to `W.cash testnet` when this field is unset.
     ///
     /// Limited to `MAX_USER_COINBASE_DATA_LEN` bytes.
     pub extra_coinbase_data: Option<ExtraCoinbaseData>,
@@ -156,8 +157,7 @@ impl Config {
     }
 }
 
-/// Operator-configured data appended to the coinbase input of every block Zebra builds, after
-/// Zebra's `🦓` marker and `: ` separator.
+/// Operator-configured data appended after Wolf's coinbase marker and separator.
 ///
 /// Validated on construction to fit within the coinbase data budget, so an oversized value can't
 /// be represented — and an oversized `mining.extra_coinbase_data` in the config makes Zebra fail
