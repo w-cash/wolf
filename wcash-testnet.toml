@@ -32,7 +32,7 @@ debug_force_finished_sync = false
 # path; a `wutest1...` Unified Address with an Orchard receiver opts into a
 # private Ironwood reward. Inherited Zcash addresses are never accepted.
 internal_miner = false
-extra_coinbase_data = "WcashTestnet"
+extra_coinbase_data = "W.cash testnet"
 
 [tracing]
 filter = "info"
