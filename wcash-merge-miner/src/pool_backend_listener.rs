@@ -344,6 +344,11 @@ pub trait PoolBackendRequestHandler: Send + Sync {
 pub enum PoolBackendConnectionOutcome {
     /// An authorized connection closed cleanly or after a bounded protocol error.
     Served,
+    /// A peer transport fault closed only this connection, without replaying it.
+    Closed {
+        /// Fixed, payload-free diagnostic identifying the failure boundary.
+        reason: &'static str,
+    },
     /// The peer UID did not match the configured pool service account.
     Unauthorized,
     /// The connection cap was reached before any frame buffer was allocated.
@@ -371,15 +376,60 @@ pub enum PoolBackendListenerError {
     /// Safe operating-system peer credential lookup failed.
     #[error("could not authenticate pool backend peer credentials")]
     PeerCredentials(#[source] nix::Error),
-    /// The connection violated framing or a finite transport deadline.
-    #[error("pool backend connection transport failed")]
+    /// Encoding or delivering the backend's response failed.
+    #[error("pool backend response transport failed")]
     Transport(#[from] BackendTransportError),
+    /// Reading the peer's request failed before handler dispatch.
+    #[error("pool backend request transport failed")]
+    RequestTransport(#[source] BackendTransportError),
     /// The handler returned invalid ordering or an invalid message.
     #[error("pool backend handler violated its response contract")]
     InvalidHandlerResponse,
     /// A fresh session UUID could not be represented safely.
     #[error("could not create a pool backend session identity")]
     SessionIdentity,
+}
+
+impl PoolBackendListenerError {
+    fn connection_close_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::RequestTransport(BackendTransportError::TruncatedFrame) => {
+                Some("incomplete request frame")
+            }
+            Self::RequestTransport(BackendTransportError::InvalidFrameLength(_)) => {
+                Some("invalid request frame length")
+            }
+            Self::RequestTransport(BackendTransportError::InvalidFrame(_)) => {
+                Some("invalid request frame")
+            }
+            Self::RequestTransport(BackendTransportError::Timeout) => {
+                Some("request deadline expired")
+            }
+            Self::Transport(BackendTransportError::Timeout) => Some("response deadline expired"),
+            Self::Transport(BackendTransportError::TruncatedFrame) => Some("response peer closed"),
+            Self::RequestTransport(BackendTransportError::Io(error))
+                if peer_disconnected(error) =>
+            {
+                Some("request peer disconnected")
+            }
+            Self::Transport(BackendTransportError::Io(error)) if peer_disconnected(error) => {
+                Some("response peer disconnected")
+            }
+            // In particular, InvalidFrame while encoding a response is a local
+            // invariant failure, not evidence that the peer sent a bad frame.
+            _ => None,
+        }
+    }
+}
+
+fn peer_disconnected(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
 }
 
 /// Bound private Unix listener with inode-safe cleanup.
@@ -519,8 +569,14 @@ impl PoolBackendListener {
             peer_uid,
             peer_role,
         };
-        serve_authorized_connection(&mut stream, &self.config, handler, &session, &authority)?;
-        Ok(PoolBackendConnectionOutcome::Served)
+        match serve_authorized_connection(&mut stream, &self.config, handler, &session, &authority)
+        {
+            Ok(()) => Ok(PoolBackendConnectionOutcome::Served),
+            Err(error) => match error.connection_close_reason() {
+                Some(reason) => Ok(PoolBackendConnectionOutcome::Closed { reason }),
+                None => Err(error),
+            },
+        }
     }
 }
 struct ActiveStreamGuard {
@@ -650,7 +706,9 @@ fn serve_authorized_connection(
         } else {
             config.idle_timeout
         };
-        let request = match read_unix_backend_request(stream, idle_timeout, config.frame_timeout)? {
+        let request = match read_unix_backend_request(stream, idle_timeout, config.frame_timeout)
+            .map_err(PoolBackendListenerError::RequestTransport)?
+        {
             Some(request) => request,
             None => return Ok(()),
         };
@@ -1072,7 +1130,12 @@ fn sync_parent_directory(path: &Path) -> Result<(), PoolBackendListenerError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, os::unix::net::UnixStream, sync::Mutex, thread};
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        sync::{mpsc, Mutex},
+        thread,
+    };
 
     use serde_json::json;
     use wcash_pool_protocol::{
@@ -1113,6 +1176,259 @@ mod tests {
             Duration::from_secs(1),
         )
         .unwrap()
+    }
+
+    fn test_hello() -> BackendRequest {
+        BackendRequest::Hello {
+            version: BACKEND_PROTOCOL_VERSION,
+            id: 1,
+            pool_instance: canonical_uuid("f0a56cbd-c01b-4e7e-ab01-51ff7de71695"),
+            last_event_seq: 0,
+        }
+    }
+
+    fn healthy_following_connection(path: &Path) {
+        let mut client = UnixStream::connect(path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(&encode_backend_request(&test_hello()).unwrap())
+            .unwrap();
+        assert!(matches!(
+            read_message(&mut client),
+            BackendMessage::HelloOk { id: 1, .. }
+        ));
+        client
+            .write_all(
+                &encode_backend_request(&BackendRequest::SubscribeJobs {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id: 2,
+                    after_event_seq: 0,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            read_message(&mut client),
+            BackendMessage::JobSnapshot { id: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn peer_read_faults_close_only_the_session_and_next_authorized_client_works() {
+        for fault in 0..6 {
+            let directory = private_directory();
+            let path = socket_path(&directory);
+            let quick = Duration::from_millis(150);
+            let listener = Arc::new(
+                PoolBackendListener::bind(
+                    config(path.clone())
+                        .with_timeouts(quick, quick, quick, quick)
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+            let handler = Arc::new(TestHandler::default());
+            let (outcome_tx, outcome_rx) = mpsc::channel();
+            let server = {
+                let listener = Arc::clone(&listener);
+                let handler = Arc::clone(&handler);
+                thread::spawn(move || {
+                    for _ in 0..2 {
+                        let outcome = listener.serve_one(handler.as_ref());
+                        let terminal = outcome.is_err();
+                        outcome_tx.send(outcome).unwrap();
+                        if terminal {
+                            break;
+                        }
+                    }
+                })
+            };
+            let mut client = UnixStream::connect(&path).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let expected_reason = match fault {
+                0 => {
+                    client.write_all(&[0]).unwrap();
+                    client.shutdown(Shutdown::Write).unwrap();
+                    "incomplete request frame"
+                }
+                1 => "request deadline expired", // No Hello arrives.
+                2 => {
+                    client
+                        .write_all(&encode_backend_request(&test_hello()).unwrap())
+                        .unwrap();
+                    assert!(matches!(
+                        read_message(&mut client),
+                        BackendMessage::HelloOk { .. }
+                    ));
+                    "request deadline expired" // Negotiated client goes idle.
+                }
+                3 => {
+                    client.write_all(&[0; 4]).unwrap();
+                    "invalid request frame length"
+                }
+                4 => {
+                    client.write_all(&[0, 0, 0, 1, b'{']).unwrap();
+                    "invalid request frame"
+                }
+                5 => {
+                    client.write_all(&[0]).unwrap();
+                    "request deadline expired" // A frame starts but never completes.
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                outcome_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap(),
+                PoolBackendConnectionOutcome::Closed {
+                    reason: expected_reason
+                },
+            );
+            assert_eq!(
+                client.read(&mut [0]).unwrap(),
+                0,
+                "failed session is closed"
+            );
+            assert!(listener.is_accepting());
+            assert_eq!(listener.active_connections.load(Ordering::Acquire), 0);
+            assert!(listener.active_streams.lock().unwrap().is_empty());
+            healthy_following_connection(&path);
+            assert_eq!(
+                outcome_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap(),
+                PoolBackendConnectionOutcome::Served,
+            );
+            server.join().unwrap();
+            let expected_calls = if fault == 2 { 3 } else { 2 };
+            assert_eq!(handler.requests.lock().unwrap().len(), expected_calls);
+        }
+    }
+
+    #[test]
+    fn closed_peer_response_and_error_writes_preserve_platform_failure_boundary() {
+        for ordinary_response in [true, false] {
+            // Start with an established socket and a fully received request;
+            // closing a not-yet-accepted socket is platform dependent.
+            let (mut stream, mut peer) = UnixStream::pair().unwrap();
+            peer.write_all(&[1]).unwrap();
+            stream.read_exact(&mut [0]).unwrap();
+            drop(peer);
+            let error = if ordinary_response {
+                let response = BackendMessage::HealthStatus {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id: 1,
+                    event_seq: 0,
+                    healthy: true,
+                    pending_wcash: 0,
+                    quarantined_wcash: 0,
+                    pending_zcash: 0,
+                };
+                PoolBackendListenerError::Transport(
+                    write_unix_backend_messages(&mut stream, &[response], Duration::from_secs(1))
+                        .expect_err("closed peer cannot receive a response"),
+                )
+            } else {
+                write_error(
+                    &mut stream,
+                    Duration::from_secs(1),
+                    1,
+                    BackendErrorCode::InvalidRequest,
+                    "test request rejected".to_string(),
+                )
+                .expect_err("closed peer cannot receive a protocol error")
+            };
+            #[cfg(target_os = "macos")]
+            {
+                // Darwin rejects SO_SNDTIMEO after peer close before write can
+                // return EPIPE. Unexpected EINVAL deliberately remains fatal.
+                assert!(matches!(&error, PoolBackendListenerError::Transport(
+                    BackendTransportError::Io(source)) if source.kind() == io::ErrorKind::InvalidInput));
+                assert_eq!(error.connection_close_reason(), None);
+            }
+            #[cfg(not(target_os = "macos"))]
+            assert_eq!(
+                error.connection_close_reason(),
+                Some("response peer disconnected")
+            );
+        }
+    }
+
+    #[test]
+    fn outgoing_encoding_and_unexpected_io_remain_service_failures() {
+        let (mut stream, _peer) = UnixStream::pair().unwrap();
+        let invalid = BackendMessage::Error {
+            version: 0,
+            id: 1,
+            code: BackendErrorCode::InvalidRequest,
+            message: "invalid output fixture".to_string(),
+        };
+        let error = PoolBackendListenerError::Transport(
+            write_unix_backend_messages(&mut stream, &[invalid], Duration::from_secs(1))
+                .expect_err("local invalid response must not be encoded"),
+        );
+        assert!(matches!(
+            &error,
+            PoolBackendListenerError::Transport(BackendTransportError::InvalidFrame(_))
+        ));
+        assert_eq!(error.connection_close_reason(), None);
+        for error in [
+            PoolBackendListenerError::InvalidHandlerResponse,
+            PoolBackendListenerError::SessionIdentity,
+            PoolBackendListenerError::Io(io::Error::from(io::ErrorKind::PermissionDenied)),
+            PoolBackendListenerError::RequestTransport(BackendTransportError::Io(io::Error::from(
+                io::ErrorKind::InvalidInput,
+            ))),
+            PoolBackendListenerError::Transport(BackendTransportError::Io(io::Error::from(
+                io::ErrorKind::OutOfMemory,
+            ))),
+        ] {
+            assert_eq!(error.connection_close_reason(), None);
+        }
+    }
+
+    #[test]
+    fn invalid_handler_authority_remains_fatal_even_if_peer_disconnected() {
+        struct InvalidAuthorityHandler(TestHandler);
+        impl PoolBackendRequestHandler for InvalidAuthorityHandler {
+            fn persistent_authority(&self) -> PoolBackendAuthority {
+                self.0.persistent_authority()
+            }
+
+            fn handle(
+                &self,
+                context: PoolBackendRequestContext<'_>,
+                kind: BackendRequestKind,
+                request: BackendRequest,
+            ) -> Result<Vec<BackendMessage>, PoolBackendHandlerError> {
+                let mut messages = self.0.handle(context, kind, request)?;
+                let BackendMessage::HelloOk { wcash_genesis, .. } = &mut messages[0] else {
+                    unreachable!();
+                };
+                *wcash_genesis = Hex32::new([99; 32]);
+                Ok(messages)
+            }
+        }
+        let directory = private_directory();
+        let path = socket_path(&directory);
+        let listener = PoolBackendListener::bind(config(path.clone())).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .write_all(&encode_backend_request(&test_hello()).unwrap())
+            .unwrap();
+        client.shutdown(Shutdown::Both).unwrap();
+        assert!(matches!(
+            listener.serve_one(&InvalidAuthorityHandler(TestHandler::default())),
+            Err(PoolBackendListenerError::InvalidHandlerResponse),
+        ));
+        assert_eq!(listener.active_connections.load(Ordering::Acquire), 0);
+        assert!(listener.active_streams.lock().unwrap().is_empty());
     }
 
     #[test]

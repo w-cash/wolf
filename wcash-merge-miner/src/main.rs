@@ -20,8 +20,9 @@ use wcash_merge_miner::{
     accounting::{hash_worker_password, read_accounting_snapshot, WorkerCredentialStore},
     mine_zip301_once,
     pool_backend::{
-        PoolBackendIdentity, PoolBackendIdentityError, PoolBackendJournal, PoolBackendJournalError,
-        PoolBackendListener, PoolBackendListenerConfig, PoolShareTargetPolicy,
+        PoolBackendConnectionOutcome, PoolBackendIdentity, PoolBackendIdentityError,
+        PoolBackendJournal, PoolBackendJournalError, PoolBackendListener,
+        PoolBackendListenerConfig, PoolShareTargetPolicy,
     },
     protocol::serve_loopback,
     rpc::RpcEndpoint,
@@ -367,11 +368,19 @@ impl PoolBackendListenerWorkers {
                     if !listener.is_accepting() {
                         break;
                     }
-                    if let Err(error) = listener.serve_one(actor.as_ref()) {
-                        if listener.is_accepting() {
-                            let _ = failure.send(error.to_string());
+                    match listener.serve_one(actor.as_ref()) {
+                        Ok(PoolBackendConnectionOutcome::Closed { reason }) => {
+                            if listener.is_accepting() {
+                                eprintln!("private pool backend connection closed: {reason}");
+                            }
                         }
-                        break;
+                        Ok(_) => {}
+                        Err(error) => {
+                            if listener.is_accepting() {
+                                let _ = failure.send(error.to_string());
+                            }
+                            break;
+                        }
                     }
                 })?;
             workers.threads.push(thread);

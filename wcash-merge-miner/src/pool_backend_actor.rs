@@ -3307,6 +3307,238 @@ mod tests {
     }
 
     #[test]
+    fn lost_share_response_recovers_one_durable_receipt_on_explicit_new_connection() {
+        use crate::pool_backend_listener::{
+            PoolBackendConnectionOutcome, PoolBackendListener, PoolBackendListenerConfig,
+        };
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixStream,
+            sync::mpsc,
+        };
+        use wcash_pool_protocol::{
+            decode_backend_message, encode_backend_request, MAX_BACKEND_PAYLOAD_BYTES,
+        };
+
+        struct CommitBeforeResponse {
+            actor: Arc<PoolBackendActor>,
+            committed: mpsc::SyncSender<ShareReceipt>,
+            release_response: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl PoolBackendRequestHandler for CommitBeforeResponse {
+            fn persistent_authority(&self) -> PoolBackendAuthority {
+                self.actor.persistent_authority()
+            }
+
+            fn handle(
+                &self,
+                context: PoolBackendRequestContext<'_>,
+                kind: BackendRequestKind,
+                request: BackendRequest,
+            ) -> Result<Vec<BackendMessage>, PoolBackendHandlerError> {
+                // Delegate the complete operation to the real actor and durable
+                // journal, then hold its response until the client disconnects.
+                let messages = self.actor.handle(context, kind, request)?;
+                if kind == BackendRequestKind::SubmitShare {
+                    let Some(BackendMessage::ShareCommitted {
+                        receipt,
+                        replayed: false,
+                        ..
+                    }) = messages.last()
+                    else {
+                        panic!("original request must commit a fresh receipt");
+                    };
+                    self.committed.send(receipt.clone()).unwrap();
+                    self.release_response
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("client closes after commit and before response");
+                }
+                Ok(messages)
+            }
+        }
+
+        fn exchange(stream: &mut UnixStream, request: BackendRequest) -> BackendMessage {
+            stream
+                .write_all(&encode_backend_request(&request).unwrap())
+                .unwrap();
+            let mut prefix = [0; 4];
+            stream.read_exact(&mut prefix).unwrap();
+            let length = u32::from_be_bytes(prefix) as usize;
+            assert!(length <= MAX_BACKEND_PAYLOAD_BYTES);
+            let mut frame = Vec::from(prefix);
+            frame.resize(4 + length, 0);
+            stream.read_exact(&mut frame[4..]).unwrap();
+            decode_backend_message(&frame).unwrap()
+        }
+
+        fn connect(path: &Path) -> UnixStream {
+            let stream = UnixStream::connect(path).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+        }
+
+        fn hello() -> BackendRequest {
+            BackendRequest::Hello {
+                version: BACKEND_PROTOCOL_VERSION,
+                id: 1,
+                pool_instance: uuid(20),
+                last_event_seq: 0,
+            }
+        }
+
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let socket = directory.path().join("backend.sock");
+        let config = config();
+        let actor = Arc::new(actor(&path, &config, Arc::new(TestClock::new())));
+        let descriptor = job(1);
+        let retained = Arc::new(TestRetainedJob::new(descriptor.clone()));
+        actor
+            .activate_job(retained.clone(), Duration::from_secs(5))
+            .unwrap();
+        let listener = Arc::new(
+            PoolBackendListener::bind(
+                PoolBackendListenerConfig::new(
+                    socket.clone(),
+                    nix::unistd::geteuid().as_raw(),
+                    nix::unistd::getegid().as_raw(),
+                )
+                .unwrap()
+                .with_maximum_connections(1)
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let (committed_tx, committed_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let server = {
+            let listener = Arc::clone(&listener);
+            let actor = Arc::clone(&actor);
+            thread::spawn(move || {
+                listener.serve_one(&CommitBeforeResponse {
+                    actor,
+                    committed: committed_tx,
+                    release_response: Mutex::new(release_rx),
+                })
+            })
+        };
+        let mut client = connect(&socket);
+        let BackendMessage::HelloOk {
+            backend_session: first_session,
+            backend_instance: first_instance,
+            journal_stream: first_stream,
+            current_event_seq: 1,
+            ..
+        } = exchange(&mut client, hello())
+        else {
+            panic!("first Hello binds the activated journal");
+        };
+        assert!(matches!(
+            exchange(
+                &mut client,
+                BackendRequest::SubscribeJobs {
+                    version: BACKEND_PROTOCOL_VERSION,
+                    id: 2,
+                    after_event_seq: 0,
+                }
+            ),
+            BackendMessage::JobSnapshot { event_seq: 1, .. }
+        ));
+        client
+            .write_all(&encode_backend_request(&submit_request(3, &descriptor)).unwrap())
+            .unwrap();
+        let receipt = committed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(client);
+        release_tx.send(()).unwrap();
+        let outcome = server.join().unwrap();
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        assert_eq!(
+            outcome.unwrap(),
+            PoolBackendConnectionOutcome::Closed {
+                reason: "response peer disconnected",
+            }
+        );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert!(matches!(
+            outcome,
+            Err(crate::pool_backend_listener::PoolBackendListenerError::Transport(
+                crate::pool_backend_transport::BackendTransportError::Io(error)
+            )) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert!(listener.is_accepting());
+
+        // A fresh connection must fit the one-connection cap. Recovery reads
+        // authoritative events only: it never resends SubmitShare.
+        // Darwin rejects timeout setsockopt on the disconnected socket with
+        // EINVAL, which deliberately remains terminal. Its explicit next serve
+        // proves journal recovery, not supervisor continuity. Linux reaches
+        // EPIPE on write and must keep the listener worker alive instead.
+        let server = {
+            let listener = Arc::clone(&listener);
+            let actor = Arc::clone(&actor);
+            thread::spawn(move || listener.serve_one(actor.as_ref()))
+        };
+        let mut client = connect(&socket);
+        let BackendMessage::HelloOk {
+            backend_session,
+            backend_instance,
+            journal_stream,
+            current_event_seq: 2,
+            ..
+        } = exchange(&mut client, hello())
+        else {
+            panic!("new Hello exposes the committed journal watermark");
+        };
+        assert_ne!(backend_session, first_session);
+        assert_eq!(backend_instance, first_instance);
+        assert_eq!(journal_stream, first_stream);
+        let BackendMessage::EventsPage {
+            after_event_seq: 0,
+            next_event_seq: 2,
+            complete: true,
+            events,
+            ..
+        } = exchange(
+            &mut client,
+            BackendRequest::ReadEvents {
+                version: BACKEND_PROTOCOL_VERSION,
+                id: 2,
+                after_event_seq: 0,
+                limit: 10,
+            },
+        )
+        else {
+            panic!("explicit replay reaches the exact durable watermark");
+        };
+        assert!(
+            matches!(events.as_slice(), [BackendEvent::JobActivated { event_seq: 1, .. },
+            BackendEvent::ShareCommitted { receipt: replayed, .. }] if replayed == &receipt)
+        );
+        drop(client);
+        assert_eq!(
+            server.join().unwrap().unwrap(),
+            PoolBackendConnectionOutcome::Served
+        );
+        assert_eq!(retained.validations.load(Ordering::Acquire), 1);
+        assert_eq!(actor.lock_state().unwrap().shares.len(), 1);
+        drop(actor);
+
+        // Reopen the actual journal, independently of the actor's in-memory
+        // projection. The uncertain response never duplicated the commit.
+        let recovered = open_journal(&path, &config);
+        assert_eq!(recovered.current_event_seq().unwrap(), 2);
+        assert_eq!(recovered.read_events(0, 10).unwrap().events, events);
+    }
+
+    #[test]
     fn concurrent_identical_share_is_validated_and_committed_once() {
         let directory = private_temp_dir();
         let path: PathBuf = directory.path().join("actor.journal");
