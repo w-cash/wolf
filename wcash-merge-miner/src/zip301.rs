@@ -92,6 +92,7 @@ where
 pub struct Zip301Config {
     share_target: Target,
     testnet_parent_target_sampling: bool,
+    rotate_after_network_winner: bool,
     authentication: Zip301Authentication,
     maximum_clients: usize,
     maximum_parallel_authentications: usize,
@@ -115,6 +116,7 @@ impl Zip301Config {
         Ok(Self {
             share_target,
             testnet_parent_target_sampling: false,
+            rotate_after_network_winner: false,
             authentication: Zip301Authentication::SharedPassword(
                 Sha256::digest(password.as_bytes()).into(),
             ),
@@ -132,6 +134,7 @@ impl Zip301Config {
         Self {
             share_target,
             testnet_parent_target_sampling: false,
+            rotate_after_network_winner: false,
             authentication: Zip301Authentication::ExactWorkers(authenticator),
             maximum_clients: DEFAULT_ZIP301_CLIENT_LIMIT,
             maximum_parallel_authentications: DEFAULT_ZIP301_AUTHENTICATION_LIMIT,
@@ -206,7 +209,19 @@ impl Zip301Config {
             ));
         }
         self.testnet_parent_target_sampling = true;
+        self.rotate_after_network_winner = true;
         Ok(self)
+    }
+
+    /// Retires the frozen generation immediately after durably recording its
+    /// first network winner.
+    ///
+    /// This is useful when the advertised share target is derived from the
+    /// easier network target: every accepted share is then a block candidate,
+    /// and continuing to admit the old job only wastes work while a tip changes.
+    pub fn with_rotation_after_network_winner(mut self) -> Self {
+        self.rotate_after_network_winner = true;
+        self
     }
 
     /// Returns the configured share target.
@@ -217,6 +232,11 @@ impl Zip301Config {
     /// Returns true when parent winners may be sampled on Zcash Testnet.
     pub const fn testnet_parent_target_sampling(&self) -> bool {
         self.testnet_parent_target_sampling
+    }
+
+    /// Returns true when the first durable network winner retires this job.
+    pub const fn rotates_after_network_winner(&self) -> bool {
+        self.rotate_after_network_winner
     }
 
     /// Returns true when each exact worker has an independent credential.
@@ -233,6 +253,10 @@ impl std::fmt::Debug for Zip301Config {
             .field(
                 "testnet_parent_target_sampling",
                 &self.testnet_parent_target_sampling,
+            )
+            .field(
+                "rotate_after_network_winner",
+                &self.rotate_after_network_winner,
             )
             .field(
                 "authentication",
@@ -884,7 +908,7 @@ fn request_rotation_after_durable_share(
     shutdown: &AtomicBool,
     shutdown_reason: &Mutex<Option<MinerError>>,
 ) {
-    if !is_network_winner || !config.testnet_parent_target_sampling {
+    if !is_network_winner || !config.rotate_after_network_winner {
         return;
     }
 
@@ -893,7 +917,7 @@ fn request_rotation_after_durable_share(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if reason.is_none() {
         *reason = Some(MinerError::StaleNativeJob(
-            "Testnet parent-target sampling durably recorded a network winner; rotating work"
+            "the active share-target policy durably recorded a network winner; rotating work"
                 .to_string(),
         ));
         shutdown.store(true, Ordering::Release);
@@ -1743,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    fn sampled_network_winner_requests_prompt_generation_rotation() {
+    fn configured_network_winner_requests_prompt_generation_rotation() {
         let default = Zip301Config::new(Target::MAX, "correct horse battery")
             .expect("strong fixture password")
             .with_maximum_clients(1)
@@ -1752,6 +1776,7 @@ mod tests {
             .clone()
             .with_testnet_parent_target_sampling(NativeZcashNetwork::Testnet)
             .expect("public Testnet explicitly supports sampling");
+        let full_coverage = default.clone().with_rotation_after_network_winner();
         let shutdown = AtomicBool::new(false);
         let reason = Mutex::new(None);
 
@@ -1766,6 +1791,12 @@ mod tests {
             Some(MinerError::StaleNativeJob(message))
                 if message.contains("durably recorded a network winner")
         ));
+
+        let full_shutdown = AtomicBool::new(false);
+        let full_reason = Mutex::new(None);
+        request_rotation_after_durable_share(&full_coverage, true, &full_shutdown, &full_reason);
+        assert!(full_coverage.rotates_after_network_winner());
+        assert!(full_shutdown.load(Ordering::Acquire));
     }
 
     #[test]

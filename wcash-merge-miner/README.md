@@ -158,17 +158,33 @@ It proves share submission, not block discovery: for a deterministic local
 dual-winner test, use the equal child and parent network target printed by
 `native-job`, as the automated E2E gate does.
 
-### Zcash Testnet bootstrap parent sampling
+### Full dual-network winner coverage
 
-By default, `WCASH_SHARE_TARGET` must include both the Wcash child target and
-the Zcash parent target. This guarantees that miners submit every possible
-winner on either chain. Keep that default everywhere except the narrow public
-Testnet bootstrap case described here.
+Set `WCASH_SHARE_TARGET=network` for live mining. Each fresh generation then
+advertises the easier of its exact Wcash and Zcash targets, which guarantees
+that the ASIC submits every possible winner on either chain. The listener
+durably records the first network winner, acknowledges it, and immediately
+rotates work. This prevents an unusually easy Zcash Testnet target from leaving
+the old generation open for a flood of additional submissions.
+
+```sh
+export WCASH_SHARE_TARGET=network
+unset WCASH_TESTNET_PARENT_TARGET_SAMPLING
+```
+
+Preflight reports `full_network_winner_coverage`, both capture flags as `true`,
+and `rotation_after_first_durable_network_winner` as `true`. The target is
+recomputed after either chain changes difficulty. The fixed 64-submission per
+second connection cap remains a defense against malformed or nonconforming
+clients; an honest ASIC's first accepted submission for a network-derived job
+is already a candidate for at least one chain and closes that generation.
+
+### Legacy Zcash Testnet parent sampling
 
 Live Zcash Testnet can temporarily advertise a parent target that is much
 easier than the ASIC-rate Wcash Testnet target. Advertising that parent target
-as the share target would make an initial Z15 submit at an unsafe rate. For the
-initial deployment, copy the exact Wcash `child_target` reported by
+as a long-lived fixed share target would make an initial Z15 submit at an unsafe
+rate. Older deployments can copy the exact Wcash `child_target` reported by
 `native-job` into `WCASH_SHARE_TARGET` (approximately one Wcash-target share per
 75 seconds at the calibrated launch rate), then explicitly enable sampling:
 
@@ -199,7 +215,7 @@ fallback for interruption or unavailable nodes. This does not weaken winner
 validation, durable accounting, authentication, independent chain submission,
 or Wcash winner capture. Do not raise the existing
 64-submission-per-second connection cap to compensate for the parent target.
-Remove this bootstrap opt-in once full parent coverage is operationally safe.
+New deployments should use the network-derived full-coverage mode above.
 
 The `-` address argument reads `WCASH_PAYOUT_ADDRESS` without exposing it in a
 process listing or plaintext diagnostic field. Raw JSON-RPC body logging is
