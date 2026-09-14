@@ -23,7 +23,7 @@ pub(crate) const WOLF_COINBASE_MARKER: &str = "🐺 Wolf";
 pub(crate) const WOLF_COINBASE_SEPARATOR: &str = ": ";
 
 /// The default public coinbase tag for Testnet blocks built by Wolf.
-pub(crate) const WCASH_TESTNET_COINBASE_TAG: &str = "W.cash testnet";
+pub(crate) const WCASH_TESTNET_COINBASE_TAG: &str = "W.cash AuxPow";
 
 /// The maximum length of the user-configurable `extra_coinbase_data`.
 ///
@@ -106,7 +106,7 @@ pub struct Config {
     pub miner_address: Option<MinerAddress>,
 
     /// Optional tag that Wolf appends after the `🐺 Wolf: ` coinbase marker.
-    /// Testnet defaults to `W.cash testnet` when this field is unset.
+    /// Testnet defaults to `W.cash AuxPow` when this field is unset.
     ///
     /// Limited to `MAX_USER_COINBASE_DATA_LEN` bytes.
     pub extra_coinbase_data: Option<ExtraCoinbaseData>,

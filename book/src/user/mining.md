@@ -61,19 +61,19 @@ If `miner_address` is a Unified Address with more than one receiver, Zebra sends
 
 [#extra-coinbase-data]: #extra-coinbase-data
 
-Wolf prepends a `🐺 Wolf` marker to the coinbase input of every block it builds. Testnet defaults to `🐺 Wolf: W.cash testnet`. Setting `extra_coinbase_data` replaces the default Testnet label with your own tag after the marker, separated by `": "`:
+Wolf prepends a `🐺 Wolf` marker to the coinbase input of every block it builds. Testnet defaults to `🐺 Wolf: W.cash AuxPow`. Setting `extra_coinbase_data` replaces the default Testnet label with your own tag after the marker, separated by `": "`:
 
 ```toml
 [mining]
 miner_address = 't3dvVE3SQEi7kqNzwrfNePxZ1d4hUyztBA1'
-extra_coinbase_data = "W.cash testnet"
+extra_coinbase_data = "W.cash AuxPow"
 ```
 
 How it's used:
 
 - Inserted into the coinbase input script after the block height and `🐺 Wolf: ` marker.
 - Limited to the remaining coinbase-data budget. If exceeded, Wolf refuses to start.
-- Optional. If unset, Testnet uses `W.cash testnet`; Mainnet carries only the Wolf marker.
+- Optional. If unset, Testnet uses `W.cash AuxPow`; Mainnet carries only the Wolf marker.
 
 You can confirm the marker by calling `getblocktemplate` and checking the `coinbasetxn.data` field (see [Testing the setup](#testing-the-setup)).
 
