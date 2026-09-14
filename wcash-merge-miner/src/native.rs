@@ -384,10 +384,10 @@ impl NativeZcashProvider {
             ));
         }
 
-        let template_long_poll_id = template.long_poll_id.clone();
-        let validator_long_poll_ids = validator_payout_templates
+        let template_prewarm = (template.height, template.long_poll_id.clone());
+        let validator_prewarms = validator_payout_templates
             .iter()
-            .map(|template| template.long_poll_id.clone())
+            .map(|template| (template.height, template.long_poll_id.clone()))
             .collect::<Vec<_>>();
 
         let prepared = NativePreparedJob::from_template(
@@ -444,25 +444,30 @@ impl NativeZcashProvider {
         // Keep one ordinary long poll open on each parent node. Zebra proves the
         // next height's shielded coinbase while it waits for a tip change, so a
         // winning share can rotate directly onto cached, proof-complete work.
-        self.start_coinbase_prewarms(template_long_poll_id, validator_long_poll_ids);
+        self.start_coinbase_prewarms(template_prewarm, validator_prewarms);
 
         Ok(prepared)
     }
 
     fn start_coinbase_prewarms(
         &self,
-        template_long_poll_id: Option<String>,
-        validator_long_poll_ids: Vec<Option<String>>,
+        template_prewarm: (u32, Option<String>),
+        validator_prewarms: Vec<(u32, Option<String>)>,
     ) {
-        self.start_coinbase_prewarm(0, self.template_node.clone(), template_long_poll_id);
-        for (index, (validator, long_poll_id)) in self
+        self.start_coinbase_prewarm(
+            0,
+            self.template_node.clone(),
+            template_prewarm.0,
+            template_prewarm.1,
+        );
+        for (index, (validator, (template_height, long_poll_id))) in self
             .proposal_validators
             .iter()
             .cloned()
-            .zip(validator_long_poll_ids)
+            .zip(validator_prewarms)
             .enumerate()
         {
-            self.start_coinbase_prewarm(index + 1, validator, long_poll_id);
+            self.start_coinbase_prewarm(index + 1, validator, template_height, long_poll_id);
         }
     }
 
@@ -470,12 +475,13 @@ impl NativeZcashProvider {
         &self,
         index: usize,
         client: ZebraRpcClient,
+        template_height: u32,
         long_poll_id: Option<String>,
     ) {
         // One bounded prewarm is started for every admitted generation. Brief
         // overlap is intentional so a replacement generation never races a
         // shared in-flight gate after a tip change.
-        client.prewarm_next_coinbase(index, long_poll_id);
+        client.prewarm_next_coinbase(index, template_height, long_poll_id);
     }
 
     /// Submits a parent-target winner byte-for-byte to every configured node.

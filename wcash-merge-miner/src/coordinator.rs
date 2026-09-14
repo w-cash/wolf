@@ -525,7 +525,7 @@ impl NativeMiningSupervisor {
             child_candidate_bytes: Arc::clone(&child_candidate_bytes),
         })?;
         // Parent workers use indices 0 and 1 in the current two-node layout.
-        wcash_node.prewarm_next_coinbase(2, child.long_poll_id.clone());
+        wcash_node.prewarm_next_coinbase(2, child.height, child.long_poll_id.clone());
         let candidate_created_at = Instant::now();
 
         let coordinator = NativeMiningCoordinator {

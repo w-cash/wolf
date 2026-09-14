@@ -9,7 +9,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use reqwest::{
@@ -215,20 +215,36 @@ impl ZebraRpcClient {
 
     /// Starts a bounded ordinary GBT long poll so Zebra can prove and cache
     /// the next height's shielded coinbase before the current tip changes.
-    pub fn prewarm_next_coinbase(&self, worker_index: usize, long_poll_id: Option<String>) {
-        let Some(long_poll_id) = long_poll_id.filter(|id| {
+    pub fn prewarm_next_coinbase(
+        &self,
+        worker_index: usize,
+        template_height: u32,
+        long_poll_id: Option<String>,
+    ) {
+        let Some(mut long_poll_id) = long_poll_id.filter(|id| {
             !id.is_empty() && id.len() <= 1_024 && !id.bytes().any(|byte| byte.is_ascii_control())
         }) else {
             return;
         };
-        let client = self.clone();
+        let endpoint = self.endpoint.clone();
         let spawn_result = thread::Builder::new()
             .name(format!("coinbase-prewarm-{worker_index}"))
             .spawn(move || {
-                // The ordinary client has a 15-second deadline. Renew the same
-                // long poll for up to one minute. The 45-second generation
-                // lifetime starts another bounded worker before coverage ends.
-                for _ in 0..4 {
+                // Keep one request armed for the whole 45-second generation.
+                // A shorter ordinary RPC deadline creates periodic gaps where
+                // a winner can arrive while Zebra is proving the replacement
+                // coinbase again. Five extra seconds bound handoff overlap.
+                let deadline = Instant::now() + Duration::from_secs(50);
+                // The attempt cap also bounds a misbehaving endpoint that
+                // repeatedly returns an immediately stale long-poll identity.
+                for _ in 0..16 {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let Ok(client) = Self::new(endpoint.clone(), remaining) else {
+                        break;
+                    };
                     match client.call_value(
                         "getblocktemplate",
                         json!([{
@@ -237,8 +253,33 @@ impl ZebraRpcClient {
                             "longpollid": long_poll_id,
                         }]),
                     ) {
-                        Ok(_) => break,
-                        Err(MinerError::RpcTransport(error)) if error.is_timeout() => continue,
+                        Ok(response) => {
+                            if response
+                                .get("height")
+                                .and_then(Value::as_u64)
+                                .is_some_and(|height| height > u64::from(template_height))
+                            {
+                                break;
+                            }
+
+                            // A mempool-only change returns a same-height
+                            // template. Rearm against its new identity while
+                            // keeping the original generation deadline.
+                            let Some(next_long_poll_id) = response
+                                .get("longpollid")
+                                .and_then(Value::as_str)
+                                .filter(|id| {
+                                    !id.is_empty()
+                                        && id.len() <= 1_024
+                                        && !id.bytes().any(|byte| byte.is_ascii_control())
+                                })
+                                .map(str::to_owned)
+                            else {
+                                break;
+                            };
+                            long_poll_id = next_long_poll_id;
+                        }
+                        Err(MinerError::RpcTransport(error)) if error.is_timeout() => break,
                         Err(_) => break,
                     }
                 }
