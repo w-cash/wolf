@@ -5,7 +5,16 @@
 //! from a genuine Zcash `getblocktemplate`, checked locally, and submitted in
 //! proposal mode to every configured validation node before miners can see it.
 
-use std::{collections::HashSet, fmt, sync::Arc, thread, time::Duration};
+use std::{
+    collections::HashSet,
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
 use hex::FromHex;
 use serde_json::{json, Value};
@@ -68,6 +77,8 @@ struct BlockTemplateResponse {
     cur_time: u32,
     bits: String,
     height: u32,
+    #[serde(rename = "longpollid", default)]
+    long_poll_id: Option<String>,
     #[serde(rename = "wcashparentpayoutcommitment")]
     parent_payout_commitment: Option<String>,
 }
@@ -264,6 +275,7 @@ impl NativeZcashConfig {
 pub struct NativeZcashProvider {
     template_node: ZebraRpcClient,
     proposal_validators: Vec<ZebraRpcClient>,
+    coinbase_prewarm_in_flight: Arc<Vec<AtomicBool>>,
     parent_network: NativeZcashNetwork,
     expected_parent_network: Network,
     expected_parent_payout_commitment: [u8; 32],
@@ -294,9 +306,15 @@ impl NativeZcashProvider {
             .into_iter()
             .map(|endpoint| ZebraRpcClient::new(endpoint, config.rpc_timeout))
             .collect::<Result<Vec<_>, _>>()?;
+        let coinbase_prewarm_in_flight = Arc::new(
+            (0..=proposal_validators.len())
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+        );
         Ok(Self {
             template_node,
             proposal_validators,
+            coinbase_prewarm_in_flight,
             parent_network,
             expected_parent_network,
             expected_parent_payout_commitment,
@@ -382,6 +400,12 @@ impl NativeZcashProvider {
             ));
         }
 
+        let template_long_poll_id = template.long_poll_id.clone();
+        let validator_long_poll_ids = validator_payout_templates
+            .iter()
+            .map(|template| template.long_poll_id.clone())
+            .collect::<Vec<_>>();
+
         let prepared = NativePreparedJob::from_template(
             child_block_hash,
             child_target,
@@ -433,7 +457,78 @@ impl NativeZcashProvider {
         // Close the race where a tip changed while the proposal checks ran.
         self.assert_current(&prepared)?;
 
+        // Keep one ordinary long poll open on each parent node. Zebra proves the
+        // next height's shielded coinbase while it waits for a tip change, so a
+        // winning share can rotate directly onto cached, proof-complete work.
+        self.start_coinbase_prewarms(template_long_poll_id, validator_long_poll_ids);
+
         Ok(prepared)
+    }
+
+    fn start_coinbase_prewarms(
+        &self,
+        template_long_poll_id: Option<String>,
+        validator_long_poll_ids: Vec<Option<String>>,
+    ) {
+        self.start_coinbase_prewarm(0, self.template_node.clone(), template_long_poll_id);
+        for (index, (validator, long_poll_id)) in self
+            .proposal_validators
+            .iter()
+            .cloned()
+            .zip(validator_long_poll_ids)
+            .enumerate()
+        {
+            self.start_coinbase_prewarm(index + 1, validator, long_poll_id);
+        }
+    }
+
+    fn start_coinbase_prewarm(
+        &self,
+        index: usize,
+        client: ZebraRpcClient,
+        long_poll_id: Option<String>,
+    ) {
+        let Some(long_poll_id) = long_poll_id.filter(|id| {
+            !id.is_empty() && id.len() <= 1_024 && !id.bytes().any(|byte| byte.is_ascii_control())
+        }) else {
+            return;
+        };
+        let Some(in_flight) = self.coinbase_prewarm_in_flight.get(index) else {
+            return;
+        };
+        if in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let gates = Arc::clone(&self.coinbase_prewarm_in_flight);
+        let spawn_result = thread::Builder::new()
+            .name(format!("parent-coinbase-prewarm-{index}"))
+            .spawn(move || {
+                // The ordinary RPC client has a 15-second deadline. Renew the
+                // same long poll for up to one minute, which covers the active
+                // generation and bounds detached work during an outage.
+                for _ in 0..4 {
+                    match client.call_value(
+                        "getblocktemplate",
+                        json!([{
+                            "mode": "template",
+                            "capabilities": ["coinbasetxn"],
+                            "longpollid": long_poll_id,
+                        }]),
+                    ) {
+                        Ok(_) => break,
+                        Err(MinerError::RpcTransport(error)) if error.is_timeout() => continue,
+                        Err(_) => break,
+                    }
+                }
+                gates[index].store(false, Ordering::Release);
+            });
+        if spawn_result.is_err() {
+            self.coinbase_prewarm_in_flight[index].store(false, Ordering::Release);
+        }
     }
 
     /// Submits a parent-target winner byte-for-byte to every configured node.

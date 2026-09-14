@@ -2948,6 +2948,18 @@ where
                     let precomputed_coinbase = (next_height == precomputed_height)
                         .then_some(precomputed_coinbase);
 
+                    // Publish the proof-complete next-height coinbase to the
+                    // shared cache before returning from long poll. A merged
+                    // mining request can then add its cheap Wcash commitment
+                    // without rebuilding the shielded proof after every win.
+                    if let Some(coinbase) = &precomputed_coinbase {
+                        self.gbt.coinbase_cache().store(
+                            next_height,
+                            Amount::zero(),
+                            coinbase.clone(),
+                        );
+                    }
+
                     // Respond instantly with an empty block upon a chain tip change so that
                     // the miner doesn't waste their effort trying to extend a shorter
                     // chain.

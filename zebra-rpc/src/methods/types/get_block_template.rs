@@ -731,7 +731,7 @@ impl CoinbaseCache {
     }
 
     /// Stores `coinbase` as the cached transaction for `height` and `fee`.
-    fn store(
+    pub(crate) fn store(
         &self,
         height: block::Height,
         fee: Amount<NonNegative>,
