@@ -1316,6 +1316,40 @@ impl PoolBackendJournal {
         self.next_winner_state_by_maturity(after_ordinal, Some(false))
     }
 
+    /// Inspects a bounded slice of newly retained winners for a first attempt.
+    ///
+    /// Advance over every inspected entry, including non-pending entries and
+    /// the returned winner, before external RPC. A failed first attempt is
+    /// retried by the normal reconciliation scan, not by this tail cursor.
+    pub(crate) fn next_first_attempt_winner_state(
+        &self,
+        next_ordinal: &mut usize,
+    ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
+        const MAX_INSPECTED_WINNERS: usize = 256;
+        let state = self.lock_state()?;
+        ensure_usable(&state)?;
+        let event_seq = next_event_seq(&state)?;
+        for (index, key) in state
+            .semantic
+            .winner_order
+            .iter()
+            .enumerate()
+            .skip(*next_ordinal)
+            .take(MAX_INSPECTED_WINNERS)
+        {
+            let winner = state.semantic.winners.get(key).ok_or_else(|| {
+                semantic(event_seq, "winner index references absent private state")
+            })?;
+            *next_ordinal = index
+                .checked_add(1)
+                .ok_or(PoolBackendJournalError::Overflow)?;
+            if matches!(winner.lifecycle, JournalWinnerLifecycle::Pending) {
+                return Ok(Some((index, winner.clone())));
+            }
+        }
+        Ok(None)
+    }
+
     /// Returns the next reversibly matured winner for low-rate reorg audits.
     pub(crate) fn next_matured_winner_state(
         &self,
