@@ -312,17 +312,58 @@ impl NativeZcashProvider {
         auxiliary_nonce: u32,
     ) -> Result<NativePreparedJob, MinerError> {
         let child_display = display_hex(child_block_hash);
-        let template: BlockTemplateResponse = self.template_node.call(
-            "getblocktemplate",
-            json!([{
-                "mode": "template",
-                "capabilities": ["coinbasetxn", "proposal"],
-                "wcashaux": {
-                    "blockhash": child_display,
-                    "nonce": auxiliary_nonce,
-                }
-            }]),
-        )?;
+        // Both nodes can build their height-specific shielded coinbases at the
+        // same time. The independent template does not depend on the Wcash
+        // commitment, and the exact shared predecessor is checked below before
+        // either result is admitted.
+        let (template, validator_payout_templates): (
+            BlockTemplateResponse,
+            Vec<BlockTemplateResponse>,
+        ) = thread::scope(|scope| -> Result<_, MinerError> {
+            let template_worker = scope.spawn(|| {
+                self.template_node.call(
+                    "getblocktemplate",
+                    json!([{
+                        "mode": "template",
+                        "capabilities": ["coinbasetxn", "proposal"],
+                        "wcashaux": {
+                            "blockhash": child_display,
+                            "nonce": auxiliary_nonce,
+                        }
+                    }]),
+                )
+            });
+            let validator_workers = self
+                .proposal_validators
+                .iter()
+                .map(|validator| {
+                    scope.spawn(move || {
+                        validator.call(
+                            "getblocktemplate",
+                            json!([{
+                                "mode": "template",
+                                "capabilities": ["coinbasetxn"],
+                            }]),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let template = template_worker.join().map_err(|_| {
+                MinerError::RpcProtocol("parent template worker panicked".to_string())
+            })??;
+            let validator_payout_templates = validator_workers
+                .into_iter()
+                .map(|worker| {
+                    worker.join().map_err(|_| {
+                        MinerError::RpcProtocol(
+                            "parent payout-template worker panicked".to_string(),
+                        )
+                    })?
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((template, validator_payout_templates))
+        })?;
 
         let actual_parent_payout_commitment: [u8; 32] = parse_template_hex(
             template
@@ -352,16 +393,12 @@ impl NativeZcashProvider {
         )?;
 
         // Check the same predecessor on every node before proposal validation.
-        self.require_tip(&self.template_node, &prepared)?;
-        for validator in &self.proposal_validators {
-            self.require_tip(validator, &prepared)?;
-            let payout_template: BlockTemplateResponse = validator.call(
-                "getblocktemplate",
-                json!([{
-                    "mode": "template",
-                    "capabilities": ["coinbasetxn"],
-                }]),
-            )?;
+        self.assert_current(&prepared)?;
+        for (validator, payout_template) in self
+            .proposal_validators
+            .iter()
+            .zip(validator_payout_templates)
+        {
             validate_independent_parent_payout_template(
                 &prepared,
                 &payout_template,
@@ -394,10 +431,7 @@ impl NativeZcashProvider {
         }
 
         // Close the race where a tip changed while the proposal checks ran.
-        self.require_tip(&self.template_node, &prepared)?;
-        for validator in &self.proposal_validators {
-            self.require_tip(validator, &prepared)?;
-        }
+        self.assert_current(&prepared)?;
 
         Ok(prepared)
     }
