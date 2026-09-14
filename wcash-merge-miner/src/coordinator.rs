@@ -7,7 +7,7 @@ use std::{
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
     },
     thread,
@@ -90,6 +90,8 @@ pub struct NativeMiningSupervisor {
     journal: Arc<ShareJournal>,
     generation_preparation: Mutex<()>,
     pending_candidate_retirement: Mutex<Option<ChildCandidateLease>>,
+    outbox_retry: Arc<OutboxRetryState>,
+    initial_outbox_recovery_complete: AtomicBool,
 }
 
 /// A fully prepared dual-chain job and its submission backend.
@@ -104,10 +106,26 @@ pub struct NativeMiningCoordinator {
     child_candidate_lease: ChildCandidateLease,
     candidate_created_at: Instant,
     freshness: Mutex<JobFreshness>,
-    last_outbox_retry: Mutex<Instant>,
-    outbox_retry_requested: AtomicBool,
-    outbox_retry_in_progress: AtomicBool,
+    outbox_retry: Arc<OutboxRetryState>,
     journal: Arc<ShareJournal>,
+}
+
+struct OutboxRetryState {
+    last_maintenance: Mutex<Instant>,
+    requested: AtomicBool,
+    in_progress: AtomicBool,
+    maintenance_cursor: AtomicUsize,
+}
+
+impl OutboxRetryState {
+    fn new() -> Self {
+        Self {
+            last_maintenance: Mutex::new(Instant::now()),
+            requested: AtomicBool::new(false),
+            in_progress: AtomicBool::new(false),
+            maintenance_cursor: AtomicUsize::new(0),
+        }
+    }
 }
 
 /// One exact consensus block produced by a validated merged-mining share.
@@ -226,6 +244,7 @@ struct JobFreshness {
 const MAX_JOB_AGE: Duration = Duration::from_secs(NATIVE_JOB_MAX_AGE_SECONDS);
 const TIP_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
 const OUTBOX_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+const OUTBOX_MAINTENANCE_BATCH_SIZE: usize = 2;
 const MAX_CHILD_BLOCK_BYTES: usize = 2_000_000;
 const WINNER_RETENTION_CONFIRMATIONS: u32 = 100;
 
@@ -313,6 +332,8 @@ impl NativeMiningSupervisor {
             journal,
             generation_preparation: Mutex::new(()),
             pending_candidate_retirement: Mutex::new(None),
+            outbox_retry: Arc::new(OutboxRetryState::new()),
+            initial_outbox_recovery_complete: AtomicBool::new(false),
         })
     }
 
@@ -335,6 +356,9 @@ impl NativeMiningSupervisor {
             require_wcash_network_identity(&wcash_node, &config.expected_wcash_genesis_hash);
         let zcash_identity = zcash.require_network_identity(&expected_zcash_genesis_hash);
         let pending = journal.all_pending()?;
+        let initial_outbox_recovery = !self
+            .initial_outbox_recovery_complete
+            .load(Ordering::Acquire);
         if wcash_identity.is_ok() {
             retry_pending_winners_with(
                 &wcash_node,
@@ -342,7 +366,10 @@ impl NativeMiningSupervisor {
                 &journal,
                 pending
                     .iter()
-                    .filter(|winner| winner.key.chain == WinnerChain::Wcash)
+                    .filter(|winner| {
+                        winner.key.chain == WinnerChain::Wcash
+                            && (initial_outbox_recovery || winner_requires_urgent_retry(winner))
+                    })
                     .cloned()
                     .collect(),
             )?;
@@ -354,7 +381,10 @@ impl NativeMiningSupervisor {
                 &journal,
                 pending
                     .into_iter()
-                    .filter(|winner| winner.key.chain == WinnerChain::Zcash)
+                    .filter(|winner| {
+                        winner.key.chain == WinnerChain::Zcash
+                            && (initial_outbox_recovery || winner_requires_urgent_retry(winner))
+                    })
                     .collect(),
             )?;
         }
@@ -364,6 +394,8 @@ impl NativeMiningSupervisor {
         // retries cache-capacity neutral even during a prolonged parent outage.
         self.retry_pending_candidate_retirement()?;
         zcash_identity?;
+        self.initial_outbox_recovery_complete
+            .store(true, Ordering::Release);
 
         let child: ChildTemplate = wcash_node.call(
             "createauxblock",
@@ -512,9 +544,7 @@ impl NativeMiningSupervisor {
                 active: true,
                 last_checked: Instant::now(),
             }),
-            last_outbox_retry: Mutex::new(Instant::now()),
-            outbox_retry_requested: AtomicBool::new(false),
-            outbox_retry_in_progress: AtomicBool::new(false),
+            outbox_retry: Arc::clone(&self.outbox_retry),
             journal,
         };
         preparation_guard.disarm();
@@ -708,30 +738,45 @@ impl NativeMiningCoordinator {
     }
 
     fn request_outbox_retry(&self) {
-        self.outbox_retry_requested.store(true, Ordering::Release);
+        self.outbox_retry.requested.store(true, Ordering::Release);
     }
 
     fn retry_pending_if_due(&self) -> Result<(), MinerError> {
         if self
-            .outbox_retry_in_progress
+            .outbox_retry
+            .in_progress
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return Ok(());
         }
-        let _in_progress = OutboxRetryGuard(&self.outbox_retry_in_progress);
-        let retry_requested = self.outbox_retry_requested.swap(false, Ordering::AcqRel);
+        let _in_progress = OutboxRetryGuard(&self.outbox_retry.in_progress);
+        let retry_requested = self.outbox_retry.requested.swap(false, Ordering::AcqRel);
         let now = Instant::now();
         let mut last_retry = self
-            .last_outbox_retry
+            .outbox_retry
+            .last_maintenance
             .lock()
             .map_err(|_| coordinator_mutex_error("outbox retry schedule"))?;
-        if !retry_requested && now.saturating_duration_since(*last_retry) < OUTBOX_RETRY_INTERVAL {
+        let maintenance_due = now.saturating_duration_since(*last_retry) >= OUTBOX_RETRY_INTERVAL;
+        if !retry_requested && !maintenance_due {
             return Ok(());
         }
-        *last_retry = now;
+        if maintenance_due {
+            *last_retry = now;
+        }
         drop(last_retry);
-        self.retry_pending_winners(self.journal.all_pending()?)
+
+        let maintenance_cursor = self
+            .outbox_retry
+            .maintenance_cursor
+            .fetch_add(OUTBOX_MAINTENANCE_BATCH_SIZE, Ordering::Relaxed);
+        let winners = pending_winners_for_retry(
+            self.journal.all_pending()?,
+            maintenance_due,
+            maintenance_cursor,
+        );
+        self.retry_pending_winners(winners)
     }
 }
 
@@ -1468,6 +1513,38 @@ struct PendingWinner {
     block_bytes: Vec<u8>,
     observed_on_best_chain: bool,
     conflicting_witness: bool,
+}
+
+fn winner_requires_urgent_retry(winner: &PendingWinner) -> bool {
+    !winner.observed_on_best_chain && !winner.conflicting_witness
+}
+
+fn pending_winners_for_retry(
+    pending: Vec<PendingWinner>,
+    include_maintenance: bool,
+    maintenance_cursor: usize,
+) -> Vec<PendingWinner> {
+    let (mut urgent, mut maintenance): (Vec<_>, Vec<_>) =
+        pending.into_iter().partition(winner_requires_urgent_retry);
+    if !include_maintenance || maintenance.is_empty() {
+        return urgent;
+    }
+
+    maintenance.sort_by(|left, right| {
+        left.key
+            .chain
+            .as_str()
+            .cmp(right.key.chain.as_str())
+            .then_with(|| left.height.cmp(&right.height))
+            .then_with(|| left.key.share_id.cmp(&right.key.share_id))
+    });
+    let start = maintenance_cursor % maintenance.len();
+    let count = OUTBOX_MAINTENANCE_BATCH_SIZE.min(maintenance.len());
+    urgent.reserve(count);
+    for offset in 0..count {
+        urgent.push(maintenance[(start + offset) % maintenance.len()].clone());
+    }
+    urgent
 }
 
 const MAX_SHARES_PER_JOB: usize = 100_000;
@@ -3256,6 +3333,50 @@ mod tests {
             observed_on_best_chain,
             conflicting_witness: false,
         }
+    }
+
+    #[test]
+    fn urgent_outbox_retry_does_not_rescan_every_observed_winner() {
+        let mut urgent = wcash_winner(false);
+        urgent.key.share_id = [0x10; 32];
+
+        let mut first_observed = wcash_winner(true);
+        first_observed.key.share_id = [0x20; 32];
+        first_observed.height = 20;
+
+        let mut second_observed = wcash_winner(true);
+        second_observed.key.share_id = [0x30; 32];
+        second_observed.height = 30;
+
+        let mut conflicting = wcash_winner(false);
+        conflicting.key.share_id = [0x40; 32];
+        conflicting.height = 40;
+        conflicting.conflicting_witness = true;
+
+        let pending = vec![
+            second_observed.clone(),
+            conflicting.clone(),
+            urgent.clone(),
+            first_observed.clone(),
+        ];
+        assert_eq!(
+            pending_winners_for_retry(pending.clone(), false, 0),
+            vec![urgent.clone()],
+            "a winner-triggered retry must submit only unobserved, non-conflicting entries"
+        );
+
+        let first_maintenance = pending_winners_for_retry(pending.clone(), true, 0);
+        assert_eq!(first_maintenance.len(), 3);
+        assert!(first_maintenance.contains(&urgent));
+        assert!(first_maintenance.contains(&first_observed));
+        assert!(first_maintenance.contains(&second_observed));
+        assert!(!first_maintenance.contains(&conflicting));
+
+        let second_maintenance = pending_winners_for_retry(pending, true, 2);
+        assert_eq!(second_maintenance.len(), 3);
+        assert!(second_maintenance.contains(&urgent));
+        assert!(second_maintenance.contains(&conflicting));
+        assert!(second_maintenance.contains(&first_observed));
     }
 
     #[test]

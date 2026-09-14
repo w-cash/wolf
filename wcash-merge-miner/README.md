@@ -308,6 +308,10 @@ writer until restart, preventing a later append from completing a corrupt
 partial line or using inconsistent memory. On
 restart, each chain is replayed independently. Exact blocks remain in the
 outbox across outages and reorgs until they have 100 best-chain confirmations.
+Winner-triggered retries submit every unobserved entry immediately without
+rescanning the complete retained history. Confirmation and reorg maintenance
+uses a bounded rotating batch every 15 seconds, so a large set of immature
+coinbase winners cannot delay the next ASIC generation.
 Zcash confirmation queries the exact winner hash and uses the lowest depth
 reported by reachable pinned nodes; authoritative unknown/not-best-chain
 answers veto maturity. Wcash confirmation uses `getauxblockstatus`, which binds
