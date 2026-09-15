@@ -273,6 +273,7 @@ struct PoolBackendListenerWorkers {
 
 struct PoolBackendWinnerWorker {
     shutdown: Arc<AtomicBool>,
+    wake: thread::Thread,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -364,6 +365,7 @@ impl PoolBackendWinnerWorker {
         failure: mpsc::Sender<String>,
     ) -> Result<Self, io::Error> {
         let worker_shutdown = Arc::clone(&shutdown);
+        let worker_actor = Arc::clone(&actor);
         let thread = thread::Builder::new()
             .name("wcash-winner-reconciliation".to_string())
             .spawn(move || {
@@ -372,7 +374,7 @@ impl PoolBackendWinnerWorker {
                     if worker_shutdown.load(Ordering::Acquire) {
                         break;
                     }
-                    let work = match scheduler.next(&actor) {
+                    let work = match scheduler.next(&worker_actor) {
                         Ok(work) => work,
                         Err(error) => {
                             let _ = failure.send(format!(
@@ -384,7 +386,7 @@ impl PoolBackendWinnerWorker {
                     if let Some(snapshot) = work.snapshot() {
                         match supervisor.reconcile_pool_backend_winner(snapshot) {
                             Ok(Some(transition)) => {
-                                match actor.compare_and_apply_winner_transition(snapshot, transition) {
+                                match worker_actor.compare_and_apply_winner_transition(snapshot, transition) {
                                     Ok(_) | Err(PoolBackendActorError::WinnerRevisionConflict) => {}
                                     Err(error) => {
                                         let _ = failure.send(format!(
@@ -411,19 +413,30 @@ impl PoolBackendWinnerWorker {
                             }
                         }
                     }
-                    if sleep_until_shutdown(work.delay(), &worker_shutdown) {
-                        break;
+                    if !work.delay().is_zero() {
+                        thread::park_timeout(work.delay());
                     }
                 }
             })?;
+        let wake = thread.thread().clone();
+        if let Err(error) = actor.register_winner_worker(wake.clone()) {
+            shutdown.store(true, Ordering::Release);
+            wake.unpark();
+            let _ = thread.join();
+            return Err(io::Error::other(format!(
+                "winner reconciliation worker registration failed: {error}"
+            )));
+        }
         Ok(Self {
             shutdown,
+            wake,
             thread: Some(thread),
         })
     }
 
     fn request_shutdown(&mut self) -> Result<(), io::Error> {
         self.shutdown.store(true, Ordering::Release);
+        self.wake.unpark();
         if let Some(worker) = self.thread.take() {
             worker.join().map_err(|_| {
                 io::Error::other("winner reconciliation worker panicked during shutdown")
@@ -928,21 +941,6 @@ fn wait_for_pool_backend_retry(
 fn is_retryable_winner_reconciliation_error(error: &MinerError) -> bool {
     matches!(error, MinerError::WinnerSubmissionDeferred { .. })
         || is_retryable_native_preparation_error(error)
-}
-
-fn sleep_until_shutdown(duration: Duration, shutdown: &AtomicBool) -> bool {
-    let Some(deadline) = Instant::now().checked_add(duration) else {
-        return false;
-    };
-    loop {
-        if shutdown.load(Ordering::Acquire) {
-            return true;
-        }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return false;
-        };
-        thread::sleep(remaining.min(Duration::from_millis(100)));
-    }
 }
 
 fn pool_backend_generations_share_tips(
