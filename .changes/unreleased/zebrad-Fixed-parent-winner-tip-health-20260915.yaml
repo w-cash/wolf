@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Fence merged-mining winner observations after Zcash submission so an accepted block advancing the tip does not pause pool share acceptance. Keep confirmed delivery independent from temporary status races, while preserving stable-tip rejection and reward-confirmation checks."
+time: 2026-09-15T15:40:00.000000000Z

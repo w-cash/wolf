@@ -319,6 +319,15 @@ pub struct PoolBackendWinnerSnapshot {
 }
 
 impl PoolBackendWinnerSnapshot {
+    #[cfg(test)]
+    pub(crate) fn from_test_state(state: JournalWinnerState) -> Self {
+        Self {
+            journal_stream: CanonicalUuid::new(uuid::Uuid::from_u128(1)),
+            winner_ordinal: 0,
+            state,
+        }
+    }
+
     /// Returns an authority-bound key suitable for point lookup or pagination.
     pub fn key(&self) -> PoolBackendWinnerKey {
         PoolBackendWinnerKey {
