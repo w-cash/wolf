@@ -69,6 +69,8 @@ const WCASH_EXPECTED_GENESIS_HASH: &str = "WCASH_EXPECTED_GENESIS_HASH";
 const ZCASH_EXPECTED_GENESIS_HASH: &str = "ZCASH_EXPECTED_GENESIS_HASH";
 const ZCASH_NETWORK: &str = "ZCASH_NETWORK";
 const WCASH_TESTNET_PARENT_TARGET_SAMPLING: &str = "WCASH_TESTNET_PARENT_TARGET_SAMPLING";
+const WCASH_TESTNET_ALLOW_LAGGING_PARENT_VALIDATOR: &str =
+    "WCASH_TESTNET_ALLOW_LAGGING_PARENT_VALIDATOR";
 const WCASH_POOL_BACKEND_IDENTITY: &str = "WCASH_POOL_BACKEND_IDENTITY";
 const WCASH_POOL_BACKEND_JOURNAL: &str = "WCASH_POOL_BACKEND_JOURNAL";
 const WCASH_POOL_BACKEND_SOCKET: &str = "WCASH_POOL_BACKEND_SOCKET";
@@ -166,6 +168,13 @@ listener. It permits the advertised share target to sample the abnormally easy
 parent target, but never to exclude a Wcash network winner. Without this explicit
 bootstrap mode, the share target must include both network targets. Sampling mode
 rotates immediately after durably recording a network winner.
+WCASH_TESTNET_ALLOW_LAGGING_PARENT_VALIDATOR may be set to exactly `1` only
+with ZCASH_NETWORK=testnet and the built-in Wcash Testnet genesis. The exact
+proposal remains locally validated and must be accepted by the template node.
+An independent validator that has reached the same tip must also accept it; a
+validator still catching up does not pause Testnet work, while an ahead or
+equal-height conflicting validator still rejects the job. Mainnet always
+requires every independent validator on the exact work tip.
 WCASH_SHARE_JOURNAL optionally selects the durable JSON-lines share journal; the
 default is .wcash-share-journal-v2.jsonl in the current directory (created 0600
 on Unix). The default listener is 127.0.0.1:28237 and the default client limit is
@@ -1745,6 +1754,11 @@ fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredN
     let expected_wcash_genesis_hash = required_display_hash_env(WCASH_EXPECTED_GENESIS_HASH)?;
     let expected_zcash_genesis_hash = required_display_hash_env(ZCASH_EXPECTED_GENESIS_HASH)?;
     let expected_zcash_network = required_zcash_network_env()?;
+    let allow_lagging_parent_validator = parse_testnet_lagging_parent_validator(
+        optional_env(WCASH_TESTNET_ALLOW_LAGGING_PARENT_VALIDATOR)?,
+        expected_zcash_network,
+        &expected_wcash_genesis_hash,
+    )?;
     let summary = EndpointSummary {
         wcash_label: wcash_node.label().to_string(),
         wcash_authenticated,
@@ -1756,13 +1770,19 @@ fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredN
         wcash_payout_address_source: WCASH_PAYOUT_ADDRESS,
         zcash_payout_address_source: ZCASH_PAYOUT_ADDRESS,
     };
-    let zcash = NativeZcashConfig::new(
+    let mut zcash = NativeZcashConfig::new(
         template_node,
         vec![validator_node],
         expected_zcash_network,
         expected_zcash_genesis_hash,
         expected_parent_payout_address,
     )?;
+    if allow_lagging_parent_validator {
+        zcash = zcash.allow_lagging_proposal_validators_on_testnet()?;
+        eprintln!(
+            "WARNING: {WCASH_TESTNET_ALLOW_LAGGING_PARENT_VALIDATOR}=1 permits a catching-up independent Zcash Testnet validator while the template node remains exact and proposal-valid"
+        );
+    }
 
     Ok(ConfiguredNative {
         config: CoordinatorConfig {
@@ -1826,6 +1846,32 @@ fn parse_testnet_parent_target_sampling(
     if !expected_wcash_genesis_hash.eq_ignore_ascii_case(WCASH_TESTNET_GENESIS_HASH) {
         return Err(MinerError::InvalidRequest(format!(
             "environment variable {WCASH_TESTNET_PARENT_TARGET_SAMPLING} is allowed only with the built-in Wcash Testnet genesis"
+        )));
+    }
+    Ok(true)
+}
+
+fn parse_testnet_lagging_parent_validator(
+    configured: Option<String>,
+    zcash_network: NativeZcashNetwork,
+    expected_wcash_genesis_hash: &str,
+) -> Result<bool, MinerError> {
+    let Some(configured) = configured else {
+        return Ok(false);
+    };
+    if configured != "1" {
+        return Err(MinerError::InvalidRequest(format!(
+            "environment variable {WCASH_TESTNET_ALLOW_LAGGING_PARENT_VALIDATOR} must be exactly `1` when set"
+        )));
+    }
+    if zcash_network != NativeZcashNetwork::Testnet {
+        return Err(MinerError::InvalidRequest(format!(
+            "environment variable {WCASH_TESTNET_ALLOW_LAGGING_PARENT_VALIDATOR} is allowed only when {ZCASH_NETWORK}=testnet"
+        )));
+    }
+    if !expected_wcash_genesis_hash.eq_ignore_ascii_case(WCASH_TESTNET_GENESIS_HASH) {
+        return Err(MinerError::InvalidRequest(format!(
+            "environment variable {WCASH_TESTNET_ALLOW_LAGGING_PARENT_VALIDATOR} is allowed only with the built-in Wcash Testnet genesis"
         )));
     }
     Ok(true)
@@ -2446,6 +2492,45 @@ mod tests {
             .is_err());
         }
         assert!(parse_testnet_parent_target_sampling(
+            Some("1".to_string()),
+            NativeZcashNetwork::Testnet,
+            &"00".repeat(32),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lagging_parent_validator_requires_exact_testnet_opt_in() {
+        let wcash_testnet_genesis = WCASH_TESTNET_GENESIS_HASH;
+        assert!(!parse_testnet_lagging_parent_validator(
+            None,
+            NativeZcashNetwork::Testnet,
+            wcash_testnet_genesis,
+        )
+        .expect("an absent opt-in preserves the strict validator quorum"));
+        assert!(parse_testnet_lagging_parent_validator(
+            Some("1".to_string()),
+            NativeZcashNetwork::Testnet,
+            wcash_testnet_genesis,
+        )
+        .expect("the exact Testnet opt-in is accepted"));
+        for network in [NativeZcashNetwork::Mainnet, NativeZcashNetwork::Regtest] {
+            assert!(parse_testnet_lagging_parent_validator(
+                Some("1".to_string()),
+                network,
+                wcash_testnet_genesis,
+            )
+            .is_err());
+        }
+        for value in ["", "0", "true", "yes", " 1"] {
+            assert!(parse_testnet_lagging_parent_validator(
+                Some(value.to_string()),
+                NativeZcashNetwork::Testnet,
+                wcash_testnet_genesis,
+            )
+            .is_err());
+        }
+        assert!(parse_testnet_lagging_parent_validator(
             Some("1".to_string()),
             NativeZcashNetwork::Testnet,
             &"00".repeat(32),

@@ -188,6 +188,10 @@ pub struct NativeZcashConfig {
     expected_parent_payout_address: ZcashAddress,
     /// Deadline applied independently to each RPC request.
     rpc_timeout: Duration,
+    /// Testnet-only liveness policy that permits an independent validator to
+    /// trail the template node while retaining strict local and template-node
+    /// proposal validation.
+    allow_lagging_proposal_validators: bool,
 }
 
 impl fmt::Debug for NativeZcashConfig {
@@ -201,6 +205,10 @@ impl fmt::Debug for NativeZcashConfig {
             .field("expected_parent_payout_commitment", &"[REDACTED]")
             .field("expected_parent_payout_address", &"[REDACTED]")
             .field("rpc_timeout", &self.rpc_timeout)
+            .field(
+                "allow_lagging_proposal_validators",
+                &self.allow_lagging_proposal_validators,
+            )
             .finish()
     }
 }
@@ -224,9 +232,27 @@ impl NativeZcashConfig {
             expected_parent_payout_commitment,
             expected_parent_payout_address,
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
+            allow_lagging_proposal_validators: false,
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Allows Testnet work to remain live while an independent proposal
+    /// validator is still catching up to the template node.
+    ///
+    /// The template node must still be on the exact job tip and must accept the
+    /// exact proposal. A validator on the same tip must also accept it, while a
+    /// validator ahead of the template still invalidates the job immediately.
+    pub fn allow_lagging_proposal_validators_on_testnet(mut self) -> Result<Self, MinerError> {
+        if self.expected_parent_network != NativeZcashNetwork::Testnet {
+            return Err(MinerError::RpcConfiguration(
+                "lagging proposal validators may be tolerated only on Zcash Testnet".to_string(),
+            ));
+        }
+        self.allow_lagging_proposal_validators = true;
+        self.validate()?;
+        Ok(self)
     }
 
     fn validate(&self) -> Result<(), MinerError> {
@@ -239,6 +265,13 @@ impl NativeZcashConfig {
         if self.proposal_validators.is_empty() {
             return Err(MinerError::RpcConfiguration(
                 "at least one proposal-validation node is required".to_string(),
+            ));
+        }
+        if self.allow_lagging_proposal_validators
+            && self.expected_parent_network != NativeZcashNetwork::Testnet
+        {
+            return Err(MinerError::RpcConfiguration(
+                "lagging proposal validators may be tolerated only on Zcash Testnet".to_string(),
             ));
         }
         let mut endpoints = HashSet::with_capacity(self.proposal_validators.len() + 1);
@@ -297,6 +330,7 @@ pub struct NativeZcashProvider {
     expected_parent_network: Network,
     expected_parent_payout_commitment: [u8; 32],
     expected_parent_payout_address: ZcashAddress,
+    allow_lagging_proposal_validators: bool,
 }
 
 /// Exact chain tip sampled from one or more pinned consensus nodes.
@@ -331,6 +365,7 @@ impl NativeZcashProvider {
         let expected_parent_network = config.expected_parent_network.consensus_parameters();
         let expected_parent_payout_commitment = config.expected_parent_payout_commitment;
         let expected_parent_payout_address = config.expected_parent_payout_address;
+        let allow_lagging_proposal_validators = config.allow_lagging_proposal_validators;
         let template_node = ZebraRpcClient::new(config.template_node, config.rpc_timeout)?;
         let proposal_validators = config
             .proposal_validators
@@ -344,6 +379,7 @@ impl NativeZcashProvider {
             expected_parent_network,
             expected_parent_payout_commitment,
             expected_parent_payout_address,
+            allow_lagging_proposal_validators,
         })
     }
 
@@ -396,10 +432,18 @@ impl NativeZcashProvider {
             &self.expected_parent_network,
         )?;
 
-        // Check the same predecessor on every node before proposal validation.
+        // Check the same predecessor before proposal validation. The explicit
+        // Testnet liveness policy still validates the exact proposal on the
+        // authoritative template node, and only skips independent validators
+        // that have not reached that predecessor yet.
         self.require_tip(&self.template_node, &prepared)?;
+        if self.allow_lagging_proposal_validators {
+            self.validate_parent_proposal(&self.template_node, &prepared)?;
+        }
         for validator in &self.proposal_validators {
-            self.require_tip(validator, &prepared)?;
+            if !self.proposal_validator_matches_or_lags(validator, &prepared)? {
+                continue;
+            }
             // Local decoding above proves that the exact coinbase pays the
             // configured recipient and at least the consensus miner subsidy.
             // The independent node then checks that exact block in proposal
@@ -407,25 +451,7 @@ impl NativeZcashProvider {
             // Asking it to build a second shielded coinbase would duplicate the
             // expensive proof and delay the next ASIC job without adding a new
             // payout or consensus invariant.
-            let result = validator.call_value(
-                "getblocktemplate",
-                json!([{
-                    "mode": "proposal",
-                    "data": hex::encode(prepared.proposal_bytes()),
-                }]),
-            )?;
-            match result {
-                Value::Null => {}
-                Value::String(reason) => {
-                    return Err(self.recheck_parent_proposal_rejection(validator, &prepared, reason))
-                }
-                other => {
-                    return Err(MinerError::RpcProtocol(format!(
-                        "{} returned non-null, non-string proposal result {other}",
-                        validator.label()
-                    )))
-                }
-            }
+            self.validate_parent_proposal(validator, &prepared)?;
         }
 
         // Close the race where a tip changed while the proposal checks ran.
@@ -442,6 +468,64 @@ impl NativeZcashProvider {
         );
 
         Ok(prepared)
+    }
+
+    fn validate_parent_proposal(
+        &self,
+        validator: &ZebraRpcClient,
+        prepared: &NativePreparedJob,
+    ) -> Result<(), MinerError> {
+        let result = validator.call_value(
+            "getblocktemplate",
+            json!([{
+                "mode": "proposal",
+                "data": hex::encode(prepared.proposal_bytes()),
+            }]),
+        )?;
+        match result {
+            Value::Null => Ok(()),
+            Value::String(reason) => {
+                Err(self.recheck_parent_proposal_rejection(validator, prepared, reason))
+            }
+            other => Err(MinerError::RpcProtocol(format!(
+                "{} returned non-null, non-string proposal result {other}",
+                validator.label()
+            ))),
+        }
+    }
+
+    /// Returns `false` only when the explicit Testnet policy permits this
+    /// validator to catch up asynchronously. Equal-height forks and validators
+    /// ahead of the work source remain hard failures.
+    fn proposal_validator_matches_or_lags(
+        &self,
+        validator: &ZebraRpcClient,
+        prepared: &NativePreparedJob,
+    ) -> Result<bool, MinerError> {
+        let expected_height = prepared.parent_height().checked_sub(1).ok_or_else(|| {
+            MinerError::InvalidParentTemplate("parent height must be positive".to_string())
+        })?;
+        let actual = native_chain_tip_on_node(validator)?;
+        if actual.height == expected_height
+            && actual.block_hash_le == prepared.parent_proposal.header.previous_block_hash.0
+        {
+            return Ok(true);
+        }
+        if self.allow_lagging_proposal_validators && actual.height < expected_height {
+            return Ok(false);
+        }
+        Err(MinerError::ParentTipMismatch {
+            expected: format!(
+                "{} at height {expected_height}",
+                prepared.parent_tip_display()
+            ),
+            endpoint: validator.label().to_string(),
+            actual: format!(
+                "{} at height {}",
+                display_hex(actual.block_hash_le),
+                actual.height
+            ),
+        })
     }
 
     fn start_coinbase_prewarm(
@@ -712,6 +796,13 @@ impl NativeZcashProvider {
 
     /// Requires every configured parent node to remain on the exact job tip.
     pub fn assert_current(&self, job: &NativePreparedJob) -> Result<(), MinerError> {
+        if self.allow_lagging_proposal_validators {
+            self.require_tip(&self.template_node, job)?;
+            for validator in &self.proposal_validators {
+                self.proposal_validator_matches_or_lags(validator, job)?;
+            }
+            return Ok(());
+        }
         let mut nodes = Vec::with_capacity(self.proposal_validators.len() + 1);
         nodes.push(&self.template_node);
         nodes.extend(self.proposal_validators.iter());
@@ -2263,6 +2354,34 @@ mod tests {
     }
 
     #[test]
+    fn testnet_policy_skips_only_a_strictly_lagging_validator() {
+        let (prepared, _) = proposal_race_fixture();
+        let expected_height = prepared.parent_height - 1;
+        let expected_hash = prepared.parent_tip_display.clone();
+        let cases = [
+            (expected_height - 1, expected_hash.clone(), Ok(false)),
+            (expected_height, expected_hash, Ok(true)),
+            (expected_height, "42".repeat(32), Err(())),
+            (expected_height + 1, "43".repeat(32), Err(())),
+        ];
+
+        for (height, hash, expected) in cases {
+            let (mut provider, server) = parent_tip_recheck_server(Some(Ok(json!({
+                "blocks": height,
+                "bestblockhash": hash,
+            }))));
+            provider.allow_lagging_proposal_validators = true;
+            let actual = provider
+                .proposal_validator_matches_or_lags(&provider.proposal_validators[0], &prepared);
+            match expected {
+                Ok(expected) => assert_eq!(actual.expect("permitted validator state"), expected),
+                Err(()) => assert!(matches!(actual, Err(MinerError::ParentTipMismatch { .. }))),
+            }
+            server.join().expect("tip server exits");
+        }
+    }
+
+    #[test]
     fn independent_template_rollover_is_checked_before_content_validation() {
         let (prepared, mut template) = proposal_race_fixture();
         template.height += 1;
@@ -2679,11 +2798,53 @@ mod tests {
             ),
             expected_parent_payout_address: payout_address,
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
+            allow_lagging_proposal_validators: false,
         };
         assert!(
             NativeZcashProvider::connect(bypass_attempt).is_err(),
             "the provider must revalidate configs even when an in-crate caller bypasses new()"
         );
+    }
+
+    #[test]
+    fn lagging_validator_policy_is_testnet_only() {
+        let template =
+            || RpcEndpoint::new("http://127.0.0.1:8232", None, None).expect("template endpoint");
+        let validator =
+            || RpcEndpoint::new("http://127.0.0.1:8233", None, None).expect("validator endpoint");
+        let payout_address: ZcashAddress = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
+            .parse()
+            .expect("valid Zcash testnet address");
+
+        let testnet = NativeZcashConfig::new(
+            template(),
+            vec![validator()],
+            NativeZcashNetwork::Testnet,
+            NativeZcashNetwork::Testnet
+                .consensus_parameters()
+                .genesis_hash()
+                .to_string(),
+            payout_address.clone(),
+        )
+        .expect("strict Testnet config");
+        assert!(testnet
+            .allow_lagging_proposal_validators_on_testnet()
+            .is_ok());
+
+        let regtest = NativeZcashConfig::new(
+            template(),
+            vec![validator()],
+            NativeZcashNetwork::Regtest,
+            NativeZcashNetwork::Regtest
+                .consensus_parameters()
+                .genesis_hash()
+                .to_string(),
+            payout_address,
+        )
+        .expect("strict Regtest config");
+        assert!(regtest
+            .allow_lagging_proposal_validators_on_testnet()
+            .is_err());
     }
 
     #[test]
