@@ -1521,18 +1521,18 @@ fn is_retryable_native_preparation_error(error: &MinerError) -> bool {
 
 fn native_preparation_retry_delay(error: &MinerError, backoff: Duration) -> Duration {
     match error {
-        MinerError::ParentTipMismatch { .. } | MinerError::ChildTipMismatch { .. } => {
-            TIP_RACE_RETRY_DELAY
-        }
+        MinerError::ParentTipMismatch { .. }
+        | MinerError::ChildTipMismatch { .. }
+        | MinerError::StaleNativeJob(_) => TIP_RACE_RETRY_DELAY,
         _ => backoff,
     }
 }
 
 fn next_native_preparation_backoff(error: &MinerError, backoff: Duration) -> Duration {
     match error {
-        MinerError::ParentTipMismatch { .. } | MinerError::ChildTipMismatch { .. } => {
-            INITIAL_NATIVE_PREPARATION_BACKOFF
-        }
+        MinerError::ParentTipMismatch { .. }
+        | MinerError::ChildTipMismatch { .. }
+        | MinerError::StaleNativeJob(_) => INITIAL_NATIVE_PREPARATION_BACKOFF,
         _ => (backoff * 2).min(MAX_NATIVE_PREPARATION_BACKOFF),
     }
 }
@@ -2737,8 +2737,9 @@ mod tests {
             endpoint: "child".to_string(),
             actual: "child-b".to_string(),
         };
+        let stale_job = MinerError::StaleNativeJob("durably activated job".to_string());
 
-        for error in [&parent_tip_race, &child_tip_race] {
+        for error in [&parent_tip_race, &child_tip_race, &stale_job] {
             assert_eq!(
                 native_preparation_retry_delay(error, Duration::from_secs(32)),
                 TIP_RACE_RETRY_DELAY

@@ -7,7 +7,7 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
     },
     thread,
@@ -180,6 +180,7 @@ pub struct NativeMiningSupervisor {
     zcash: NativeZcashProvider,
     journal: Arc<ShareJournal>,
     generation_preparation: Mutex<()>,
+    next_auxiliary_nonce: AtomicU64,
     pending_candidate_retirement: Mutex<Option<ChildCandidateLease>>,
     outbox_retry: Arc<OutboxRetryState>,
     initial_outbox_recovery_complete: AtomicBool,
@@ -417,6 +418,17 @@ impl NativeMiningSupervisor {
         let journal = Arc::new(ShareJournal::open(journal_path)?);
         let wcash_node = ZebraRpcClient::new(config.wcash_node.clone(), DEFAULT_RPC_TIMEOUT)?;
         let zcash = NativeZcashProvider::connect(config.zcash.clone())?;
+        let generation_count = journal.generation_count()?;
+        let next_auxiliary_nonce = u64::from(config.auxiliary_nonce)
+            .checked_add(generation_count)
+            .filter(|nonce| *nonce <= u64::from(u32::MAX))
+            .ok_or_else(|| {
+                MinerError::InvalidRequest(
+                    "the configured auxiliary nonce plus durable generation count exceeds 32 bits"
+                        .to_string(),
+                )
+            })?;
+        let next_auxiliary_nonce = AtomicU64::new(next_auxiliary_nonce);
         Ok(Self {
             config,
             wcash_network,
@@ -426,6 +438,7 @@ impl NativeMiningSupervisor {
             zcash,
             journal,
             generation_preparation: Mutex::new(()),
+            next_auxiliary_nonce,
             pending_candidate_retirement: Mutex::new(None),
             outbox_retry: Arc::new(OutboxRetryState::new()),
             initial_outbox_recovery_complete: AtomicBool::new(false),
@@ -587,7 +600,8 @@ impl NativeMiningSupervisor {
             .hash()
             .0;
 
-        let job = zcash.prepare_job(child_hash, child_target, config.auxiliary_nonce)?;
+        let auxiliary_nonce = reserve_auxiliary_nonce(&self.next_auxiliary_nonce)?;
+        let job = zcash.prepare_job(child_hash, child_target, auxiliary_nonce)?;
         let generation_descriptor = job.generation_descriptor(
             child_candidate.header.previous_block_hash.0,
             child_coinbase_txid_le,
@@ -678,6 +692,22 @@ impl NativeMiningSupervisor {
             }
         }
     }
+}
+
+fn reserve_auxiliary_nonce(counter: &AtomicU64) -> Result<u32, MinerError> {
+    let value = counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            (value <= u64::from(u32::MAX)).then_some(value + 1)
+        })
+        .map_err(|_| {
+            MinerError::InvalidRequest(
+                "every 32-bit auxiliary nonce was consumed; start a new mining deployment"
+                    .to_string(),
+            )
+        })?;
+    u32::try_from(value).map_err(|_| {
+        MinerError::InvalidRequest("the reserved auxiliary nonce exceeded 32 bits".to_string())
+    })
 }
 
 struct CandidatePreparationGuard<'a> {
@@ -2400,7 +2430,7 @@ impl ShareJournal {
         }
         let mut state = self.lock_state()?;
         if state.seen_job_ids.contains(&job_id) {
-            return Err(MinerError::InvalidRequest(format!(
+            return Err(MinerError::StaleNativeJob(format!(
                 "native job ID {} was already activated or recorded; refusing unsafe reuse",
                 active_job.job_id
             )));
@@ -2423,6 +2453,15 @@ impl ShareJournal {
         state.active_winner_attributions.clear();
         state.active_job = Some(Arc::new(active_job));
         Ok(())
+    }
+
+    fn generation_count(&self) -> Result<u64, MinerError> {
+        let state = self.lock_state()?;
+        u64::try_from(state.seen_job_ids.len()).map_err(|_| {
+            MinerError::InvalidRequest(
+                "the durable mining generation count exceeds 64 bits".to_string(),
+            )
+        })
     }
 
     fn record(
@@ -5765,14 +5804,33 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_nonce_rotation_never_reuses_or_wraps() {
+        let counter = AtomicU64::new(u64::from(u32::MAX - 1));
+        assert_eq!(
+            reserve_auxiliary_nonce(&counter).expect("penultimate nonce remains available"),
+            u32::MAX - 1
+        );
+        assert_eq!(
+            reserve_auxiliary_nonce(&counter).expect("last nonce remains available"),
+            u32::MAX
+        );
+        assert!(
+            reserve_auxiliary_nonce(&counter).is_err(),
+            "the counter must fail closed before wrapping to reused work"
+        );
+    }
+
+    #[test]
     fn job_activation_is_durable_and_reuse_fails_after_restart() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("shares.jsonl");
         let first = active_job_fixture(0x11);
         let journal = ShareJournal::open(&path).expect("new private journal");
+        assert_eq!(journal.generation_count().expect("empty count"), 0);
         journal
             .activate_job(first.clone())
             .expect("first activation is durable");
+        assert_eq!(journal.generation_count().expect("live count"), 1);
         let records = fs::read_to_string(&path).expect("read activation journal");
         let activation: serde_json::Value =
             serde_json::from_str(records.trim()).expect("activation is JSON");
@@ -5782,7 +5840,11 @@ mod tests {
         drop(journal);
 
         let recovered = ShareJournal::open(&path).expect("recover activation");
-        assert!(recovered.activate_job(first).is_err());
+        assert_eq!(recovered.generation_count().expect("recovered count"), 1);
+        assert!(matches!(
+            recovered.activate_job(first),
+            Err(MinerError::StaleNativeJob(_))
+        ));
     }
 
     #[test]
