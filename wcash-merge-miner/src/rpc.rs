@@ -1,12 +1,13 @@
 //! Bounded, credential-safe JSON-RPC transport for native Zcash nodes.
 
 use std::{
+    collections::HashSet,
     fmt,
     io::Read,
     net::IpAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -135,6 +136,20 @@ pub struct ZebraRpcClient {
     endpoint: RpcEndpoint,
     client: Client,
     next_id: Arc<AtomicU64>,
+    active_coinbase_prewarms: Arc<Mutex<HashSet<u32>>>,
+}
+
+struct CoinbasePrewarmReservation {
+    active_heights: Arc<Mutex<HashSet<u32>>>,
+    template_height: u32,
+}
+
+impl Drop for CoinbasePrewarmReservation {
+    fn drop(&mut self) {
+        if let Ok(mut active_heights) = self.active_heights.lock() {
+            active_heights.remove(&self.template_height);
+        }
+    }
 }
 
 impl ZebraRpcClient {
@@ -162,6 +177,7 @@ impl ZebraRpcClient {
             endpoint,
             client,
             next_id: Arc::new(AtomicU64::new(1)),
+            active_coinbase_prewarms: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -226,10 +242,14 @@ impl ZebraRpcClient {
         }) else {
             return;
         };
+        let Some(prewarm_reservation) = self.reserve_coinbase_prewarm(template_height) else {
+            return;
+        };
         let endpoint = self.endpoint.clone();
         let spawn_result = thread::Builder::new()
             .name(format!("coinbase-prewarm-{worker_index}"))
             .spawn(move || {
+                let _prewarm_reservation = prewarm_reservation;
                 // Keep one request armed for the whole 45-second generation.
                 // A shorter ordinary RPC deadline creates periodic gaps where
                 // a winner can arrive while Zebra is proving the replacement
@@ -287,6 +307,18 @@ impl ZebraRpcClient {
         if let Err(error) = spawn_result {
             eprintln!("could not start coinbase prewarm worker {worker_index}: {error}");
         }
+    }
+
+    fn reserve_coinbase_prewarm(&self, template_height: u32) -> Option<CoinbasePrewarmReservation> {
+        let mut active_heights = self.active_coinbase_prewarms.lock().ok()?;
+        if !active_heights.insert(template_height) {
+            return None;
+        }
+        drop(active_heights);
+        Some(CoinbasePrewarmReservation {
+            active_heights: Arc::clone(&self.active_coinbase_prewarms),
+            template_height,
+        })
     }
 }
 
@@ -443,5 +475,29 @@ mod tests {
             ),
             Err(MinerError::RpcHttpStatus(reqwest::StatusCode::UNAUTHORIZED))
         ));
+    }
+
+    #[test]
+    fn coinbase_prewarms_are_deduplicated_per_endpoint_and_height() {
+        let endpoint =
+            RpcEndpoint::new("http://127.0.0.1:8232/", None, None).expect("loopback endpoint");
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(1))
+            .expect("RPC client configuration is valid");
+        let clone = client.clone();
+
+        let height_10 = client
+            .reserve_coinbase_prewarm(10)
+            .expect("the first height reservation succeeds");
+        assert!(
+            clone.reserve_coinbase_prewarm(10).is_none(),
+            "client clones must not start duplicate proofs for one height"
+        );
+        let height_11 = clone
+            .reserve_coinbase_prewarm(11)
+            .expect("different heights may briefly overlap during handoff");
+
+        drop(height_10);
+        assert!(client.reserve_coinbase_prewarm(10).is_some());
+        drop(height_11);
     }
 }
