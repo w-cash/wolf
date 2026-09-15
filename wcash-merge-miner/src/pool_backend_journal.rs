@@ -568,8 +568,9 @@ pub struct JournalShareCommit {
 pub enum JournalWinnerLifecycle {
     /// Exact bytes are retained for initial submission or reconciliation.
     Pending,
-    /// Every pinned parent proved this exact Zcash block committed off the best
-    /// chain. Status-only monitoring survives side-chain pruning and restart.
+    /// This exact valid Zcash proof lost its height race or every pinned parent
+    /// proved it committed off the best chain. Status-only monitoring survives
+    /// side-chain pruning and restart.
     SideChain {
         /// Stable best-chain tip sampled with the committed side-chain proof.
         tip: ChainTip,
@@ -614,7 +615,8 @@ pub enum JournalWinnerLifecycle {
 /// snapshots can authorize a compare-and-swap transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum JournalWinnerTransition {
-    /// Every pinned parent retained this exact Zcash proof off the best chain.
+    /// This exact valid Zcash proof lost its height race or every pinned parent
+    /// retained it off the best chain.
     SideChain {
         /// Stable best-chain tip sampled with the noncanonical proof.
         tip: ChainTip,

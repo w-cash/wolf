@@ -1338,13 +1338,21 @@ enum PoolWinnerObservation {
     Present { tip: ChainTip, confirmations: u32 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParentWinnerTipPosition {
+    ReadyForSubmission,
+    Overtaken,
+    DependencyBehind,
+}
+
 fn reconcile_wcash_pool_winner(
     wcash_node: &ZebraRpcClient,
     snapshot: &PoolBackendWinnerSnapshot,
 ) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
     let winner = snapshot.winner();
     let expected_hash = display_hash(*winner.block_hash_le.as_bytes());
-    validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Wcash, &expected_hash)?;
+    let _previous_hash =
+        validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Wcash, &expected_hash)?;
     let should_submit = winner_lifecycle_requires_submission(snapshot.lifecycle());
     let submission = if should_submit {
         // `submitblock` is idempotent and remains valid after the candidate
@@ -1389,21 +1397,35 @@ fn reconcile_zcash_pool_winner(
 ) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
     let winner = snapshot.winner();
     let expected_hash = display_hash(*winner.block_hash_le.as_bytes());
-    validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Zcash, &expected_hash)?;
-    // Fence the initial all-node exact side-chain proof as well as later
-    // canonical status reads. A submission that advances the tip simply
-    // defers this observation to the next reconciliation pass.
+    let previous_hash =
+        validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Zcash, &expected_hash)?;
+    // Fence both submission and the later canonical status reads. Once a
+    // stable best chain has already reached this candidate's height, replaying
+    // a losing proof can only produce Zebra's generic `rejected` response.
+    // The exact proof was validated before it entered the durable outbox, so
+    // retain it as a noncanonical proof and monitor it without resubmission.
+    // This also bounds duplicate winner bursts before a replacement job reaches
+    // a fast ASIC.
     let before = zcash.consistent_chain_tip()?;
-    let known_side_chain = if winner_lifecycle_requires_submission(snapshot.lifecycle()) {
-        let report =
-            zcash.replay_parent_bytes(snapshot.block_bytes(), winner.height, &expected_hash)?;
-        require_parent_submission_progress(&report)?;
-        report.is_known_side_chain()
-    } else {
-        false
-    };
+    let requires_submission = winner_lifecycle_requires_submission(snapshot.lifecycle());
+    let tip_position = parent_winner_tip_position(before, winner.height, previous_hash)?;
+    let submission =
+        match (requires_submission, tip_position) {
+            (true, ParentWinnerTipPosition::ReadyForSubmission) => Some(
+                zcash.replay_parent_bytes(snapshot.block_bytes(), winner.height, &expected_hash)?,
+            ),
+            (true, ParentWinnerTipPosition::DependencyBehind) => {
+                return Err(MinerError::WinnerSubmissionDeferred { chain: "Zcash" });
+            }
+            _ => None,
+        };
+    let noncanonical = requires_submission
+        && matches!(tip_position, ParentWinnerTipPosition::Overtaken)
+        || submission
+            .as_ref()
+            .is_some_and(ParentSubmissionReport::is_known_side_chain);
 
-    let confirmations = if known_side_chain
+    let confirmations = if noncanonical
         || matches!(
             snapshot.lifecycle(),
             JournalWinnerLifecycle::SideChain { .. }
@@ -1413,12 +1435,12 @@ fn reconcile_zcash_pool_winner(
         zcash.parent_confirmation_depth(winner.height, &expected_hash)?
     };
     let after = zcash.consistent_chain_tip()?;
-    if before != after {
+    if !parent_submission_completed_on_stable_tip(before, after, submission.as_ref())? {
         return Ok(None);
     }
     let tip = pool_chain_tip(before);
     let observation = confirmations.map_or(
-        if known_side_chain {
+        if noncanonical {
             PoolWinnerObservation::SideChain { tip: tip.clone() }
         } else {
             PoolWinnerObservation::Absent { tip: tip.clone() }
@@ -1426,6 +1448,37 @@ fn reconcile_zcash_pool_winner(
         |confirmations| PoolWinnerObservation::Present { tip, confirmations },
     );
     pool_winner_transition(snapshot.lifecycle(), winner, observation)
+}
+
+fn parent_winner_tip_position(
+    tip: NativeChainTip,
+    winner_height: u32,
+    previous_hash_le: [u8; 32],
+) -> Result<ParentWinnerTipPosition, MinerError> {
+    let predecessor_height = winner_height.checked_sub(1).ok_or_else(|| {
+        MinerError::InvalidRequest("a parent winner cannot have height zero".to_string())
+    })?;
+    if tip.height < predecessor_height {
+        return Ok(ParentWinnerTipPosition::DependencyBehind);
+    }
+    if tip.height == predecessor_height && tip.block_hash_le == previous_hash_le {
+        return Ok(ParentWinnerTipPosition::ReadyForSubmission);
+    }
+    Ok(ParentWinnerTipPosition::Overtaken)
+}
+
+fn parent_submission_completed_on_stable_tip(
+    before: NativeChainTip,
+    after: NativeChainTip,
+    submission: Option<&ParentSubmissionReport>,
+) -> Result<bool, MinerError> {
+    if before != after {
+        return Ok(false);
+    }
+    if let Some(submission) = submission {
+        require_parent_submission_progress(submission)?;
+    }
+    Ok(true)
 }
 
 fn classify_wcash_submission(
@@ -1497,7 +1550,7 @@ fn validate_pool_winner_material(
     snapshot: &PoolBackendWinnerSnapshot,
     kind: PersistedWinnerBlockKind,
     expected_hash: &str,
-) -> Result<(), MinerError> {
+) -> Result<[u8; 32], MinerError> {
     let recovered_parent = validate_persisted_winner_block(
         snapshot.block_bytes(),
         expected_hash,
@@ -1509,7 +1562,15 @@ fn validate_pool_winner_material(
             "backend winner bytes do not bind their durable parent header hash".to_string(),
         ));
     }
-    Ok(())
+    let block: Block = snapshot
+        .block_bytes()
+        .zcash_deserialize_into()
+        .map_err(|error| {
+            MinerError::InvalidRequest(format!(
+                "backend winner block became undecodable after validation: {error}"
+            ))
+        })?;
+    Ok(block.header.previous_block_hash.0)
 }
 
 fn winner_lifecycle_requires_submission(lifecycle: &JournalWinnerLifecycle) -> bool {
@@ -4375,6 +4436,22 @@ mod tests {
             require_parent_submission_progress(&rejected),
             Err(MinerError::InvalidParentTemplate(_))
         ));
+        let before = NativeChainTip {
+            block_hash_le: [0x21; 32],
+            height: 0,
+        };
+        let advanced = NativeChainTip {
+            block_hash_le: [0x22; 32],
+            height: 1,
+        };
+        assert!(
+            !parent_submission_completed_on_stable_tip(before, advanced, Some(&rejected))
+                .expect("a tip race defers the ambiguous rejection")
+        );
+        assert!(matches!(
+            parent_submission_completed_on_stable_tip(before, before, Some(&rejected)),
+            Err(MinerError::InvalidParentTemplate(_))
+        ));
         template_server.join().expect("template server exits");
         validator_server.join().expect("validator server exits");
 
@@ -4395,6 +4472,58 @@ mod tests {
         ));
         template_server.join().expect("template server exits");
         validator_server.join().expect("validator server exits");
+    }
+
+    #[test]
+    fn parent_winner_tip_position_only_submits_on_its_exact_predecessor() {
+        let previous_hash = [0x41; 32];
+        let exact_predecessor = NativeChainTip {
+            block_hash_le: previous_hash,
+            height: 9,
+        };
+        assert_eq!(
+            parent_winner_tip_position(exact_predecessor, 10, previous_hash).unwrap(),
+            ParentWinnerTipPosition::ReadyForSubmission
+        );
+        assert_eq!(
+            parent_winner_tip_position(
+                NativeChainTip {
+                    block_hash_le: [0x42; 32],
+                    height: 9,
+                },
+                10,
+                previous_hash,
+            )
+            .unwrap(),
+            ParentWinnerTipPosition::Overtaken,
+            "a different predecessor proves the candidate lost a fork race",
+        );
+        assert_eq!(
+            parent_winner_tip_position(
+                NativeChainTip {
+                    block_hash_le: [0x43; 32],
+                    height: 10,
+                },
+                10,
+                previous_hash,
+            )
+            .unwrap(),
+            ParentWinnerTipPosition::Overtaken,
+            "a filled candidate height must not be replayed",
+        );
+        assert_eq!(
+            parent_winner_tip_position(
+                NativeChainTip {
+                    block_hash_le: [0x40; 32],
+                    height: 8,
+                },
+                10,
+                previous_hash,
+            )
+            .unwrap(),
+            ParentWinnerTipPosition::DependencyBehind,
+        );
+        assert!(parent_winner_tip_position(exact_predecessor, 0, previous_hash).is_err());
     }
 
     #[test]
