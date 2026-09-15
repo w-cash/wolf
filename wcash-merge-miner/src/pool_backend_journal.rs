@@ -568,8 +568,9 @@ pub struct JournalShareCommit {
 pub enum JournalWinnerLifecycle {
     /// Exact bytes are retained for initial submission or reconciliation.
     Pending,
-    /// Every pinned parent proved this exact Zcash block committed off the best
-    /// chain. Status-only monitoring survives side-chain pruning and restart.
+    /// This exact valid Zcash proof lost its height race or every pinned parent
+    /// proved it committed off the best chain. Status-only monitoring survives
+    /// side-chain pruning and restart.
     SideChain {
         /// Stable best-chain tip sampled with the committed side-chain proof.
         tip: ChainTip,
@@ -608,13 +609,25 @@ pub enum JournalWinnerLifecycle {
     },
 }
 
+impl JournalWinnerLifecycle {
+    /// Returns true while exact winner bytes still require node submission.
+    ///
+    /// A dependency failure in these states blocks safe winner delivery and
+    /// therefore mining admission. Status-only audits retain exact bytes and
+    /// keep payout transitions closed without blocking current share work.
+    pub fn requires_submission(&self) -> bool {
+        matches!(self, Self::Pending | Self::Requeued { .. })
+    }
+}
+
 /// One lifecycle result produced by a future winner-reconciliation worker.
 ///
 /// This type remains crate-private so only the actor's authority-bound public
 /// snapshots can authorize a compare-and-swap transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum JournalWinnerTransition {
-    /// Every pinned parent retained this exact Zcash proof off the best chain.
+    /// This exact valid Zcash proof lost its height race or every pinned parent
+    /// retained it off the best chain.
     SideChain {
         /// Stable best-chain tip sampled with the noncanonical proof.
         tip: ChainTip,

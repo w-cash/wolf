@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Keep a healthy current merge-mining generation available when an older grace generation becomes unhealthy, and rate-limit historical winner reconciliation so a large durable backlog cannot compete with live ASIC share validation and job-tip checks."
+time: 2026-09-15T20:30:00.000000000Z

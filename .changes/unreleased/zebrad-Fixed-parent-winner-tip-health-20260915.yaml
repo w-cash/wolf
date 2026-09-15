@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Fence merged-mining winner observations after Zcash submission and keep durable winner retries independent from current share-admission health. Accepted blocks, node convergence, and historical status checks no longer pause valid work, while stable-tip rejection and reward-confirmation checks remain fail closed."
+time: 2026-09-15T15:40:00.000000000Z

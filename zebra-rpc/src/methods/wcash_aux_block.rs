@@ -23,6 +23,12 @@ use zebra_state::KnownBlock;
 /// bound while allowing pools to overlap several in-flight jobs.
 pub(crate) const AUX_BLOCK_CACHE_CAPACITY: usize = 16;
 
+/// Maximum number of independently retireable jobs that may share one exact candidate.
+const AUX_BLOCK_MAX_ACTIVE_LEASES: usize = 16;
+
+/// Bounded replay window for idempotent retirement across candidate reuse.
+const AUX_BLOCK_RETIRED_TOKEN_CAPACITY: usize = 64;
+
 /// Maximum age of a cached candidate, independent of chain-tip invalidation.
 pub(crate) const AUX_BLOCK_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
@@ -222,13 +228,20 @@ pub(crate) struct AuxBlockCandidateCache {
 #[derive(Default)]
 struct CacheInner {
     entries: HashMap<block::Hash, CacheEntry>,
+    retired_tokens: Vec<RetiredCandidateToken>,
 }
 
 struct CacheEntry {
     candidate: Arc<Block>,
     created_at: Instant,
-    retire_token: [u8; 32],
+    active_retire_tokens: Vec<[u8; 32]>,
     state: CacheEntryState,
+}
+
+struct RetiredCandidateToken {
+    id: block::Hash,
+    token: [u8; 32],
+    retired_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -288,10 +301,21 @@ impl AuxBlockCandidateCache {
             if existing.state == CacheEntryState::Publishing {
                 return Err(CandidateInsertError::Publishing);
             }
+            if existing.active_retire_tokens.len() >= AUX_BLOCK_MAX_ACTIVE_LEASES {
+                return Err(CandidateInsertError::Full);
+            }
 
+            let retire_token =
+                unique_retire_token(&inner.retired_tokens, id, &existing.active_retire_tokens);
+            inner
+                .entries
+                .get_mut(&id)
+                .expect("the locked candidate entry remains present")
+                .active_retire_tokens
+                .push(retire_token);
             return Ok(CandidateLease {
                 id,
-                retire_token: existing.retire_token,
+                retire_token,
                 needs_publication: false,
             });
         }
@@ -300,14 +324,13 @@ impl AuxBlockCandidateCache {
             return Err(CandidateInsertError::Full);
         }
 
-        let mut retire_token = [0; 32];
-        OsRng.fill_bytes(&mut retire_token);
+        let retire_token = unique_retire_token(&inner.retired_tokens, id, &[]);
         inner.entries.insert(
             id,
             CacheEntry {
                 candidate,
                 created_at: now,
-                retire_token,
+                active_retire_tokens: vec![retire_token],
                 state: CacheEntryState::Publishing,
             },
         );
@@ -335,7 +358,7 @@ impl AuxBlockCandidateCache {
             .get_mut(&lease.id)
             .expect("a candidate reservation must exist until publication");
         assert!(
-            bool::from(entry.retire_token.ct_eq(&lease.retire_token)),
+            contains_token(&entry.active_retire_tokens, &lease.retire_token),
             "a candidate reservation token must not change"
         );
         assert_eq!(
@@ -358,7 +381,7 @@ impl AuxBlockCandidateCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let should_remove = inner.entries.get(&lease.id).is_some_and(|entry| {
             entry.state == CacheEntryState::Publishing
-                && bool::from(entry.retire_token.ct_eq(&lease.retire_token))
+                && contains_token(&entry.active_retire_tokens, &lease.retire_token)
         });
         if should_remove {
             inner.entries.remove(&lease.id);
@@ -387,7 +410,7 @@ impl AuxBlockCandidateCache {
             .remove(&id);
     }
 
-    /// Retires one published entry only for its unguessable capability.
+    /// Releases one published lease only for its unguessable capability.
     ///
     /// Once any decoded submission begins, explicit retirement is refused so
     /// a concurrent valid share remains retryable. The normal TTL still bounds
@@ -401,17 +424,26 @@ impl AuxBlockCandidateCache {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::purge_expired(&mut inner, Instant::now(), self.ttl);
-        let Some(entry) = inner.entries.get(&id) else {
+        let now = Instant::now();
+        Self::purge_expired(&mut inner, now, self.ttl);
+        if contains_retired_token(&inner.retired_tokens, id, &retire_token) {
+            return Ok(CandidateRetirement::AlreadyAbsent);
+        }
+        let Some(entry) = inner.entries.get_mut(&id) else {
             return Ok(CandidateRetirement::AlreadyAbsent);
         };
-        if !bool::from(entry.retire_token.ct_eq(&retire_token)) {
+        let Some(token_index) = token_index(&entry.active_retire_tokens, &retire_token) else {
             return Err(CandidateRetirementError::Unauthorized);
-        }
+        };
         match entry.state {
             CacheEntryState::Publishing => Err(CandidateRetirementError::Unauthorized),
             CacheEntryState::Published => {
-                inner.entries.remove(&id);
+                entry.active_retire_tokens.swap_remove(token_index);
+                let remove_entry = entry.active_retire_tokens.is_empty();
+                if remove_entry {
+                    inner.entries.remove(&id);
+                }
+                remember_retired_token(&mut inner, id, retire_token, now);
                 Ok(CandidateRetirement::Retired)
             }
             CacheEntryState::SubmissionStarted => Ok(CandidateRetirement::SubmissionStarted),
@@ -428,18 +460,19 @@ impl AuxBlockCandidateCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        let expired = inner.entries.get(&id).is_some_and(|entry| {
+            now.checked_duration_since(entry.created_at)
+                .unwrap_or_default()
+                >= self.ttl
+        });
+        if expired {
+            Self::expire_entry(&mut inner, id, now);
+            return Err(CandidateLookupError::Expired);
+        }
+
         let Some(entry) = inner.entries.get_mut(&id) else {
             return Err(CandidateLookupError::Unknown);
         };
-
-        if now
-            .checked_duration_since(entry.created_at)
-            .unwrap_or_default()
-            >= self.ttl
-        {
-            inner.entries.remove(&id);
-            return Err(CandidateLookupError::Expired);
-        }
 
         if entry.state == CacheEntryState::Publishing {
             return Err(CandidateLookupError::Unknown);
@@ -449,12 +482,83 @@ impl AuxBlockCandidateCache {
     }
 
     fn purge_expired(inner: &mut CacheInner, now: Instant, ttl: Duration) {
-        inner.entries.retain(|_, entry| {
-            now.checked_duration_since(entry.created_at)
+        inner.retired_tokens.retain(|retired| {
+            now.checked_duration_since(retired.retired_at)
                 .unwrap_or_default()
                 < ttl
         });
+        let expired: Vec<_> = inner
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                (now.checked_duration_since(entry.created_at)
+                    .unwrap_or_default()
+                    >= ttl)
+                    .then_some(*id)
+            })
+            .collect();
+        for id in expired {
+            Self::expire_entry(inner, id, now);
+        }
     }
+
+    fn expire_entry(inner: &mut CacheInner, id: block::Hash, now: Instant) {
+        if let Some(entry) = inner.entries.remove(&id) {
+            for token in entry.active_retire_tokens {
+                remember_retired_token(inner, id, token, now);
+            }
+        }
+    }
+}
+
+fn unique_retire_token(
+    retired_tokens: &[RetiredCandidateToken],
+    id: block::Hash,
+    active_tokens: &[[u8; 32]],
+) -> [u8; 32] {
+    loop {
+        let mut token = [0; 32];
+        OsRng.fill_bytes(&mut token);
+        if !contains_token(active_tokens, &token)
+            && !contains_retired_token(retired_tokens, id, &token)
+        {
+            return token;
+        }
+    }
+}
+
+fn token_index(tokens: &[[u8; 32]], expected: &[u8; 32]) -> Option<usize> {
+    tokens
+        .iter()
+        .position(|token| bool::from(token.ct_eq(expected)))
+}
+
+fn contains_token(tokens: &[[u8; 32]], expected: &[u8; 32]) -> bool {
+    token_index(tokens, expected).is_some()
+}
+
+fn contains_retired_token(
+    tokens: &[RetiredCandidateToken],
+    id: block::Hash,
+    expected: &[u8; 32],
+) -> bool {
+    tokens
+        .iter()
+        .any(|retired| retired.id == id && bool::from(retired.token.ct_eq(expected)))
+}
+
+fn remember_retired_token(inner: &mut CacheInner, id: block::Hash, token: [u8; 32], now: Instant) {
+    if contains_retired_token(&inner.retired_tokens, id, &token) {
+        return;
+    }
+    if inner.retired_tokens.len() >= AUX_BLOCK_RETIRED_TOKEN_CAPACITY {
+        inner.retired_tokens.remove(0);
+    }
+    inner.retired_tokens.push(RetiredCandidateToken {
+        id,
+        token,
+        retired_at: now,
+    });
 }
 
 #[cfg(test)]
@@ -579,6 +683,124 @@ mod tests {
                 CandidateRetirement::AlreadyAbsent
             );
         }
+    }
+
+    #[test]
+    fn reused_candidates_have_independent_idempotent_retirement_leases() {
+        let cache = AuxBlockCandidateCache::new(2, Duration::from_secs(600));
+        let now = Instant::now();
+        let candidate = candidate(1, block::Hash([0x35; 32]));
+        let first = cache
+            .insert_at(Arc::clone(&candidate), now)
+            .expect("first candidate lease is available");
+        cache.publish(first);
+        let second = cache
+            .insert_at(candidate, now)
+            .expect("the published candidate can be leased again");
+
+        assert_eq!(first.id(), second.id());
+        assert_ne!(first.retire_token(), second.retire_token());
+        assert_eq!(
+            cache
+                .retire(first.id(), first.retire_token())
+                .expect("the first lease retires independently"),
+            CandidateRetirement::Retired
+        );
+        assert!(
+            cache.begin_submission_at(second.id(), now).is_ok(),
+            "retiring the first lease must retain the second job's candidate"
+        );
+        assert_eq!(
+            cache
+                .retire(first.id(), first.retire_token())
+                .expect("the first retirement can be retried"),
+            CandidateRetirement::AlreadyAbsent,
+            "the retired lease remains idempotent after another lease starts submission"
+        );
+        assert_eq!(
+            cache
+                .retire(second.id(), second.retire_token())
+                .expect("the second lease recognizes the started submission"),
+            CandidateRetirement::SubmissionStarted
+        );
+    }
+
+    #[test]
+    fn reused_candidate_retirement_retry_is_idempotent_before_submission() {
+        let cache = AuxBlockCandidateCache::new(1, Duration::from_secs(600));
+        let now = Instant::now();
+        let candidate = candidate(2, block::Hash([0x36; 32]));
+        let first = cache
+            .insert_at(Arc::clone(&candidate), now)
+            .expect("first candidate lease is available");
+        cache.publish(first);
+        let second = cache
+            .insert_at(candidate, now)
+            .expect("second candidate lease is available");
+
+        assert_eq!(
+            cache
+                .retire(first.id(), first.retire_token())
+                .expect("first lease retires"),
+            CandidateRetirement::Retired
+        );
+        assert_eq!(
+            cache
+                .retire(first.id(), first.retire_token())
+                .expect("lost retirement responses are safely retryable"),
+            CandidateRetirement::AlreadyAbsent
+        );
+        assert_eq!(
+            cache
+                .retire(second.id(), second.retire_token())
+                .expect("last lease retires the candidate"),
+            CandidateRetirement::Retired
+        );
+        assert_eq!(
+            cache
+                .begin_submission_at(second.id(), now)
+                .expect_err("the candidate is gone after its last lease retires"),
+            CandidateLookupError::Unknown
+        );
+    }
+
+    #[test]
+    fn expired_candidate_tokens_remain_idempotent_across_exact_reissue() {
+        let cache = AuxBlockCandidateCache::new(1, Duration::from_secs(10));
+        let now = Instant::now();
+        let candidate = candidate(3, block::Hash([0x37; 32]));
+        let first = cache
+            .insert_at(Arc::clone(&candidate), now)
+            .expect("first candidate lease is available");
+        cache.publish(first);
+        let second = cache
+            .insert_at(Arc::clone(&candidate), now + Duration::from_secs(9))
+            .expect("second candidate lease is available before expiry");
+
+        let replacement = cache
+            .insert_at(candidate, now + Duration::from_secs(10))
+            .expect("the exact candidate can be reissued after expiry");
+        cache.publish(replacement);
+
+        for expired in [first, second] {
+            assert_eq!(
+                cache
+                    .retire(expired.id(), expired.retire_token())
+                    .expect("an expired lease stays idempotent after exact candidate reuse"),
+                CandidateRetirement::AlreadyAbsent
+            );
+        }
+        assert_eq!(
+            cache.retire(replacement.id(), [0xff; 32]),
+            Err(CandidateRetirementError::Unauthorized),
+            "an unrelated capability must not inherit idempotency"
+        );
+        assert_eq!(
+            cache
+                .retire(replacement.id(), replacement.retire_token())
+                .expect("the replacement lease remains independently authorized"),
+            CandidateRetirement::Retired
+        );
     }
 
     #[test]

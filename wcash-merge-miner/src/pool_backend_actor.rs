@@ -9,10 +9,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex, MutexGuard,
-    },
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -37,6 +34,12 @@ use crate::{
         PoolBackendRequestContext, PoolBackendRequestHandler,
     },
 };
+
+// Historical winner observation must never compete with live share validation
+// and job-tip RPCs at ASIC submission rates. New winners still receive their
+// immediate first attempt; the durable historical cursor advances at this
+// deliberately slower cadence.
+const WINNER_HISTORICAL_STEP_INTERVAL: Duration = Duration::from_secs(1);
 
 const MAX_RECENT_JOBS: usize = 2;
 const MAX_SUPERSEDED_GRACE: Duration = Duration::from_secs(60);
@@ -279,7 +282,7 @@ impl PoolBackendWinnerScheduler {
         {
             Some(snapshot) => {
                 self.unsettled_after = Some(snapshot.key());
-                (Some(snapshot), false, Duration::from_millis(100))
+                (Some(snapshot), false, WINNER_HISTORICAL_STEP_INTERVAL)
             }
             None => {
                 self.unsettled_after = None;
@@ -319,6 +322,15 @@ pub struct PoolBackendWinnerSnapshot {
 }
 
 impl PoolBackendWinnerSnapshot {
+    #[cfg(test)]
+    pub(crate) fn from_test_state(state: JournalWinnerState) -> Self {
+        Self {
+            journal_stream: CanonicalUuid::new(uuid::Uuid::from_u128(1)),
+            winner_ordinal: 0,
+            state,
+        }
+    }
+
     /// Returns an authority-bound key suitable for point lookup or pagination.
     pub fn key(&self) -> PoolBackendWinnerKey {
         PoolBackendWinnerKey {
@@ -637,7 +649,6 @@ pub struct PoolBackendActor {
     authority: PoolBackendAuthority,
     authority_fields: AuthorityFields,
     clock: Arc<dyn ActorClock>,
-    winner_reconciliation_healthy: AtomicBool,
     state: Mutex<ActorState>,
 }
 
@@ -695,18 +706,8 @@ impl PoolBackendActor {
             authority,
             authority_fields,
             clock,
-            winner_reconciliation_healthy: AtomicBool::new(true),
             state: Mutex::new(state),
         })
-    }
-
-    /// Updates the live status of the sole winner-reconciliation worker.
-    ///
-    /// This flag affects only health reporting. Exact winners remain durable
-    /// and share validation remains consensus-authoritative during an outage.
-    pub fn set_winner_reconciliation_health(&self, healthy: bool) {
-        self.winner_reconciliation_healthy
-            .store(healthy, Ordering::Release);
     }
 
     /// Durably advertises a healthy exact job, superseding the current job
@@ -1098,14 +1099,14 @@ impl PoolBackendActor {
         if after_event_seq > event_seq {
             return Err(invalid_request());
         }
-        for job_id in state.current.iter().chain(state.recent.iter()) {
+        if let Some(job_id) = state.current.as_ref() {
             let job = state
                 .live_jobs
                 .get(job_id)
                 .ok_or_else(|| unhealthy_backend("retained job projection requires restart"))?;
             if !job.validator.is_healthy() {
                 return Err(unhealthy_backend(
-                    "retained job validator requires durable invalidation",
+                    "current job validator requires durable invalidation",
                 ));
             }
         }
@@ -1119,6 +1120,10 @@ impl PoolBackendActor {
             .iter()
             .rev()
             .filter_map(|job_id| state.live_jobs.get(job_id))
+            // A superseded generation can lose its last useful chain while a
+            // healthy replacement is already current. Omit that grace job from
+            // a new snapshot rather than withholding the replacement.
+            .filter(|job| job.validator.is_healthy())
             .filter_map(|job| acceptable_job(job, now))
             .take(MAX_RECENT_JOBS)
             .collect();
@@ -1280,10 +1285,10 @@ impl PoolBackendActor {
         id: u64,
         now: Duration,
     ) -> Result<Vec<BackendMessage>, PoolBackendHandlerError> {
-        // This synchronous snapshot reports durable outbox pressure and share
-        // admission health. A future actor-owned reconciliation worker must
-        // also gate `healthy` on live winner-submission dependencies; callers
-        // must not interpret these counters as proof that submission ran.
+        // `healthy` is strictly the current share-admission boundary. Winner
+        // delivery and settlement remain fail-closed through their durable
+        // lifecycle events and the pending/quarantined counters below. A
+        // historical retry must never reject valid work for a current job.
         let winner_summary = state
             .journal
             .winner_summary()
@@ -1297,15 +1302,10 @@ impl PoolBackendActor {
             .as_ref()
             .and_then(|job_id| state.live_jobs.get(job_id))
             .is_some_and(|job| job.validator.is_healthy() && acceptable_job(job, now).is_some());
-        let recent_healthy = state.recent.iter().all(|job_id| {
-            state
-                .live_jobs
-                .get(job_id)
-                .is_some_and(|job| job.validator.is_healthy() && acceptable_job(job, now).is_some())
-        });
-        let healthy = current_healthy
-            && recent_healthy
-            && self.winner_reconciliation_healthy.load(Ordering::Acquire);
+        // Health is the current share-admission boundary. An unhealthy grace
+        // generation rejects its own ordinary shares, but must not pause a
+        // healthy replacement and strand every miner on the superseded job.
+        let healthy = current_healthy;
         let response = BackendMessage::HealthStatus {
             version: BACKEND_PROTOCOL_VERSION,
             id,
@@ -2323,17 +2323,17 @@ mod tests {
         // unchanged. The next step must still advance historical monitoring.
         let work = scheduler.next(&actor).unwrap();
         assert_eq!(work.snapshot().unwrap().share_id(), &historical[0]);
-        assert_eq!(work.delay(), Duration::from_millis(100));
+        assert_eq!(work.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
         let work = scheduler.next(&actor).unwrap();
         assert_eq!(work.snapshot().unwrap().share_id(), &second);
         assert_eq!(work.delay(), Duration::ZERO);
         assert_eq!(scheduler.first_attempt_next, 202);
         let work = scheduler.next(&actor).unwrap();
         assert_eq!(work.snapshot().unwrap().share_id(), &historical[1]);
-        assert_eq!(work.delay(), Duration::from_millis(100));
+        assert_eq!(work.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
         let work = scheduler.next(&actor).unwrap();
         assert_eq!(work.snapshot().unwrap().share_id(), &historical[2]);
-        assert_eq!(work.delay(), Duration::from_millis(100));
+        assert_eq!(work.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
 
         // A later durable append remains visible after the tail was exhausted.
         let third = append_scheduler_after_restore(&actor, 203);
@@ -2378,7 +2378,7 @@ mod tests {
             let work = scheduler.next(&actor).unwrap();
             assert_eq!(scheduler.first_attempt_next, expected_cursor);
             assert_eq!(work.snapshot().unwrap().share_id(), expected_share);
-            assert_eq!(work.delay(), Duration::from_millis(100));
+            assert_eq!(work.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
         }
         let new = append_scheduler_after_restore(&actor, 301);
         let work = scheduler.next(&actor).unwrap();
@@ -2414,7 +2414,7 @@ mod tests {
         );
         let duplicate = scheduler.next(&actor).unwrap();
         assert!(duplicate.snapshot().is_none());
-        assert_eq!(duplicate.delay(), Duration::from_millis(100));
+        assert_eq!(duplicate.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
         let end = scheduler.next(&actor).unwrap();
         assert!(end.snapshot().is_none());
         assert!(end.completes_pass());
@@ -2465,7 +2465,7 @@ mod tests {
             let unsettled = scheduler.next(&actor).unwrap();
             assert_eq!(unsettled.snapshot().unwrap().share_id(), &shares[0]);
             assert!(!unsettled.completes_pass());
-            assert_eq!(unsettled.delay(), Duration::from_millis(100));
+            assert_eq!(unsettled.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
             let audit = scheduler.next(&actor).unwrap();
             assert_eq!(
                 audit.snapshot().map(PoolBackendWinnerSnapshot::share_id),
@@ -2736,7 +2736,7 @@ mod tests {
             .expect_err("unhealthy validator cannot silently alter a snapshot");
         assert_eq!(
             error,
-            unhealthy_backend("retained job validator requires durable invalidation")
+            unhealthy_backend("current job validator requires durable invalidation")
         );
         assert_eq!(
             actor
@@ -2919,19 +2919,23 @@ mod tests {
     }
 
     #[test]
-    fn winner_reconciliation_outage_is_visible_in_backend_health() {
+    fn winner_backlog_is_independent_from_share_admission_health() {
         let directory = private_temp_dir();
         let path = directory.path().join("actor.journal");
         let config = config();
         let actor = actor(&path, &config, Arc::new(TestClock::new()));
+        let (descriptor, request, block_bytes) = zcash_winner_fixture(10);
+        let retained = Arc::new(TestRetainedJob::new(descriptor));
+        retained.set_validated(PoolBackendValidatedShare::with_winners(
+            None,
+            Some(block_bytes),
+        ));
         actor
-            .activate_job(
-                Arc::new(TestRetainedJob::new(job(1))),
-                Duration::from_secs(5),
-            )
+            .activate_job(retained, Duration::from_secs(5))
             .expect("activate healthy job");
-        actor.set_winner_reconciliation_health(false);
-
+        actor
+            .dispatch(uuid(20), Some(1), BackendRequestKind::SubmitShare, request)
+            .expect("commit pending winner");
         assert!(matches!(
             actor
                 .dispatch(
@@ -2945,7 +2949,11 @@ mod tests {
                 )
                 .expect("health response succeeds")
                 .as_slice(),
-            [BackendMessage::HealthStatus { healthy: false, .. }]
+            [BackendMessage::HealthStatus {
+                healthy: true,
+                pending_zcash: 1,
+                ..
+            }]
         ));
     }
 
@@ -2995,9 +3003,16 @@ mod tests {
             .expect("health response succeeds");
         assert!(matches!(
             health.as_slice(),
-            [BackendMessage::HealthStatus { healthy: false, .. }]
+            [BackendMessage::HealthStatus { healthy: true, .. }]
         ));
-        first_validator.healthy.store(true, Ordering::Release);
+        assert!(matches!(
+            snapshot(&actor, 0),
+            BackendMessage::JobSnapshot {
+                current: Some(AcceptableJob { job, .. }),
+                recent,
+                ..
+            } if job.job_id == second.job_id && recent.is_empty()
+        ));
 
         clock.advance(Duration::from_secs(5));
         assert!(matches!(

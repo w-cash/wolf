@@ -7,7 +7,7 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
     },
     thread,
@@ -79,6 +79,49 @@ pub struct CoordinatorConfig {
     pub wcash_payout_incoming_viewing_key: Option<WcashIncomingViewingKey>,
     /// Auxiliary-tree nonce; one-child native jobs normally use zero.
     pub auxiliary_nonce: u32,
+}
+
+/// A failed durable-winner reconciliation attempt with its mining impact.
+///
+/// The flag distinguishes blocked winner delivery from a status-only audit
+/// failure for operations and settlement monitoring. Both leave unrelated
+/// current-job share admission available because the exact winner bytes are
+/// already durable; neither can create a reward transition without node proof.
+#[derive(Debug)]
+pub struct PoolWinnerReconciliationError {
+    source: MinerError,
+    submission_blocked: bool,
+}
+
+impl PoolWinnerReconciliationError {
+    fn new(source: MinerError, submission_blocked: bool) -> Self {
+        Self {
+            source,
+            submission_blocked,
+        }
+    }
+
+    /// Returns true when exact durable winner delivery remains blocked.
+    pub const fn submission_blocked(&self) -> bool {
+        self.submission_blocked
+    }
+
+    /// Returns the underlying reconciliation failure.
+    pub const fn miner_error(&self) -> &MinerError {
+        &self.source
+    }
+}
+
+impl fmt::Display for PoolWinnerReconciliationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for PoolWinnerReconciliationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 impl fmt::Debug for CoordinatorConfig {
@@ -180,6 +223,7 @@ pub struct NativeMiningSupervisor {
     zcash: NativeZcashProvider,
     journal: Arc<ShareJournal>,
     generation_preparation: Mutex<()>,
+    next_auxiliary_nonce: AtomicU64,
     pending_candidate_retirement: Mutex<Option<ChildCandidateLease>>,
     outbox_retry: Arc<OutboxRetryState>,
     initial_outbox_recovery_complete: AtomicBool,
@@ -327,13 +371,28 @@ pub struct WinnerOutboxStatus {
 struct JobFreshness {
     active: bool,
     last_checked: Instant,
+    replacement_requested: bool,
+}
+
+/// Admission state for a retained pool generation.
+///
+/// A merged-mining header can remain useful to one chain after the other
+/// chain advances. Pool workers keep that exact generation available while a
+/// replacement is prepared, but request immediate rotation so both chains are
+/// covered again as soon as a newly proposal-validated job is ready.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PoolGenerationCurrentness {
+    /// Both frozen chain predecessors are still current.
+    Current,
+    /// Exactly one chain check succeeded; rotate while retaining the other.
+    OneChainUnavailable,
 }
 
 // Refresh before the common 55-second S-NOMP/ASIC liveness rebroadcast interval.
 // A fresh child and independently proposal-validated parent are required: merely
 // replaying the same header could restart a miner's duplicate nonce search.
 const MAX_JOB_AGE: Duration = Duration::from_secs(NATIVE_JOB_MAX_AGE_SECONDS);
-const TIP_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
+const TIP_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 const OUTBOX_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const OUTBOX_MAINTENANCE_BATCH_SIZE: usize = 2;
 const MAX_CHILD_BLOCK_BYTES: usize = 2_000_000;
@@ -417,6 +476,17 @@ impl NativeMiningSupervisor {
         let journal = Arc::new(ShareJournal::open(journal_path)?);
         let wcash_node = ZebraRpcClient::new(config.wcash_node.clone(), DEFAULT_RPC_TIMEOUT)?;
         let zcash = NativeZcashProvider::connect(config.zcash.clone())?;
+        let generation_count = journal.generation_count()?;
+        let next_auxiliary_nonce = u64::from(config.auxiliary_nonce)
+            .checked_add(generation_count)
+            .filter(|nonce| *nonce <= u64::from(u32::MAX))
+            .ok_or_else(|| {
+                MinerError::InvalidRequest(
+                    "the configured auxiliary nonce plus durable generation count exceeds 32 bits"
+                        .to_string(),
+                )
+            })?;
+        let next_auxiliary_nonce = AtomicU64::new(next_auxiliary_nonce);
         Ok(Self {
             config,
             wcash_network,
@@ -426,6 +496,7 @@ impl NativeMiningSupervisor {
             zcash,
             journal,
             generation_preparation: Mutex::new(()),
+            next_auxiliary_nonce,
             pending_candidate_retirement: Mutex::new(None),
             outbox_retry: Arc::new(OutboxRetryState::new()),
             initial_outbox_recovery_complete: AtomicBool::new(false),
@@ -587,7 +658,8 @@ impl NativeMiningSupervisor {
             .hash()
             .0;
 
-        let job = zcash.prepare_job(child_hash, child_target, config.auxiliary_nonce)?;
+        let auxiliary_nonce = reserve_auxiliary_nonce(&self.next_auxiliary_nonce)?;
+        let job = zcash.prepare_job(child_hash, child_target, auxiliary_nonce)?;
         let generation_descriptor = job.generation_descriptor(
             child_candidate.header.previous_block_hash.0,
             child_coinbase_txid_le,
@@ -641,6 +713,7 @@ impl NativeMiningSupervisor {
             freshness: Mutex::new(JobFreshness {
                 active: true,
                 last_checked: Instant::now(),
+                replacement_requested: false,
             }),
             outbox_retry: Arc::clone(&self.outbox_retry),
             journal,
@@ -662,22 +735,43 @@ impl NativeMiningSupervisor {
     pub fn reconcile_pool_backend_winner(
         &self,
         snapshot: &PoolBackendWinnerSnapshot,
-    ) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
+    ) -> Result<Option<PoolBackendWinnerTransition>, PoolWinnerReconciliationError> {
+        let submission_blocked = snapshot.lifecycle().requires_submission();
         match snapshot.winner().chain {
             MergedChain::Wcash => {
                 require_wcash_network_identity(
                     &self.wcash_node,
                     &self.config.expected_wcash_genesis_hash,
-                )?;
+                )
+                .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))?;
                 reconcile_wcash_pool_winner(&self.wcash_node, snapshot)
             }
             MergedChain::Zcash => {
                 self.zcash
-                    .require_network_identity(self.config.zcash.expected_genesis_hash())?;
+                    .require_network_identity(self.config.zcash.expected_genesis_hash())
+                    .map_err(|error| {
+                        PoolWinnerReconciliationError::new(error, submission_blocked)
+                    })?;
                 reconcile_zcash_pool_winner(&self.zcash, snapshot)
             }
         }
     }
+}
+
+fn reserve_auxiliary_nonce(counter: &AtomicU64) -> Result<u32, MinerError> {
+    let value = counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            (value <= u64::from(u32::MAX)).then_some(value + 1)
+        })
+        .map_err(|_| {
+            MinerError::InvalidRequest(
+                "every 32-bit auxiliary nonce was consumed; start a new mining deployment"
+                    .to_string(),
+            )
+        })?;
+    u32::try_from(value).map_err(|_| {
+        MinerError::InvalidRequest("the reserved auxiliary nonce exceeded 32 bits".to_string())
+    })
 }
 
 struct CandidatePreparationGuard<'a> {
@@ -810,7 +904,79 @@ impl NativeMiningCoordinator {
             return Ok(());
         }
 
-        let (child, parent) = thread::scope(|scope| {
+        let (child, parent) = self.check_chain_tips();
+        match (child, parent) {
+            (Ok(()), Ok(())) => {
+                freshness.last_checked = now;
+                freshness.replacement_requested = false;
+                Ok(())
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                if matches!(
+                    &error,
+                    MinerError::ChildTipMismatch { .. } | MinerError::ParentTipMismatch { .. }
+                ) {
+                    freshness.active = false;
+                }
+                freshness.replacement_requested = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Refreshes pool admission without discarding work that remains useful
+    /// to one side of the merge-mined pair.
+    ///
+    /// New generations still pass the strict dual-chain proposal gate. This
+    /// method only governs the short handoff after an already-admitted job
+    /// loses one predecessor. If either chain remains current, exact shares
+    /// continue through validation while the supervisor prepares a
+    /// replacement. Once neither check succeeds, admission fails closed.
+    pub(crate) fn refresh_pool_currentness(&self) -> Result<PoolGenerationCurrentness, MinerError> {
+        let now = Instant::now();
+        let mut freshness = self
+            .freshness
+            .lock()
+            .map_err(|_| coordinator_mutex_error("job freshness"))?;
+        if !freshness.active {
+            return Err(MinerError::StaleNativeJob(
+                "the job was already deactivated".to_string(),
+            ));
+        }
+        if now.saturating_duration_since(self.candidate_created_at) >= MAX_JOB_AGE {
+            freshness.active = false;
+            return Err(MinerError::StaleNativeJob(format!(
+                "the native job reached its {}-second fresh-work lifetime",
+                MAX_JOB_AGE.as_secs()
+            )));
+        }
+        if now.saturating_duration_since(freshness.last_checked) < TIP_RECHECK_INTERVAL {
+            return Ok(if freshness.replacement_requested {
+                PoolGenerationCurrentness::OneChainUnavailable
+            } else {
+                PoolGenerationCurrentness::Current
+            });
+        }
+
+        let result = classify_pool_generation_currentness(self.check_chain_tips());
+        freshness.last_checked = now;
+        match result {
+            Ok(PoolGenerationCurrentness::Current) => {
+                freshness.replacement_requested = false;
+            }
+            Ok(PoolGenerationCurrentness::OneChainUnavailable) => {
+                freshness.replacement_requested = true;
+            }
+            Err(_) => {
+                freshness.active = false;
+                freshness.replacement_requested = true;
+            }
+        }
+        result
+    }
+
+    fn check_chain_tips(&self) -> (Result<(), MinerError>, Result<(), MinerError>) {
+        thread::scope(|scope| {
             let child = scope.spawn(|| self.check_child_tip());
             let parent = scope.spawn(|| self.zcash.assert_current(&self.job));
             (
@@ -825,22 +991,7 @@ impl NativeMiningCoordinator {
                     ))
                 }),
             )
-        });
-        match (child, parent) {
-            (Ok(()), Ok(())) => {
-                freshness.last_checked = now;
-                Ok(())
-            }
-            (Err(error), _) | (_, Err(error)) => {
-                if matches!(
-                    &error,
-                    MinerError::ChildTipMismatch { .. } | MinerError::ParentTipMismatch { .. }
-                ) {
-                    freshness.active = false;
-                }
-                Err(error)
-            }
-        }
+        })
     }
 
     fn check_child_tip(&self) -> Result<(), MinerError> {
@@ -906,6 +1057,16 @@ impl NativeMiningCoordinator {
             maintenance_cursor,
         );
         self.retry_pending_winners(winners)
+    }
+}
+
+fn classify_pool_generation_currentness(
+    (child, parent): (Result<(), MinerError>, Result<(), MinerError>),
+) -> Result<PoolGenerationCurrentness, MinerError> {
+    match (child, parent) {
+        (Ok(()), Ok(())) => Ok(PoolGenerationCurrentness::Current),
+        (Ok(()), Err(_)) | (Err(_), Ok(())) => Ok(PoolGenerationCurrentness::OneChainUnavailable),
+        (Err(error), Err(_)) => Err(error),
     }
 }
 
@@ -1308,14 +1469,23 @@ enum PoolWinnerObservation {
     Present { tip: ChainTip, confirmations: u32 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParentWinnerTipPosition {
+    ReadyForSubmission,
+    Overtaken,
+    DependencyBehind,
+}
+
 fn reconcile_wcash_pool_winner(
     wcash_node: &ZebraRpcClient,
     snapshot: &PoolBackendWinnerSnapshot,
-) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
+) -> Result<Option<PoolBackendWinnerTransition>, PoolWinnerReconciliationError> {
     let winner = snapshot.winner();
     let expected_hash = display_hash(*winner.block_hash_le.as_bytes());
-    validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Wcash, &expected_hash)?;
-    let should_submit = winner_lifecycle_requires_submission(snapshot.lifecycle());
+    let should_submit = snapshot.lifecycle().requires_submission();
+    let _previous_hash =
+        validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Wcash, &expected_hash)
+            .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
     let submission = if should_submit {
         // `submitblock` is idempotent and remains valid after the candidate
         // cache expires. The exact bytes were validated above and were durable
@@ -1328,16 +1498,25 @@ fn reconcile_wcash_pool_winner(
         None
     };
 
-    let before = native_chain_tip_on_node(wcash_node)?;
+    let before = native_chain_tip_on_node(wcash_node)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
     let observation = wcash_confirmation_depth_checked(
         wcash_node,
         winner.height,
         &expected_hash,
         snapshot.block_bytes(),
         should_submit,
-    )?;
-    let after = native_chain_tip_on_node(wcash_node)?;
+    )
+    .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
+    let after = native_chain_tip_on_node(wcash_node)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
     if before != after {
+        if should_submit {
+            return Err(PoolWinnerReconciliationError::new(
+                MinerError::WinnerSubmissionDeferred { chain: "Wcash" },
+                true,
+            ));
+        }
         return Ok(None);
     }
     let tip = pool_chain_tip(before);
@@ -1349,46 +1528,116 @@ fn reconcile_wcash_pool_winner(
             PoolWinnerObservation::Present { tip, confirmations }
         }
     };
-    require_wcash_submission_progress(&observation, submission)?;
+    require_wcash_submission_progress(&observation, submission)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
     pool_winner_transition(snapshot.lifecycle(), winner, observation)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))
 }
 
 fn reconcile_zcash_pool_winner(
     zcash: &NativeZcashProvider,
     snapshot: &PoolBackendWinnerSnapshot,
-) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
+) -> Result<Option<PoolBackendWinnerTransition>, PoolWinnerReconciliationError> {
     let winner = snapshot.winner();
     let expected_hash = display_hash(*winner.block_hash_le.as_bytes());
-    validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Zcash, &expected_hash)?;
-    // Fence the initial all-node exact side-chain proof as well as later
-    // canonical status reads. A submission that advances the tip simply
-    // defers this observation to the next reconciliation pass.
-    let before = zcash.consistent_chain_tip()?;
-    let known_side_chain = if winner_lifecycle_requires_submission(snapshot.lifecycle()) {
-        let report =
-            zcash.replay_parent_bytes(snapshot.block_bytes(), winner.height, &expected_hash)?;
-        require_parent_submission_progress(&report)?;
-        report.is_known_side_chain()
-    } else {
-        false
+    let requires_submission = snapshot.lifecycle().requires_submission();
+    let previous_hash =
+        validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Zcash, &expected_hash)
+            .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
+    // Fence both submission and the later canonical status reads. Once a
+    // stable best chain has already reached this candidate's height, replaying
+    // a losing proof can only produce Zebra's generic `rejected` response.
+    // The exact proof was validated before it entered the durable outbox, so
+    // retain it as a noncanonical proof and monitor it without resubmission.
+    // This also bounds duplicate winner bursts before a replacement job reaches
+    // a fast ASIC.
+    let before = zcash
+        .consistent_chain_tip()
+        .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
+    let tip_position = parent_winner_tip_position(before, winner.height, previous_hash)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
+    let submission_required = parent_winner_submission_required(snapshot.lifecycle(), tip_position);
+    let submission = match (requires_submission, tip_position) {
+        (true, ParentWinnerTipPosition::ReadyForSubmission) => Some(
+            zcash
+                .replay_parent_bytes(snapshot.block_bytes(), winner.height, &expected_hash)
+                .map_err(|error| PoolWinnerReconciliationError::new(error, true))?,
+        ),
+        (true, ParentWinnerTipPosition::DependencyBehind) => {
+            return Err(PoolWinnerReconciliationError::new(
+                MinerError::WinnerSubmissionDeferred { chain: "Zcash" },
+                true,
+            ));
+        }
+        _ => None,
     };
+    let noncanonical = requires_submission
+        && matches!(tip_position, ParentWinnerTipPosition::Overtaken)
+        || submission
+            .as_ref()
+            .is_some_and(ParentSubmissionReport::is_known_side_chain);
 
-    let confirmations = if known_side_chain
+    // A successful submit advances the tip itself. Fence confirmation reads
+    // with a new post-submit snapshot rather than requiring the pre-submit
+    // predecessor to remain the tip. Delivered winners can await a stable
+    // accounting observation without disabling unrelated share acceptance.
+    let mut submission_blocked = submission_required
+        && !submission
+            .as_ref()
+            .is_some_and(|report| report.is_confirmed() || report.is_known_side_chain());
+    let observation_before = if submission.is_some() {
+        zcash
+            .consistent_chain_tip()
+            .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))?
+    } else {
+        before
+    };
+    // A competing block can also fill the candidate height while submitblock
+    // is in flight. Delivery of this obsolete candidate no longer blocks new
+    // work; the next status pass classifies it without inventing reward credit.
+    if parent_winner_tip_position(observation_before, winner.height, previous_hash)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))?
+        == ParentWinnerTipPosition::Overtaken
+    {
+        submission_blocked = false;
+    }
+    if !parent_submission_completed_on_stable_tip(before, observation_before, submission.as_ref())
+        .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))?
+    {
+        return Err(PoolWinnerReconciliationError::new(
+            MinerError::WinnerSubmissionDeferred { chain: "Zcash" },
+            submission_blocked,
+        ));
+    }
+
+    let confirmations = if noncanonical
         || matches!(
             snapshot.lifecycle(),
             JournalWinnerLifecycle::SideChain { .. }
         ) {
-        zcash.parent_confirmation_depth_strict(winner.height, &expected_hash)?
+        zcash
+            .parent_confirmation_depth_strict(winner.height, &expected_hash)
+            .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))?
     } else {
-        zcash.parent_confirmation_depth(winner.height, &expected_hash)?
+        zcash
+            .parent_confirmation_depth(winner.height, &expected_hash)
+            .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))?
     };
-    let after = zcash.consistent_chain_tip()?;
-    if before != after {
+    let after = zcash
+        .consistent_chain_tip()
+        .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))?;
+    if observation_before != after {
+        if submission_blocked {
+            return Err(PoolWinnerReconciliationError::new(
+                MinerError::WinnerSubmissionDeferred { chain: "Zcash" },
+                true,
+            ));
+        }
         return Ok(None);
     }
-    let tip = pool_chain_tip(before);
+    let tip = pool_chain_tip(observation_before);
     let observation = confirmations.map_or(
-        if known_side_chain {
+        if noncanonical {
             PoolWinnerObservation::SideChain { tip: tip.clone() }
         } else {
             PoolWinnerObservation::Absent { tip: tip.clone() }
@@ -1396,6 +1645,49 @@ fn reconcile_zcash_pool_winner(
         |confirmations| PoolWinnerObservation::Present { tip, confirmations },
     );
     pool_winner_transition(snapshot.lifecycle(), winner, observation)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))
+}
+
+fn parent_winner_tip_position(
+    tip: NativeChainTip,
+    winner_height: u32,
+    previous_hash_le: [u8; 32],
+) -> Result<ParentWinnerTipPosition, MinerError> {
+    let predecessor_height = winner_height.checked_sub(1).ok_or_else(|| {
+        MinerError::InvalidRequest("a parent winner cannot have height zero".to_string())
+    })?;
+    if tip.height < predecessor_height {
+        return Ok(ParentWinnerTipPosition::DependencyBehind);
+    }
+    if tip.height == predecessor_height && tip.block_hash_le == previous_hash_le {
+        return Ok(ParentWinnerTipPosition::ReadyForSubmission);
+    }
+    Ok(ParentWinnerTipPosition::Overtaken)
+}
+
+fn parent_winner_submission_required(
+    lifecycle: &JournalWinnerLifecycle,
+    tip_position: ParentWinnerTipPosition,
+) -> bool {
+    lifecycle.requires_submission()
+        && matches!(tip_position, ParentWinnerTipPosition::ReadyForSubmission)
+}
+
+fn parent_submission_completed_on_stable_tip(
+    before: NativeChainTip,
+    after: NativeChainTip,
+    submission: Option<&ParentSubmissionReport>,
+) -> Result<bool, MinerError> {
+    if submission.is_some_and(|report| report.is_confirmed() || report.is_known_side_chain()) {
+        return Ok(true);
+    }
+    if before != after {
+        return Ok(false);
+    }
+    if let Some(submission) = submission {
+        require_parent_submission_progress(submission)?;
+    }
+    Ok(true)
 }
 
 fn classify_wcash_submission(
@@ -1467,7 +1759,7 @@ fn validate_pool_winner_material(
     snapshot: &PoolBackendWinnerSnapshot,
     kind: PersistedWinnerBlockKind,
     expected_hash: &str,
-) -> Result<(), MinerError> {
+) -> Result<[u8; 32], MinerError> {
     let recovered_parent = validate_persisted_winner_block(
         snapshot.block_bytes(),
         expected_hash,
@@ -1479,14 +1771,15 @@ fn validate_pool_winner_material(
             "backend winner bytes do not bind their durable parent header hash".to_string(),
         ));
     }
-    Ok(())
-}
-
-fn winner_lifecycle_requires_submission(lifecycle: &JournalWinnerLifecycle) -> bool {
-    matches!(
-        lifecycle,
-        JournalWinnerLifecycle::Pending | JournalWinnerLifecycle::Requeued { .. }
-    )
+    let block: Block = snapshot
+        .block_bytes()
+        .zcash_deserialize_into()
+        .map_err(|error| {
+            MinerError::InvalidRequest(format!(
+                "backend winner block became undecodable after validation: {error}"
+            ))
+        })?;
+    Ok(block.header.previous_block_hash.0)
 }
 
 fn pool_chain_tip(tip: NativeChainTip) -> ChainTip {
@@ -2400,7 +2693,7 @@ impl ShareJournal {
         }
         let mut state = self.lock_state()?;
         if state.seen_job_ids.contains(&job_id) {
-            return Err(MinerError::InvalidRequest(format!(
+            return Err(MinerError::StaleNativeJob(format!(
                 "native job ID {} was already activated or recorded; refusing unsafe reuse",
                 active_job.job_id
             )));
@@ -2423,6 +2716,15 @@ impl ShareJournal {
         state.active_winner_attributions.clear();
         state.active_job = Some(Arc::new(active_job));
         Ok(())
+    }
+
+    fn generation_count(&self) -> Result<u64, MinerError> {
+        let state = self.lock_state()?;
+        u64::try_from(state.seen_job_ids.len()).map_err(|_| {
+            MinerError::InvalidRequest(
+                "the durable mining generation count exceeds 64 bits".to_string(),
+            )
+        })
     }
 
     fn record(
@@ -3662,6 +3964,48 @@ mod tests {
     use super::*;
     use crate::NativeZcashNetwork;
 
+    fn parent_tip_mismatch() -> MinerError {
+        MinerError::ParentTipMismatch {
+            expected: "11".repeat(32),
+            endpoint: "parent-test".to_string(),
+            actual: "22".repeat(32),
+        }
+    }
+
+    fn child_tip_mismatch() -> MinerError {
+        MinerError::ChildTipMismatch {
+            expected: "33".repeat(32),
+            endpoint: "child-test".to_string(),
+            actual: "44".repeat(32),
+        }
+    }
+
+    #[test]
+    fn pool_generation_retains_work_while_exactly_one_chain_is_current() {
+        assert_eq!(
+            classify_pool_generation_currentness((Ok(()), Ok(())))
+                .expect("both current tips remain usable"),
+            PoolGenerationCurrentness::Current
+        );
+        assert_eq!(
+            classify_pool_generation_currentness((Ok(()), Err(parent_tip_mismatch())))
+                .expect("current child work remains usable"),
+            PoolGenerationCurrentness::OneChainUnavailable
+        );
+        assert_eq!(
+            classify_pool_generation_currentness((Err(child_tip_mismatch()), Ok(())))
+                .expect("current parent work remains usable"),
+            PoolGenerationCurrentness::OneChainUnavailable
+        );
+        assert!(matches!(
+            classify_pool_generation_currentness((
+                Err(child_tip_mismatch()),
+                Err(parent_tip_mismatch())
+            )),
+            Err(MinerError::ChildTipMismatch { .. })
+        ));
+    }
+
     fn mainnet_genesis_block() -> Block {
         Vec::from_hex(include_str!("../../zebra-test/src/vectors/block-main-0-000-000.txt").trim())
             .expect("mainnet genesis fixture is hex")
@@ -3751,6 +4095,11 @@ mod tests {
     }
 
     fn read_test_rpc_request(stream: &mut std::net::TcpStream) -> serde_json::Value {
+        // Accepted sockets inherit the listener's nonblocking mode on some
+        // platforms. These scripted servers use blocking request framing.
+        stream
+            .set_nonblocking(false)
+            .expect("make test RPC stream blocking");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("set test RPC read timeout");
@@ -4311,6 +4660,173 @@ mod tests {
         }
     }
 
+    fn parent_reconciliation_fixture(block: &Block) -> PoolBackendWinnerSnapshot {
+        PoolBackendWinnerSnapshot::from_test_state(
+            crate::pool_backend_journal::JournalWinnerState {
+                share_id: Hex32::new([0x51; 32]),
+                job_id: Hex32::new([0x52; 32]),
+                winner: WinnerDescriptor {
+                    block_hash_le: Hex32::new(block.hash().0),
+                    height: 1,
+                    ..pool_winner_fixture(MergedChain::Zcash)
+                },
+                parent_hash_le: Hex32::new(block.hash().0),
+                block_bytes: block.zcash_serialize_to_vec().unwrap(),
+                lifecycle: JournalWinnerLifecycle::Pending,
+                revision_event_seq: 1,
+            },
+        )
+    }
+
+    #[test]
+    fn confirmed_parent_advancing_tip_does_not_pause_mining() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let previous =
+            json!({"blocks":0,"bestblockhash":display_hash(block.header.previous_block_hash.0)});
+        let advanced = json!({"blocks":1,"bestblockhash":hash});
+        let header = json!({"hash":hash,"height":1,"confirmations":1});
+        let snapshot = parent_reconciliation_fixture(&block);
+        let responses = vec![
+            previous,
+            serde_json::Value::Null,
+            header.clone(),
+            advanced.clone(),
+            header,
+            advanced,
+        ];
+        let (template, a) = spawn_scripted_rpc_server(responses.clone());
+        let (validator, b) = spawn_scripted_rpc_server(responses);
+        let provider = test_zcash_provider(template, validator);
+        let result = reconcile_zcash_pool_winner(&provider, &snapshot);
+        assert!(
+            matches!(
+                result,
+                Ok(Some(PoolBackendWinnerTransition::Observed {
+                    confirmations: 1,
+                    ..
+                }))
+            ),
+            "successful own-tip advancement must be observed immediately, got {result:?}"
+        );
+        for server in [a, b] {
+            let requests = server.join().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request["method"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "getblockchaininfo",
+                    "submitblock",
+                    "getblockheader",
+                    "getblockchaininfo",
+                    "getblockheader",
+                    "getblockchaininfo"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_parent_status_races_preserve_mining_without_credit() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let previous =
+            json!({"blocks":0,"bestblockhash":display_hash(block.header.previous_block_hash.0)});
+        let advanced = json!({"blocks":1,"bestblockhash":hash});
+        let header = json!({"hash":hash,"height":1,"confirmations":1});
+        let snapshot = parent_reconciliation_fixture(&block);
+        for split_nodes in [false, true] {
+            let mut a_replies = vec![
+                previous.clone(),
+                serde_json::Value::Null,
+                header.clone(),
+                advanced.clone(),
+            ];
+            let mut b_replies = a_replies.clone();
+            if split_nodes {
+                *b_replies.last_mut().unwrap() = previous.clone();
+            } else {
+                let next = json!({"blocks":2,"bestblockhash":"42".repeat(32)});
+                a_replies.extend([header.clone(), next.clone()]);
+                b_replies.extend([header.clone(), next]);
+            }
+            let (template, a) = spawn_scripted_rpc_server(a_replies);
+            let (validator, b) = spawn_scripted_rpc_server(b_replies);
+            let result =
+                reconcile_zcash_pool_winner(&test_zcash_provider(template, validator), &snapshot);
+            if split_nodes {
+                let error = result.expect_err("split status snapshots must not credit a winner");
+                assert!(
+                    !error.submission_blocked(),
+                    "already confirmed delivery must not pause mining"
+                );
+                assert!(matches!(
+                    error.miner_error(),
+                    MinerError::ParentTipMismatch { .. }
+                ));
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    None,
+                    "a moving observation tip must not credit a winner"
+                );
+            }
+            a.join().unwrap();
+            b.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn parent_submission_failure_and_competing_tip_have_distinct_mining_health() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let previous =
+            json!({"blocks":0,"bestblockhash":display_hash(block.header.previous_block_hash.0)});
+        let competing = json!({"blocks":1,"bestblockhash":"43".repeat(32)});
+        let absent = json!({"hash":hash,"height":1,"confirmations":0});
+        let snapshot = parent_reconciliation_fixture(&block);
+        for (unconfirmed, raced) in [(false, false), (false, true), (true, false)] {
+            let mut replies = vec![
+                previous.clone(),
+                if unconfirmed {
+                    serde_json::Value::Null
+                } else {
+                    json!("rejected")
+                },
+                absent.clone(),
+            ];
+            if unconfirmed {
+                replies.push(json!({"state":"unknown"}));
+            }
+            replies.push(if raced {
+                competing.clone()
+            } else {
+                previous.clone()
+            });
+            let (template, a) = spawn_scripted_rpc_server(replies.clone());
+            let (validator, b) = spawn_scripted_rpc_server(replies);
+            let error =
+                reconcile_zcash_pool_winner(&test_zcash_provider(template, validator), &snapshot)
+                    .unwrap_err();
+            assert_eq!(error.submission_blocked(), !raced);
+            if raced || unconfirmed {
+                assert!(matches!(
+                    error.miner_error(),
+                    MinerError::WinnerSubmissionDeferred { .. }
+                ));
+            } else {
+                assert!(
+                    matches!(error.miner_error(), MinerError::InvalidParentTemplate(_)),
+                    "stable authoritative rejection must remain fatal"
+                );
+            }
+            a.join().unwrap();
+            b.join().unwrap();
+        }
+    }
+
     #[test]
     fn retained_parent_submission_distinguishes_rejection_from_deferred_propagation() {
         let block = mainnet_block_one();
@@ -4336,6 +4852,22 @@ mod tests {
             require_parent_submission_progress(&rejected),
             Err(MinerError::InvalidParentTemplate(_))
         ));
+        let before = NativeChainTip {
+            block_hash_le: [0x21; 32],
+            height: 0,
+        };
+        let advanced = NativeChainTip {
+            block_hash_le: [0x22; 32],
+            height: 1,
+        };
+        assert!(
+            !parent_submission_completed_on_stable_tip(before, advanced, Some(&rejected))
+                .expect("a tip race defers the ambiguous rejection")
+        );
+        assert!(matches!(
+            parent_submission_completed_on_stable_tip(before, before, Some(&rejected)),
+            Err(MinerError::InvalidParentTemplate(_))
+        ));
         template_server.join().expect("template server exits");
         validator_server.join().expect("validator server exits");
 
@@ -4356,6 +4888,79 @@ mod tests {
         ));
         template_server.join().expect("template server exits");
         validator_server.join().expect("validator server exits");
+    }
+
+    #[test]
+    fn parent_winner_tip_position_only_submits_on_its_exact_predecessor() {
+        let previous_hash = [0x41; 32];
+        let exact_predecessor = NativeChainTip {
+            block_hash_le: previous_hash,
+            height: 9,
+        };
+        assert_eq!(
+            parent_winner_tip_position(exact_predecessor, 10, previous_hash).unwrap(),
+            ParentWinnerTipPosition::ReadyForSubmission
+        );
+        assert_eq!(
+            parent_winner_tip_position(
+                NativeChainTip {
+                    block_hash_le: [0x42; 32],
+                    height: 9,
+                },
+                10,
+                previous_hash,
+            )
+            .unwrap(),
+            ParentWinnerTipPosition::Overtaken,
+            "a different predecessor proves the candidate lost a fork race",
+        );
+        assert_eq!(
+            parent_winner_tip_position(
+                NativeChainTip {
+                    block_hash_le: [0x43; 32],
+                    height: 10,
+                },
+                10,
+                previous_hash,
+            )
+            .unwrap(),
+            ParentWinnerTipPosition::Overtaken,
+            "a filled candidate height must not be replayed",
+        );
+        assert_eq!(
+            parent_winner_tip_position(
+                NativeChainTip {
+                    block_hash_le: [0x40; 32],
+                    height: 8,
+                },
+                10,
+                previous_hash,
+            )
+            .unwrap(),
+            ParentWinnerTipPosition::DependencyBehind,
+        );
+        assert!(parent_winner_tip_position(exact_predecessor, 0, previous_hash).is_err());
+    }
+
+    #[test]
+    fn parent_retry_health_tracks_the_actual_submission_path() {
+        let tip = pool_tip(9, 0x71);
+        assert!(parent_winner_submission_required(
+            &JournalWinnerLifecycle::Pending,
+            ParentWinnerTipPosition::ReadyForSubmission,
+        ));
+        assert!(parent_winner_submission_required(
+            &JournalWinnerLifecycle::Requeued { tip: tip.clone() },
+            ParentWinnerTipPosition::ReadyForSubmission,
+        ));
+        assert!(!parent_winner_submission_required(
+            &JournalWinnerLifecycle::Pending,
+            ParentWinnerTipPosition::Overtaken,
+        ));
+        assert!(!parent_winner_submission_required(
+            &JournalWinnerLifecycle::SideChain { tip },
+            ParentWinnerTipPosition::ReadyForSubmission,
+        ));
     }
 
     #[test]
@@ -4597,7 +5202,7 @@ mod tests {
             Some(PoolBackendWinnerTransition::SideChain { tip: tip.clone() })
         );
         let retained = JournalWinnerLifecycle::SideChain { tip };
-        assert!(!winner_lifecycle_requires_submission(&retained));
+        assert!(!retained.requires_submission());
         // Standard header -5/absent after node fork eviction is interpreted as
         // absence of a previously validated proof, never as permission to send
         // its now-obsolete parent again or to create an orphan/reward event.
@@ -4645,15 +5250,12 @@ mod tests {
             tip: orphan_tip.clone(),
         };
 
-        assert!(winner_lifecycle_requires_submission(
-            &JournalWinnerLifecycle::Pending
-        ));
-        assert!(winner_lifecycle_requires_submission(
-            &JournalWinnerLifecycle::Requeued {
-                tip: orphan_tip.clone(),
-            }
-        ));
-        assert!(!winner_lifecycle_requires_submission(&orphaned));
+        assert!(JournalWinnerLifecycle::Pending.requires_submission());
+        assert!(JournalWinnerLifecycle::Requeued {
+            tip: orphan_tip.clone(),
+        }
+        .requires_submission());
+        assert!(!orphaned.requires_submission());
 
         assert_eq!(
             pool_winner_transition(
@@ -5765,14 +6367,33 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_nonce_rotation_never_reuses_or_wraps() {
+        let counter = AtomicU64::new(u64::from(u32::MAX - 1));
+        assert_eq!(
+            reserve_auxiliary_nonce(&counter).expect("penultimate nonce remains available"),
+            u32::MAX - 1
+        );
+        assert_eq!(
+            reserve_auxiliary_nonce(&counter).expect("last nonce remains available"),
+            u32::MAX
+        );
+        assert!(
+            reserve_auxiliary_nonce(&counter).is_err(),
+            "the counter must fail closed before wrapping to reused work"
+        );
+    }
+
+    #[test]
     fn job_activation_is_durable_and_reuse_fails_after_restart() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("shares.jsonl");
         let first = active_job_fixture(0x11);
         let journal = ShareJournal::open(&path).expect("new private journal");
+        assert_eq!(journal.generation_count().expect("empty count"), 0);
         journal
             .activate_job(first.clone())
             .expect("first activation is durable");
+        assert_eq!(journal.generation_count().expect("live count"), 1);
         let records = fs::read_to_string(&path).expect("read activation journal");
         let activation: serde_json::Value =
             serde_json::from_str(records.trim()).expect("activation is JSON");
@@ -5782,7 +6403,11 @@ mod tests {
         drop(journal);
 
         let recovered = ShareJournal::open(&path).expect("recover activation");
-        assert!(recovered.activate_job(first).is_err());
+        assert_eq!(recovered.generation_count().expect("recovered count"), 1);
+        assert!(matches!(
+            recovered.activate_job(first),
+            Err(MinerError::StaleNativeJob(_))
+        ));
     }
 
     #[test]

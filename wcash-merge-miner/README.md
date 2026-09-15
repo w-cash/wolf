@@ -352,21 +352,24 @@ the bound. The reconciler polls every non-matured winner fairly in journal
 order with fixed RPC pacing. Matured history is not replayed on every pass:
 one matured winner is re-audited per pass with an advancing round-robin cursor,
 so deep reorganizations remain detectable without node load growing with the
-full history. A Wcash `submitblock` rejection, or rejection by every pinned
-Zcash node, stops the backend unless exact status already proves the block is
-known. Ambiguous or unavailable submission remains durable, immediately makes
-backend health false, and is retried; it is never reported as a healthy
-successful submission. A competing Zcash proof is instead healthy pending work
-only when every pinned parent independently returns `side_chain` with its exact
-hash and coinbase height through `getblockstatus`. The backend appends an explicit
-`winner_side_chain` event once, then polls the retained proof without submitting
-it again. This event is not an observation, maturity, or orphan event and creates
-no reward. Its exact bytes and side-chain state survive journal replay. Later
-node fork eviction or finalization can remove the block from node storage;
-authoritative absence then leaves this already-proven side-chain state intact.
-Later best-chain inclusion still requires ordinary observation and maturity.
-Unknown status without that durable evidence, malformed responses, rejection,
-and unavailable dependencies retain the failure behavior. The required
+full history. A Wcash `submitblock` rejection stops the backend unless exact
+status already proves the block is known. Rejection by every pinned Zcash node
+also stops the backend when the stable best-chain tip is still the exact
+predecessor on which the candidate was built. A tip change during submission
+defers that verdict. If a stable tip has filled the candidate height or replaced
+its predecessor, the locally revalidated proof has lost its race: the backend
+appends `winner_side_chain` once and monitors it without replay or reward.
+Every pinned parent returning `side_chain` with the exact hash and coinbase
+height through `getblockstatus` produces the same noncanonical state. Ambiguous
+or unavailable submission remains durable, immediately makes backend health
+false, and is retried; it is never reported as a healthy successful submission.
+The noncanonical event is not an observation, maturity, or orphan event and
+creates no reward. Its exact bytes and state survive journal replay. Later node
+fork eviction or finalization can remove the block from node storage;
+authoritative absence then leaves this state intact. Later best-chain inclusion
+still requires ordinary observation and maturity. Unknown status without stable
+overtaking evidence, malformed responses, rejection on the exact stable
+predecessor, and unavailable dependencies retain the failure behavior. The required
 `winner_side_chain_v1` capability rejects older pool/backend pairs before mining;
 existing version-2 journal headers and records remain readable unchanged.
 After the first `winner_side_chain` record, older binaries that do not recognize

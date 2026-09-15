@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Keep an admitted merged-mining generation available to the chain whose predecessor is still current while the other chain rotates, and make pool health checks local so RPC latency cannot pause Stratum share admission. New generations still require strict proposal validation against both chains."
+time: 2026-09-15T17:00:00.000000000Z
