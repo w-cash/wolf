@@ -398,9 +398,13 @@ impl PoolBackendWinnerWorker {
                                 }
                             }
                             Ok(None) => {}
-                            Err(error) if is_retryable_winner_reconciliation_error(&error) => {
-                                pass_healthy = false;
-                                actor.set_winner_reconciliation_health(false);
+                            Err(error)
+                                if is_retryable_winner_reconciliation_error(error.miner_error()) =>
+                            {
+                                if error.submission_blocked() {
+                                    pass_healthy = false;
+                                    actor.set_winner_reconciliation_health(false);
+                                }
                                 eprintln!(
                                     "winner reconciliation dependency unavailable; exact bytes remain durable: {error}"
                                 );

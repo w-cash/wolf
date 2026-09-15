@@ -609,6 +609,17 @@ pub enum JournalWinnerLifecycle {
     },
 }
 
+impl JournalWinnerLifecycle {
+    /// Returns true while exact winner bytes still require node submission.
+    ///
+    /// A dependency failure in these states blocks safe winner delivery and
+    /// therefore mining admission. Status-only audits retain exact bytes and
+    /// keep payout transitions closed without blocking current share work.
+    pub fn requires_submission(&self) -> bool {
+        matches!(self, Self::Pending | Self::Requeued { .. })
+    }
+}
+
 /// One lifecycle result produced by a future winner-reconciliation worker.
 ///
 /// This type remains crate-private so only the actor's authority-bound public

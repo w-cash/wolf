@@ -81,6 +81,48 @@ pub struct CoordinatorConfig {
     pub auxiliary_nonce: u32,
 }
 
+/// A failed durable-winner reconciliation attempt with its mining impact.
+///
+/// Retryable node failures only block new share admission when this exact
+/// attempt still needed to deliver winner bytes. Status-only audit failures
+/// keep reward transitions closed without pausing unrelated mining work.
+#[derive(Debug)]
+pub struct PoolWinnerReconciliationError {
+    source: MinerError,
+    submission_blocked: bool,
+}
+
+impl PoolWinnerReconciliationError {
+    fn new(source: MinerError, submission_blocked: bool) -> Self {
+        Self {
+            source,
+            submission_blocked,
+        }
+    }
+
+    /// Returns true when exact durable winner delivery remains blocked.
+    pub const fn submission_blocked(&self) -> bool {
+        self.submission_blocked
+    }
+
+    /// Returns the underlying reconciliation failure.
+    pub const fn miner_error(&self) -> &MinerError {
+        &self.source
+    }
+}
+
+impl fmt::Display for PoolWinnerReconciliationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for PoolWinnerReconciliationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl fmt::Debug for CoordinatorConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -676,18 +718,23 @@ impl NativeMiningSupervisor {
     pub fn reconcile_pool_backend_winner(
         &self,
         snapshot: &PoolBackendWinnerSnapshot,
-    ) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
+    ) -> Result<Option<PoolBackendWinnerTransition>, PoolWinnerReconciliationError> {
+        let submission_blocked = snapshot.lifecycle().requires_submission();
         match snapshot.winner().chain {
             MergedChain::Wcash => {
                 require_wcash_network_identity(
                     &self.wcash_node,
                     &self.config.expected_wcash_genesis_hash,
-                )?;
+                )
+                .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))?;
                 reconcile_wcash_pool_winner(&self.wcash_node, snapshot)
             }
             MergedChain::Zcash => {
                 self.zcash
-                    .require_network_identity(self.config.zcash.expected_genesis_hash())?;
+                    .require_network_identity(self.config.zcash.expected_genesis_hash())
+                    .map_err(|error| {
+                        PoolWinnerReconciliationError::new(error, submission_blocked)
+                    })?;
                 reconcile_zcash_pool_winner(&self.zcash, snapshot)
             }
         }
@@ -1348,12 +1395,13 @@ enum ParentWinnerTipPosition {
 fn reconcile_wcash_pool_winner(
     wcash_node: &ZebraRpcClient,
     snapshot: &PoolBackendWinnerSnapshot,
-) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
+) -> Result<Option<PoolBackendWinnerTransition>, PoolWinnerReconciliationError> {
     let winner = snapshot.winner();
     let expected_hash = display_hash(*winner.block_hash_le.as_bytes());
+    let should_submit = snapshot.lifecycle().requires_submission();
     let _previous_hash =
-        validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Wcash, &expected_hash)?;
-    let should_submit = winner_lifecycle_requires_submission(snapshot.lifecycle());
+        validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Wcash, &expected_hash)
+            .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
     let submission = if should_submit {
         // `submitblock` is idempotent and remains valid after the candidate
         // cache expires. The exact bytes were validated above and were durable
@@ -1366,16 +1414,25 @@ fn reconcile_wcash_pool_winner(
         None
     };
 
-    let before = native_chain_tip_on_node(wcash_node)?;
+    let before = native_chain_tip_on_node(wcash_node)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
     let observation = wcash_confirmation_depth_checked(
         wcash_node,
         winner.height,
         &expected_hash,
         snapshot.block_bytes(),
         should_submit,
-    )?;
-    let after = native_chain_tip_on_node(wcash_node)?;
+    )
+    .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
+    let after = native_chain_tip_on_node(wcash_node)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
     if before != after {
+        if should_submit {
+            return Err(PoolWinnerReconciliationError::new(
+                MinerError::WinnerSubmissionDeferred { chain: "Wcash" },
+                true,
+            ));
+        }
         return Ok(None);
     }
     let tip = pool_chain_tip(before);
@@ -1387,18 +1444,22 @@ fn reconcile_wcash_pool_winner(
             PoolWinnerObservation::Present { tip, confirmations }
         }
     };
-    require_wcash_submission_progress(&observation, submission)?;
+    require_wcash_submission_progress(&observation, submission)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
     pool_winner_transition(snapshot.lifecycle(), winner, observation)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))
 }
 
 fn reconcile_zcash_pool_winner(
     zcash: &NativeZcashProvider,
     snapshot: &PoolBackendWinnerSnapshot,
-) -> Result<Option<PoolBackendWinnerTransition>, MinerError> {
+) -> Result<Option<PoolBackendWinnerTransition>, PoolWinnerReconciliationError> {
     let winner = snapshot.winner();
     let expected_hash = display_hash(*winner.block_hash_le.as_bytes());
+    let requires_submission = snapshot.lifecycle().requires_submission();
     let previous_hash =
-        validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Zcash, &expected_hash)?;
+        validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Zcash, &expected_hash)
+            .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
     // Fence both submission and the later canonical status reads. Once a
     // stable best chain has already reached this candidate's height, replaying
     // a losing proof can only produce Zebra's generic `rejected` response.
@@ -1406,19 +1467,26 @@ fn reconcile_zcash_pool_winner(
     // retain it as a noncanonical proof and monitor it without resubmission.
     // This also bounds duplicate winner bursts before a replacement job reaches
     // a fast ASIC.
-    let before = zcash.consistent_chain_tip()?;
-    let requires_submission = winner_lifecycle_requires_submission(snapshot.lifecycle());
-    let tip_position = parent_winner_tip_position(before, winner.height, previous_hash)?;
-    let submission =
-        match (requires_submission, tip_position) {
-            (true, ParentWinnerTipPosition::ReadyForSubmission) => Some(
-                zcash.replay_parent_bytes(snapshot.block_bytes(), winner.height, &expected_hash)?,
-            ),
-            (true, ParentWinnerTipPosition::DependencyBehind) => {
-                return Err(MinerError::WinnerSubmissionDeferred { chain: "Zcash" });
-            }
-            _ => None,
-        };
+    let before = zcash
+        .consistent_chain_tip()
+        .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
+    let tip_position = parent_winner_tip_position(before, winner.height, previous_hash)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
+    let submission_required = parent_winner_submission_required(snapshot.lifecycle(), tip_position);
+    let submission = match (requires_submission, tip_position) {
+        (true, ParentWinnerTipPosition::ReadyForSubmission) => Some(
+            zcash
+                .replay_parent_bytes(snapshot.block_bytes(), winner.height, &expected_hash)
+                .map_err(|error| PoolWinnerReconciliationError::new(error, true))?,
+        ),
+        (true, ParentWinnerTipPosition::DependencyBehind) => {
+            return Err(PoolWinnerReconciliationError::new(
+                MinerError::WinnerSubmissionDeferred { chain: "Zcash" },
+                true,
+            ));
+        }
+        _ => None,
+    };
     let noncanonical = requires_submission
         && matches!(tip_position, ParentWinnerTipPosition::Overtaken)
         || submission
@@ -1430,12 +1498,26 @@ fn reconcile_zcash_pool_winner(
             snapshot.lifecycle(),
             JournalWinnerLifecycle::SideChain { .. }
         ) {
-        zcash.parent_confirmation_depth_strict(winner.height, &expected_hash)?
+        zcash
+            .parent_confirmation_depth_strict(winner.height, &expected_hash)
+            .map_err(|error| PoolWinnerReconciliationError::new(error, submission_required))?
     } else {
-        zcash.parent_confirmation_depth(winner.height, &expected_hash)?
+        zcash
+            .parent_confirmation_depth(winner.height, &expected_hash)
+            .map_err(|error| PoolWinnerReconciliationError::new(error, submission_required))?
     };
-    let after = zcash.consistent_chain_tip()?;
-    if !parent_submission_completed_on_stable_tip(before, after, submission.as_ref())? {
+    let after = zcash
+        .consistent_chain_tip()
+        .map_err(|error| PoolWinnerReconciliationError::new(error, submission_required))?;
+    if !parent_submission_completed_on_stable_tip(before, after, submission.as_ref())
+        .map_err(|error| PoolWinnerReconciliationError::new(error, submission_required))?
+    {
+        if submission_required {
+            return Err(PoolWinnerReconciliationError::new(
+                MinerError::WinnerSubmissionDeferred { chain: "Zcash" },
+                true,
+            ));
+        }
         return Ok(None);
     }
     let tip = pool_chain_tip(before);
@@ -1448,6 +1530,7 @@ fn reconcile_zcash_pool_winner(
         |confirmations| PoolWinnerObservation::Present { tip, confirmations },
     );
     pool_winner_transition(snapshot.lifecycle(), winner, observation)
+        .map_err(|error| PoolWinnerReconciliationError::new(error, submission_required))
 }
 
 fn parent_winner_tip_position(
@@ -1465,6 +1548,14 @@ fn parent_winner_tip_position(
         return Ok(ParentWinnerTipPosition::ReadyForSubmission);
     }
     Ok(ParentWinnerTipPosition::Overtaken)
+}
+
+fn parent_winner_submission_required(
+    lifecycle: &JournalWinnerLifecycle,
+    tip_position: ParentWinnerTipPosition,
+) -> bool {
+    lifecycle.requires_submission()
+        && matches!(tip_position, ParentWinnerTipPosition::ReadyForSubmission)
 }
 
 fn parent_submission_completed_on_stable_tip(
@@ -1571,13 +1662,6 @@ fn validate_pool_winner_material(
             ))
         })?;
     Ok(block.header.previous_block_hash.0)
-}
-
-fn winner_lifecycle_requires_submission(lifecycle: &JournalWinnerLifecycle) -> bool {
-    matches!(
-        lifecycle,
-        JournalWinnerLifecycle::Pending | JournalWinnerLifecycle::Requeued { .. }
-    )
 }
 
 fn pool_chain_tip(tip: NativeChainTip) -> ChainTip {
@@ -3851,6 +3935,11 @@ mod tests {
     }
 
     fn read_test_rpc_request(stream: &mut std::net::TcpStream) -> serde_json::Value {
+        // Accepted sockets inherit the listener's nonblocking mode on some
+        // platforms. These scripted servers use blocking request framing.
+        stream
+            .set_nonblocking(false)
+            .expect("make test RPC stream blocking");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("set test RPC read timeout");
@@ -4527,6 +4616,27 @@ mod tests {
     }
 
     #[test]
+    fn parent_retry_health_tracks_the_actual_submission_path() {
+        let tip = pool_tip(9, 0x71);
+        assert!(parent_winner_submission_required(
+            &JournalWinnerLifecycle::Pending,
+            ParentWinnerTipPosition::ReadyForSubmission,
+        ));
+        assert!(parent_winner_submission_required(
+            &JournalWinnerLifecycle::Requeued { tip: tip.clone() },
+            ParentWinnerTipPosition::ReadyForSubmission,
+        ));
+        assert!(!parent_winner_submission_required(
+            &JournalWinnerLifecycle::Pending,
+            ParentWinnerTipPosition::Overtaken,
+        ));
+        assert!(!parent_winner_submission_required(
+            &JournalWinnerLifecycle::SideChain { tip },
+            ParentWinnerTipPosition::ReadyForSubmission,
+        ));
+    }
+
+    #[test]
     fn candidate_retirement_is_authenticated_idempotent_and_submission_safe() {
         let results = vec![
             json!({"state": "retired"}),
@@ -4765,7 +4875,7 @@ mod tests {
             Some(PoolBackendWinnerTransition::SideChain { tip: tip.clone() })
         );
         let retained = JournalWinnerLifecycle::SideChain { tip };
-        assert!(!winner_lifecycle_requires_submission(&retained));
+        assert!(!retained.requires_submission());
         // Standard header -5/absent after node fork eviction is interpreted as
         // absence of a previously validated proof, never as permission to send
         // its now-obsolete parent again or to create an orphan/reward event.
@@ -4813,15 +4923,12 @@ mod tests {
             tip: orphan_tip.clone(),
         };
 
-        assert!(winner_lifecycle_requires_submission(
-            &JournalWinnerLifecycle::Pending
-        ));
-        assert!(winner_lifecycle_requires_submission(
-            &JournalWinnerLifecycle::Requeued {
-                tip: orphan_tip.clone(),
-            }
-        ));
-        assert!(!winner_lifecycle_requires_submission(&orphaned));
+        assert!(JournalWinnerLifecycle::Pending.requires_submission());
+        assert!(JournalWinnerLifecycle::Requeued {
+            tip: orphan_tip.clone(),
+        }
+        .requires_submission());
+        assert!(!orphaned.requires_submission());
 
         assert_eq!(
             pool_winner_transition(
