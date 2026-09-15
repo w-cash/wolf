@@ -239,11 +239,13 @@ impl NativeZcashConfig {
     }
 
     /// Allows Testnet work to remain live while an independent proposal
-    /// validator is still catching up to the template node.
+    /// validator is still converging on the template node's chain.
     ///
     /// The template node must still be on the exact job tip and must accept the
-    /// exact proposal. A validator on the same tip must also accept it, while a
-    /// validator ahead of the template still invalidates the job immediately.
+    /// exact proposal. A validator on the same tip must also accept it. A
+    /// lower validator or an equal-height competing Testnet tip is skipped
+    /// until it converges, while a validator ahead of the template still
+    /// invalidates the job immediately.
     pub fn allow_lagging_proposal_validators_on_testnet(mut self) -> Result<Self, MinerError> {
         if self.expected_parent_network != NativeZcashNetwork::Testnet {
             return Err(MinerError::RpcConfiguration(
@@ -434,8 +436,8 @@ impl NativeZcashProvider {
 
         // Check the same predecessor before proposal validation. The explicit
         // Testnet liveness policy still validates the exact proposal on the
-        // authoritative template node, and only skips independent validators
-        // that have not reached that predecessor yet.
+        // authoritative template node, and skips independent validators that
+        // have not converged on that predecessor yet.
         self.require_tip(&self.template_node, &prepared)?;
         if self.allow_lagging_proposal_validators {
             self.validate_parent_proposal(&self.template_node, &prepared)?;
@@ -495,8 +497,9 @@ impl NativeZcashProvider {
     }
 
     /// Returns `false` only when the explicit Testnet policy permits this
-    /// validator to catch up asynchronously. Equal-height forks and validators
-    /// ahead of the work source remain hard failures.
+    /// validator to converge asynchronously. Lower tips and equal-height
+    /// competing tips are skipped. Validators ahead of the work source remain
+    /// hard failures because they prove the template node is behind.
     fn proposal_validator_matches_or_lags(
         &self,
         validator: &ZebraRpcClient,
@@ -511,7 +514,7 @@ impl NativeZcashProvider {
         {
             return Ok(true);
         }
-        if self.allow_lagging_proposal_validators && actual.height < expected_height {
+        if self.allow_lagging_proposal_validators && actual.height <= expected_height {
             return Ok(false);
         }
         Err(MinerError::ParentTipMismatch {
@@ -2354,14 +2357,14 @@ mod tests {
     }
 
     #[test]
-    fn testnet_policy_skips_only_a_strictly_lagging_validator() {
+    fn testnet_policy_skips_a_validator_until_it_converges_on_the_template_tip() {
         let (prepared, _) = proposal_race_fixture();
         let expected_height = prepared.parent_height - 1;
         let expected_hash = prepared.parent_tip_display.clone();
         let cases = [
             (expected_height - 1, expected_hash.clone(), Ok(false)),
             (expected_height, expected_hash, Ok(true)),
-            (expected_height, "42".repeat(32), Err(())),
+            (expected_height, "42".repeat(32), Ok(false)),
             (expected_height + 1, "43".repeat(32), Err(())),
         ];
 

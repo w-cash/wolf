@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Under the explicit Zcash Testnet lagging-validator policy, keep exact template-node proposal-validated work moving while an independent validator is lower or temporarily follows an equal-height competing tip. Validators ahead of the work source still fail closed, and mainnet continues to require every validator on the exact predecessor."
+time: 2026-09-15T17:30:00.000000000Z
