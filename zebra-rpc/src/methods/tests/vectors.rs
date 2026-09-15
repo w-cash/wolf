@@ -2852,9 +2852,11 @@ async fn getblocktemplate_precomputed() {
     mock_sync_status.set_is_close_to_tip(true);
 
     let mining_conf = mining::Config {
-        miner_address: Some(ZcashAddress::from_transparent_p2pkh(
-            NetworkType::from(NetworkKind::from(&net)),
-            [0x7e; 20],
+        miner_address: Some(mining::MinerAddress::Zcash(
+            ZcashAddress::from_transparent_p2pkh(
+                NetworkType::from(NetworkKind::from(&net)),
+                [0x7e; 20],
+            ),
         )),
         extra_coinbase_data: None,
         miner_memo: None,
@@ -3033,9 +3035,11 @@ async fn getblocktemplate_long_poll_waits_for_a_new_template() {
     mock_sync_status.set_is_close_to_tip(true);
 
     let mining_conf = mining::Config {
-        miner_address: Some(ZcashAddress::from_transparent_p2pkh(
-            NetworkType::from(NetworkKind::from(&net)),
-            [0x7e; 20],
+        miner_address: Some(mining::MinerAddress::Zcash(
+            ZcashAddress::from_transparent_p2pkh(
+                NetworkType::from(NetworkKind::from(&net)),
+                [0x7e; 20],
+            ),
         )),
         extra_coinbase_data: None,
         miner_memo: None,
@@ -3208,6 +3212,7 @@ async fn getblocktemplate_long_poll_waits_for_a_new_template() {
                 capabilities: vec![],
                 long_poll_id: Some(long_poll_id),
                 _work_id: None,
+                wcash_aux: None,
             }))
             .await
         }
@@ -3270,9 +3275,11 @@ async fn getblocktemplate_ignores_precomputed_template_when_tip_channel_lags_sta
     mock_sync_status.set_is_close_to_tip(true);
 
     let mining_conf = mining::Config {
-        miner_address: Some(ZcashAddress::from_transparent_p2pkh(
-            NetworkType::from(NetworkKind::from(&net)),
-            [0x7e; 20],
+        miner_address: Some(mining::MinerAddress::Zcash(
+            ZcashAddress::from_transparent_p2pkh(
+                NetworkType::from(NetworkKind::from(&net)),
+                [0x7e; 20],
+            ),
         )),
         extra_coinbase_data: None,
         miner_memo: None,

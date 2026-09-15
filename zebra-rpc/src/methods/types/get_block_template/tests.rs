@@ -50,8 +50,8 @@ use crate::methods::{
 
 use super::{
     check_parameters, check_synced_to_tip, fetch_mempool_transactions, BlockTemplateResponse,
-    DefaultRoots, GetBlockTemplateParameters, GetBlockTemplateRequestMode, MinerParams,
-    WcashAuxRequest,
+    CoinbaseCache, DefaultRoots, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
+    MinerParams, WcashAuxRequest,
 };
 
 /// A clean Wcash Testnet node must be able to serve its first mining template
@@ -176,8 +176,7 @@ fn wcash_template_includes_v6_transfer_fees_and_private_coinbase() {
 
     let response = BlockTemplateResponse::new_internal(
         &network,
-        None,
-        None,
+        &CoinbaseCache::default(),
         &miner_params,
         None,
         &chain_info,

@@ -27,6 +27,7 @@ use zebra_chain::{
     chain_tip::ChainTip,
     parameters::Network,
 };
+use zebra_consensus::error::TransactionError;
 use zebra_node_services::mempool::MempoolService;
 use zebra_state::ReadState;
 
@@ -329,7 +330,7 @@ where
 
     let (mempool_txs, mempool_tx_deps) = match mempool {
         Some(mempool) => {
-            match fetch_mempool_transactions(mempool, chain_info.tip_hash).await? {
+            match fetch_mempool_transactions(network, height, mempool, chain_info.tip_hash).await? {
                 Some(mempool_data) => mempool_data,
                 // The state and the mempool were out of sync, so a template built from this data
                 // could contain transactions that are already mined.
@@ -353,30 +354,33 @@ where
 
     // Transaction selection, the coinbase transaction, and the block roots are all CPU-bound, and
     // a shielded coinbase takes seconds to prove, so keep them off the async executor.
-    tokio::task::spawn_blocking(move || {
-        let mempool_txs = select_mempool_transactions(
-            &network,
-            height,
-            &miner_params,
-            mempool_txs,
-            mempool_tx_deps,
-            Some(&coinbase_cache),
-            None,
-        );
+    tokio::task::spawn_blocking(
+        move || -> Result<Option<BlockTemplateResponse>, TransactionError> {
+            let mempool_txs = select_mempool_transactions(
+                &network,
+                height,
+                &miner_params,
+                mempool_txs,
+                mempool_tx_deps,
+                Some(&coinbase_cache),
+                None,
+            )?;
 
-        // `submit_old` depends on the long poll ID the client sent, so the RPC sets it.
-        Some(BlockTemplateResponse::new_internal(
-            &network,
-            &coinbase_cache,
-            &miner_params,
-            None,
-            &chain_info,
-            long_poll_id,
-            mempool_txs,
-            None,
-        ))
-    })
+            // `submit_old` depends on the long poll ID the client sent, so the RPC sets it.
+            Ok(Some(BlockTemplateResponse::new_internal(
+                &network,
+                &coinbase_cache,
+                &miner_params,
+                None,
+                &chain_info,
+                long_poll_id,
+                mempool_txs,
+                None,
+            )?))
+        },
+    )
     .await
+    .map_misc_error()?
     .map_misc_error()
 }
 

@@ -30,7 +30,8 @@ use zcash_script::{opcode::PushValue, pv::push_value};
 use zebra_chain::{
     amount::{self, Amount, NonNegative},
     block::{
-        self, Block, ChainHistoryBlockTxAuthCommitmentHash, MAX_BLOCK_BYTES, ZCASH_BLOCK_VERSION,
+        self, Block, ChainHistoryBlockTxAuthCommitmentHash, Height, MAX_BLOCK_BYTES,
+        ZCASH_BLOCK_VERSION,
     },
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
@@ -392,17 +393,11 @@ impl BlockTemplateResponse {
             .map(|tx| tx.miner_fee)
             .sum::<amount::Result<Amount<NonNegative>>>()?;
 
-        // Reuse the cached coinbase for this height and fee, and only build (and re-prove, for a
-        // shielded address) as a last resort — caching the result so subsequent requests for the
-        // same height and fees reuse it.
-        let coinbase_txn = coinbase_cache.get(height, txs_fee).unwrap_or_else(|| {
-            let coinbase_txn =
-                TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                    .expect("valid coinbase tx");
-
-            coinbase_cache.store(height, txs_fee, coinbase_txn.clone());
-
-            coinbase_txn
+        // Reuse the cached coinbase for this height and fee. Concurrent requests share one
+        // builder so a shielded payout never starts duplicate proofs for the same template.
+        let coinbase_txn = coinbase_cache.get_or_build(height, txs_fee, || {
+            TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
+                .expect("valid coinbase tx")
         });
 
         // Always cache the proof-complete, child-independent coinbase above.

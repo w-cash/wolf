@@ -2,8 +2,6 @@
 
 use std::time::Duration;
 
-use zcash_keys::address::Address;
-
 use zebra_chain::{
     block,
     parameters::{Network, NetworkUpgrade},
@@ -13,8 +11,9 @@ use zebra_chain::{
 use zebra_state::GetBlockTemplateChainInfo;
 
 use crate::{
-    config::mining::{default_miner_address, MinerAddressType},
+    config::mining::{default_miner_address, Config, MinerAddressType},
     methods::tests::utils::fake_history_tree,
+    methods::types::get_block_template::WcashAuxRequest,
 };
 
 use super::*;
@@ -27,13 +26,18 @@ fn template() -> BlockTemplateResponse {
         .activation_height(&net)
         .expect("Nu5 is active on Mainnet");
 
-    let miner_params = MinerParams::from(
-        Address::decode(
-            &net,
-            default_miner_address(net.kind(), &MinerAddressType::Transparent),
-        )
-        .expect("hard-coded transparent address is valid"),
-    );
+    let miner_params = MinerParams::new(
+        &net,
+        Config {
+            miner_address: Some(
+                default_miner_address(net.kind(), &MinerAddressType::Transparent)
+                    .parse()
+                    .expect("hard-coded transparent address is valid"),
+            ),
+            ..Default::default()
+        },
+    )
+    .expect("the miner parameters are valid");
 
     let chain_info = GetBlockTemplateChainInfo {
         expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
@@ -57,11 +61,87 @@ fn template() -> BlockTemplateResponse {
         &net,
         &CoinbaseCache::default(),
         &miner_params,
+        None,
         &chain_info,
         long_poll_id,
         vec![],
         None,
     )
+    .expect("the test template is valid")
+}
+
+/// Child commitments are applied to clones of the cached parent template. This
+/// keeps ordinary Zcash work child-independent and prevents one Wcash job from
+/// leaking its commitment into the next job.
+#[test]
+fn wcash_aux_transforms_are_isolated_from_the_cached_template() {
+    let net = Network::Mainnet;
+    let miner_params = MinerParams::new(
+        &net,
+        Config {
+            miner_address: Some(
+                default_miner_address(net.kind(), &MinerAddressType::Transparent)
+                    .parse()
+                    .expect("hard-coded transparent address is valid"),
+            ),
+            ..Default::default()
+        },
+    )
+    .expect("the miner parameters are valid");
+    let cached = template();
+
+    let first = cached
+        .clone()
+        .with_wcash_aux(
+            &net,
+            &miner_params,
+            WcashAuxRequest::new(block::Hash([0x11; 32]), 1),
+        )
+        .expect("the first child commitment is valid");
+    let second = cached
+        .clone()
+        .with_wcash_aux(
+            &net,
+            &miner_params,
+            WcashAuxRequest::new(block::Hash([0x22; 32]), 2),
+        )
+        .expect("the second child commitment is valid");
+
+    assert!(cached.wcash_parent_payout_commitment.is_none());
+    assert!(first.wcash_parent_payout_commitment.is_some());
+    assert!(second.wcash_parent_payout_commitment.is_some());
+
+    assert_eq!(cached.coinbase_txn.hash(), first.coinbase_txn.hash());
+    assert_eq!(cached.coinbase_txn.hash(), second.coinbase_txn.hash());
+    assert_ne!(
+        cached.coinbase_txn.auth_digest(),
+        first.coinbase_txn.auth_digest()
+    );
+    assert_ne!(
+        first.coinbase_txn.auth_digest(),
+        second.coinbase_txn.auth_digest()
+    );
+
+    assert_eq!(
+        cached.default_roots.merkle_root(),
+        first.default_roots.merkle_root(),
+        "ZIP-244 keeps the transaction ID Merkle root stable",
+    );
+    assert_ne!(
+        cached.default_roots.auth_data_root(),
+        first.default_roots.auth_data_root(),
+    );
+    assert_ne!(
+        first.default_roots.auth_data_root(),
+        second.default_roots.auth_data_root(),
+    );
+    assert_ne!(first.block_commitments_hash, second.block_commitments_hash);
+
+    assert_eq!(
+        cached,
+        template(),
+        "transforming clones must not mutate or contaminate the cached template",
+    );
 }
 
 /// Checks that a subscription taken before a template is published still reports it.

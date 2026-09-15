@@ -61,7 +61,7 @@ use wcash_zcash_aux::AuxPowProof;
 use zcash_address::{unified::Encoding, TryFromAddress};
 use zcash_protocol::consensus::{self, Parameters};
 use zebra_chain::{
-    amount::{Amount, NegativeAllowed, NegativeOrZero, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative},
     block::{self, Block, Commitment, Height, SerializedBlock, TryIntoHeight, MAX_BLOCK_BYTES},
     chain_sync_status::ChainSyncStatus,
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
@@ -122,7 +122,7 @@ use types::{
         precompute,
         proposal::proposal_block_from_template,
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
-        GetBlockTemplateParameters, GetBlockTemplateResponse, MinerParams,
+        GetBlockTemplateParameters, GetBlockTemplateResponse, MinerParams, WcashAuxRequest,
     },
     get_blockchain_info::GetBlockchainInfoBalance,
     get_mempool_info::GetMempoolInfoResponse,
@@ -1078,7 +1078,7 @@ where
     ///
     /// Returns `None` if mining isn't configured.
     pub fn spawn_block_template_updater(&self) -> Option<JoinHandle<()>> {
-        let miner_params = self.gbt.miner_params()?.clone();
+        let miner_params = self.gbt.miner_params().ok().flatten()?.clone();
         let template_cache = self.gbt.template_cache()?.clone();
 
         Some(tokio::spawn(
@@ -1162,6 +1162,7 @@ where
                     let miner_params = self
                         .gbt
                         .miner_params()
+                        .expect("a precomputed template requires valid miner parameters")
                         .expect("a precomputed template requires configured miner parameters");
                     template = template
                         .with_wcash_aux(&self.network, miner_params, wcash_aux)
