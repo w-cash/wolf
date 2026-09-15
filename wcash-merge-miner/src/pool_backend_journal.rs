@@ -1321,6 +1321,43 @@ impl PoolBackendJournal {
         self.next_winner_state_by_maturity(after_ordinal, None)
     }
 
+    /// Returns the winner tail and the newest pending proof for each chain.
+    ///
+    /// The two bounded recovery snapshots protect a block durably committed
+    /// immediately before a crash. All older proofs remain available to the
+    /// paced historical reconciliation cursor.
+    pub(crate) fn winner_recovery_state(
+        &self,
+    ) -> Result<(usize, Vec<(usize, JournalWinnerState)>), PoolBackendJournalError> {
+        let state = self.lock_state()?;
+        ensure_usable(&state)?;
+        let event_seq = next_event_seq(&state)?;
+        let tail = state.semantic.winner_order.len();
+        let mut wcash = None;
+        let mut zcash = None;
+        for (ordinal, key) in state.semantic.winner_order.iter().enumerate().rev() {
+            let winner = state.semantic.winners.get(key).ok_or_else(|| {
+                semantic(event_seq, "winner index references absent private state")
+            })?;
+            if !matches!(winner.lifecycle, JournalWinnerLifecycle::Pending) {
+                continue;
+            }
+            match key.chain {
+                MergedChain::Wcash if wcash.is_none() => wcash = Some((ordinal, winner.clone())),
+                MergedChain::Zcash if zcash.is_none() => zcash = Some((ordinal, winner.clone())),
+                _ => {}
+            }
+            if wcash.is_some() && zcash.is_some() {
+                break;
+            }
+        }
+        let mut recovery = Vec::with_capacity(2);
+        recovery.extend(wcash);
+        recovery.extend(zcash);
+        recovery.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        Ok((tail, recovery))
+    }
+
     /// Returns the next winner that has not reached reversible maturity.
     pub(crate) fn next_unsettled_winner_state(
         &self,

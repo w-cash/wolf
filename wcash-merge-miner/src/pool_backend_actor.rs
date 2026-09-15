@@ -40,6 +40,7 @@ use crate::{
 // immediate first attempt; the durable historical cursor advances at this
 // deliberately slower cadence.
 const WINNER_HISTORICAL_STEP_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_CONSECUTIVE_FIRST_ATTEMPTS: u8 = 8;
 
 const MAX_RECENT_JOBS: usize = 2;
 const MAX_SUPERSEDED_GRACE: Duration = Duration::from_secs(60);
@@ -195,16 +196,18 @@ impl PoolBackendWinnerKey {
 
 /// Fair selection for the single native winner-reconciliation worker.
 ///
-/// A cursor over durable winner order gives each pending proof one prompt
-/// first attempt. Historical reconciliation follows every priority attempt
-/// and remains responsible for bounded retries and lifecycle monitoring.
-/// Restart reconstructs pending work from the journal; no new durable format
-/// or in-memory-only submission queue is introduced.
+/// A cursor over durable winner order gives each newly appended proof one
+/// prompt first attempt. On restart the cursor binds to the durable tail, so a
+/// historical backlog cannot delay a live block submission. Historical
+/// reconciliation remains responsible for older pending proofs, bounded
+/// retries, and lifecycle monitoring. No new durable format or in-memory-only
+/// submission queue is introduced.
 #[derive(Debug, Default)]
 pub struct PoolBackendWinnerScheduler {
     journal_stream: Option<CanonicalUuid>,
     first_attempt_next: usize,
-    historical_due: bool,
+    consecutive_first_attempts: u8,
+    recovery_first_attempts: VecDeque<PoolBackendWinnerSnapshot>,
     last_first_attempt: Option<PoolBackendWinnerKey>,
     unsettled_after: Option<PoolBackendWinnerKey>,
     matured_after: Option<PoolBackendWinnerKey>,
@@ -236,7 +239,7 @@ impl PoolBackendWinnerWork {
 }
 
 impl PoolBackendWinnerScheduler {
-    /// Selects at most one first attempt before the next historical step.
+    /// Selects a bounded burst of live first attempts before historical work.
     ///
     /// Selection advances the cursor before the caller can perform RPC, so a
     /// failed pending winner cannot monopolize priority. Each tail check scans
@@ -252,21 +255,36 @@ impl PoolBackendWinnerScheduler {
         {
             return Err(PoolBackendActorError::WinnerAuthorityMismatch);
         }
+        if self.journal_stream.is_none() {
+            let state = actor.lock_state()?;
+            let (tail, recovery) = state.journal.winner_recovery_state()?;
+            self.first_attempt_next = tail;
+            self.recovery_first_attempts = recovery
+                .into_iter()
+                .map(|(winner_ordinal, state)| PoolBackendWinnerSnapshot {
+                    journal_stream,
+                    winner_ordinal,
+                    state,
+                })
+                .collect();
+        }
         self.journal_stream = Some(journal_stream);
-        if !self.historical_due {
-            self.historical_due = true;
-            let first = {
+        if self.consecutive_first_attempts < MAX_CONSECUTIVE_FIRST_ATTEMPTS {
+            let first = if let Some(recovery) = self.recovery_first_attempts.pop_front() {
+                Some(recovery)
+            } else {
                 let state = actor.lock_state()?;
                 state
                     .journal
                     .next_first_attempt_winner_state(&mut self.first_attempt_next)?
+                    .map(|(winner_ordinal, state)| PoolBackendWinnerSnapshot {
+                        journal_stream,
+                        winner_ordinal,
+                        state,
+                    })
             };
-            if let Some((winner_ordinal, state)) = first {
-                let snapshot = PoolBackendWinnerSnapshot {
-                    journal_stream,
-                    winner_ordinal,
-                    state,
-                };
+            if let Some(snapshot) = first {
+                self.consecutive_first_attempts += 1;
                 self.last_first_attempt = Some(snapshot.key());
                 return Ok(PoolBackendWinnerWork {
                     snapshot: Some(snapshot),
@@ -276,7 +294,7 @@ impl PoolBackendWinnerScheduler {
             }
         }
 
-        self.historical_due = false;
+        self.consecutive_first_attempts = 0;
         let (mut snapshot, completes_pass, delay) = match actor
             .next_unsettled_winner_snapshot(self.unsettled_after.as_ref())?
         {
@@ -2257,16 +2275,19 @@ mod tests {
     }
 
     fn append_scheduler_after_restore(actor: &PoolBackendActor, ordinal: u32) -> Hex32 {
-        let mut descriptor = {
+        let descriptor = {
             let state = actor.lock_state().unwrap();
             state.journal.job_descriptors().unwrap()[0].0.clone()
         };
-        let mut job_id = [0x95; 32];
-        job_id[..4].copy_from_slice(&ordinal.to_le_bytes());
-        descriptor.job_id = Hex32::new(job_id);
-        actor
-            .activate_job(Arc::new(TestRetainedJob::new(descriptor)), Duration::ZERO)
-            .expect("activate fresh job after actor restoration retired the original");
+        if actor.lock_state().unwrap().current.is_none() {
+            let mut descriptor = descriptor;
+            let mut job_id = [0x95; 32];
+            job_id[..4].copy_from_slice(&ordinal.to_le_bytes());
+            descriptor.job_id = Hex32::new(job_id);
+            actor
+                .activate_job(Arc::new(TestRetainedJob::new(descriptor)), Duration::ZERO)
+                .expect("activate fresh job after actor restoration retired the original");
+        }
         let state = actor.lock_state().unwrap();
         append_scheduler_pending(&state.journal, ordinal)
     }
@@ -2310,24 +2331,27 @@ mod tests {
         let path = directory.path().join("scheduler.jsonl");
         let config = config();
         let (journal, historical) = scheduler_journal(&path, &config, 200);
-        let first = append_scheduler_pending(&journal, 201);
-        let second = append_scheduler_pending(&journal, 202);
         let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
         let mut scheduler = PoolBackendWinnerScheduler::default();
 
+        // Bind to the existing durable tail. Restart history belongs to the
+        // paced audit path and cannot occupy the live first-attempt cursor.
+        let work = scheduler.next(&actor).unwrap();
+        assert_eq!(work.snapshot().unwrap().share_id(), &historical[0]);
+        assert_eq!(work.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
+        assert_eq!(scheduler.first_attempt_next, 200);
+
+        let first = append_scheduler_after_restore(&actor, 201);
+        let second = append_scheduler_after_restore(&actor, 202);
         let work = scheduler.next(&actor).unwrap();
         assert_eq!(work.snapshot().unwrap().share_id(), &first);
         assert_eq!(work.delay(), Duration::ZERO);
         assert_eq!(scheduler.first_attempt_next, 201);
-        // Simulate a failed first submission: leave its durable Pending state
-        // unchanged. The next step must still advance historical monitoring.
-        let work = scheduler.next(&actor).unwrap();
-        assert_eq!(work.snapshot().unwrap().share_id(), &historical[0]);
-        assert_eq!(work.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
         let work = scheduler.next(&actor).unwrap();
         assert_eq!(work.snapshot().unwrap().share_id(), &second);
         assert_eq!(work.delay(), Duration::ZERO);
         assert_eq!(scheduler.first_attempt_next, 202);
+        // A bounded live burst drains both chains before resuming paced audit.
         let work = scheduler.next(&actor).unwrap();
         assert_eq!(work.snapshot().unwrap().share_id(), &historical[1]);
         assert_eq!(work.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
@@ -2354,29 +2378,27 @@ mod tests {
         let restored = actor_from_journal(open_journal(&path, &config), Arc::new(TestClock::new()));
         let mut recovered_schedule = PoolBackendWinnerScheduler::default();
         let work = recovered_schedule.next(&restored).unwrap();
-        assert_eq!(work.snapshot().unwrap().share_id(), &first);
-        assert!(matches!(
-            work.snapshot().unwrap().lifecycle(),
-            JournalWinnerLifecycle::Pending
-        ));
+        assert_eq!(work.snapshot().unwrap().share_id(), &third);
+        assert_eq!(work.delay(), Duration::ZERO);
+        assert_eq!(recovered_schedule.first_attempt_next, 203);
+        let fourth = append_scheduler_after_restore(&restored, 204);
+        let work = recovered_schedule.next(&restored).unwrap();
+        assert_eq!(work.snapshot().unwrap().share_id(), &fourth);
+        assert_eq!(work.delay(), Duration::ZERO);
         assert!(scheduler.next(&restored).is_ok());
     }
 
     #[test]
-    fn winner_scheduler_advances_bounded_tail_even_without_pending_proofs() {
+    fn winner_scheduler_binds_directly_to_tail_even_without_pending_proofs() {
         let directory = private_temp_dir();
         let path = directory.path().join("scheduler-tail.jsonl");
         let config = config();
         let (journal, historical) = scheduler_journal(&path, &config, 300);
         let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
         let mut scheduler = PoolBackendWinnerScheduler::default();
-        for (expected_cursor, expected_share) in [
-            (256, &historical[0]),
-            (300, &historical[1]),
-            (300, &historical[2]),
-        ] {
+        for expected_share in [&historical[0], &historical[1], &historical[2]] {
             let work = scheduler.next(&actor).unwrap();
-            assert_eq!(scheduler.first_attempt_next, expected_cursor);
+            assert_eq!(scheduler.first_attempt_next, 300);
             assert_eq!(work.snapshot().unwrap().share_id(), expected_share);
             assert_eq!(work.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
         }
@@ -2403,27 +2425,24 @@ mod tests {
         let (journal, shares) = scheduler_journal(&path, &config, 0);
         let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
         let mut scheduler = PoolBackendWinnerScheduler::default();
-        assert_eq!(
-            scheduler
-                .next(&actor)
-                .unwrap()
-                .snapshot()
-                .unwrap()
-                .share_id(),
-            &shares[0]
-        );
+        let restart_backlog = scheduler.next(&actor).unwrap();
+        assert_eq!(restart_backlog.snapshot().unwrap().share_id(), &shares[0]);
+        assert_eq!(restart_backlog.delay(), Duration::ZERO);
+        let live = append_scheduler_after_restore(&actor, 1);
+        let first_attempt = scheduler.next(&actor).unwrap();
+        assert_eq!(first_attempt.snapshot().unwrap().share_id(), &live);
+        assert_eq!(first_attempt.delay(), Duration::ZERO);
         let duplicate = scheduler.next(&actor).unwrap();
-        assert!(duplicate.snapshot().is_none());
+        assert_eq!(duplicate.snapshot().unwrap().share_id(), &shares[0]);
         assert_eq!(duplicate.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
         let end = scheduler.next(&actor).unwrap();
-        assert!(end.snapshot().is_none());
-        assert!(end.completes_pass());
-        assert_eq!(end.delay(), Duration::from_secs(1));
+        assert_eq!(end.snapshot().unwrap().share_id(), &live);
+        assert_eq!(end.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
         for _ in 0..8 {
             let work = scheduler.next(&actor).unwrap();
             assert!(!work.delay().is_zero());
             if let Some(snapshot) = work.snapshot() {
-                assert_eq!(snapshot.share_id(), &shares[0]);
+                assert!([&shares[0], &live].contains(&snapshot.share_id()));
             }
         }
         let other_path = directory.path().join("other.jsonl");
