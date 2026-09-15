@@ -1,7 +1,15 @@
 //! Tests for types and functions for the `getblocktemplate` RPC.
 
 use anyhow::anyhow;
-use std::{iter, sync::Arc};
+use std::{
+    iter,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    },
+    thread,
+    time::Duration,
+};
 use zebra_chain::{
     amount::{Amount, MAX_WCASH_COINBASE_VALUE},
     block,
@@ -769,7 +777,7 @@ fn coinbase_cache_retains_both_fake_and_real_fee_entries() {
     // Both entries coexist — the zero-fee sizing coinbase survives the real-fee store.
     assert_eq!(
         cache.get(height, zero_fee),
-        Some(fake_coinbase),
+        Some(fake_coinbase.clone()),
         "zero-fee fake coinbase should still be cached after storing real-fee coinbase"
     );
     assert_eq!(
@@ -778,7 +786,7 @@ fn coinbase_cache_retains_both_fake_and_real_fee_entries() {
         "real-fee coinbase should be cached"
     );
 
-    // Height transition: storing at a new height evicts the stale entries.
+    // Next-height precomputation keeps the current height available until the chain advances.
     let next_height = Height(height.0 + 1);
     let next_coinbase = TransactionTemplate::new_coinbase(
         &Network::Mainnet,
@@ -800,13 +808,116 @@ fn coinbase_cache_retains_both_fake_and_real_fee_entries() {
     cache.store(next_height, zero_fee, next_coinbase.clone());
     assert_eq!(
         cache.get(next_height, zero_fee),
-        Some(next_coinbase),
+        Some(next_coinbase.clone()),
         "new-height entry should be cached"
     );
-    assert!(
-        cache.get(height, zero_fee).is_none(),
-        "old-height entry should be evicted"
+    assert_eq!(
+        cache.get(height, zero_fee),
+        Some(fake_coinbase),
+        "an adjacent current-height entry must survive next-height precomputation"
     );
+
+    let later_height = Height(height.0 + 2);
+    cache.store(later_height, zero_fee, next_coinbase);
+    assert!(cache.get(height, zero_fee).is_none());
+}
+
+#[test]
+fn coinbase_cache_singleflight_builds_one_proof_for_concurrent_waiters() {
+    use super::CoinbaseCache;
+
+    let network = Network::Mainnet;
+    let height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("Nu5 is active on Mainnet");
+    let fee = Amount::zero();
+    let params = MinerParams::from(
+        Address::decode(
+            &network,
+            default_miner_address(network.kind(), &MinerAddressType::Sapling),
+        )
+        .expect("hard-coded Sapling address is valid"),
+    );
+    let expected = TransactionTemplate::new_coinbase(&network, height, &params, fee)
+        .expect("valid coinbase transaction");
+    let cache = CoinbaseCache::default();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(Barrier::new(5));
+    let workers = (0..4)
+        .map(|_| {
+            let cache = cache.clone();
+            let builds = Arc::clone(&builds);
+            let start = Arc::clone(&start);
+            let expected = expected.clone();
+            thread::spawn(move || {
+                start.wait();
+                cache.get_or_build(height, fee, || {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(25));
+                    expected
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    start.wait();
+
+    for worker in workers {
+        assert_eq!(
+            worker.join().expect("singleflight worker did not panic"),
+            expected
+        );
+    }
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn coinbase_cache_recovers_after_singleflight_builder_panics() {
+    use super::CoinbaseCache;
+
+    let network = Network::Mainnet;
+    let height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("Nu5 is active on Mainnet");
+    let fee = Amount::zero();
+    let params = MinerParams::from(
+        Address::decode(
+            &network,
+            default_miner_address(network.kind(), &MinerAddressType::Sapling),
+        )
+        .expect("hard-coded Sapling address is valid"),
+    );
+    let expected = TransactionTemplate::new_coinbase(&network, height, &params, fee)
+        .expect("valid coinbase transaction");
+    let cache = CoinbaseCache::default();
+    let (building_tx, building_rx) = std::sync::mpsc::channel();
+
+    let failed_cache = cache.clone();
+    let failed_builder = thread::spawn(move || {
+        failed_cache.get_or_build(height, fee, || {
+            building_tx
+                .send(())
+                .expect("the waiting test worker is still listening");
+            thread::sleep(Duration::from_millis(25));
+            panic!("simulated proof builder failure");
+        })
+    });
+    building_rx
+        .recv()
+        .expect("the failing builder started its proof");
+
+    let recovery_cache = cache.clone();
+    let recovered_coinbase = expected.clone();
+    let recovery_builder =
+        thread::spawn(move || recovery_cache.get_or_build(height, fee, || recovered_coinbase));
+
+    assert!(failed_builder.join().is_err());
+    assert_eq!(
+        recovery_builder
+            .join()
+            .expect("a waiting builder must recover after the first builder fails"),
+        expected
+    );
+    assert_eq!(cache.get(height, fee), Some(expected));
 }
 
 /// Verifies that fee churn beyond the cache cap (4 entries) evicts stale nonzero-fee entries

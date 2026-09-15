@@ -61,7 +61,7 @@ use wcash_zcash_aux::AuxPowProof;
 use zcash_address::{unified::Encoding, TryFromAddress};
 use zcash_protocol::consensus::{self, Parameters};
 use zebra_chain::{
-    amount::{Amount, NegativeAllowed, NonNegative},
+    amount::{Amount, NegativeAllowed, NegativeOrZero, NonNegative},
     block::{self, Block, Commitment, Height, SerializedBlock, TryIntoHeight, MAX_BLOCK_BYTES},
     chain_sync_status::ChainSyncStatus,
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
@@ -2754,6 +2754,10 @@ where
         //
         // Set up the loop.
         let mut max_time_reached = false;
+        let mut next_coinbase_precompute: Option<(
+            Height,
+            JoinHandle<TransactionTemplate<NegativeOrZero>>,
+        )> = None;
 
         // The loop returns the server long poll ID, which should be different to the client one.
         let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
@@ -2863,32 +2867,39 @@ where
             let wait_for_new_tip = wait_for_new_tip.best_tip_changed();
             // `+2`: we expect the tip to advance by one block before waking us up.
             let precomputed_height = Height(chain_info.tip_height.0 + 2);
-            let wait_for_new_tip = async {
-                // Precompute the coinbase tx for an empty block that will sit on the new tip. We
-                // will return this provisional block upon a chain tip change so that miners can
-                // mine on the newest tip, and don't waste their effort on a shorter chain while we
-                // compute a new template for a properly filled block. We do this precomputation
-                // before we start waiting for a new tip since computing the coinbase tx takes a few
-                // seconds if the miner mines to a shielded address, and we want to return fast
-                // when the tip changes.
-                let precompute_coinbase = |network, height, params| {
-                    tokio::task::spawn_blocking(move || {
-                        TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
-                            .expect("valid coinbase tx")
+            if next_coinbase_precompute
+                .as_ref()
+                .is_none_or(|(height, _)| *height != precomputed_height)
+            {
+                if let Some((_, obsolete_task)) = next_coinbase_precompute.take() {
+                    // A started blocking proof cannot be aborted. Its singleflight cache entry
+                    // still receives the result, but this request no longer waits for a height
+                    // that cannot match its next template.
+                    obsolete_task.abort();
+                }
+                let network = self.network.clone();
+                let params = miner_params.clone();
+                let cache = self.gbt.coinbase_cache();
+                let task = tokio::task::spawn_blocking(move || {
+                    cache.get_or_build(precomputed_height, Amount::zero(), || {
+                        TransactionTemplate::new_coinbase(
+                            &network,
+                            precomputed_height,
+                            &params,
+                            Amount::zero(),
+                        )
+                        .expect("valid coinbase tx")
                     })
-                };
-
-                let precomputed_coinbase = precompute_coinbase(
-                    self.network.clone(),
-                    precomputed_height,
-                    miner_params.clone(),
-                )
-                .await
-                .expect("valid coinbase tx");
-
+                });
+                next_coinbase_precompute = Some((precomputed_height, task));
+            }
+            let precompute_task = &mut next_coinbase_precompute
+                .as_mut()
+                .expect("the next-height coinbase task was initialized")
+                .1;
+            let wait_for_new_tip = async {
                 let _ = wait_for_new_tip.await;
-
-                precomputed_coinbase
+                precompute_task.await.expect("valid coinbase tx")
             };
 
             // Wait for the maximum block time to elapse. This can change the block header

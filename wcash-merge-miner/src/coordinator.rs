@@ -333,7 +333,7 @@ struct JobFreshness {
 // A fresh child and independently proposal-validated parent are required: merely
 // replaying the same header could restart a miner's duplicate nonce search.
 const MAX_JOB_AGE: Duration = Duration::from_secs(NATIVE_JOB_MAX_AGE_SECONDS);
-const TIP_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
+const TIP_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 const OUTBOX_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const OUTBOX_MAINTENANCE_BATCH_SIZE: usize = 2;
 const MAX_CHILD_BLOCK_BYTES: usize = 2_000_000;
