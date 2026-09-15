@@ -10,6 +10,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt,
     sync::{Arc, Mutex, MutexGuard},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -563,6 +564,10 @@ pub enum PoolBackendActorError {
     #[error("winner reconciliation authority does not match this backend journal")]
     WinnerAuthorityMismatch,
 
+    /// Exactly one reconciliation worker can receive live-winner wakeups.
+    #[error("winner reconciliation worker is already registered")]
+    WinnerWorkerAlreadyRegistered,
+
     /// A winner snapshot no longer names retained private block material.
     #[error("winner reconciliation snapshot is not retained")]
     WinnerNotRetained,
@@ -668,6 +673,7 @@ pub struct PoolBackendActor {
     authority_fields: AuthorityFields,
     clock: Arc<dyn ActorClock>,
     state: Mutex<ActorState>,
+    winner_worker: Mutex<Option<thread::Thread>>,
 }
 
 impl PoolBackendActor {
@@ -725,7 +731,37 @@ impl PoolBackendActor {
             authority_fields,
             clock,
             state: Mutex::new(state),
+            winner_worker: Mutex::new(None),
         })
+    }
+
+    /// Registers the single reconciliation worker that receives live-winner
+    /// wakeups after durable share commit.
+    pub fn register_winner_worker(
+        &self,
+        worker: thread::Thread,
+    ) -> Result<(), PoolBackendActorError> {
+        let mut registered = self
+            .winner_worker
+            .lock()
+            .map_err(|_| PoolBackendActorError::MutexPoisoned)?;
+        if registered.is_some() {
+            return Err(PoolBackendActorError::WinnerWorkerAlreadyRegistered);
+        }
+        *registered = Some(worker);
+        Ok(())
+    }
+
+    fn wake_winner_worker(&self) -> Result<(), PoolBackendActorError> {
+        if let Some(worker) = self
+            .winner_worker
+            .lock()
+            .map_err(|_| PoolBackendActorError::MutexPoisoned)?
+            .as_ref()
+        {
+            worker.unpark();
+        }
+        Ok(())
     }
 
     /// Durably advertises a healthy exact job, superseding the current job
@@ -1251,6 +1287,7 @@ impl PoolBackendActor {
                 winner_blocks,
             )
             .map_err(journal_handler_error)?;
+        let wake_winner_worker = !commit.replayed && !commit.receipt.winners.is_empty();
         state.shares.insert(
             share_id,
             StoredShare {
@@ -1259,6 +1296,10 @@ impl PoolBackendActor {
                 target_le,
             },
         );
+        if wake_winner_worker {
+            self.wake_winner_worker()
+                .map_err(|_| unhealthy_backend("winner reconciliation wakeup is unavailable"))?;
+        }
         let response = BackendMessage::ShareCommitted {
             version: BACKEND_PROTOCOL_VERSION,
             id,
@@ -2907,6 +2948,21 @@ mod tests {
             .activate_job(retained.clone(), Duration::from_secs(5))
             .expect("activate exact winner fixture");
 
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+        let (elapsed_sender, elapsed_receiver) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            ready_sender.send(()).expect("announce parked worker");
+            let started = Instant::now();
+            thread::park_timeout(Duration::from_secs(2));
+            elapsed_sender
+                .send(started.elapsed())
+                .expect("report winner wake latency");
+        });
+        actor
+            .register_winner_worker(waiter.thread().clone())
+            .expect("register winner wake test thread");
+        ready_receiver.recv().expect("waiter reached park boundary");
+
         retained.healthy.store(false, Ordering::Release);
         let response = actor
             .dispatch(uuid(20), Some(1), BackendRequestKind::SubmitShare, request)
@@ -2919,6 +2975,13 @@ mod tests {
                 ..
             }) if matches!(winners.as_slice(), [WinnerDescriptor { chain: MergedChain::Zcash, .. }])
         ));
+        assert!(
+            elapsed_receiver
+                .recv_timeout(Duration::from_millis(500))
+                .expect("durable winner wakes reconciliation worker")
+                < Duration::from_millis(500)
+        );
+        waiter.join().expect("winner wake test thread joins");
         assert_eq!(retained.validations.load(Ordering::Acquire), 1);
         assert!(matches!(
             actor
