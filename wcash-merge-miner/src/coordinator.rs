@@ -1544,16 +1544,25 @@ fn reconcile_zcash_pool_winner(
     let previous_hash =
         validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Zcash, &expected_hash)
             .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
-    // Fence both submission and the later canonical status reads. Once a
-    // stable best chain has already reached this candidate's height, replaying
-    // a losing proof can only produce Zebra's generic `rejected` response.
+    // Fence time-critical submission against the template node which produced
+    // and proposal-validated this exact candidate. A lagging independent
+    // validator must not hold a solved block until the parent chain overtakes
+    // it. Status-only reconciliation still requires an exact multi-node tip
+    // before it can credit the winner.
+    //
+    // Once a stable best chain has already reached this candidate's height,
+    // replaying a losing proof can only produce Zebra's generic `rejected`
+    // response.
     // The exact proof was validated before it entered the durable outbox, so
     // retain it as a noncanonical proof and monitor it without resubmission.
     // This also bounds duplicate winner bursts before a replacement job reaches
     // a fast ASIC.
-    let before = zcash
-        .consistent_chain_tip()
-        .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
+    let before = if requires_submission {
+        zcash.template_chain_tip()
+    } else {
+        zcash.consistent_chain_tip()
+    }
+    .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
     let tip_position = parent_winner_tip_position(before, winner.height, previous_hash)
         .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
     let submission_required = parent_winner_submission_required(snapshot.lifecycle(), tip_position);
@@ -4695,8 +4704,9 @@ mod tests {
             header,
             advanced,
         ];
-        let (template, a) = spawn_scripted_rpc_server(responses.clone());
-        let (validator, b) = spawn_scripted_rpc_server(responses);
+        let validator_responses = responses[1..].to_vec();
+        let (template, a) = spawn_scripted_rpc_server(responses);
+        let (validator, b) = spawn_scripted_rpc_server(validator_responses);
         let provider = test_zcash_provider(template, validator);
         let result = reconcile_zcash_pool_winner(&provider, &snapshot);
         assert!(
@@ -4709,23 +4719,35 @@ mod tests {
             ),
             "successful own-tip advancement must be observed immediately, got {result:?}"
         );
-        for server in [a, b] {
-            let requests = server.join().unwrap();
-            assert_eq!(
-                requests
-                    .iter()
-                    .map(|request| request["method"].as_str().unwrap())
-                    .collect::<Vec<_>>(),
-                [
-                    "getblockchaininfo",
-                    "submitblock",
-                    "getblockheader",
-                    "getblockchaininfo",
-                    "getblockheader",
-                    "getblockchaininfo"
-                ]
-            );
-        }
+        let template_requests = a.join().unwrap();
+        assert_eq!(
+            template_requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "getblockchaininfo",
+                "submitblock",
+                "getblockheader",
+                "getblockchaininfo",
+                "getblockheader",
+                "getblockchaininfo"
+            ]
+        );
+        let validator_requests = b.join().unwrap();
+        assert_eq!(
+            validator_requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "submitblock",
+                "getblockheader",
+                "getblockchaininfo",
+                "getblockheader",
+                "getblockchaininfo"
+            ]
+        );
     }
 
     #[test]
@@ -4738,22 +4760,20 @@ mod tests {
         let header = json!({"hash":hash,"height":1,"confirmations":1});
         let snapshot = parent_reconciliation_fixture(&block);
         for split_nodes in [false, true] {
-            let mut a_replies = vec![
-                previous.clone(),
-                serde_json::Value::Null,
-                header.clone(),
-                advanced.clone(),
-            ];
-            let mut b_replies = a_replies.clone();
+            let mut common_replies =
+                vec![serde_json::Value::Null, header.clone(), advanced.clone()];
+            let mut validator_replies = common_replies.clone();
             if split_nodes {
-                *b_replies.last_mut().unwrap() = previous.clone();
+                *validator_replies.last_mut().unwrap() = previous.clone();
             } else {
                 let next = json!({"blocks":2,"bestblockhash":"42".repeat(32)});
-                a_replies.extend([header.clone(), next.clone()]);
-                b_replies.extend([header.clone(), next]);
+                common_replies.extend([header.clone(), next.clone()]);
+                validator_replies.extend([header.clone(), next]);
             }
-            let (template, a) = spawn_scripted_rpc_server(a_replies);
-            let (validator, b) = spawn_scripted_rpc_server(b_replies);
+            let mut template_replies = vec![previous.clone()];
+            template_replies.extend(common_replies);
+            let (template, a) = spawn_scripted_rpc_server(template_replies);
+            let (validator, b) = spawn_scripted_rpc_server(validator_replies);
             let result =
                 reconcile_zcash_pool_winner(&test_zcash_provider(template, validator), &snapshot);
             if split_nodes {
@@ -4788,8 +4808,7 @@ mod tests {
         let absent = json!({"hash":hash,"height":1,"confirmations":0});
         let snapshot = parent_reconciliation_fixture(&block);
         for (unconfirmed, raced) in [(false, false), (false, true), (true, false)] {
-            let mut replies = vec![
-                previous.clone(),
+            let mut common_replies = vec![
                 if unconfirmed {
                     serde_json::Value::Null
                 } else {
@@ -4798,15 +4817,17 @@ mod tests {
                 absent.clone(),
             ];
             if unconfirmed {
-                replies.push(json!({"state":"unknown"}));
+                common_replies.push(json!({"state":"unknown"}));
             }
-            replies.push(if raced {
+            common_replies.push(if raced {
                 competing.clone()
             } else {
                 previous.clone()
             });
-            let (template, a) = spawn_scripted_rpc_server(replies.clone());
-            let (validator, b) = spawn_scripted_rpc_server(replies);
+            let mut template_replies = vec![previous.clone()];
+            template_replies.extend(common_replies.clone());
+            let (template, a) = spawn_scripted_rpc_server(template_replies);
+            let (validator, b) = spawn_scripted_rpc_server(common_replies);
             let error =
                 reconcile_zcash_pool_winner(&test_zcash_provider(template, validator), &snapshot)
                     .unwrap_err();

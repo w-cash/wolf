@@ -1,0 +1,3 @@
+kind: Fixed
+body: Broadcast locally validated Zcash winners immediately through the template node even while an independent validator is catching up, while retaining multi-node confirmation before accounting credit.
+time: 2026-09-15T21:15:00Z
