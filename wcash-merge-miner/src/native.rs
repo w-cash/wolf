@@ -797,6 +797,17 @@ impl NativeZcashProvider {
         Ok(expected)
     }
 
+    /// Returns the template node's atomic tip for time-critical winner delivery.
+    ///
+    /// Every parent candidate was already locally validated and accepted as a
+    /// proposal by this node before mining began. An independent validator may
+    /// legitimately trail the public tip, so its synchronization state must
+    /// not delay broadcasting a solved block. Conservative multi-node reads
+    /// remain mandatory before accounting credits the winner.
+    pub(crate) fn template_chain_tip(&self) -> Result<NativeChainTip, MinerError> {
+        native_chain_tip_on_node(&self.template_node)
+    }
+
     /// Requires every configured parent node to remain on the exact job tip.
     pub fn assert_current(&self, job: &NativePreparedJob) -> Result<(), MinerError> {
         if self.allow_lagging_proposal_validators {
