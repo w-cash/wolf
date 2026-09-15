@@ -9,10 +9,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex, MutexGuard,
-    },
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -646,7 +643,6 @@ pub struct PoolBackendActor {
     authority: PoolBackendAuthority,
     authority_fields: AuthorityFields,
     clock: Arc<dyn ActorClock>,
-    winner_reconciliation_healthy: AtomicBool,
     state: Mutex<ActorState>,
 }
 
@@ -704,18 +700,8 @@ impl PoolBackendActor {
             authority,
             authority_fields,
             clock,
-            winner_reconciliation_healthy: AtomicBool::new(true),
             state: Mutex::new(state),
         })
-    }
-
-    /// Updates the live status of the sole winner-reconciliation worker.
-    ///
-    /// This flag affects only health reporting. Exact winners remain durable
-    /// and share validation remains consensus-authoritative during an outage.
-    pub fn set_winner_reconciliation_health(&self, healthy: bool) {
-        self.winner_reconciliation_healthy
-            .store(healthy, Ordering::Release);
     }
 
     /// Durably advertises a healthy exact job, superseding the current job
@@ -1289,10 +1275,10 @@ impl PoolBackendActor {
         id: u64,
         now: Duration,
     ) -> Result<Vec<BackendMessage>, PoolBackendHandlerError> {
-        // This synchronous snapshot reports durable outbox pressure and share
-        // admission health. A future actor-owned reconciliation worker must
-        // also gate `healthy` on live winner-submission dependencies; callers
-        // must not interpret these counters as proof that submission ran.
+        // `healthy` is strictly the current share-admission boundary. Winner
+        // delivery and settlement remain fail-closed through their durable
+        // lifecycle events and the pending/quarantined counters below. A
+        // historical retry must never reject valid work for a current job.
         let winner_summary = state
             .journal
             .winner_summary()
@@ -1312,9 +1298,7 @@ impl PoolBackendActor {
                 .get(job_id)
                 .is_some_and(|job| job.validator.is_healthy() && acceptable_job(job, now).is_some())
         });
-        let healthy = current_healthy
-            && recent_healthy
-            && self.winner_reconciliation_healthy.load(Ordering::Acquire);
+        let healthy = current_healthy && recent_healthy;
         let response = BackendMessage::HealthStatus {
             version: BACKEND_PROTOCOL_VERSION,
             id,
@@ -2928,19 +2912,23 @@ mod tests {
     }
 
     #[test]
-    fn winner_reconciliation_outage_is_visible_in_backend_health() {
+    fn winner_backlog_is_independent_from_share_admission_health() {
         let directory = private_temp_dir();
         let path = directory.path().join("actor.journal");
         let config = config();
         let actor = actor(&path, &config, Arc::new(TestClock::new()));
+        let (descriptor, request, block_bytes) = zcash_winner_fixture(10);
+        let retained = Arc::new(TestRetainedJob::new(descriptor));
+        retained.set_validated(PoolBackendValidatedShare::with_winners(
+            None,
+            Some(block_bytes),
+        ));
         actor
-            .activate_job(
-                Arc::new(TestRetainedJob::new(job(1))),
-                Duration::from_secs(5),
-            )
+            .activate_job(retained, Duration::from_secs(5))
             .expect("activate healthy job");
-        actor.set_winner_reconciliation_health(false);
-
+        actor
+            .dispatch(uuid(20), Some(1), BackendRequestKind::SubmitShare, request)
+            .expect("commit pending winner");
         assert!(matches!(
             actor
                 .dispatch(
@@ -2954,7 +2942,11 @@ mod tests {
                 )
                 .expect("health response succeeds")
                 .as_slice(),
-            [BackendMessage::HealthStatus { healthy: false, .. }]
+            [BackendMessage::HealthStatus {
+                healthy: true,
+                pending_zcash: 1,
+                ..
+            }]
         ));
     }
 

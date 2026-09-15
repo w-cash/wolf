@@ -83,9 +83,10 @@ pub struct CoordinatorConfig {
 
 /// A failed durable-winner reconciliation attempt with its mining impact.
 ///
-/// Retryable node failures only block new share admission when this exact
-/// attempt still needed to deliver winner bytes. Status-only audit failures
-/// keep reward transitions closed without pausing unrelated mining work.
+/// The flag distinguishes blocked winner delivery from a status-only audit
+/// failure for operations and settlement monitoring. Both leave unrelated
+/// current-job share admission available because the exact winner bytes are
+/// already durable; neither can create a reward transition without node proof.
 #[derive(Debug)]
 pub struct PoolWinnerReconciliationError {
     source: MinerError,

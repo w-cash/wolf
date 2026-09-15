@@ -368,7 +368,6 @@ impl PoolBackendWinnerWorker {
             .name("wcash-winner-reconciliation".to_string())
             .spawn(move || {
                 let mut scheduler = PoolBackendWinnerScheduler::default();
-                let mut pass_healthy = true;
                 loop {
                     if worker_shutdown.load(Ordering::Acquire) {
                         break;
@@ -376,7 +375,6 @@ impl PoolBackendWinnerWorker {
                     let work = match scheduler.next(&actor) {
                         Ok(work) => work,
                         Err(error) => {
-                            actor.set_winner_reconciliation_health(false);
                             let _ = failure.send(format!(
                                 "winner journal scheduling failed: {error}"
                             ));
@@ -389,7 +387,6 @@ impl PoolBackendWinnerWorker {
                                 match actor.compare_and_apply_winner_transition(snapshot, transition) {
                                     Ok(_) | Err(PoolBackendActorError::WinnerRevisionConflict) => {}
                                     Err(error) => {
-                                        actor.set_winner_reconciliation_health(false);
                                         let _ = failure.send(format!(
                                             "winner lifecycle persistence failed: {error}"
                                         ));
@@ -401,26 +398,18 @@ impl PoolBackendWinnerWorker {
                             Err(error)
                                 if is_retryable_winner_reconciliation_error(error.miner_error()) =>
                             {
-                                if error.submission_blocked() {
-                                    pass_healthy = false;
-                                    actor.set_winner_reconciliation_health(false);
-                                }
                                 eprintln!(
-                                    "winner reconciliation dependency unavailable; exact bytes remain durable: {error}"
+                                    "winner reconciliation dependency unavailable (submission_blocked={}): exact bytes remain durable: {error}",
+                                    error.submission_blocked(),
                                 );
                             }
                             Err(error) => {
-                                actor.set_winner_reconciliation_health(false);
                                 let _ = failure.send(format!(
                                     "winner reconciliation failed closed: {error}"
                                 ));
                                 break;
                             }
                         }
-                    }
-                    if work.completes_pass() {
-                        actor.set_winner_reconciliation_health(pass_healthy);
-                        pass_healthy = true;
                     }
                     if sleep_until_shutdown(work.delay(), &worker_shutdown) {
                         break;
