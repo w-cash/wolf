@@ -859,7 +859,8 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
             let current = active.as_ref().ok_or_else(|| {
                 MinerError::InvalidRequest("private backend lost its active generation".to_string())
             })?;
-            if Instant::now() >= current.rotation_deadline || !current.retained.is_healthy() {
+            if Instant::now() >= current.rotation_deadline || current.retained.refresh_currentness()
+            {
                 break PoolBackendGenerationControl::Rotate;
             }
         };

@@ -371,6 +371,21 @@ pub struct WinnerOutboxStatus {
 struct JobFreshness {
     active: bool,
     last_checked: Instant,
+    replacement_requested: bool,
+}
+
+/// Admission state for a retained pool generation.
+///
+/// A merged-mining header can remain useful to one chain after the other
+/// chain advances. Pool workers keep that exact generation available while a
+/// replacement is prepared, but request immediate rotation so both chains are
+/// covered again as soon as a newly proposal-validated job is ready.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PoolGenerationCurrentness {
+    /// Both frozen chain predecessors are still current.
+    Current,
+    /// Exactly one chain check succeeded; rotate while retaining the other.
+    OneChainUnavailable,
 }
 
 // Refresh before the common 55-second S-NOMP/ASIC liveness rebroadcast interval.
@@ -698,6 +713,7 @@ impl NativeMiningSupervisor {
             freshness: Mutex::new(JobFreshness {
                 active: true,
                 last_checked: Instant::now(),
+                replacement_requested: false,
             }),
             outbox_retry: Arc::clone(&self.outbox_retry),
             journal,
@@ -888,7 +904,79 @@ impl NativeMiningCoordinator {
             return Ok(());
         }
 
-        let (child, parent) = thread::scope(|scope| {
+        let (child, parent) = self.check_chain_tips();
+        match (child, parent) {
+            (Ok(()), Ok(())) => {
+                freshness.last_checked = now;
+                freshness.replacement_requested = false;
+                Ok(())
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                if matches!(
+                    &error,
+                    MinerError::ChildTipMismatch { .. } | MinerError::ParentTipMismatch { .. }
+                ) {
+                    freshness.active = false;
+                }
+                freshness.replacement_requested = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Refreshes pool admission without discarding work that remains useful
+    /// to one side of the merge-mined pair.
+    ///
+    /// New generations still pass the strict dual-chain proposal gate. This
+    /// method only governs the short handoff after an already-admitted job
+    /// loses one predecessor. If either chain remains current, exact shares
+    /// continue through validation while the supervisor prepares a
+    /// replacement. Once neither check succeeds, admission fails closed.
+    pub(crate) fn refresh_pool_currentness(&self) -> Result<PoolGenerationCurrentness, MinerError> {
+        let now = Instant::now();
+        let mut freshness = self
+            .freshness
+            .lock()
+            .map_err(|_| coordinator_mutex_error("job freshness"))?;
+        if !freshness.active {
+            return Err(MinerError::StaleNativeJob(
+                "the job was already deactivated".to_string(),
+            ));
+        }
+        if now.saturating_duration_since(self.candidate_created_at) >= MAX_JOB_AGE {
+            freshness.active = false;
+            return Err(MinerError::StaleNativeJob(format!(
+                "the native job reached its {}-second fresh-work lifetime",
+                MAX_JOB_AGE.as_secs()
+            )));
+        }
+        if now.saturating_duration_since(freshness.last_checked) < TIP_RECHECK_INTERVAL {
+            return Ok(if freshness.replacement_requested {
+                PoolGenerationCurrentness::OneChainUnavailable
+            } else {
+                PoolGenerationCurrentness::Current
+            });
+        }
+
+        let result = classify_pool_generation_currentness(self.check_chain_tips());
+        freshness.last_checked = now;
+        match result {
+            Ok(PoolGenerationCurrentness::Current) => {
+                freshness.replacement_requested = false;
+            }
+            Ok(PoolGenerationCurrentness::OneChainUnavailable) => {
+                freshness.replacement_requested = true;
+            }
+            Err(_) => {
+                freshness.active = false;
+                freshness.replacement_requested = true;
+            }
+        }
+        result
+    }
+
+    fn check_chain_tips(&self) -> (Result<(), MinerError>, Result<(), MinerError>) {
+        thread::scope(|scope| {
             let child = scope.spawn(|| self.check_child_tip());
             let parent = scope.spawn(|| self.zcash.assert_current(&self.job));
             (
@@ -903,22 +991,7 @@ impl NativeMiningCoordinator {
                     ))
                 }),
             )
-        });
-        match (child, parent) {
-            (Ok(()), Ok(())) => {
-                freshness.last_checked = now;
-                Ok(())
-            }
-            (Err(error), _) | (_, Err(error)) => {
-                if matches!(
-                    &error,
-                    MinerError::ChildTipMismatch { .. } | MinerError::ParentTipMismatch { .. }
-                ) {
-                    freshness.active = false;
-                }
-                Err(error)
-            }
-        }
+        })
     }
 
     fn check_child_tip(&self) -> Result<(), MinerError> {
@@ -984,6 +1057,16 @@ impl NativeMiningCoordinator {
             maintenance_cursor,
         );
         self.retry_pending_winners(winners)
+    }
+}
+
+fn classify_pool_generation_currentness(
+    (child, parent): (Result<(), MinerError>, Result<(), MinerError>),
+) -> Result<PoolGenerationCurrentness, MinerError> {
+    match (child, parent) {
+        (Ok(()), Ok(())) => Ok(PoolGenerationCurrentness::Current),
+        (Ok(()), Err(_)) | (Err(_), Ok(())) => Ok(PoolGenerationCurrentness::OneChainUnavailable),
+        (Err(error), Err(_)) => Err(error),
     }
 }
 
@@ -3880,6 +3963,48 @@ mod tests {
 
     use super::*;
     use crate::NativeZcashNetwork;
+
+    fn parent_tip_mismatch() -> MinerError {
+        MinerError::ParentTipMismatch {
+            expected: "11".repeat(32),
+            endpoint: "parent-test".to_string(),
+            actual: "22".repeat(32),
+        }
+    }
+
+    fn child_tip_mismatch() -> MinerError {
+        MinerError::ChildTipMismatch {
+            expected: "33".repeat(32),
+            endpoint: "child-test".to_string(),
+            actual: "44".repeat(32),
+        }
+    }
+
+    #[test]
+    fn pool_generation_retains_work_while_exactly_one_chain_is_current() {
+        assert_eq!(
+            classify_pool_generation_currentness((Ok(()), Ok(())))
+                .expect("both current tips remain usable"),
+            PoolGenerationCurrentness::Current
+        );
+        assert_eq!(
+            classify_pool_generation_currentness((Ok(()), Err(parent_tip_mismatch())))
+                .expect("current child work remains usable"),
+            PoolGenerationCurrentness::OneChainUnavailable
+        );
+        assert_eq!(
+            classify_pool_generation_currentness((Err(child_tip_mismatch()), Ok(())))
+                .expect("current parent work remains usable"),
+            PoolGenerationCurrentness::OneChainUnavailable
+        );
+        assert!(matches!(
+            classify_pool_generation_currentness((
+                Err(child_tip_mismatch()),
+                Err(parent_tip_mismatch())
+            )),
+            Err(MinerError::ChildTipMismatch { .. })
+        ));
+    }
 
     fn mainnet_genesis_block() -> Block {
         Vec::from_hex(include_str!("../../zebra-test/src/vectors/block-main-0-000-000.txt").trim())

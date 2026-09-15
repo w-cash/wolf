@@ -1,12 +1,15 @@
 //! Pool-backend retention for one exact native merged-mining generation.
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use wcash_pool_protocol::{Hex32, JobDescriptor, TargetLe};
 use wcash_zcash_aux::{AuxPowError, Target};
 
 use crate::{
-    coordinator::{GenerationRetirement, NativeMiningCoordinator},
+    coordinator::{GenerationRetirement, NativeMiningCoordinator, PoolGenerationCurrentness},
     pool_backend::{job_descriptor_from_native, PoolBackendAdapterError},
     pool_backend_actor::{
         PoolBackendRetainedJob, PoolBackendShareRequest, PoolBackendShareValidationError,
@@ -31,6 +34,7 @@ use crate::{
 pub struct NativePoolBackendRetainedJob {
     coordinator: NativeMiningCoordinator,
     descriptor: JobDescriptor,
+    admission_healthy: AtomicBool,
 }
 
 impl NativePoolBackendRetainedJob {
@@ -40,7 +44,31 @@ impl NativePoolBackendRetainedJob {
         Ok(Self {
             coordinator,
             descriptor,
+            admission_healthy: AtomicBool::new(true),
         })
+    }
+
+    /// Refreshes chain currentness and returns whether a replacement should
+    /// be prepared immediately.
+    ///
+    /// One-chain rollover keeps admission enabled because the exact frozen
+    /// work can still win on the other network. A replacement restores dual
+    /// coverage. If neither chain check succeeds, admission is disabled.
+    pub fn refresh_currentness(&self) -> bool {
+        match self.coordinator.refresh_pool_currentness() {
+            Ok(PoolGenerationCurrentness::Current) => {
+                self.admission_healthy.store(true, Ordering::Release);
+                false
+            }
+            Ok(PoolGenerationCurrentness::OneChainUnavailable) => {
+                self.admission_healthy.store(true, Ordering::Release);
+                true
+            }
+            Err(_) => {
+                self.admission_healthy.store(false, Ordering::Release);
+                true
+            }
+        }
     }
 
     /// Retires the underlying Wcash candidate after validation ownership is unique.
@@ -90,7 +118,7 @@ impl PoolBackendRetainedJob for NativePoolBackendRetainedJob {
     }
 
     fn is_healthy(&self) -> bool {
-        self.coordinator.assert_current().is_ok()
+        self.admission_healthy.load(Ordering::Acquire)
     }
 
     fn validate_share(
@@ -98,7 +126,7 @@ impl PoolBackendRetainedJob for NativePoolBackendRetainedJob {
         share: PoolBackendShareRequest<'_>,
     ) -> Result<PoolBackendValidatedShare, PoolBackendShareValidationError> {
         validate_retained_share(
-            &self.coordinator,
+            self,
             *share.time().as_bytes(),
             share.nonce().as_bytes(),
             share.solution().as_bytes(),
@@ -143,6 +171,35 @@ impl NativeValidationBackend for NativeMiningCoordinator {
             wcash: material.wcash().map(|winner| winner.block_bytes().to_vec()),
             zcash: material.zcash().map(|winner| winner.block_bytes().to_vec()),
         })
+    }
+}
+
+impl NativeValidationBackend for NativePoolBackendRetainedJob {
+    fn assert_current(&self) -> Result<(), MinerError> {
+        self.admission_healthy
+            .load(Ordering::Acquire)
+            .then_some(())
+            .ok_or_else(|| {
+                MinerError::StaleNativeJob(
+                    "neither merge-mined chain remains available for this job".to_string(),
+                )
+            })
+    }
+
+    fn validate_and_materialize(
+        &self,
+        header_time: [u8; 4],
+        nonce: &[u8; 32],
+        solution: &[u8; EQUIHASH_SOLUTION_BYTES],
+        share_target: Target,
+    ) -> Result<ValidatedWinnerBlocks, MinerError> {
+        NativeValidationBackend::validate_and_materialize(
+            &self.coordinator,
+            header_time,
+            nonce,
+            solution,
+            share_target,
+        )
     }
 }
 
