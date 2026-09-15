@@ -11,7 +11,11 @@
 //! the chain: the RPC ignores a template whose previous block hash isn't the current tip, and
 //! [`run()`] publishes a coinbase-only template for a new tip as soon as it sees one.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use jsonrpsee::core::RpcResult;
 use tokio::{
@@ -55,6 +59,19 @@ const NEW_TIP_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long [`run()`] waits before retrying, when Zebra isn't synced to the chain tip, or the state
 /// and the mempool disagree about the tip.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Number of future block heights whose zero-fee coinbases are proved in advance.
+///
+/// A private coinbase proof takes several seconds on typical pool hardware. One-height
+/// lookahead still stalls when two blocks arrive before that proof finishes. Keeping four
+/// height-specific proofs in flight gives a burst enough reserve while bounding CPU and memory.
+/// The proof for the nearest height is spawned first.
+const COINBASE_LOOKAHEAD_DEPTH: usize = 4;
+
+/// Log any wait large enough to affect a miner's next-job latency.
+const COINBASE_LOOKAHEAD_WAIT_WARNING: Duration = Duration::from_millis(250);
+
+type CoinbasePrecomputations = BTreeMap<Height, JoinHandle<TransactionTemplate<NegativeOrZero>>>;
 
 /// A block template for the block after the current chain tip, shared between [`run()`] and the
 /// `getblocktemplate` RPC.
@@ -170,9 +187,9 @@ pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
     Tip: ChainTip + Clone + Send + Sync + 'static,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
-    // The coinbase transaction for a coinbase-only block at this height, built while we're idle. A
-    // shielded coinbase takes seconds to prove, which is too slow to do after the tip changes.
-    let mut next_coinbase: Option<(Height, JoinHandle<TransactionTemplate<NegativeOrZero>>)> = None;
+    // Zero-fee coinbases for the next few heights, built while we're idle. A shielded coinbase
+    // takes seconds to prove, so a single future proof is not enough when blocks arrive in a burst.
+    let mut future_coinbases = CoinbasePrecomputations::new();
 
     // Whether the last build failed, so a failing spell is logged once rather than every second.
     let mut was_failing = false;
@@ -201,7 +218,8 @@ pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
         if let Some((tip_height, tip_hash)) = latest_chain_tip.best_tip_height_and_hash() {
             if !cache.holds_tip(tip_hash) {
                 if let Ok(height) = tip_height.next() {
-                    store_precomputed_coinbase(&mut next_coinbase, height, &coinbase_cache).await;
+                    store_precomputed_coinbase(&mut future_coinbases, height, &coinbase_cache)
+                        .await;
                 }
 
                 match build(
@@ -222,6 +240,16 @@ pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
                     }
                 }
             }
+        }
+
+        // Refill the rolling reserve before selecting mempool transactions. The current
+        // coinbase-only template is already published, so these proofs cannot delay miners, and
+        // starting them here maximizes their lead time before the next tip change.
+        if let Some(height) = latest_chain_tip
+            .best_tip_height()
+            .and_then(|tip_height| tip_height.next().ok())
+        {
+            start_precomputing_coinbases(&mut future_coinbases, &network, &miner_params, height);
         }
 
         // Build a template with mempool transactions, and give up if the tip changes while we're
@@ -282,16 +310,6 @@ pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
                 sleep(RETRY_DELAY).await;
                 continue;
             }
-        }
-
-        // Build the coinbase transaction for the block after next while we're idle, so the next tip
-        // change doesn't have to wait for a shielded coinbase proof.
-        if let Some(height) = latest_chain_tip
-            .best_tip_height()
-            .and_then(|tip_height| tip_height.next().ok())
-            .and_then(|next_height| next_height.next().ok())
-        {
-            start_precomputing_coinbase(&mut next_coinbase, &network, &miner_params, height);
         }
 
         // Refresh the template when the chain tip changes, or when the mempool has had time to
@@ -384,30 +402,61 @@ where
     .map_misc_error()
 }
 
-/// Starts building the coinbase transaction for a coinbase-only block at `height`, unless it is
-/// already built or being built.
-fn start_precomputing_coinbase(
-    next_coinbase: &mut Option<(Height, JoinHandle<TransactionTemplate<NegativeOrZero>>)>,
+/// Keeps a bounded rolling reserve of zero-fee coinbases after `current_template_height`.
+fn start_precomputing_coinbases(
+    future_coinbases: &mut CoinbasePrecomputations,
     network: &Network,
     miner_params: &MinerParams,
-    height: Height,
+    current_template_height: Height,
 ) {
-    if next_coinbase
-        .as_ref()
-        .is_some_and(|(precomputed_height, _)| *precomputed_height == height)
-    {
-        return;
+    let heights = coinbase_lookahead_heights(current_template_height);
+
+    // Reorgs and large height jumps can leave proofs that can no longer be consumed. Dropping a
+    // blocking task handle does not cancel a task that already started, but it does prevent stale
+    // results from entering the active cache.
+    future_coinbases.retain(|height, _| heights.contains(height));
+
+    for (priority, height) in heights.into_iter().enumerate() {
+        if future_coinbases.contains_key(&height) {
+            continue;
+        }
+
+        let (network, miner_params) = (network.clone(), miner_params.clone());
+        future_coinbases.insert(
+            height,
+            tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let coinbase = TransactionTemplate::new_coinbase(
+                    &network,
+                    height,
+                    &miner_params,
+                    Amount::zero(),
+                )
+                .expect("valid coinbase tx");
+                tracing::info!(
+                    ?height,
+                    priority,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "filled future coinbase proof reserve"
+                );
+                coinbase
+            }),
+        );
     }
+}
 
-    let (network, miner_params) = (network.clone(), miner_params.clone());
-
-    *next_coinbase = Some((
-        height,
-        tokio::task::spawn_blocking(move || {
-            TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero())
-                .expect("valid coinbase tx")
-        }),
-    ));
+/// Returns the next bounded set of valid heights after `current_template_height`.
+fn coinbase_lookahead_heights(current_template_height: Height) -> Vec<Height> {
+    let mut heights = Vec::with_capacity(COINBASE_LOOKAHEAD_DEPTH);
+    let mut height = current_template_height;
+    for _ in 0..COINBASE_LOOKAHEAD_DEPTH {
+        let Ok(next_height) = height.next() else {
+            break;
+        };
+        heights.push(next_height);
+        height = next_height;
+    }
+    heights
 }
 
 /// Moves the precomputed coinbase transaction into `coinbase_cache`, if it was built for `height`.
@@ -415,21 +464,41 @@ fn start_precomputing_coinbase(
 /// A coinbase built for another height has the wrong BIP-34 height and subsidy, so it is discarded:
 /// the chain advanced by more than one block, or there was a reorg.
 async fn store_precomputed_coinbase(
-    next_coinbase: &mut Option<(Height, JoinHandle<TransactionTemplate<NegativeOrZero>>)>,
+    future_coinbases: &mut CoinbasePrecomputations,
     height: Height,
     coinbase_cache: &CoinbaseCache,
 ) {
-    let Some((_, coinbase)) = next_coinbase
-        .take()
-        .filter(|(precomputed_height, _)| *precomputed_height == height)
-    else {
+    let Some(coinbase) = future_coinbases.remove(&height) else {
+        tracing::debug!(?height, "future coinbase proof was not reserved");
         return;
     };
 
+    let was_ready = coinbase.is_finished();
+    let wait_started = Instant::now();
     match coinbase.await {
         // A coinbase-only block pays no fees, so this also caches the zero-fee coinbase that
         // ZIP-317 transaction selection needs for its size and sigop limits.
-        Ok(coinbase) => coinbase_cache.store(height, Amount::zero(), coinbase),
+        Ok(coinbase) => {
+            let waited = wait_started.elapsed();
+            coinbase_cache.store(height, Amount::zero(), coinbase);
+            if waited >= COINBASE_LOOKAHEAD_WAIT_WARNING {
+                tracing::warn!(
+                    ?height,
+                    was_ready,
+                    waited_ms = waited.as_millis(),
+                    remaining_reserve = future_coinbases.len(),
+                    "waited for a future coinbase proof during tip rotation"
+                );
+            } else {
+                tracing::debug!(
+                    ?height,
+                    was_ready,
+                    waited_ms = waited.as_millis(),
+                    remaining_reserve = future_coinbases.len(),
+                    "consumed future coinbase proof"
+                );
+            }
+        }
         Err(error) => tracing::warn!(?error, "precomputed coinbase transaction task failed"),
     }
 }

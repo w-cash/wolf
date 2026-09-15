@@ -144,6 +144,88 @@ fn wcash_aux_transforms_are_isolated_from_the_cached_template() {
     );
 }
 
+/// Rapid consecutive tips must consume a reserve of distinct height-specific coinbases instead
+/// of waiting for a new private proof after every block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coinbase_lookahead_rolls_forward_without_duplicate_heights() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let miner_params = MinerParams::new(
+        &network,
+        Config {
+            miner_address: Some(
+                default_miner_address(network.kind(), &MinerAddressType::Transparent)
+                    .parse()
+                    .expect("hard-coded transparent address is valid"),
+            ),
+            ..Default::default()
+        },
+    )
+    .expect("the miner parameters are valid");
+    let current_template_height = block::Height(1_000_000);
+    let expected = coinbase_lookahead_heights(current_template_height);
+    assert_eq!(expected.len(), COINBASE_LOOKAHEAD_DEPTH);
+
+    let mut future_coinbases = CoinbasePrecomputations::new();
+    start_precomputing_coinbases(
+        &mut future_coinbases,
+        &network,
+        &miner_params,
+        current_template_height,
+    );
+    assert_eq!(
+        future_coinbases.keys().copied().collect::<Vec<_>>(),
+        expected
+    );
+
+    // Refill attempts for the same tip must retain the existing singleflight tasks.
+    start_precomputing_coinbases(
+        &mut future_coinbases,
+        &network,
+        &miner_params,
+        current_template_height,
+    );
+    assert_eq!(future_coinbases.len(), COINBASE_LOOKAHEAD_DEPTH);
+
+    let coinbase_cache = CoinbaseCache::default();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !future_coinbases.values().all(JoinHandle::is_finished) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the initial lookahead reserve must finish");
+
+    // Consume the entire initial reserve as a rapid four-block burst. Refilling after each tip
+    // must preserve every still-needed completed proof and add exactly one farther future height.
+    for next_height in expected {
+        assert!(
+            future_coinbases
+                .get(&next_height)
+                .is_some_and(JoinHandle::is_finished),
+            "each proof in the warmed burst reserve must already be complete",
+        );
+        store_precomputed_coinbase(&mut future_coinbases, next_height, &coinbase_cache).await;
+        assert!(
+            coinbase_cache.get(next_height, Amount::zero()).is_some(),
+            "the consumed proof must enter the shared coinbase cache",
+        );
+
+        start_precomputing_coinbases(&mut future_coinbases, &network, &miner_params, next_height);
+        assert_eq!(
+            future_coinbases.keys().copied().collect::<Vec<_>>(),
+            coinbase_lookahead_heights(next_height),
+            "advancing one height must preserve the remaining reserve and add one future proof",
+        );
+    }
+
+    // Do not leave blocking tasks detached from this test's runtime.
+    for (_, task) in future_coinbases {
+        task.await.expect("future coinbase proof task must finish");
+    }
+}
+
 /// Checks that a subscription taken before a template is published still reports it.
 ///
 /// `getblocktemplate` reads the cache, decides the client already has that template, and only then
