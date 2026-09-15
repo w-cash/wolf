@@ -14,8 +14,12 @@ use wcash_zcash_aux::{
     parent_payout_address_commitment, sha256d_merkle_root, validate_miner_data_commitment,
     ParentBlockHash, Target, MAX_COINBASE_BYTES,
 };
-use zcash_address::{unified::Receiver, ZcashAddress};
+#[cfg(test)]
+use zcash_address::unified::Receiver;
+use zcash_address::ZcashAddress;
 use zcash_protocol::consensus::NetworkType;
+#[cfg(test)]
+use zebra_chain::transparent;
 use zebra_chain::{
     block::{
         self,
@@ -29,7 +33,6 @@ use zebra_chain::{
     },
     serialization::{BytesInDisplayOrder, DateTime32, ZcashDeserializeInto, ZcashSerialize},
     transaction::{AuthDigest, Hash as TransactionHash, Transaction},
-    transparent,
     work::{
         difficulty::{CompactDifficulty, ExpandedDifficulty},
         equihash::Solution,
@@ -352,58 +355,17 @@ impl NativeZcashProvider {
         auxiliary_nonce: u32,
     ) -> Result<NativePreparedJob, MinerError> {
         let child_display = display_hex(child_block_hash);
-        // Both nodes can build their height-specific shielded coinbases at the
-        // same time. The independent template does not depend on the Wcash
-        // commitment, and the exact shared predecessor is checked below before
-        // either result is admitted.
-        let (template, validator_payout_templates): (
-            BlockTemplateResponse,
-            Vec<BlockTemplateResponse>,
-        ) = thread::scope(|scope| -> Result<_, MinerError> {
-            let template_worker = scope.spawn(|| {
-                self.template_node.call(
-                    "getblocktemplate",
-                    json!([{
-                        "mode": "template",
-                        "capabilities": ["coinbasetxn", "proposal"],
-                        "wcashaux": {
-                            "blockhash": child_display,
-                            "nonce": auxiliary_nonce,
-                        }
-                    }]),
-                )
-            });
-            let validator_workers = self
-                .proposal_validators
-                .iter()
-                .map(|validator| {
-                    scope.spawn(move || {
-                        validator.call(
-                            "getblocktemplate",
-                            json!([{
-                                "mode": "template",
-                                "capabilities": ["coinbasetxn"],
-                            }]),
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            let template = template_worker.join().map_err(|_| {
-                MinerError::RpcProtocol("parent template worker panicked".to_string())
-            })??;
-            let validator_payout_templates = validator_workers
-                .into_iter()
-                .map(|worker| {
-                    worker.join().map_err(|_| {
-                        MinerError::RpcProtocol(
-                            "parent payout-template worker panicked".to_string(),
-                        )
-                    })?
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((template, validator_payout_templates))
-        })?;
+        let template: BlockTemplateResponse = self.template_node.call(
+            "getblocktemplate",
+            json!([{
+                "mode": "template",
+                "capabilities": ["coinbasetxn", "proposal"],
+                "wcashaux": {
+                    "blockhash": child_display,
+                    "nonce": auxiliary_nonce,
+                }
+            }]),
+        )?;
 
         let actual_parent_payout_commitment: [u8; 32] = parse_template_hex(
             template
@@ -423,10 +385,6 @@ impl NativeZcashProvider {
         }
 
         let template_prewarm = (template.height, template.long_poll_id.clone());
-        let validator_prewarms = validator_payout_templates
-            .iter()
-            .map(|template| (template.height, template.long_poll_id.clone()))
-            .collect::<Vec<_>>();
 
         let prepared = NativePreparedJob::from_template(
             child_block_hash,
@@ -440,17 +398,15 @@ impl NativeZcashProvider {
 
         // Check the same predecessor on every node before proposal validation.
         self.require_tip(&self.template_node, &prepared)?;
-        for (validator, payout_template) in self
-            .proposal_validators
-            .iter()
-            .zip(validator_payout_templates)
-        {
+        for validator in &self.proposal_validators {
             self.require_tip(validator, &prepared)?;
-            self.validate_current_independent_payout_template(
-                validator,
-                &prepared,
-                &payout_template,
-            )?;
+            // Local decoding above proves that the exact coinbase pays the
+            // configured recipient and at least the consensus miner subsidy.
+            // The independent node then checks that exact block in proposal
+            // mode, including the subsidy, fees, and mandatory funding outputs.
+            // Asking it to build a second shielded coinbase would duplicate the
+            // expensive proof and delay the next ASIC job without adding a new
+            // payout or consensus invariant.
             let result = validator.call_value(
                 "getblocktemplate",
                 json!([{
@@ -478,31 +434,14 @@ impl NativeZcashProvider {
         // Keep one ordinary long poll open on each parent node. Zebra proves the
         // next height's shielded coinbase while it waits for a tip change, so a
         // winning share can rotate directly onto cached, proof-complete work.
-        self.start_coinbase_prewarms(template_prewarm, validator_prewarms);
-
-        Ok(prepared)
-    }
-
-    fn start_coinbase_prewarms(
-        &self,
-        template_prewarm: (u32, Option<String>),
-        validator_prewarms: Vec<(u32, Option<String>)>,
-    ) {
         self.start_coinbase_prewarm(
             0,
             self.template_node.clone(),
             template_prewarm.0,
             template_prewarm.1,
         );
-        for (index, (validator, (template_height, long_poll_id))) in self
-            .proposal_validators
-            .iter()
-            .cloned()
-            .zip(validator_prewarms)
-            .enumerate()
-        {
-            self.start_coinbase_prewarm(index + 1, validator, template_height, long_poll_id);
-        }
+
+        Ok(prepared)
     }
 
     fn start_coinbase_prewarm(
@@ -518,6 +457,7 @@ impl NativeZcashProvider {
         client.prewarm_next_coinbase(index, template_height, long_poll_id);
     }
 
+    #[cfg(test)]
     fn validate_current_independent_payout_template(
         &self,
         validator: &ZebraRpcClient,
@@ -1892,6 +1832,7 @@ fn decode_template_coinbase(template: &TransactionTemplate) -> Result<Transactio
     Ok(coinbase)
 }
 
+#[cfg(test)]
 fn validate_independent_parent_payout_template(
     prepared: &NativePreparedJob,
     validator_template: &BlockTemplateResponse,
@@ -2029,6 +1970,7 @@ fn validate_parent_miner_payout(
 /// Funding-stream and lockbox outputs are independent of those fees and must still
 /// match exactly. The exact prepared block is subsequently checked in proposal
 /// mode, which enforces its consensus subsidy and fee total.
+#[cfg(test)]
 fn validate_matching_non_payout_transparent_outputs(
     prepared_outputs: &[transparent::Output],
     validator_outputs: &[transparent::Output],
@@ -2047,6 +1989,7 @@ fn validate_matching_non_payout_transparent_outputs(
     Ok(())
 }
 
+#[cfg(test)]
 fn non_payout_transparent_outputs<'a>(
     outputs: &'a [transparent::Output],
     expected_address: &ZcashAddress,
@@ -2061,6 +2004,7 @@ fn non_payout_transparent_outputs<'a>(
         .collect()
 }
 
+#[cfg(test)]
 fn transparent_output_receiver(output: &transparent::Output) -> Result<Receiver, MinerError> {
     // The selected network only changes textual address encoding; the receiver
     // payload recovered from a P2PKH or P2SH script is network-independent.

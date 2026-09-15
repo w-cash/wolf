@@ -43,6 +43,9 @@ use zebra_chain::block::genesis::WCASH_TESTNET_GENESIS_HASH;
 
 const DEFAULT_BIND: &str = "127.0.0.1:28237";
 const DEFAULT_SHARE_JOURNAL: &str = ".wcash-share-journal-v2.jsonl";
+const INITIAL_NATIVE_PREPARATION_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_NATIVE_PREPARATION_BACKOFF: Duration = Duration::from_secs(60);
+const TIP_RACE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 const WCASH_RPC_USERNAME: &str = "WCASH_RPC_USERNAME";
 const WCASH_RPC_PASSWORD: &str = "WCASH_RPC_PASSWORD";
@@ -564,7 +567,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     )?;
     drop(listener_failure_tx);
 
-    let mut preparation_backoff = Duration::from_secs(1);
+    let mut preparation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
     loop {
         if shutdown.load(Ordering::Acquire) {
             listeners.request_shutdown()?;
@@ -595,16 +598,17 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
         }
         let coordinator = match supervisor.prepare_generation() {
             Ok(coordinator) => {
-                preparation_backoff = Duration::from_secs(1);
+                preparation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
                 coordinator
             }
             Err(error) if is_retryable_native_preparation_error(&error) => {
+                let retry_delay = native_preparation_retry_delay(&error, preparation_backoff);
                 eprintln!(
-                    "transient native backend preparation failure: {error}; retrying in {} second(s)",
-                    preparation_backoff.as_secs()
+                    "transient native backend preparation failure: {error}; retrying in {} millisecond(s)",
+                    retry_delay.as_millis()
                 );
                 match wait_for_pool_backend_retry(
-                    preparation_backoff,
+                    retry_delay,
                     shutdown.as_ref(),
                     &listener_failure_rx,
                 ) {
@@ -626,7 +630,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                         .into());
                     }
                 }
-                preparation_backoff = (preparation_backoff * 2).min(Duration::from_secs(60));
+                preparation_backoff = next_native_preparation_backoff(&error, preparation_backoff);
                 continue;
             }
             Err(error) => return Err(error.into()),
@@ -1120,21 +1124,22 @@ fn run_native_server(
     } else {
         "native-serve-once"
     };
-    let mut preparation_backoff = Duration::from_secs(1);
+    let mut preparation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
 
     loop {
         let mut coordinator = match supervisor.prepare_generation() {
             Ok(coordinator) => {
-                preparation_backoff = Duration::from_secs(1);
+                preparation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
                 coordinator
             }
             Err(error) if automatic_rotation && is_retryable_native_preparation_error(&error) => {
+                let retry_delay = native_preparation_retry_delay(&error, preparation_backoff);
                 eprintln!(
-                    "transient native job preparation failure: {error}; retrying in {} second(s)",
-                    preparation_backoff.as_secs()
+                    "transient native job preparation failure: {error}; retrying in {} millisecond(s)",
+                    retry_delay.as_millis()
                 );
-                thread::sleep(preparation_backoff);
-                preparation_backoff = (preparation_backoff * 2).min(Duration::from_secs(60));
+                thread::sleep(retry_delay);
+                preparation_backoff = next_native_preparation_backoff(&error, preparation_backoff);
                 continue;
             }
             Err(error) => return Err(error.into()),
@@ -1266,6 +1271,24 @@ fn is_retryable_native_preparation_error(error: &MinerError) -> bool {
         | MinerError::ChildTipMismatch { .. }
         | MinerError::StaleNativeJob(_) => true,
         _ => false,
+    }
+}
+
+fn native_preparation_retry_delay(error: &MinerError, backoff: Duration) -> Duration {
+    match error {
+        MinerError::ParentTipMismatch { .. } | MinerError::ChildTipMismatch { .. } => {
+            TIP_RACE_RETRY_DELAY
+        }
+        _ => backoff,
+    }
+}
+
+fn next_native_preparation_backoff(error: &MinerError, backoff: Duration) -> Duration {
+    match error {
+        MinerError::ParentTipMismatch { .. } | MinerError::ChildTipMismatch { .. } => {
+            INITIAL_NATIVE_PREPARATION_BACKOFF
+        }
+        _ => (backoff * 2).min(MAX_NATIVE_PREPARATION_BACKOFF),
     }
 }
 
@@ -2455,6 +2478,41 @@ mod tests {
                 "{error} must stop the supervisor"
             );
         }
+    }
+
+    #[test]
+    fn preparation_retry_uses_short_fixed_delay_for_tip_races() {
+        let parent_tip_race = MinerError::ParentTipMismatch {
+            expected: "parent-a".to_string(),
+            endpoint: "validator".to_string(),
+            actual: "parent-b".to_string(),
+        };
+        let child_tip_race = MinerError::ChildTipMismatch {
+            expected: "child-a".to_string(),
+            endpoint: "child".to_string(),
+            actual: "child-b".to_string(),
+        };
+
+        for error in [&parent_tip_race, &child_tip_race] {
+            assert_eq!(
+                native_preparation_retry_delay(error, Duration::from_secs(32)),
+                TIP_RACE_RETRY_DELAY
+            );
+            assert_eq!(
+                next_native_preparation_backoff(error, Duration::from_secs(32)),
+                INITIAL_NATIVE_PREPARATION_BACKOFF
+            );
+        }
+
+        let unavailable = rpc_error(Some(-28));
+        assert_eq!(
+            native_preparation_retry_delay(&unavailable, Duration::from_secs(32)),
+            Duration::from_secs(32)
+        );
+        assert_eq!(
+            next_native_preparation_backoff(&unavailable, Duration::from_secs(32)),
+            MAX_NATIVE_PREPARATION_BACKOFF
+        );
     }
 
     fn rpc_error(code: Option<i64>) -> MinerError {
