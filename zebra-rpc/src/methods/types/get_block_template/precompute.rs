@@ -19,7 +19,7 @@ use std::{
 
 use jsonrpsee::core::RpcResult;
 use tokio::{
-    sync::watch,
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -63,15 +63,120 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// Number of future block heights whose zero-fee coinbases are proved in advance.
 ///
 /// A private coinbase proof takes several seconds on typical pool hardware. One-height
-/// lookahead still stalls when two blocks arrive before that proof finishes. Keeping four
-/// height-specific proofs in flight gives a burst enough reserve while bounding CPU and memory.
-/// The proof for the nearest height is spawned first.
-const COINBASE_LOOKAHEAD_DEPTH: usize = 4;
+/// lookahead still stalls when two blocks arrive before that proof finishes. Keeping eight
+/// height-specific proofs in a strict nearest-height-first queue absorbs a burst while bounding
+/// CPU and memory. A single proof worker avoids making the immediately needed height compete with
+/// speculative later heights for the same proving threads.
+const COINBASE_LOOKAHEAD_DEPTH: usize = 8;
 
 /// Log any wait large enough to affect a miner's next-job latency.
 const COINBASE_LOOKAHEAD_WAIT_WARNING: Duration = Duration::from_millis(250);
 
-type CoinbasePrecomputations = BTreeMap<Height, JoinHandle<TransactionTemplate<NegativeOrZero>>>;
+type PrecomputedCoinbase = TransactionTemplate<NegativeOrZero>;
+
+struct CoinbasePrecomputeJob {
+    height: Height,
+    priority: usize,
+    queued_at: Instant,
+    network: Network,
+    miner_params: MinerParams,
+    result: oneshot::Sender<PrecomputedCoinbase>,
+}
+
+struct CoinbasePrecomputations {
+    tasks: BTreeMap<Height, JoinHandle<PrecomputedCoinbase>>,
+    jobs: mpsc::UnboundedSender<CoinbasePrecomputeJob>,
+    worker: JoinHandle<()>,
+}
+
+impl CoinbasePrecomputations {
+    fn new() -> Self {
+        let (jobs, mut queued_jobs) = mpsc::unbounded_channel::<CoinbasePrecomputeJob>();
+        let worker = tokio::spawn(async move {
+            while let Some(job) = queued_jobs.recv().await {
+                // Reorg pruning aborts the receiver for work that has not started yet.
+                if job.result.is_closed() {
+                    continue;
+                }
+
+                let queue_ms = job.queued_at.elapsed().as_millis();
+                let proof_started = Instant::now();
+                let network = job.network;
+                let miner_params = job.miner_params;
+                let height = job.height;
+                let proof = tokio::task::spawn_blocking(move || {
+                    TransactionTemplate::new_coinbase(
+                        &network,
+                        height,
+                        &miner_params,
+                        Amount::zero(),
+                    )
+                    .expect("valid coinbase tx")
+                })
+                .await;
+
+                match proof {
+                    Ok(coinbase) => {
+                        tracing::info!(
+                            ?height,
+                            priority = job.priority,
+                            queue_ms,
+                            proof_ms = proof_started.elapsed().as_millis(),
+                            "filled future coinbase proof reserve"
+                        );
+                        let _ = job.result.send(coinbase);
+                    }
+                    Err(error) => {
+                        tracing::warn!(?height, ?error, "future coinbase proof worker failed")
+                    }
+                }
+            }
+        });
+
+        Self {
+            tasks: BTreeMap::new(),
+            jobs,
+            worker,
+        }
+    }
+
+    fn enqueue(
+        &mut self,
+        height: Height,
+        priority: usize,
+        network: Network,
+        miner_params: MinerParams,
+    ) {
+        let (result, ready) = oneshot::channel();
+        self.jobs
+            .send(CoinbasePrecomputeJob {
+                height,
+                priority,
+                queued_at: Instant::now(),
+                network,
+                miner_params,
+                result,
+            })
+            .expect("the coinbase proof worker lives as long as its queue");
+        self.tasks.insert(
+            height,
+            tokio::spawn(async move {
+                ready
+                    .await
+                    .expect("the coinbase proof worker returns every live queued job")
+            }),
+        );
+    }
+}
+
+impl Drop for CoinbasePrecomputations {
+    fn drop(&mut self) {
+        for task in self.tasks.values() {
+            task.abort();
+        }
+        self.worker.abort();
+    }
+}
 
 /// A block template for the block after the current chain tip, shared between [`run()`] and the
 /// `getblocktemplate` RPC.
@@ -414,34 +519,20 @@ fn start_precomputing_coinbases(
     // Reorgs and large height jumps can leave proofs that can no longer be consumed. Dropping a
     // blocking task handle does not cancel a task that already started, but it does prevent stale
     // results from entering the active cache.
-    future_coinbases.retain(|height, _| heights.contains(height));
+    future_coinbases.tasks.retain(|height, task| {
+        let keep = heights.contains(height);
+        if !keep {
+            task.abort();
+        }
+        keep
+    });
 
     for (priority, height) in heights.into_iter().enumerate() {
-        if future_coinbases.contains_key(&height) {
+        if future_coinbases.tasks.contains_key(&height) {
             continue;
         }
 
-        let (network, miner_params) = (network.clone(), miner_params.clone());
-        future_coinbases.insert(
-            height,
-            tokio::task::spawn_blocking(move || {
-                let started = Instant::now();
-                let coinbase = TransactionTemplate::new_coinbase(
-                    &network,
-                    height,
-                    &miner_params,
-                    Amount::zero(),
-                )
-                .expect("valid coinbase tx");
-                tracing::info!(
-                    ?height,
-                    priority,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "filled future coinbase proof reserve"
-                );
-                coinbase
-            }),
-        );
+        future_coinbases.enqueue(height, priority, network.clone(), miner_params.clone());
     }
 }
 
@@ -468,7 +559,7 @@ async fn store_precomputed_coinbase(
     height: Height,
     coinbase_cache: &CoinbaseCache,
 ) {
-    let Some(coinbase) = future_coinbases.remove(&height) else {
+    let Some(coinbase) = future_coinbases.tasks.remove(&height) else {
         tracing::debug!(?height, "future coinbase proof was not reserved");
         return;
     };
@@ -486,7 +577,7 @@ async fn store_precomputed_coinbase(
                     ?height,
                     was_ready,
                     waited_ms = waited.as_millis(),
-                    remaining_reserve = future_coinbases.len(),
+                    remaining_reserve = future_coinbases.tasks.len(),
                     "waited for a future coinbase proof during tip rotation"
                 );
             } else {
@@ -494,7 +585,7 @@ async fn store_precomputed_coinbase(
                     ?height,
                     was_ready,
                     waited_ms = waited.as_millis(),
-                    remaining_reserve = future_coinbases.len(),
+                    remaining_reserve = future_coinbases.tasks.len(),
                     "consumed future coinbase proof"
                 );
             }

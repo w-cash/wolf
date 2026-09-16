@@ -175,7 +175,7 @@ async fn coinbase_lookahead_rolls_forward_without_duplicate_heights() {
         current_template_height,
     );
     assert_eq!(
-        future_coinbases.keys().copied().collect::<Vec<_>>(),
+        future_coinbases.tasks.keys().copied().collect::<Vec<_>>(),
         expected
     );
 
@@ -186,11 +186,11 @@ async fn coinbase_lookahead_rolls_forward_without_duplicate_heights() {
         &miner_params,
         current_template_height,
     );
-    assert_eq!(future_coinbases.len(), COINBASE_LOOKAHEAD_DEPTH);
+    assert_eq!(future_coinbases.tasks.len(), COINBASE_LOOKAHEAD_DEPTH);
 
     let coinbase_cache = CoinbaseCache::default();
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !future_coinbases.values().all(JoinHandle::is_finished) {
+        while !future_coinbases.tasks.values().all(JoinHandle::is_finished) {
             tokio::task::yield_now().await;
         }
     })
@@ -202,6 +202,7 @@ async fn coinbase_lookahead_rolls_forward_without_duplicate_heights() {
     for next_height in expected {
         assert!(
             future_coinbases
+                .tasks
                 .get(&next_height)
                 .is_some_and(JoinHandle::is_finished),
             "each proof in the warmed burst reserve must already be complete",
@@ -214,14 +215,14 @@ async fn coinbase_lookahead_rolls_forward_without_duplicate_heights() {
 
         start_precomputing_coinbases(&mut future_coinbases, &network, &miner_params, next_height);
         assert_eq!(
-            future_coinbases.keys().copied().collect::<Vec<_>>(),
+            future_coinbases.tasks.keys().copied().collect::<Vec<_>>(),
             coinbase_lookahead_heights(next_height),
             "advancing one height must preserve the remaining reserve and add one future proof",
         );
     }
 
     // Do not leave blocking tasks detached from this test's runtime.
-    for (_, task) in future_coinbases {
+    while let Some((_, task)) = future_coinbases.tasks.pop_first() {
         task.await.expect("future coinbase proof task must finish");
     }
 }
