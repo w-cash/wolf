@@ -74,21 +74,17 @@ fn v4_transactions_remain_valid_in_nu6_3() {
 }
 
 #[test]
-fn wcash_testnet_v1_requires_v6() {
-    assert_eq!(
-        TxVersion::suggested_for_branch(BranchId::WcashTestnetV1),
-        TxVersion::V6
-    );
-    assert_eq!(
-        TxVersion::suggested_for_branch(BranchId::WcashRegtestV1),
-        TxVersion::V6
-    );
-    assert!(!TxVersion::V4.valid_in_branch(BranchId::WcashTestnetV1));
-    assert!(!TxVersion::V5.valid_in_branch(BranchId::WcashTestnetV1));
-    assert!(TxVersion::V6.valid_in_branch(BranchId::WcashTestnetV1));
-    assert!(!TxVersion::V4.valid_in_branch(BranchId::WcashRegtestV1));
-    assert!(!TxVersion::V5.valid_in_branch(BranchId::WcashRegtestV1));
-    assert!(TxVersion::V6.valid_in_branch(BranchId::WcashRegtestV1));
+fn wcash_domains_require_v6() {
+    for branch in [
+        BranchId::WcashTestnetV1,
+        BranchId::WcashTestnetV2,
+        BranchId::WcashRegtestV1,
+    ] {
+        assert_eq!(TxVersion::suggested_for_branch(branch), TxVersion::V6);
+        assert!(!TxVersion::V4.valid_in_branch(branch));
+        assert!(!TxVersion::V5.valid_in_branch(branch));
+        assert!(TxVersion::V6.valid_in_branch(branch));
+    }
 }
 
 #[cfg(all(test, not(zcash_unstable = "nu7")))]

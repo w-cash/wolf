@@ -10,8 +10,8 @@ declare -a child_pids=()
 wcash_rpc=http://127.0.0.1:38232
 zcash_template_rpc=http://127.0.0.1:18232
 zcash_validator_rpc=http://127.0.0.1:18242
-wcash_genesis=0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a
-wcash_launch_target=0000008859000000000000000000000000000000000000000000000000000000
+wcash_genesis=efffff94fbd682f4a55e0abdb74048208491b7312ce917324ea333953d640ed7
+wcash_launch_target=00002fabe8000000000000000000000000000000000000000000000000000000
 wcash_payout_address=WT6kWkxJzyp4LdwrjtvvuVFRbkMhH2SsBeq
 wallet_sync_batch_size=16
 
@@ -238,7 +238,7 @@ assert result["coinbasevalue"] == 625_000_000, result
 assert len(result["hash"]) == 64, result
 assert len(result["retiretoken"]) == 64, result
 assert result["target"] == sys.argv[3], result
-assert result["bits"] == "1e008859", result
+assert result["bits"] == "1e2fabe8", result
 assert result["data"], result
 PY
 

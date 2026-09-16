@@ -37,7 +37,7 @@ impl WalletNetwork {
     /// Returns this network's transaction signature and transaction-ID domain.
     pub const fn branch_id(self) -> BranchId {
         match self {
-            Self::Testnet => BranchId::WcashTestnetV1,
+            Self::Testnet => BranchId::WcashTestnetV2,
             Self::Regtest => BranchId::WcashRegtestV1,
         }
     }

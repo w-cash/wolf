@@ -14,12 +14,12 @@ fn wcash_builder_rejects_standard_nu6_3_branch() {
     let build_config = || BuildConfig::Coinbase { miner_data: None };
 
     for (params, expected_branch) in [
-        (Network::new_wcash_testnet(), BranchId::WcashTestnetV1),
+        (Network::new_wcash_testnet(), BranchId::WcashTestnetV2),
         (Network::new_wcash_regtest(), BranchId::WcashRegtestV1),
     ] {
         let wrong_wcash_branch = match expected_branch {
-            BranchId::WcashTestnetV1 => BranchId::WcashRegtestV1,
-            BranchId::WcashRegtestV1 => BranchId::WcashTestnetV1,
+            BranchId::WcashTestnetV2 => BranchId::WcashRegtestV1,
+            BranchId::WcashRegtestV1 => BranchId::WcashTestnetV2,
             _ => unreachable!("only Wcash branches are in this test table"),
         };
         Builder::new_with_branch_id(
@@ -54,12 +54,26 @@ fn wcash_builder_rejects_standard_nu6_3_branch() {
         };
         assert_eq!(cross_network.expected(), expected_branch);
         assert_eq!(cross_network.actual(), wrong_wcash_branch);
+
+        if expected_branch == BranchId::WcashTestnetV2 {
+            let retired_v1 = match Builder::new_with_branch_id(
+                Network::new_wcash_testnet(),
+                target_height,
+                BranchId::WcashTestnetV1,
+                build_config(),
+            ) {
+                Ok(_) => panic!("the retired Testnet v1 transaction domain must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(retired_v1.expected(), BranchId::WcashTestnetV2);
+            assert_eq!(retired_v1.actual(), BranchId::WcashTestnetV1);
+        }
     }
 }
 
 #[test]
 fn wcash_pczt_creator_preserves_v6_custom_branch() {
-    for expected_branch in [BranchId::WcashTestnetV1, BranchId::WcashRegtestV1] {
+    for expected_branch in [BranchId::WcashTestnetV2, BranchId::WcashRegtestV1] {
         let branch_id = u32::from(expected_branch);
         let pczt = Creator::new(branch_id, 2, 133, Some([0; 32]), Some([0; 32]))
             .expect("the Wcash branch must be recognized")

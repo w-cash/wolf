@@ -7,7 +7,7 @@ a claim that mainnet or community-pool infrastructure is production ready.
 `WEC` denotes the future mainnet currency. Testnet and regtest balances use the
 valueless display ticker `TWC` (Test Wcash). The ticker is not serialized by
 consensus: amounts remain integer zatoshi, and the frozen testing genesis
-statements and hashes are unchanged.
+statement remains unchanged; a new testnet target produces a new genesis hash.
 
 ## Activation status
 
@@ -20,8 +20,8 @@ The built-in Testnet profile freezes Bitcoin mainnet block 965,900, hash
 `0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851`.
 The release vector records Bitcoin height 966,011, or 112 confirmations counting
 the anchor block. Its complete Wcash genesis block ID is
-`0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a`.
-Its `Wcash/testnet/v5` P2P magic is `95d14004`; its default P2P and
+`efffff94fbd682f4a55e0abdb74048208491b7312ce917324ea333953d640ed7`.
+Its `Wcash/testnet/v6` P2P magic is `00d1ca27`; its default P2P and
 recommended loopback RPC ports are 38233 and 38232. It never inherits Zcash's
 DNS seeds.
 
@@ -47,10 +47,11 @@ not a consensus or runtime input.
 
 ### Transaction version and replay domain
 
-Wcash Testnet v1 uses consensus branch ID `0xb3cfd27e`; isolated Wcash Regtest
-uses the separate ID `0xc3a6678a`. Both select NU6.3 / Ironwood semantics, while
-standard Zcash NU6.3 keeps `0x37a5165b`. The selected Wcash ID is carried in
-every post-genesis version-6 transaction and is used by transaction IDs,
+Wcash Testnet v2 uses consensus branch ID `0xa8d6c929`; retired Testnet v1 used
+`0xb3cfd27e`, and isolated Wcash Regtest uses the separate ID `0xc3a6678a`.
+The active testing domains select NU6.3 / Ironwood semantics, while standard
+Zcash NU6.3 keeps `0x37a5165b`. The selected Wcash ID is carried in every
+post-genesis version-6 transaction and is used by transaction IDs,
 signature hashes, shielded authorization, parsing, block checks, and
 chain-history commitments. Validators compare the exact network-specific ID
 rather than treating the shared NU6.3 feature set as sufficient.
@@ -115,14 +116,14 @@ belongs to the miner coinbase and is subject to the coinbase payout-mode rules b
 
 The target spacing is 75 seconds. Regtest deliberately uses its fixed
 proof-of-work limit. The built-in Testnet profile starts at compact target
-`0x1e008859` (expanded target `00000088590000…`). That launch target expects
-approximately one block per 75 seconds at 420,000 Equihash solutions per
-second, instead of allowing a production ASIC to flood one child candidate
-with valid witnesses. Testnet uses the inherited damped 17-block retarget from launch. A
+`0x1e2fabe8` (expanded target `00002fabe80000…`). This bootstrap target is
+exactly 50 times the target encoded by the observed Zcash Testnet compact target
+`0x1e00f414`, deliberately exercising Wcash-only AuxPoW winners. Testnet uses
+the inherited damped 17-block retarget from launch. A
 candidate strictly more than 450 seconds after its predecessor may use the
 same Testnet proof-of-work limit; exactly 450 seconds does not trigger the rule.
-The limit is calibrated for one 420 KSol/s Equihash ASIC: Testnet has no
-CPU-easy fallback, so comparable launch hash rate is a liveness prerequisite.
+The limit is a test-only asymmetry profile and is not a proposed mainnet launch
+target.
 The maximum block-time rule is enforced from height 1, and template construction
 evaluates both rules using the candidate height, including the height-1 boundary.
 These public-testnet boundary conditions have frozen unit tests, but long-running

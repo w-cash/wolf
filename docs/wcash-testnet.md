@@ -8,13 +8,14 @@ testnet coins must have no monetary value.
 
 User-facing Testnet balances use `TWC` (Test Wcash) rather than mainnet `WEC`.
 This label does not alter the eight-decimal integer-zatoshi encoding.
-The frozen genesis statement retains its historical `WEC` text, so the genesis
-bytes and hash listed below remain unchanged.
+The genesis statement retains its historical `WEC` text. Testnet v2 changes
+the proof-of-work limit, so its frozen genesis header and hash are distinct
+from the retired v1 chain.
 
 > **Transaction-domain test boundary:** Wcash Testnet accepts only post-genesis V6
-> transactions carrying its chain-specific branch ID `0xb3cfd27e`. Zcash
-> domains, the distinct Wcash Regtest domain `0xc3a6678a`, and V1-V5 are
-> rejected. The controlled private-transfer and
+> transactions carrying its chain-specific branch ID `0xa8d6c929`. Zcash,
+> the retired Testnet v1 domain `0xb3cfd27e`, the distinct Wcash Regtest domain
+> `0xc3a6678a`, and V1-V5 are rejected. The controlled private-transfer and
 > transparent-coinbase shielding lifecycles have passed on isolated Regtest, but
 > no coin has monetary value and those local tests do not
 > make the wallet, a public Testnet, a mining pool, or payout/settlement system
@@ -28,9 +29,9 @@ The built-in `WcashTestnet` network commits to Bitcoin mainnet block 965,900:
 Bitcoin block:       965900
 Bitcoin block hash:  0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851
 Anchor audit height: 966011 (112 confirmations counting the anchor)
-Wcash genesis hash:  0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a
-P2P identity:        Wcash/testnet/v5
-P2P magic:           95d14004
+Wcash genesis hash:  efffff94fbd682f4a55e0abdb74048208491b7312ce917324ea333953d640ed7
+P2P identity:        Wcash/testnet/v6
+P2P magic:           00d1ca27
 P2P port:            38233
 Suggested RPC port:  38232 (loopback only)
 ```
@@ -40,7 +41,7 @@ Wcash genesis bytes, and derived hash are frozen test vectors in the source.
 Consensus never fetches or replaces an anchor at runtime. Testnet, regtest, and
 Zcash use different genesis hashes, P2P magic, ports, and peer-cache paths.
 Wcash configuration also rejects inherited Zcash DNS seeds. The corrected
-Testnet identity stores state under `wcashtestnet-v5` and peers under its
+Testnet identity stores state under `wcashtestnet-v6` and peers under its
 matching cache namespace, so earlier profile data is not loaded. Operators must
 start from the new empty paths and must not copy or rename older Wcash state
 into them.
@@ -105,13 +106,13 @@ external audit snapshot only. Nodes do not trust explorers: runtime consensus
 uses only the immutable header and derived values compiled into this release.
 
 Testnet activates NU6.3 at height 1, uses a 75-second target spacing, starts at
-the compact proof-of-work limit `0x1e008859` (expanded target
-`00000088590000…`), calibrated to approximately 75 seconds at 420,000 Equihash
-solutions per second, and enables normal damped retargeting from launch. A block
-more than 450 seconds after its predecessor may use the testnet minimum
+the compact proof-of-work limit `0x1e2fabe8` (expanded target
+`00002fabe80000…`), exactly 50 times the target encoded by the observed Zcash
+Testnet compact target `0x1e00f414`, and enables normal damped retargeting from
+launch. A block more than 450 seconds after its predecessor may use the testnet minimum
 difficulty. The boundary is strict: exactly 450 seconds is not enough. That
-minimum is the same ASIC-calibrated launch limit, not a CPU-easy recovery target.
-Comparable launch hash rate is therefore a Testnet liveness prerequisite.
+minimum is the same bootstrap limit. This deliberately produces many Wcash-only
+AuxPoW blocks per Zcash winner while the test ASIC dominates Zcash Testnet.
 
 ## Full Z15 coverage of both networks
 
