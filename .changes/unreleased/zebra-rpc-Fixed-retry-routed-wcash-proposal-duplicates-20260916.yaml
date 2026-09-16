@@ -1,0 +1,3 @@
+kind: Fixed
+body: Retry Wcash auxiliary candidate proposal races when the block verifier reports a duplicate through its router error.
+time: 2026-09-16T12:25:00.000000000Z

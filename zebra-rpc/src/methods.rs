@@ -189,8 +189,11 @@ fn is_duplicate_wcash_aux_proposal_error(
     error: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> bool {
     error
-        .downcast_ref::<zebra_consensus::VerifyBlockError>()
-        .is_some_and(zebra_consensus::VerifyBlockError::is_duplicate_request)
+        .downcast_ref::<zebra_consensus::RouterError>()
+        .is_some_and(zebra_consensus::RouterError::is_duplicate_request)
+        || error
+            .downcast_ref::<zebra_consensus::VerifyBlockError>()
+            .is_some_and(zebra_consensus::VerifyBlockError::is_duplicate_request)
 }
 
 pub(super) const PARAM_TXID_DESC: &str = "The transaction ID to return.";
@@ -5162,19 +5165,35 @@ mod wcash_aux_proposal_error_tests {
     #[test]
     fn duplicate_candidate_errors_are_retryable_without_reclassifying_rejections() {
         let hash = block::Hash::from([0; 32]);
-        let duplicate: zebra_consensus::BoxError = Box::new(
+        let duplicate_verifier_error = || {
             zebra_consensus::VerifyBlockError::from(zebra_consensus::BlockError::AlreadyInChain(
                 hash,
                 zebra_state::KnownBlock::WriteChannel,
+            ))
+        };
+        let direct_duplicate: zebra_consensus::BoxError = Box::new(duplicate_verifier_error());
+        assert!(is_duplicate_wcash_aux_proposal_error(
+            direct_duplicate.as_ref()
+        ));
+
+        // The production block-verifier service erases RouterError into
+        // BoxError, so createauxblock must classify the router wrapper rather
+        // than relying only on the inner semantic verifier error.
+        let routed_duplicate: zebra_consensus::BoxError = Box::new(
+            zebra_consensus::RouterError::from(duplicate_verifier_error()),
+        );
+        assert!(is_duplicate_wcash_aux_proposal_error(
+            routed_duplicate.as_ref()
+        ));
+
+        let routed_rejection: zebra_consensus::BoxError = Box::new(
+            zebra_consensus::RouterError::from(zebra_consensus::VerifyBlockError::from(
+                zebra_consensus::BlockError::MissingHeight(hash),
             )),
         );
-        assert!(is_duplicate_wcash_aux_proposal_error(duplicate.as_ref()));
-
-        let rejection: zebra_consensus::BoxError =
-            Box::new(zebra_consensus::VerifyBlockError::from(
-                zebra_consensus::BlockError::MissingHeight(hash),
-            ));
-        assert!(!is_duplicate_wcash_aux_proposal_error(rejection.as_ref()));
+        assert!(!is_duplicate_wcash_aux_proposal_error(
+            routed_rejection.as_ref()
+        ));
     }
 }
 
