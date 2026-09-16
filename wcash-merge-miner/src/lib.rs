@@ -58,8 +58,9 @@ pub use native::{
 };
 pub use native_retained_job::NativePoolBackendRetainedJob;
 pub use pool_backend_actor::{
-    PoolBackendActor, PoolBackendActorError, PoolBackendRetainedJob, PoolBackendShareRequest,
-    PoolBackendShareValidationError, PoolBackendValidatedShare, PoolBackendWinnerKey,
+    PoolBackendActor, PoolBackendActorError, PoolBackendLiveWinnerScheduler,
+    PoolBackendRetainedJob, PoolBackendShareRequest, PoolBackendShareValidationError,
+    PoolBackendValidatedShare, PoolBackendWinnerAuditScheduler, PoolBackendWinnerKey,
     PoolBackendWinnerScheduler, PoolBackendWinnerSnapshot, PoolBackendWinnerTransition,
     PoolBackendWinnerWork,
 };

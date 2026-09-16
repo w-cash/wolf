@@ -1,0 +1,3 @@
+kind: Fixed
+body: Isolate newly committed merged-mining winners from slow historical reconciliation RPCs, while prioritizing durable submission retries ahead of ordinary lifecycle audits.
+time: 2026-09-16T11:40:00Z
