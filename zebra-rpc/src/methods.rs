@@ -182,6 +182,17 @@ pub(super) const PARAM_RETIRE_TOKEN_DESC: &str =
 /// Stable server error returned when an exact Wcash auxiliary candidate loses
 /// a best-tip race while it is being constructed or proposal-validated.
 const WCASH_AUX_TIP_CHANGED_ERROR_CODE: i32 = -32_001;
+
+/// Returns true only when proposal verification rejected the exact candidate
+/// because that candidate is already present in the node's state pipeline.
+fn is_duplicate_wcash_aux_proposal_error(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> bool {
+    error
+        .downcast_ref::<zebra_consensus::VerifyBlockError>()
+        .is_some_and(zebra_consensus::VerifyBlockError::is_duplicate_request)
+}
+
 pub(super) const PARAM_TXID_DESC: &str = "The transaction ID to return.";
 pub(super) const PARAM_HASH_OR_HEIGHT_DESC: &str = "The block hash or height to return.";
 pub(super) const PARAM_PARAMETERS_DESC: &str = "The parameters for the command.";
@@ -3424,7 +3435,7 @@ where
         .await
         .map_err(|_| {
             ErrorObject::borrowed(
-                ErrorCode::InternalError.code(),
+                WCASH_AUX_TIP_CHANGED_ERROR_CODE,
                 "Wcash candidate proposal validation timed out; retry createauxblock",
                 None,
             )
@@ -3432,6 +3443,24 @@ where
         let validated_hash = match proposal_validation {
             Ok(validated_hash) => validated_hash,
             Err(error) => {
+                // The proof-free candidate can be submitted and accepted by a
+                // miner while this concurrent proposal check is waiting on the
+                // state service. In that case the verifier reports the exact
+                // candidate as already known before the chain-tip watch has
+                // necessarily published the new tip. Returning the candidate
+                // would publish stale work, while treating it as malformed
+                // would terminate the mining backend. Retry generation instead.
+                //
+                // Keep every non-duplicate failure fail-closed below: an
+                // unchanged tip must never turn a genuine proposal rejection
+                // into a liveness retry.
+                if is_duplicate_wcash_aux_proposal_error(error.as_ref()) {
+                    return Err(ErrorObject::borrowed(
+                        WCASH_AUX_TIP_CHANGED_ERROR_CODE,
+                        "Wcash candidate was accepted during proposal validation; retry createauxblock",
+                        None,
+                    ));
+                }
                 // A candidate can lose the race after the explicit predecessor
                 // check but before semantic verification reads the best tip.
                 // Retry only when the authoritative tip actually changed. The
@@ -5123,6 +5152,29 @@ mod wcash_address_validation_tests {
                 HashSet::from([indexed_address])
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod wcash_aux_proposal_error_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_candidate_errors_are_retryable_without_reclassifying_rejections() {
+        let hash = block::Hash::from([0; 32]);
+        let duplicate: zebra_consensus::BoxError = Box::new(
+            zebra_consensus::VerifyBlockError::from(zebra_consensus::BlockError::AlreadyInChain(
+                hash,
+                zebra_state::KnownBlock::WriteChannel,
+            )),
+        );
+        assert!(is_duplicate_wcash_aux_proposal_error(duplicate.as_ref()));
+
+        let rejection: zebra_consensus::BoxError =
+            Box::new(zebra_consensus::VerifyBlockError::from(
+                zebra_consensus::BlockError::MissingHeight(hash),
+            ));
+        assert!(!is_duplicate_wcash_aux_proposal_error(rejection.as_ref()));
     }
 }
 
