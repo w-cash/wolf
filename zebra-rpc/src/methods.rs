@@ -179,6 +179,9 @@ pub(super) const PARAM_HEX_DATA_DESC: &str = "The hex-encoded data to return.";
 pub(super) const PARAM_AUX_POW_DESC: &str = "The hex-encoded Wcash AuxPoW proof.";
 pub(super) const PARAM_RETIRE_TOKEN_DESC: &str =
     "The 32-byte hexadecimal capability returned by createauxblock for this candidate.";
+/// Stable server error returned when an exact Wcash auxiliary candidate loses
+/// a best-tip race while it is being constructed or proposal-validated.
+const WCASH_AUX_TIP_CHANGED_ERROR_CODE: i32 = -32_001;
 pub(super) const PARAM_TXID_DESC: &str = "The transaction ID to return.";
 pub(super) const PARAM_HASH_OR_HEIGHT_DESC: &str = "The block hash or height to return.";
 pub(super) const PARAM_PARAMETERS_DESC: &str = "The parameters for the command.";
@@ -3400,7 +3403,7 @@ where
         })?;
         if candidate.header.previous_block_hash != expected_tip {
             return Err(ErrorObject::borrowed(
-                ErrorCode::InternalError.code(),
+                WCASH_AUX_TIP_CHANGED_ERROR_CODE,
                 "Wcash tip changed while constructing the candidate; retry createauxblock",
                 None,
             ));
@@ -3426,13 +3429,27 @@ where
                 None,
             )
         })?;
-        let validated_hash = proposal_validation.map_err(|error| {
-            ErrorObject::owned(
-                ErrorCode::InternalError.code(),
-                format!("generated Wcash candidate failed proposal validation: {error}"),
-                None::<()>,
-            )
-        })?;
+        let validated_hash = match proposal_validation {
+            Ok(validated_hash) => validated_hash,
+            Err(error) => {
+                // A candidate can lose the race after the explicit predecessor
+                // check but before semantic verification reads the best tip.
+                // Retry only when the authoritative tip actually changed. The
+                // same verifier error on an unchanged tip remains fatal.
+                if self.latest_chain_tip.best_tip_hash() != Some(expected_tip) {
+                    return Err(ErrorObject::borrowed(
+                        WCASH_AUX_TIP_CHANGED_ERROR_CODE,
+                        "Wcash tip changed during proposal validation; retry createauxblock",
+                        None,
+                    ));
+                }
+                return Err(ErrorObject::owned(
+                    ErrorCode::InternalError.code(),
+                    format!("generated Wcash candidate failed proposal validation: {error}"),
+                    None::<()>,
+                ));
+            }
+        };
         if validated_hash != hash {
             return Err(ErrorObject::borrowed(
                 ErrorCode::InternalError.code(),
@@ -3445,7 +3462,7 @@ where
         // again before making this candidate externally visible.
         if self.latest_chain_tip.best_tip_hash() != Some(expected_tip) {
             return Err(ErrorObject::borrowed(
-                ErrorCode::InternalError.code(),
+                WCASH_AUX_TIP_CHANGED_ERROR_CODE,
                 "Wcash tip changed while validating the candidate; retry createauxblock",
                 None,
             ));
@@ -3491,7 +3508,7 @@ where
         // pin publication to the same tip on both sides of the insertion.
         if self.latest_chain_tip.best_tip_hash() != Some(expected_tip) {
             return Err(ErrorObject::borrowed(
-                ErrorCode::InternalError.code(),
+                WCASH_AUX_TIP_CHANGED_ERROR_CODE,
                 "Wcash tip changed before publishing the candidate; retry createauxblock",
                 None,
             ));
@@ -3518,7 +3535,7 @@ where
             // published identical candidate must remain retryable.
             self.wcash_aux_blocks.discard_unpublished(candidate_lease);
             return Err(ErrorObject::borrowed(
-                ErrorCode::InternalError.code(),
+                WCASH_AUX_TIP_CHANGED_ERROR_CODE,
                 "Wcash tip changed while publishing the candidate; retry createauxblock",
                 None,
             ));

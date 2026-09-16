@@ -46,6 +46,8 @@ const DEFAULT_SHARE_JOURNAL: &str = ".wcash-share-journal-v2.jsonl";
 const INITIAL_NATIVE_PREPARATION_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_NATIVE_PREPARATION_BACKOFF: Duration = Duration::from_secs(60);
 const TIP_RACE_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// Stable `createauxblock` server error for an ordinary Wcash best-tip race.
+const WCASH_AUX_TIP_CHANGED_ERROR_CODE: i64 = -32_001;
 const POOL_BACKEND_MONITOR_INTERVAL: Duration = Duration::from_millis(50);
 const POOL_BACKEND_SUPERSEDED_GRACE: Duration = Duration::from_secs(2);
 const POOL_BACKEND_RETIREMENT_QUEUE: usize = 4;
@@ -1509,7 +1511,7 @@ fn is_retryable_native_preparation_error(error: &MinerError) -> bool {
         MinerError::RpcTransport(error) => is_retryable_rpc_transport(error),
         MinerError::RpcHttpStatus(status) => is_retryable_http_status(*status),
         MinerError::RpcError {
-            code: Some(-9 | -10 | -28),
+            code: Some(-9 | -10 | -28 | WCASH_AUX_TIP_CHANGED_ERROR_CODE),
             ..
         } => true,
         MinerError::Io(error) => is_retryable_io_kind(error.kind()),
@@ -1525,6 +1527,10 @@ fn native_preparation_retry_delay(error: &MinerError, backoff: Duration) -> Dura
         MinerError::ParentTipMismatch { .. }
         | MinerError::ChildTipMismatch { .. }
         | MinerError::StaleNativeJob(_) => TIP_RACE_RETRY_DELAY,
+        MinerError::RpcError {
+            code: Some(WCASH_AUX_TIP_CHANGED_ERROR_CODE),
+            ..
+        } => TIP_RACE_RETRY_DELAY,
         _ => backoff,
     }
 }
@@ -1534,6 +1540,10 @@ fn next_native_preparation_backoff(error: &MinerError, backoff: Duration) -> Dur
         MinerError::ParentTipMismatch { .. }
         | MinerError::ChildTipMismatch { .. }
         | MinerError::StaleNativeJob(_) => INITIAL_NATIVE_PREPARATION_BACKOFF,
+        MinerError::RpcError {
+            code: Some(WCASH_AUX_TIP_CHANGED_ERROR_CODE),
+            ..
+        } => INITIAL_NATIVE_PREPARATION_BACKOFF,
         _ => (backoff * 2).min(MAX_NATIVE_PREPARATION_BACKOFF),
     }
 }
@@ -2673,7 +2683,7 @@ mod tests {
             );
         }
 
-        for code in [-9, -10, -28] {
+        for code in [-9, -10, -28, WCASH_AUX_TIP_CHANGED_ERROR_CODE] {
             assert!(is_retryable_native_preparation_error(&rpc_error(Some(
                 code
             ))));
@@ -2815,8 +2825,14 @@ mod tests {
             actual: "child-b".to_string(),
         };
         let stale_job = MinerError::StaleNativeJob("durably activated job".to_string());
+        let child_rpc_tip_race = rpc_error(Some(WCASH_AUX_TIP_CHANGED_ERROR_CODE));
 
-        for error in [&parent_tip_race, &child_tip_race, &stale_job] {
+        for error in [
+            &parent_tip_race,
+            &child_tip_race,
+            &stale_job,
+            &child_rpc_tip_race,
+        ] {
             assert_eq!(
                 native_preparation_retry_delay(error, Duration::from_secs(32)),
                 TIP_RACE_RETRY_DELAY
