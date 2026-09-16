@@ -76,9 +76,13 @@ impl TryFrom<u32> for NetworkUpgrade {
     type Error = crate::Error;
 
     fn try_from(branch_id: u32) -> Result<Self, Self::Error> {
-        if [WCASH_TESTNET_V1_BRANCH_ID, WCASH_REGTEST_V1_BRANCH_ID]
-            .map(u32::from)
-            .contains(&branch_id)
+        if [
+            WCASH_TESTNET_V1_BRANCH_ID,
+            WCASH_TESTNET_V2_BRANCH_ID,
+            WCASH_REGTEST_V1_BRANCH_ID,
+        ]
+        .map(u32::from)
+        .contains(&branch_id)
         {
             return Ok(Self::Nu6_3);
         }
@@ -163,6 +167,12 @@ pub struct ConsensusBranchId(pub(crate) u32);
 /// This ID is not a Wcash mainnet parameter. A future mainnet must allocate a
 /// distinct reviewed branch ID.
 pub const WCASH_TESTNET_V1_BRANCH_ID: ConsensusBranchId = ConsensusBranchId(0xb3cf_d27e);
+
+/// The transaction signature domain for Wcash Testnet v2.
+///
+/// This is the first four display-order bytes of SHA-256 over
+/// `Wcash/NU6.3/Ironwood/v1`. It prevents replay from the retired v1 testnet.
+pub const WCASH_TESTNET_V2_BRANCH_ID: ConsensusBranchId = ConsensusBranchId(0xa8d6_c929);
 
 /// The transaction signature domain for Wcash Regtest v1.
 ///
@@ -580,7 +590,7 @@ impl ConsensusBranchId {
         if network_upgrade == NetworkUpgrade::Nu6_3 {
             match network.wcash_network() {
                 Some(wcash_genesis::WcashNetwork::Testnet) => {
-                    return Some(WCASH_TESTNET_V1_BRANCH_ID);
+                    return Some(WCASH_TESTNET_V2_BRANCH_ID);
                 }
                 Some(wcash_genesis::WcashNetwork::Regtest) => {
                     return Some(WCASH_REGTEST_V1_BRANCH_ID);

@@ -69,9 +69,10 @@ and is never consulted as consensus or runtime input. Node consensus uses only
 the immutable anchor fields, Wcash network discriminator, genesis statement,
 commitment, and complete serialized Wcash genesis block.
 
-The Testnet profile uses Wcash Testnet v1 branch ID `0xb3cfd27e` for NU6.3 /
-Ironwood transactions; local Regtest uses the separate ID `0xc3a6678a`. Both
-reject the standard Zcash NU6.3 ID and each other's Wcash ID. Every post-genesis
+The Testnet profile uses Wcash Testnet v2 branch ID `0xa8d6c929` for NU6.3 /
+Ironwood transactions; retired Testnet v1 used `0xb3cfd27e`, and local Regtest
+uses the separate ID `0xc3a6678a`. They reject the standard Zcash NU6.3 ID and
+each other's Wcash ID. Every post-genesis
 transaction must be V6, so V1-V5 and wrong-domain transactions are invalid in
 both blocks and the mempool. A controlled local Regtest E2E has spent a private
 coinbase through its Wcash V6 domain, but that does not establish public-network

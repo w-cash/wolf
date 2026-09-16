@@ -358,7 +358,7 @@ async fn wcash_rejects_inherited_shielded_pools_in_blocks_and_mempool() {
         .expect("the Zcash block test vectors contain a non-coinbase Sprout transaction");
 
     let orchard_bundle = fake_bundle_for_branch(
-        zcash_protocol::consensus::BranchId::WcashTestnetV1,
+        zcash_protocol::consensus::BranchId::WcashTestnetV2,
         ::orchard::ValuePool::Orchard,
         1,
         0x0057_4341_5348,
@@ -369,7 +369,7 @@ async fn wcash_rejects_inherited_shielded_pools_in_blocks_and_mempool() {
         .with_orchard_bundle(Some(orchard_bundle));
 
     let ironwood_bundle = fake_bundle_for_branch(
-        zcash_protocol::consensus::BranchId::WcashTestnetV1,
+        zcash_protocol::consensus::BranchId::WcashTestnetV2,
         ::orchard::ValuePool::Ironwood,
         1,
         0x4952_4f4e_574f_4f44,

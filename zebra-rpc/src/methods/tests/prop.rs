@@ -20,7 +20,7 @@ use zebra_chain::{
     chain_sync_status::MockSyncStatus,
     chain_tip::{mock::MockChainTip, ChainTip, NoChainTip},
     history_tree::HistoryTree,
-    parameters::{ConsensusBranchId, Network, WCASH_TESTNET_V1_BRANCH_ID},
+    parameters::{ConsensusBranchId, Network, WCASH_TESTNET_V2_BRANCH_ID},
     serialization::{DateTime32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction::{self, Transaction, UnminedTx, VerifiedUnminedTx},
     transparent,
@@ -974,14 +974,14 @@ fn wcash_get_blockchain_info_reports_custom_transaction_domain() {
         let (response, ()) = tokio::join!(response_fut, mock_state_handler);
         let response = response.expect("Wcash getblockchaininfo must succeed");
 
-        assert_eq!(response.consensus.chain_tip.0, WCASH_TESTNET_V1_BRANCH_ID);
-        assert_eq!(response.consensus.next_block.0, WCASH_TESTNET_V1_BRANCH_ID);
+        assert_eq!(response.consensus.chain_tip.0, WCASH_TESTNET_V2_BRANCH_ID);
+        assert_eq!(response.consensus.next_block.0, WCASH_TESTNET_V2_BRANCH_ID);
         assert!(
             response
                 .upgrades
                 .keys()
-                .any(|id| id.0 == WCASH_TESTNET_V1_BRANCH_ID),
-            "the upgrades map must expose the Wcash Testnet v1 branch ID"
+                .any(|id| id.0 == WCASH_TESTNET_V2_BRANCH_ID),
+            "the upgrades map must expose the Wcash Testnet v2 branch ID"
         );
 
         mempool

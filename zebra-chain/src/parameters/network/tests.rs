@@ -17,6 +17,7 @@ use crate::{
             WCASH_HALVING_INTERVAL, WCASH_INITIAL_BLOCK_SUBSIDY,
         },
         ConsensusBranchId, NetworkUpgrade, WCASH_REGTEST_V1_BRANCH_ID, WCASH_TESTNET_V1_BRANCH_ID,
+        WCASH_TESTNET_V2_BRANCH_ID,
     },
     serialization::DateTime32,
     work::difficulty::ParameterDifficulty as _,
@@ -96,7 +97,7 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
             .to_work()
             .expect("the Wcash Testnet launch target has non-zero work")
             .as_u128(),
-        31_500_118,
+        351_933,
         "the frozen launch target must retain its independently checked work value"
     );
     assert_eq!(
@@ -125,14 +126,14 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
     );
     assert_eq!(
         ConsensusBranchId::current(&testnet, Height(1)),
-        Some(WCASH_TESTNET_V1_BRANCH_ID)
+        Some(WCASH_TESTNET_V2_BRANCH_ID)
     );
     assert_eq!(
         ConsensusBranchId::current(&regtest, Height(1)),
         Some(WCASH_REGTEST_V1_BRANCH_ID)
     );
     assert_eq!(
-        NetworkUpgrade::try_from(u32::from(WCASH_TESTNET_V1_BRANCH_ID)),
+        NetworkUpgrade::try_from(u32::from(WCASH_TESTNET_V2_BRANCH_ID)),
         Ok(NetworkUpgrade::Nu6_3)
     );
     assert_eq!(
@@ -144,7 +145,7 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
             &testnet,
             zcash_protocol::consensus::BlockHeight::from_u32(1),
         ),
-        zcash_protocol::consensus::BranchId::WcashTestnetV1
+        zcash_protocol::consensus::BranchId::WcashTestnetV2
     );
     assert_eq!(
         zcash_protocol::consensus::BranchId::for_height(
@@ -153,7 +154,8 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
         ),
         zcash_protocol::consensus::BranchId::WcashRegtestV1
     );
-    assert_ne!(WCASH_TESTNET_V1_BRANCH_ID, WCASH_REGTEST_V1_BRANCH_ID);
+    assert_ne!(WCASH_TESTNET_V2_BRANCH_ID, WCASH_TESTNET_V1_BRANCH_ID);
+    assert_ne!(WCASH_TESTNET_V2_BRANCH_ID, WCASH_REGTEST_V1_BRANCH_ID);
 
     for zcash in zcash_networks {
         assert!(!zcash.uses_wcash_consensus());

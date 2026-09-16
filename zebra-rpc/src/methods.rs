@@ -179,6 +179,23 @@ pub(super) const PARAM_HEX_DATA_DESC: &str = "The hex-encoded data to return.";
 pub(super) const PARAM_AUX_POW_DESC: &str = "The hex-encoded Wcash AuxPoW proof.";
 pub(super) const PARAM_RETIRE_TOKEN_DESC: &str =
     "The 32-byte hexadecimal capability returned by createauxblock for this candidate.";
+/// Stable server error returned when an exact Wcash auxiliary candidate loses
+/// a best-tip race while it is being constructed or proposal-validated.
+const WCASH_AUX_TIP_CHANGED_ERROR_CODE: i32 = -32_001;
+
+/// Returns true only when proposal verification rejected the exact candidate
+/// because that candidate is already present in the node's state pipeline.
+fn is_duplicate_wcash_aux_proposal_error(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> bool {
+    error
+        .downcast_ref::<zebra_consensus::RouterError>()
+        .is_some_and(zebra_consensus::RouterError::is_duplicate_request)
+        || error
+            .downcast_ref::<zebra_consensus::VerifyBlockError>()
+            .is_some_and(zebra_consensus::VerifyBlockError::is_duplicate_request)
+}
+
 pub(super) const PARAM_TXID_DESC: &str = "The transaction ID to return.";
 pub(super) const PARAM_HASH_OR_HEIGHT_DESC: &str = "The block hash or height to return.";
 pub(super) const PARAM_PARAMETERS_DESC: &str = "The parameters for the command.";
@@ -3400,7 +3417,7 @@ where
         })?;
         if candidate.header.previous_block_hash != expected_tip {
             return Err(ErrorObject::borrowed(
-                ErrorCode::InternalError.code(),
+                WCASH_AUX_TIP_CHANGED_ERROR_CODE,
                 "Wcash tip changed while constructing the candidate; retry createauxblock",
                 None,
             ));
@@ -3421,18 +3438,50 @@ where
         .await
         .map_err(|_| {
             ErrorObject::borrowed(
-                ErrorCode::InternalError.code(),
+                WCASH_AUX_TIP_CHANGED_ERROR_CODE,
                 "Wcash candidate proposal validation timed out; retry createauxblock",
                 None,
             )
         })?;
-        let validated_hash = proposal_validation.map_err(|error| {
-            ErrorObject::owned(
-                ErrorCode::InternalError.code(),
-                format!("generated Wcash candidate failed proposal validation: {error}"),
-                None::<()>,
-            )
-        })?;
+        let validated_hash = match proposal_validation {
+            Ok(validated_hash) => validated_hash,
+            Err(error) => {
+                // The proof-free candidate can be submitted and accepted by a
+                // miner while this concurrent proposal check is waiting on the
+                // state service. In that case the verifier reports the exact
+                // candidate as already known before the chain-tip watch has
+                // necessarily published the new tip. Returning the candidate
+                // would publish stale work, while treating it as malformed
+                // would terminate the mining backend. Retry generation instead.
+                //
+                // Keep every non-duplicate failure fail-closed below: an
+                // unchanged tip must never turn a genuine proposal rejection
+                // into a liveness retry.
+                if is_duplicate_wcash_aux_proposal_error(error.as_ref()) {
+                    return Err(ErrorObject::borrowed(
+                        WCASH_AUX_TIP_CHANGED_ERROR_CODE,
+                        "Wcash candidate was accepted during proposal validation; retry createauxblock",
+                        None,
+                    ));
+                }
+                // A candidate can lose the race after the explicit predecessor
+                // check but before semantic verification reads the best tip.
+                // Retry only when the authoritative tip actually changed. The
+                // same verifier error on an unchanged tip remains fatal.
+                if self.latest_chain_tip.best_tip_hash() != Some(expected_tip) {
+                    return Err(ErrorObject::borrowed(
+                        WCASH_AUX_TIP_CHANGED_ERROR_CODE,
+                        "Wcash tip changed during proposal validation; retry createauxblock",
+                        None,
+                    ));
+                }
+                return Err(ErrorObject::owned(
+                    ErrorCode::InternalError.code(),
+                    format!("generated Wcash candidate failed proposal validation: {error}"),
+                    None::<()>,
+                ));
+            }
+        };
         if validated_hash != hash {
             return Err(ErrorObject::borrowed(
                 ErrorCode::InternalError.code(),
@@ -3445,7 +3494,7 @@ where
         // again before making this candidate externally visible.
         if self.latest_chain_tip.best_tip_hash() != Some(expected_tip) {
             return Err(ErrorObject::borrowed(
-                ErrorCode::InternalError.code(),
+                WCASH_AUX_TIP_CHANGED_ERROR_CODE,
                 "Wcash tip changed while validating the candidate; retry createauxblock",
                 None,
             ));
@@ -3491,7 +3540,7 @@ where
         // pin publication to the same tip on both sides of the insertion.
         if self.latest_chain_tip.best_tip_hash() != Some(expected_tip) {
             return Err(ErrorObject::borrowed(
-                ErrorCode::InternalError.code(),
+                WCASH_AUX_TIP_CHANGED_ERROR_CODE,
                 "Wcash tip changed before publishing the candidate; retry createauxblock",
                 None,
             ));
@@ -3518,7 +3567,7 @@ where
             // published identical candidate must remain retryable.
             self.wcash_aux_blocks.discard_unpublished(candidate_lease);
             return Err(ErrorObject::borrowed(
-                ErrorCode::InternalError.code(),
+                WCASH_AUX_TIP_CHANGED_ERROR_CODE,
                 "Wcash tip changed while publishing the candidate; retry createauxblock",
                 None,
             ));
@@ -5106,6 +5155,45 @@ mod wcash_address_validation_tests {
                 HashSet::from([indexed_address])
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod wcash_aux_proposal_error_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_candidate_errors_are_retryable_without_reclassifying_rejections() {
+        let hash = block::Hash::from([0; 32]);
+        let duplicate_verifier_error = || {
+            zebra_consensus::VerifyBlockError::from(zebra_consensus::BlockError::AlreadyInChain(
+                hash,
+                zebra_state::KnownBlock::WriteChannel,
+            ))
+        };
+        let direct_duplicate: zebra_consensus::BoxError = Box::new(duplicate_verifier_error());
+        assert!(is_duplicate_wcash_aux_proposal_error(
+            direct_duplicate.as_ref()
+        ));
+
+        // The production block-verifier service erases RouterError into
+        // BoxError, so createauxblock must classify the router wrapper rather
+        // than relying only on the inner semantic verifier error.
+        let routed_duplicate: zebra_consensus::BoxError = Box::new(
+            zebra_consensus::RouterError::from(duplicate_verifier_error()),
+        );
+        assert!(is_duplicate_wcash_aux_proposal_error(
+            routed_duplicate.as_ref()
+        ));
+
+        let routed_rejection: zebra_consensus::BoxError = Box::new(
+            zebra_consensus::RouterError::from(zebra_consensus::VerifyBlockError::from(
+                zebra_consensus::BlockError::MissingHeight(hash),
+            )),
+        );
+        assert!(!is_duplicate_wcash_aux_proposal_error(
+            routed_rejection.as_ref()
+        ));
     }
 }
 

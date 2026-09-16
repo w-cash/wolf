@@ -41,6 +41,7 @@ use crate::{
 // immediate first attempt; the durable historical cursor advances at this
 // deliberately slower cadence.
 const WINNER_HISTORICAL_STEP_INTERVAL: Duration = Duration::from_secs(1);
+const WINNER_SUBMISSION_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CONSECUTIVE_FIRST_ATTEMPTS: u8 = 8;
 
 const MAX_RECENT_JOBS: usize = 2;
@@ -212,6 +213,132 @@ pub struct PoolBackendWinnerScheduler {
     last_first_attempt: Option<PoolBackendWinnerKey>,
     unsettled_after: Option<PoolBackendWinnerKey>,
     matured_after: Option<PoolBackendWinnerKey>,
+}
+
+/// Latency-sensitive first attempts for newly durable winner proofs.
+///
+/// This scheduler never selects historical status work. Its exclusive audit
+/// bound advances only after the caller has claimed the returned snapshot, so
+/// a separate audit worker cannot take fresh work first.
+#[derive(Debug, Default)]
+pub struct PoolBackendLiveWinnerScheduler {
+    journal_stream: Option<CanonicalUuid>,
+    first_attempt_next: usize,
+    recovery_first_attempts: VecDeque<PoolBackendWinnerSnapshot>,
+}
+
+impl PoolBackendLiveWinnerScheduler {
+    /// Returns one recovery or newly appended pending proof without delay.
+    pub fn next(
+        &mut self,
+        actor: &PoolBackendActor,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        let journal_stream = actor.authority_fields.journal_stream;
+        if self
+            .journal_stream
+            .is_some_and(|bound| bound != journal_stream)
+        {
+            return Err(PoolBackendActorError::WinnerAuthorityMismatch);
+        }
+        if self.journal_stream.is_none() {
+            let state = actor.lock_state()?;
+            let (tail, recovery) = state.journal.winner_recovery_state()?;
+            self.first_attempt_next = tail;
+            self.recovery_first_attempts = recovery
+                .into_iter()
+                .map(|(winner_ordinal, state)| PoolBackendWinnerSnapshot {
+                    journal_stream,
+                    winner_ordinal,
+                    state,
+                })
+                .collect();
+        }
+        self.journal_stream = Some(journal_stream);
+        if let Some(recovery) = self.recovery_first_attempts.pop_front() {
+            return Ok(Some(recovery));
+        }
+        let state = actor.lock_state()?;
+        Ok(state
+            .journal
+            .next_first_attempt_winner_state(&mut self.first_attempt_next)?
+            .map(|(winner_ordinal, state)| PoolBackendWinnerSnapshot {
+                journal_stream,
+                winner_ordinal,
+                state,
+            }))
+    }
+
+    /// Exclusive durable ordinal below which historical work is safe.
+    pub fn audit_before(&self) -> usize {
+        if self.recovery_first_attempts.is_empty() {
+            self.first_attempt_next
+        } else {
+            0
+        }
+    }
+}
+
+/// Historical retries and lifecycle audits isolated from live submissions.
+#[derive(Debug, Default)]
+pub struct PoolBackendWinnerAuditScheduler {
+    journal_stream: Option<CanonicalUuid>,
+    submission_after: Option<PoolBackendWinnerKey>,
+    unsettled_after: Option<PoolBackendWinnerKey>,
+    matured_after: Option<PoolBackendWinnerKey>,
+}
+
+impl PoolBackendWinnerAuditScheduler {
+    /// Selects submission retries first, then paced status and maturity work.
+    pub fn next(
+        &mut self,
+        actor: &PoolBackendActor,
+        before_ordinal: usize,
+    ) -> Result<PoolBackendWinnerWork, PoolBackendActorError> {
+        let journal_stream = actor.authority_fields.journal_stream;
+        if self
+            .journal_stream
+            .is_some_and(|bound| bound != journal_stream)
+        {
+            return Err(PoolBackendActorError::WinnerAuthorityMismatch);
+        }
+        self.journal_stream = Some(journal_stream);
+
+        if let Some(snapshot) = actor.next_submission_required_winner_snapshot_before(
+            self.submission_after.as_ref(),
+            before_ordinal,
+        )? {
+            self.submission_after = Some(snapshot.key());
+            return Ok(PoolBackendWinnerWork {
+                snapshot: Some(snapshot),
+                completes_pass: false,
+                delay: WINNER_SUBMISSION_RETRY_INTERVAL,
+            });
+        }
+        self.submission_after = None;
+
+        let (snapshot, completes_pass, delay) = match actor
+            .next_unsettled_winner_snapshot_before(self.unsettled_after.as_ref(), before_ordinal)?
+        {
+            Some(snapshot) => {
+                self.unsettled_after = Some(snapshot.key());
+                (Some(snapshot), false, WINNER_HISTORICAL_STEP_INTERVAL)
+            }
+            None => {
+                self.unsettled_after = None;
+                let snapshot = actor.next_matured_winner_snapshot_before(
+                    self.matured_after.as_ref(),
+                    before_ordinal,
+                )?;
+                self.matured_after = snapshot.as_ref().map(PoolBackendWinnerSnapshot::key);
+                (snapshot, true, Duration::from_secs(1))
+            }
+        };
+        Ok(PoolBackendWinnerWork {
+            snapshot,
+            completes_pass,
+            delay,
+        })
+    }
 }
 
 /// One bounded reconciliation step, including the existing audit cadence.
@@ -959,12 +1086,48 @@ impl PoolBackendActor {
         self.next_winner_snapshot_with(after, PoolBackendJournal::next_unsettled_winner_state)
     }
 
+    fn next_submission_required_winner_snapshot_before(
+        &self,
+        after: Option<&PoolBackendWinnerKey>,
+        before_ordinal: usize,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        self.next_winner_snapshot_before_with(
+            after,
+            before_ordinal,
+            PoolBackendJournal::next_submission_required_winner_state_before,
+        )
+    }
+
+    fn next_unsettled_winner_snapshot_before(
+        &self,
+        after: Option<&PoolBackendWinnerKey>,
+        before_ordinal: usize,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        self.next_winner_snapshot_before_with(
+            after,
+            before_ordinal,
+            PoolBackendJournal::next_unsettled_winner_state_before,
+        )
+    }
+
     /// Returns the next matured winner in durable order for low-rate audits.
     pub fn next_matured_winner_snapshot(
         &self,
         after: Option<&PoolBackendWinnerKey>,
     ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
         self.next_winner_snapshot_with(after, PoolBackendJournal::next_matured_winner_state)
+    }
+
+    fn next_matured_winner_snapshot_before(
+        &self,
+        after: Option<&PoolBackendWinnerKey>,
+        before_ordinal: usize,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        self.next_winner_snapshot_before_with(
+            after,
+            before_ordinal,
+            PoolBackendJournal::next_matured_winner_state_before,
+        )
     }
 
     fn next_winner_snapshot_with(
@@ -981,6 +1144,32 @@ impl PoolBackendActor {
         let state = self.lock_state()?;
         let after_ordinal = after.map(|key| key.winner_ordinal);
         select(&state.journal, after_ordinal)
+            .map(|winner| {
+                winner.map(|(winner_ordinal, state)| PoolBackendWinnerSnapshot {
+                    journal_stream: self.authority_fields.journal_stream,
+                    winner_ordinal,
+                    state,
+                })
+            })
+            .map_err(PoolBackendActorError::Journal)
+    }
+
+    fn next_winner_snapshot_before_with(
+        &self,
+        after: Option<&PoolBackendWinnerKey>,
+        before_ordinal: usize,
+        select: fn(
+            &PoolBackendJournal,
+            Option<usize>,
+            usize,
+        ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError>,
+    ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
+        if after.is_some_and(|key| key.journal_stream != self.authority_fields.journal_stream) {
+            return Err(PoolBackendActorError::WinnerAuthorityMismatch);
+        }
+        let state = self.lock_state()?;
+        let after_ordinal = after.map(|key| key.winner_ordinal);
+        select(&state.journal, after_ordinal, before_ordinal)
             .map(|winner| {
                 winner.map(|(winner_ordinal, state)| PoolBackendWinnerSnapshot {
                     journal_stream: self.authority_fields.journal_stream,
@@ -2534,6 +2723,63 @@ mod tests {
             assert!(audit.completes_pass());
             assert_eq!(audit.delay(), Duration::from_secs(1));
         }
+    }
+
+    #[test]
+    fn split_live_lane_publishes_only_claimable_history_to_the_audit_lane() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("split-live-lane.jsonl");
+        let config = config();
+        let (journal, historical) = scheduler_journal(&path, &config, 200);
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+        let mut live = PoolBackendLiveWinnerScheduler::default();
+        let mut audit = PoolBackendWinnerAuditScheduler::default();
+
+        assert!(live.next(&actor).unwrap().is_none());
+        assert_eq!(live.audit_before(), historical.len());
+        let historical_work = audit.next(&actor, live.audit_before()).unwrap();
+        assert_eq!(
+            historical_work.snapshot().unwrap().share_id(),
+            &historical[0]
+        );
+
+        let fresh = append_scheduler_after_restore(&actor, 201);
+        let old_bound = live.audit_before();
+        let first_attempt = live.next(&actor).unwrap().unwrap();
+        assert_eq!(first_attempt.share_id(), &fresh);
+        assert_eq!(old_bound, historical.len());
+
+        let mut bounded_audit = PoolBackendWinnerAuditScheduler::default();
+        for _ in 0..historical.len().saturating_add(2) {
+            if let Some(snapshot) = bounded_audit.next(&actor, old_bound).unwrap().snapshot() {
+                assert_ne!(snapshot.share_id(), &fresh);
+            }
+        }
+    }
+
+    #[test]
+    fn split_audit_lane_prioritizes_bounded_submission_retries() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("split-audit-lane.jsonl");
+        let config = config();
+        let (journal, shares) = scheduler_journal(&path, &config, 0);
+        let second = append_scheduler_pending(&journal, 2);
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+        let mut audit = PoolBackendWinnerAuditScheduler::default();
+
+        let first = audit.next(&actor, 1).unwrap();
+        assert_eq!(first.snapshot().unwrap().share_id(), &shares[0]);
+        assert_eq!(first.delay(), WINNER_SUBMISSION_RETRY_INTERVAL);
+
+        let end_of_bounded_pass = audit.next(&actor, 1).unwrap();
+        assert_ne!(end_of_bounded_pass.snapshot().unwrap().share_id(), &second);
+
+        let mut expanded = PoolBackendWinnerAuditScheduler::default();
+        let first = expanded.next(&actor, 2).unwrap();
+        assert_eq!(first.snapshot().unwrap().share_id(), &shares[0]);
+        let next = expanded.next(&actor, 2).unwrap();
+        assert_eq!(next.snapshot().unwrap().share_id(), &second);
+        assert_eq!(next.delay(), WINNER_SUBMISSION_RETRY_INTERVAL);
     }
 
     fn identity() -> WorkerIdentity {

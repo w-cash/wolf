@@ -11,7 +11,7 @@ Upstream provenance:
 - crates.io archive SHA-256:
   `314329b91ec4bbb517441840e47d0b2029bf0b946f086980c96c889c2d92dc5d`
 
-Wcash makes two consensus-critical extensions:
+Wcash makes three consensus-critical extensions:
 
 - `BranchId::WcashTestnetV1` is `0xb3cfd27e`. It is the first four bytes, in
   display order, of SHA-256 over the exact UTF-8 string
@@ -20,6 +20,12 @@ Wcash makes two consensus-critical extensions:
 - The ID gives Wcash Testnet v1 a signature and transaction-hash domain that is
   distinct from Zcash NU6.3 (`0x37a5165b`) while retaining NU6.3 / Ironwood
   protocol semantics.
+- `BranchId::WcashTestnetV2` is `0xa8d6c929`. It is the first four bytes, in
+  display order, of SHA-256 over the exact UTF-8 string
+  `Wcash/NU6.3/Ironwood/v1` (full digest
+  `a8d6c929bd7103673d9deb302f34b0120334f488c8e44e92066ee5b04a797599`).
+  Testnet v2 selects this domain so transactions signed for the retired v1
+  chain cannot be replayed on the reset chain.
 - `BranchId::WcashRegtestV1` is `0xc3a6678a`. It is the first four bytes, in
   display order, of SHA-256 over the exact UTF-8 string
   `Wcash/regtest/NU6.3/Ironwood/v1` (full digest
@@ -29,9 +35,9 @@ Wcash makes two consensus-critical extensions:
 - `Parameters::branch_id_for_upgrade` lets an independent network select its
   branch ID without changing any standard Zcash mapping.
 
-These identifiers are frozen for Wcash Testnet v1 and local Regtest only. A
-future Wcash mainnet must allocate and review a different branch ID; it must not
-reuse either non-production ID.
+These identifiers are frozen for Wcash Testnet v1, Testnet v2, and local
+Regtest only. A future Wcash mainnet must allocate and review a different
+branch ID; it must not reuse any non-production ID.
 
 The candidate was checked against the Zcash branch IDs known to this release,
 the reserved development/test identifiers used by Zebra, and Wcash AuxPoW chain
