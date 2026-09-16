@@ -61,7 +61,7 @@ use wcash_zcash_aux::AuxPowProof;
 use zcash_address::{unified::Encoding, TryFromAddress};
 use zcash_protocol::consensus::{self, Parameters};
 use zebra_chain::{
-    amount::{Amount, NegativeAllowed, NegativeOrZero, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative},
     block::{self, Block, Commitment, Height, SerializedBlock, TryIntoHeight, MAX_BLOCK_BYTES},
     chain_sync_status::ChainSyncStatus,
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
@@ -93,7 +93,6 @@ use zebra_state::{
 };
 
 use crate::{
-    client::TransactionTemplate,
     client::Treestate,
     config,
     methods::types::{
@@ -120,16 +119,17 @@ use types::{
             DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MEMPOOL_LONG_POLL_INTERVAL,
             ZCASHD_FUNDING_STREAM_ORDER,
         },
+        precompute,
         proposal::proposal_block_from_template,
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
-        GetBlockTemplateParameters, GetBlockTemplateResponse, MinerParams,
+        GetBlockTemplateParameters, GetBlockTemplateResponse, MinerParams, WcashAuxRequest,
     },
     get_blockchain_info::GetBlockchainInfoBalance,
     get_mempool_info::GetMempoolInfoResponse,
     get_mining_info::GetMiningInfoResponse,
     get_raw_mempool::{self, GetRawMempoolResponse},
     get_standard_fee::GetStandardFeeResponse,
-    long_poll::LongPollInput,
+    long_poll::{LongPollId, LongPollInput},
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
     submit_block::{SubmitBlockErrorResponse, SubmitBlockParameters, SubmitBlockResponse},
@@ -1070,6 +1070,179 @@ where
         );
 
         (rpc_impl, rpc_tx_queue_task_handle)
+    }
+
+    /// Spawns a task that keeps a block template for the current chain tip precomputed, so
+    /// `getblocktemplate` calls don't have to read the state and the mempool, select transactions,
+    /// and build a coinbase transaction.
+    ///
+    /// Returns `None` if mining isn't configured.
+    pub fn spawn_block_template_updater(&self) -> Option<JoinHandle<()>> {
+        let miner_params = self.gbt.miner_params().ok().flatten()?.clone();
+        let template_cache = self.gbt.template_cache()?.clone();
+
+        Some(tokio::spawn(
+            precompute::run(
+                self.network.clone(),
+                miner_params,
+                self.gbt.coinbase_cache(),
+                template_cache,
+                self.mempool.clone(),
+                self.read_state.clone(),
+                self.latest_chain_tip.clone(),
+                self.gbt.sync_status(),
+            )
+            .in_current_span(),
+        ))
+    }
+
+    /// Returns the block template that [`Self::spawn_block_template_updater()`] keeps precomputed,
+    /// if it extends the current chain tip, and if it isn't the template the client already has.
+    ///
+    /// The precomputed template's mempool transactions can be a few seconds old, which only costs
+    /// the miner the fees of the transactions that arrived in the meantime, and the next call picks
+    /// them up. But it always extends the current tip, so miners never work on a chain that Zebra
+    /// has already seen a block for.
+    ///
+    /// A long polling client waits here until the updater publishes a template it doesn't have
+    /// yet, the chain tip changes, or `max_time` is reached.
+    ///
+    /// # Correctness
+    ///
+    /// Long polling must not fall through to the synchronous path below while this cache is
+    /// serving. That path derives its own long poll ID from a fresh state and mempool read, so
+    /// with two independent ID sources neither side ever matches the other: the client alternates
+    /// between a cached template and a freshly built one, each call returning immediately, and it
+    /// never waits. Its work is cancelled on every response, so it mines nothing.
+    ///
+    /// Returns `None` if there is no updater task, if it hasn't caught up with a recent chain tip
+    /// change, or if the chain tip channel closed.
+    async fn precomputed_block_template(
+        &self,
+        client_long_poll_id: Option<LongPollId>,
+        wcash_aux: Option<WcashAuxRequest>,
+    ) -> Result<Option<BlockTemplateResponse>> {
+        let Some(cache) = self.gbt.template_cache() else {
+            return Ok(None);
+        };
+
+        // Skip the tip read when there's nothing to serve: without an updater task, every request
+        // builds its own template anyway.
+        if cache.is_empty() {
+            return Ok(None);
+        }
+
+        // Subscribe before the first read below. A template published between reading the cache
+        // and waiting on it would otherwise be marked seen and skipped, and the only other wakes
+        // are a chain tip change and `max_time`, neither of which fires when the mempool alone
+        // changes: the caller would wait out the updater's backstop on a template it has already
+        // been told about.
+        let mut template_changes = cache.subscribe();
+
+        // Clone the chain tip once, and mark the current tip seen: a receiver created fresh on
+        // every iteration reports the tip it was created with as a change, so waiting on it would
+        // return immediately and spin this loop instead of parking it.
+        let mut tip_change = self.latest_chain_tip.clone();
+        tip_change.mark_best_tip_seen();
+
+        loop {
+            let Some(template) = self.precomputed_template_for_state_tip(cache).await else {
+                return Ok(None);
+            };
+
+            let is_client_template = Some(template.long_poll_id) == client_long_poll_id;
+
+            if !is_client_template {
+                let mut template = (*template).clone();
+                template.submit_old = client_long_poll_id
+                    .as_ref()
+                    .map(|old_long_poll_id| template.long_poll_id.submit_old(old_long_poll_id));
+
+                if let Some(wcash_aux) = wcash_aux {
+                    let miner_params = self
+                        .gbt
+                        .miner_params()
+                        .expect("a precomputed template requires valid miner parameters")
+                        .expect("a precomputed template requires configured miner parameters");
+                    template = template
+                        .with_wcash_aux(&self.network, miner_params, wcash_aux)
+                        .map_error_with_prefix(
+                            ErrorCode::InvalidParams,
+                            "invalid wcashaux parent-template request",
+                        )?;
+                }
+
+                return Ok(Some(template));
+            }
+
+            // The client is long polling on exactly this template, so wait for a reason to send
+            // another one.
+            let max_time = template.max_time;
+            let cur_time = template.cur_time;
+
+            // On Testnet the max time changes the block difficulty, so old shares become invalid.
+            // On Mainnet this means 90 minutes without a block or a mempool transaction.
+            let duration_until_max_time = max_time.saturating_duration_since(cur_time);
+            let wait_for_max_time: OptionFuture<_> = if duration_until_max_time.seconds() > 0 {
+                Some(tokio::time::sleep(duration_until_max_time.to_std()))
+            } else {
+                None
+            }
+            .into();
+
+            tokio::select! {
+                biased;
+
+                tip_changed = tip_change.best_tip_changed() => {
+                    // A closed chain tip channel means Zebra is shutting down.
+                    if tip_changed.is_err() {
+                        return Ok(None);
+                    }
+                }
+
+                () = template_changes.changed() => {}
+
+                Some(()) = wait_for_max_time => {
+                    let Some(template) = self.precomputed_template_for_state_tip(cache).await else {
+                        return Ok(None);
+                    };
+                    let mut template = (*template).clone();
+                    template.submit_old = Some(false);
+
+                    return Ok(Some(template));
+                }
+            }
+        }
+    }
+
+    /// Returns the precomputed template, if it extends the tip the state has committed.
+    ///
+    /// Waits up to `NEW_TIP_TIMEOUT` for the updater task to catch up with a recent tip change.
+    async fn precomputed_template_for_state_tip(
+        &self,
+        cache: &precompute::TemplateCache,
+    ) -> Option<Arc<BlockTemplateResponse>> {
+        // # Correctness
+        //
+        // The tip has to come from the state, not from `latest_chain_tip`. The state's write task
+        // publishes a committed block to the read state before it updates the chain tip channel
+        // (`update_latest_chain_channels()`), so between those two sends the channel still names
+        // the parent of a block the state has already committed. Trusting the channel there would
+        // serve a template for a chain this node has itself extended.
+        //
+        // `ReadRequest::Tip` reads the same non-finalized state channel that
+        // `ReadRequest::ChainInfo` builds templates from, so the two can't disagree about the tip.
+        let ReadResponse::Tip(Some((_, tip_hash))) = self
+            .read_state
+            .clone()
+            .oneshot(ReadRequest::Tip)
+            .await
+            .ok()?
+        else {
+            return None;
+        };
+
+        cache.wait_for_tip(tip_hash).await
     }
 
     /// Returns a reference to the configured network.
@@ -2750,15 +2923,23 @@ where
             })?
             .ok_or_error(0, "miner parameters are required for get_block_template")?;
 
+        // - Precomputed template
+        //
+        // Serve the template that the block template updater task keeps ready, as long as it
+        // extends the current chain tip.
+        check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
+
+        if let Some(template) = self
+            .precomputed_block_template(client_long_poll_id, wcash_aux)
+            .await?
+        {
+            return Ok(template.into());
+        }
+
         // - Checks and fetches that can change during long polling
         //
         // Set up the loop.
         let mut max_time_reached = false;
-        let mut next_coinbase_precompute: Option<(
-            Height,
-            JoinHandle<TransactionTemplate<NegativeOrZero>>,
-        )> = None;
-
         // The loop returns the server long poll ID, which should be different to the client one.
         let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
             // Check if we are synced to the tip.
@@ -2865,42 +3046,6 @@ where
             // The clone preserves the seen status of the chain tip.
             let mut wait_for_new_tip = latest_chain_tip.clone();
             let wait_for_new_tip = wait_for_new_tip.best_tip_changed();
-            // `+2`: we expect the tip to advance by one block before waking us up.
-            let precomputed_height = Height(chain_info.tip_height.0 + 2);
-            if next_coinbase_precompute
-                .as_ref()
-                .is_none_or(|(height, _)| *height != precomputed_height)
-            {
-                if let Some((_, obsolete_task)) = next_coinbase_precompute.take() {
-                    // A started blocking proof cannot be aborted. Its singleflight cache entry
-                    // still receives the result, but this request no longer waits for a height
-                    // that cannot match its next template.
-                    obsolete_task.abort();
-                }
-                let network = self.network.clone();
-                let params = miner_params.clone();
-                let cache = self.gbt.coinbase_cache();
-                let task = tokio::task::spawn_blocking(move || {
-                    cache.get_or_build(precomputed_height, Amount::zero(), || {
-                        TransactionTemplate::new_coinbase(
-                            &network,
-                            precomputed_height,
-                            &params,
-                            Amount::zero(),
-                        )
-                        .expect("valid coinbase tx")
-                    })
-                });
-                next_coinbase_precompute = Some((precomputed_height, task));
-            }
-            let precompute_task = &mut next_coinbase_precompute
-                .as_mut()
-                .expect("the next-height coinbase task was initialized")
-                .1;
-            let wait_for_new_tip = async {
-                let _ = wait_for_new_tip.await;
-                precompute_task.await.expect("valid coinbase tx")
-            };
 
             // Wait for the maximum block time to elapse. This can change the block header
             // on testnet. (On mainnet it can happen due to a network disconnection, or a
@@ -2923,8 +3068,7 @@ where
 
             // Optional TODO:
             // `zcashd` generates the next coinbase transaction while waiting for changes.
-            // When Zebra supports shielded coinbase, we might want to do this in parallel.
-            // But the coinbase value depends on the selected transactions, so this needs
+            // The coinbase value depends on the selected transactions, so this needs
             // further analysis to check if it actually saves us any time.
 
             tokio::select! {
@@ -2944,60 +3088,15 @@ where
                     );
                 }
 
-                precomputed_coinbase = wait_for_new_tip => {
-                    let chain_info = fetch_chain_info(read_state.clone()).await?;
-
-                    let server_long_poll_id = LongPollInput::new(
-                        chain_info.tip_height,
-                        chain_info.tip_hash,
-                        chain_info.max_time,
-                        vec![]
-                    )
-                    .generate_id();
-
-                    let submit_old = client_long_poll_id
-                        .as_ref()
-                        .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id));
-
-                    // Discard the precomputed coinbase if our `+2` guess was wrong
-                    // (multi-block advance, reorg, or spurious notification) — its
-                    // BIP-34 height and subsidies wouldn't match the block.
-                    let next_height = chain_info.tip_height.next().map_misc_error()?;
-                    let precomputed_coinbase = (next_height == precomputed_height)
-                        .then_some(precomputed_coinbase);
-
-                    // Publish the proof-complete next-height coinbase to the
-                    // shared cache before returning from long poll. A merged
-                    // mining request can then add its cheap Wcash commitment
-                    // without rebuilding the shielded proof after every win.
-                    if let Some(coinbase) = &precomputed_coinbase {
-                        self.gbt.coinbase_cache().store(
-                            next_height,
-                            Amount::zero(),
-                            coinbase.clone(),
-                        );
+                _ = wait_for_new_tip => {
+                    // Serve the template that the updater task precomputed for the new tip, so the
+                    // miner doesn't waste any effort extending the shorter chain. Otherwise, loop
+                    // around to build a template for the new tip from the state and the mempool.
+                    if let Some(template) =
+                        self.precomputed_block_template(client_long_poll_id, wcash_aux).await?
+                    {
+                        return Ok(template.into());
                     }
-
-                    // Respond instantly with an empty block upon a chain tip change so that
-                    // the miner doesn't waste their effort trying to extend a shorter
-                    // chain.
-                    let response = BlockTemplateResponse::new_internal(
-                        &self.network,
-                        precomputed_coinbase,
-                        None,
-                        miner_params,
-                        wcash_aux,
-                        &chain_info,
-                        server_long_poll_id,
-                        vec![],
-                        submit_old,
-                    )
-                    .map_error_with_prefix(
-                        ErrorCode::InvalidParams,
-                        "invalid wcashaux parent-template request",
-                    )?;
-
-                    return Ok(response.into())
                 }
 
                 // The max time does not elapse during normal operation on mainnet,
@@ -3061,8 +3160,7 @@ where
 
         let response = BlockTemplateResponse::new_internal(
             &self.network,
-            None,
-            Some(self.gbt.coinbase_cache()),
+            &coinbase_cache,
             miner_params,
             wcash_aux,
             &chain_info,

@@ -50,8 +50,8 @@ use crate::methods::{
 
 use super::{
     check_parameters, check_synced_to_tip, fetch_mempool_transactions, BlockTemplateResponse,
-    DefaultRoots, GetBlockTemplateParameters, GetBlockTemplateRequestMode, MinerParams,
-    WcashAuxRequest,
+    CoinbaseCache, DefaultRoots, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
+    MinerParams, WcashAuxRequest,
 };
 
 /// A clean Wcash Testnet node must be able to serve its first mining template
@@ -176,8 +176,7 @@ fn wcash_template_includes_v6_transfer_fees_and_private_coinbase() {
 
     let response = BlockTemplateResponse::new_internal(
         &network,
-        None,
-        None,
+        &CoinbaseCache::default(),
         &miner_params,
         None,
         &chain_info,
@@ -711,14 +710,12 @@ fn coinbase_cache_reuses_built_coinbase() {
         "a cache hit reuses the stored coinbase",
     );
 
-    // A different height key or a cleared cache misses, so the next request rebuilds.
+    // A different height key misses, so the next request rebuilds.
     let next_height = height.next().expect("height is below Height::MAX");
     assert!(
         cache.get(next_height, fee).is_none(),
         "a different height misses"
     );
-    cache.clear();
-    assert!(cache.get(height, fee).is_none(), "a cleared cache misses");
 }
 
 /// Verifies the fix for #10907: the multi-entry coinbase cache retains both the zero-fee fake

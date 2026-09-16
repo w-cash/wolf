@@ -2,6 +2,7 @@
 
 pub mod constants;
 pub mod parameters;
+pub(crate) mod precompute;
 pub mod proposal;
 pub mod zip317;
 
@@ -29,7 +30,8 @@ use zcash_script::{opcode::PushValue, pv::push_value};
 use zebra_chain::{
     amount::{self, Amount, NonNegative},
     block::{
-        self, Block, ChainHistoryBlockTxAuthCommitmentHash, MAX_BLOCK_BYTES, ZCASH_BLOCK_VERSION,
+        self, Block, ChainHistoryBlockTxAuthCommitmentHash, Height, MAX_BLOCK_BYTES,
+        ZCASH_BLOCK_VERSION,
     },
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
@@ -290,14 +292,51 @@ impl BlockTemplateResponse {
         CAPABILITIES_FIELD.iter().map(ToString::to_string).collect()
     }
 
+    /// Adds one child-specific Wcash commitment to a child-independent
+    /// precomputed parent template.
+    pub(crate) fn with_wcash_aux(
+        mut self,
+        net: &Network,
+        miner_params: &MinerParams,
+        wcash_aux: WcashAuxRequest,
+    ) -> Result<Self, TransactionError> {
+        self.coinbase_txn = self
+            .coinbase_txn
+            .with_wcash_aux(wcash_aux.block_hash().0, wcash_aux.nonce())?;
+
+        let height = Height(self.height);
+        self.default_roots = DefaultRoots::from_transaction_templates(
+            net,
+            height,
+            &self.coinbase_txn,
+            Some(self.default_roots.chain_history_root),
+            &self.transactions,
+        );
+        self.block_commitments_hash = self.default_roots.block_commitments_hash;
+        self.light_client_root_hash = self.default_roots.block_commitments_hash;
+        self.final_sapling_root_hash = self.default_roots.block_commitments_hash;
+        self.wcash_parent_payout_commitment = Some(
+            miner_params
+                .parent_payout_address_commitment()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    TransactionError::CoinbaseConstruction(
+                        "wcashaux requires an attested configured parent payout address"
+                            .to_string(),
+                    )
+                })?,
+        );
+
+        Ok(self)
+    }
+
     /// Returns a new [`BlockTemplateResponse`] struct, based on the supplied arguments and defaults.
     ///
     /// The result of this method only depends on the supplied arguments and constants.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_internal(
         net: &Network,
-        precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,
-        coinbase_cache: Option<CoinbaseCache>,
+        coinbase_cache: &CoinbaseCache,
         miner_params: &MinerParams,
         wcash_aux: Option<WcashAuxRequest>,
         chain_info: &GetBlockTemplateChainInfo,
@@ -354,26 +393,12 @@ impl BlockTemplateResponse {
             .map(|tx| tx.miner_fee)
             .sum::<amount::Result<Amount<NonNegative>>>()?;
 
-        // Prefer the long-poll precomputed coinbase, then the per-block cache, and only build (and
-        // re-prove, for a shielded address) as a last resort — caching the result so subsequent
-        // short-poll requests for the same height and fees reuse it.
-        let coinbase_txn = precomputed_coinbase
-            .or_else(|| {
-                coinbase_cache
-                    .as_ref()
-                    .and_then(|cache| cache.get(height, txs_fee))
-            })
-            .unwrap_or_else(|| {
-                let coinbase_txn =
-                    TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                        .expect("valid coinbase tx");
-
-                if let Some(cache) = &coinbase_cache {
-                    cache.store(height, txs_fee, coinbase_txn.clone());
-                }
-
-                coinbase_txn
-            });
+        // Reuse the cached coinbase for this height and fee. Concurrent requests share one
+        // builder so a shielded payout never starts duplicate proofs for the same template.
+        let coinbase_txn = coinbase_cache.get_or_build(height, txs_fee, || {
+            TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
+                .expect("valid coinbase tx")
+        });
 
         // Always cache the proof-complete, child-independent coinbase above.
         // A Wcash request gets its own cheap authenticated-data mutation, so a
@@ -891,14 +916,6 @@ impl CoinbaseCache {
             map.remove(&(height, fee));
         }
     }
-
-    /// Discards all cached coinbases, forcing the next request to rebuild them.
-    fn clear(&self) {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-    }
 }
 
 fn retain_adjacent_coinbase_heights(
@@ -931,6 +948,14 @@ where
     /// Caches the most recently built coinbase transaction, so short-polling miners don't re-run
     /// the shielded-coinbase proof on every request within a block.
     coinbase_cache: CoinbaseCache,
+
+    /// A block template for the current chain tip, kept up to date by the task spawned by
+    /// `RpcImpl::spawn_block_template_updater()`, so `getblocktemplate` can answer without reading
+    /// the state and the mempool.
+    ///
+    /// This is `None` on handlers whose miner parameters were overridden after cloning, because the
+    /// precomputed template pays the configured miner address.
+    template_cache: Option<precompute::TemplateCache>,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -959,6 +984,7 @@ where
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
             coinbase_cache: CoinbaseCache::default(),
+            template_cache: Some(precompute::TemplateCache::default()),
         }
     }
 
@@ -980,11 +1006,20 @@ where
         // its cache with the handler it was cloned from. Detach to a fresh cache so
         // neither handler can serve a coinbase built for the other's address.
         self.coinbase_cache = CoinbaseCache::default();
+        // The precomputed template pays the previous miner address, and it's shared with the
+        // handler this one was cloned from, so stop using it.
+        self.template_cache = None;
     }
 
     /// Returns a handle to the coinbase transaction cache.
     pub(crate) fn coinbase_cache(&self) -> CoinbaseCache {
         self.coinbase_cache.clone()
+    }
+
+    /// Returns a handle to the precomputed block template, unless this handler's miner parameters
+    /// were overridden after cloning.
+    pub(crate) fn template_cache(&self) -> Option<&precompute::TemplateCache> {
+        self.template_cache.as_ref()
     }
 
     /// Returns the sync status.
@@ -1011,8 +1046,11 @@ where
         if let Ok(Some(miner_params)) = &mut self.miner_params {
             miner_params.randomize_data();
             miner_params.randomize_memo();
-            // The cached coinbase was built with the previous data, so it's now stale.
-            self.coinbase_cache.clear();
+            // The cached coinbases were built with the previous data, and both caches are shared
+            // with the handler this one was cloned from. Detach from them, so neither handler can
+            // serve a coinbase built for the other's data.
+            self.coinbase_cache = CoinbaseCache::default();
+            self.template_cache = None;
         }
     }
 }
