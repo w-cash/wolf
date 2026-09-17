@@ -32,6 +32,12 @@ use constants::{
 /// Wcash starts at 6.25 whole units per mined block: WEC on Mainnet and TWC on testing networks.
 pub(crate) const WCASH_INITIAL_BLOCK_SUBSIDY: u64 = 625_000_000;
 
+/// Wcash Testnet reaches its full initial subsidy at this height.
+///
+/// Heights from genesis through this height use a linear subsidy ramp. This is
+/// intentionally different from Zcash's midpoint-adjusted slow-start formula.
+pub(crate) const WCASH_TESTNET_SLOW_START_INTERVAL: Height = Height(40_000);
+
 /// Wcash halves every 1,680,000 blocks, approximately four years at 75 seconds per block.
 ///
 /// Together with the 6.25-unit initial subsidy, this interval keeps total
@@ -505,6 +511,17 @@ pub fn halving(height: Height, network: &Network) -> u32 {
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 pub fn block_subsidy(height: Height, net: &Network) -> Result<Amount<NonNegative>, SubsidyError> {
     if net.uses_wcash_consensus() {
+        if net.is_wcash_testnet() && height <= WCASH_TESTNET_SLOW_START_INTERVAL {
+            // Multiplication before division implements the consensus rule
+            // floor(6.25 TWC * height / 40,000) in atomic units.
+            let amount = WCASH_INITIAL_BLOCK_SUBSIDY
+                .checked_mul(u64::from(height))
+                .expect("Wcash Testnet slow-start heights fit in u64")
+                / u64::from(WCASH_TESTNET_SLOW_START_INTERVAL);
+
+            return Ok(Amount::try_from(amount)?);
+        }
+
         if height == Height::MIN {
             return Ok(Amount::zero());
         }

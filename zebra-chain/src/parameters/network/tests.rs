@@ -14,7 +14,7 @@ use crate::{
             block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, founders_reward,
             founders_reward_address, funding_stream_values, halving, halving_divisor,
             height_for_halving, miner_subsidy, ParameterSubsidy as _, WCASH_FIRST_HALVING_HEIGHT,
-            WCASH_HALVING_INTERVAL, WCASH_INITIAL_BLOCK_SUBSIDY,
+            WCASH_HALVING_INTERVAL, WCASH_INITIAL_BLOCK_SUBSIDY, WCASH_TESTNET_SLOW_START_INTERVAL,
         },
         ConsensusBranchId, NetworkUpgrade, WCASH_REGTEST_V1_BRANCH_ID, WCASH_TESTNET_V1_BRANCH_ID,
         WCASH_TESTNET_V2_BRANCH_ID,
@@ -109,6 +109,10 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
         Amount::<NonNegative>::zero(),
         "Wcash genesis contributes no scheduled issuance"
     );
+    assert_eq!(
+        testnet.slow_start_interval(),
+        WCASH_TESTNET_SLOW_START_INTERVAL
+    );
 
     assert_ne!(testnet, regtest);
     assert_ne!(testnet.to_string(), regtest.to_string());
@@ -163,6 +167,48 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
         assert_ne!(testnet.magic(), zcash.magic());
         assert_ne!(testnet.genesis_hash(), zcash.genesis_hash());
         assert_ne!(testnet.default_port(), zcash.default_port());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn wcash_testnet_uses_linear_slow_start_subsidy() -> Result<(), Report> {
+    let testnet = Network::new_wcash_testnet();
+
+    for (height, expected_atomic_units) in [
+        (0, 0),
+        (1, 15_625),
+        (10_000, 156_250_000),
+        (20_000, 312_500_000),
+        (30_000, 468_750_000),
+        (39_999, 624_984_375),
+        (40_000, 625_000_000),
+        (40_001, 625_000_000),
+    ] {
+        let expected_subsidy = Amount::<NonNegative>::try_from(expected_atomic_units)?;
+        assert_eq!(
+            block_subsidy(Height(height), &testnet)?,
+            expected_subsidy,
+            "unexpected Wcash Testnet subsidy at height {height}"
+        );
+        assert_eq!(
+            miner_subsidy(Height(height), &testnet, expected_subsidy)?,
+            expected_subsidy,
+            "the miner must receive the entire Wcash Testnet subsidy at height {height}"
+        );
+    }
+
+    // The Wcash rule is the direct integer formula requested for every ramp
+    // height, without Zcash's midpoint adjustment.
+    for height in 0..=WCASH_TESTNET_SLOW_START_INTERVAL.0 {
+        let expected_atomic_units = WCASH_INITIAL_BLOCK_SUBSIDY * u64::from(height)
+            / u64::from(WCASH_TESTNET_SLOW_START_INTERVAL);
+        assert_eq!(
+            block_subsidy(Height(height), &testnet)?,
+            Amount::<NonNegative>::try_from(expected_atomic_units)?,
+            "linear slow-start formula changed at height {height}"
+        );
     }
 
     Ok(())
