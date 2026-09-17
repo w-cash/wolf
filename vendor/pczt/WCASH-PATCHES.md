@@ -8,7 +8,7 @@ The source comes from upstream commit
 The upstream manifests, README, changelog, tests, and dual MIT/Apache-2.0
 license texts are retained.
 
-The minimal downstream patch treats `BranchId::WcashTestnetV1`, `BranchId::WcashTestnetV2`, and the distinct
+The minimal downstream patch treats `BranchId::WcashTestnetV1`, `BranchId::WcashTestnetV3`, and the distinct
 `BranchId::WcashRegtestV1` as V6 transaction domains and permits V6
 deferred-anchor updates for them. It does not change any Zcash branch behavior
 or PCZT encoding. Tests assert that the exact selected Wcash branch ID is

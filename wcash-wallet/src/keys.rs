@@ -99,7 +99,7 @@ mod tests {
 
         assert_eq!(
             hex::encode(derived.expose_secret()),
-            "92dc36b870456da70d67656db7730a849c4921e77d80cf525f8f82001d0c43b547cc6b5c96813175927bd0985bd21e5f3f2bc0e3bac790d046e9dc5062e6e158"
+            "88bbd4c9997a4c48a0b2a1de9f25b7281b1a847ae2e09b42e80f7f4de68f7d193e536ebde3c508bd16dfaf2d32fb60b0e38ab126047181cd772d229bc97c438c"
         );
     }
 

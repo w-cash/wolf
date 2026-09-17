@@ -77,7 +77,7 @@ fn v4_transactions_remain_valid_in_nu6_3() {
 fn wcash_domains_require_v6() {
     for branch in [
         BranchId::WcashTestnetV1,
-        BranchId::WcashTestnetV2,
+        BranchId::WcashTestnetV3,
         BranchId::WcashRegtestV1,
     ] {
         assert_eq!(TxVersion::suggested_for_branch(branch), TxVersion::V6);

@@ -2240,7 +2240,7 @@ mod tests {
         let receiver = TransparentAddress::PublicKeyHash([0x55; 20]);
         let script = Script::from(receiver.script());
         let transaction = zcash_primitives::transaction::TransactionData::from_parts_v6(
-            BranchId::WcashTestnetV2,
+            BranchId::WcashTestnetV3,
             0,
             zcash_protocol::consensus::BlockHeight::from_u32(0),
             Some(Bundle {

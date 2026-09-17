@@ -16,14 +16,12 @@ consensus. Each has a distinct genesis block, P2P magic, default P2P/RPC ports,
 and peer-cache domain. Both activate NU6.3 at height 1 and use the Ironwood
 transaction format for every mined block.
 
-The built-in Testnet profile freezes Bitcoin mainnet block 965,900, hash
-`0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851`.
-The release vector records Bitcoin height 966,011, or 112 confirmations counting
-the anchor block. Its complete Wcash genesis block ID is
-`efffff94fbd682f4a55e0abdb74048208491b7312ce917324ea333953d640ed7`.
-Its `Wcash/testnet/v6` P2P magic is `00d1ca27`; its default P2P and
-recommended loopback RPC ports are 38233 and 38232. It never inherits Zcash's
-DNS seeds.
+The built-in Testnet profile freezes Zcash Testnet block 4,362,016, hash
+`00000e289ad21d2feeb17e16585790ecabec94323c2ef22925534ad104de73ac`.
+Its Wcash genesis time is 2026-09-17 23:00:00 UTC and its complete genesis ID is
+`6b66fff119977d36d9c989093b516a876dbf6596536791ff35bb4c581e3fda98`.
+Its `Wcash/testnet/v7` P2P magic is `49d2934b`; its default P2P and recommended
+loopback RPC ports remain 38233 and 38232. It never inherits Zcash DNS seeds.
 
 The designated mainnet reference is Bitcoin height 965,954, but that anchor is
 intentionally not frozen and mainnet fails closed. Local regtest anchors its
@@ -47,7 +45,7 @@ not a consensus or runtime input.
 
 ### Transaction version and replay domain
 
-Wcash Testnet v2 uses consensus branch ID `0xa8d6c929`; retired Testnet v1 used
+Wcash Testnet v3 uses consensus branch ID `0x54ba2bfb`; retired Testnet v1 used
 `0xb3cfd27e`, and isolated Wcash Regtest uses the separate ID `0xc3a6678a`.
 The active testing domains select NU6.3 / Ironwood semantics, while standard
 Zcash NU6.3 keeps `0x37a5165b`. The selected Wcash ID is carried in every

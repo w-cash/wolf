@@ -12,7 +12,7 @@ Upstream provenance:
   `403d5be1e96339534be098e3377fb8a78d68ca7585b1780133d884b810277418`
 
 The downstream changes teach the transaction implementation about
-`BranchId::WcashTestnetV1`, `BranchId::WcashTestnetV2`, and the separate
+`BranchId::WcashTestnetV1`, `BranchId::WcashTestnetV3`, and the separate
 `BranchId::WcashRegtestV1` from the
 adjacent vendored `zcash_protocol` crate:
 

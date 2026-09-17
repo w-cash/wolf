@@ -478,7 +478,7 @@ mod tests {
         assert_eq!(testnet.network_id, "wcash-testnet");
         assert_eq!(testnet.genesis_hash, WalletNetwork::Testnet.genesis_hash());
         assert_eq!(testnet.seed_kdf_version, 1);
-        assert_eq!(testnet.transaction_branch_id, 0xb3cf_d27e);
+        assert_eq!(testnet.transaction_branch_id, 0x54ba_2bfb);
 
         assert_ne!(testnet.network_id, regtest.network_id);
         assert_ne!(testnet.genesis_hash, regtest.genesis_hash);

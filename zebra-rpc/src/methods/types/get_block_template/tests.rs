@@ -219,7 +219,7 @@ fn wcash_template_includes_v6_transfer_fees_and_private_coinbase() {
             .ironwood_value_balance()
             .ironwood_amount()
             .zatoshis(),
-        -(625_000_000 + MINER_FEE)
+        -(15_625 + MINER_FEE)
     );
     zebra_consensus::transaction::check::wcash_coinbase_outputs_are_private(
         &coinbase, &network, height,

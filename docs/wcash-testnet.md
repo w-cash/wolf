@@ -2,18 +2,17 @@
 
 The source tree contains a frozen Wcash engineering and mining-interoperability
 Testnet profile so independently built nodes can agree on the same height-zero
-block. No public Wcash Testnet node, DNS seed, or community pool is deployed.
-This is not a production-readiness claim: Wcash mainnet remains disabled and
+block. Wcash mainnet remains disabled and
 testnet coins must have no monetary value.
 
 User-facing Testnet balances use `TWC` (Test Wcash) rather than mainnet `WEC`.
 This label does not alter the eight-decimal integer-zatoshi encoding.
-The genesis statement retains its historical `WEC` text. Testnet v2 changes
-the proof-of-work limit, so its frozen genesis header and hash are distinct
-from the retired v1 chain.
+The public Testnet genesis statement identifies its Zcash Testnet anchor. Testnet v3 changes
+the genesis, transaction domain, P2P identity, and cache namespace, so it is distinct
+from every retired testing chain.
 
 > **Transaction-domain test boundary:** Wcash Testnet accepts only post-genesis V6
-> transactions carrying its chain-specific branch ID `0xa8d6c929`. Zcash,
+> transactions carrying its chain-specific branch ID `0x54ba2bfb`. Zcash,
 > the retired Testnet v1 domain `0xb3cfd27e`, the distinct Wcash Regtest domain
 > `0xc3a6678a`, and V1-V5 are rejected. The controlled private-transfer and
 > transparent-coinbase shielding lifecycles have passed on isolated Regtest, but
@@ -23,96 +22,27 @@ from the retired v1 chain.
 
 ## Frozen identity
 
-The built-in `WcashTestnet` network commits to Bitcoin mainnet block 965,900:
+The built-in `WcashTestnet` network commits to canonical Zcash Testnet block
+4,362,016. Its own genesis timestamp is exactly 2026-09-17 23:00:00 UTC.
 
 ```text
-Bitcoin block:       965900
-Bitcoin block hash:  0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851
-Anchor audit height: 966011 (112 confirmations counting the anchor)
-Wcash genesis hash:  efffff94fbd682f4a55e0abdb74048208491b7312ce917324ea333953d640ed7
-P2P identity:        Wcash/testnet/v6
-P2P magic:           00d1ca27
-P2P port:            38233
-Suggested RPC port:  38232 (loopback only)
+Zcash Testnet block: 4362016
+Zcash block hash:     00000e289ad21d2feeb17e16585790ecabec94323c2ef22925534ad104de73ac
+Zcash block time:     1789685930 (2026-09-17 22:58:50 UTC)
+Wcash genesis time:   1789686000 (2026-09-17 23:00:00 UTC)
+Wcash genesis hash:   6b66fff119977d36d9c989093b516a876dbf6596536791ff35bb4c581e3fda98
+P2P identity:         Wcash/testnet/v7
+P2P magic:            49d2934b
+P2P port:             38233
+Suggested RPC port:   38232 (loopback only)
+Transaction branch:   54ba2bfb
+State cache:          wcashtestnet-v7
 ```
 
-The exact Bitcoin header, proof of work, confirmation audit height, complete
-Wcash genesis bytes, and derived hash are frozen test vectors in the source.
-Consensus never fetches or replaces an anchor at runtime. Testnet, regtest, and
-Zcash use different genesis hashes, P2P magic, ports, and peer-cache paths.
-Wcash configuration also rejects inherited Zcash DNS seeds. The corrected
-Testnet identity stores state under `wcashtestnet-v6` and peers under its
-matching cache namespace, so earlier profile data is not loaded. Operators must
-start from the new empty paths and must not copy or rename older Wcash state
-into them.
-
-## Anchor verification record
-
-The immutable runtime input is this exact 80-byte Bitcoin wire header:
-
-```text
-00203220700b5cbd51c3511db177feb5891754ee7e3ec5f4849a010000000000
-000000000444905fd34cdb083f512a1957ec2c7ffedf3a7ff5098d1f20a5aed9
-c8484b46c5719e6a5e35021706442381
-```
-
-Its decoded fields are:
-
-| Field | Frozen value |
-| --- | --- |
-| Version | `0x20322000` (`540155904`) |
-| Previous block | `000000000000000000019a84f4c53e7eee541789b5fe77b11d51c351bd5c0b70` |
-| Merkle root | `464b48c8d9aea5201f8d09f57f3adffe7f2cec57192a513f08db4cd35f904404` |
-| Timestamp | `1788768709` (`2026-09-07 08:11:49 UTC`) |
-| Compact target | `0x1702355e` (`386020702`) |
-| Nonce | `0x81234406` (`2166572038`) |
-
-At the release audit snapshot, both [Blockstream's height
-lookup](https://blockstream.info/api/block-height/965900) and [mempool.space's
-height lookup](https://mempool.space/api/block-height/965900) mapped height
-965,900 to the frozen hash. Their [Blockstream block
-record](https://blockstream.info/api/block/0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851)
-and [mempool.space block
-record](https://mempool.space/api/block/0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851)
-agreed on the decoded fields above. Both height-965,901 lookups returned
-[the same next hash on
-Blockstream](https://blockstream.info/api/block-height/965901) and [on
-mempool.space](https://mempool.space/api/block-height/965901):
-`0000000000000000000044700b8a0a6bebac628571573e05c3b71ad146ad1014`.
-That block's `previousblockhash` is the anchor. Blockchain.com's [independent
-raw record](https://blockchain.info/rawblock/0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851?format=json)
-agreed on hash, height, version, predecessor, Merkle root, timestamp, bits, and
-nonce, reported `main_chain: true`, and listed the same next block.
-
-The confirmation snapshot was taken at Bitcoin best-chain height 966,011,
-hash `0000000000000000000193744718da7f525889a7ed87d2c2a86ea309a657d7b9`.
-[Blockstream](https://blockstream.info/api/block-height/966011) and
-[mempool.space](https://mempool.space/api/block-height/966011) independently
-returned that audit-tip hash. Thus the anchor had 112 confirmations counting
-the anchor block. Later Bitcoin heights are expected and do not mutate this
-record.
-
-A local double-SHA256 of the 80 bytes, displayed in conventional reversed byte
-order, produces the frozen hash. Decoding `nBits` produces target:
-
-```text
-00000000000000000002355e0000000000000000000000000000000000000000
-```
-
-The displayed hash, interpreted as an unsigned integer, is less than or equal
-to that target (by a factor of six under integer division), so the header's
-isolated Bitcoin proof of work is valid. These explorer observations are an
-external audit snapshot only. Nodes do not trust explorers: runtime consensus
-uses only the immutable header and derived values compiled into this release.
-
-Testnet activates NU6.3 at height 1, uses a 75-second target spacing, starts at
-the compact proof-of-work limit `0x1e2fabe8` (expanded target
-`00002fabe80000…`), exactly 50 times the target encoded by the observed Zcash
-Testnet compact target `0x1e00f414`, and enables normal damped retargeting from
-launch. A block more than 450 seconds after its predecessor may use the testnet minimum
-difficulty. The boundary is strict: exactly 450 seconds is not enough. That
-minimum is the same bootstrap limit. This deliberately produces many Wcash-only
-AuxPoW blocks per Zcash winner while the test ASIC dominates Zcash Testnet.
+The exact external hash, complete Wcash genesis bytes, and derived Wcash hash
+are frozen test vectors. Consensus never fetches or replaces an anchor at
+runtime. The source-chain discriminator and Zcash-specific BLAKE2b
+personalization prevent the anchor from being confused with a Bitcoin anchor.
 
 ## Full Z15 coverage of both networks
 

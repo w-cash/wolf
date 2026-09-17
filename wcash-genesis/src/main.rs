@@ -49,10 +49,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 wcash_genesis::DESIGNATED_MAINNET_BITCOIN_HEIGHT
             );
             println!(
-                "testnet: {} (valueless); enabled for mining interoperability; Bitcoin block {} anchor (verified at Bitcoin height {})",
+                "testnet: {} (valueless); enabled for mining interoperability; Zcash Testnet block {} anchor",
                 wcash_genesis::WcashNetwork::Testnet.currency_ticker(),
-                wcash_genesis::PUBLIC_TESTNET_BITCOIN_HEIGHT,
-                wcash_genesis::PUBLIC_TESTNET_VERIFICATION_HEIGHT,
+                wcash_genesis::PUBLIC_TESTNET_ZCASH_HEIGHT,
             );
             println!(
                 "regtest: {} (valueless); enabled; frozen Bitcoin block {} anchor",
@@ -80,8 +79,9 @@ fn print_anchor(anchor: wcash_genesis::BitcoinAnchor) {
         "currency_ticker: {}",
         anchor.wcash_network().currency_ticker()
     );
-    println!("bitcoin_height: {}", anchor.bitcoin_height());
-    println!("bitcoin_hash: {}", anchor.bitcoin_block_hash());
+    println!("source_chain: {:?}", anchor.source());
+    println!("source_height: {}", anchor.bitcoin_height());
+    println!("source_hash: {}", anchor.bitcoin_block_hash());
     println!("statement: {}", anchor.genesis_statement());
     println!("encoding: {}", encode_hex(anchor.encode()));
     println!("commitment: {}", encode_hex(anchor.commitment()));

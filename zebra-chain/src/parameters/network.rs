@@ -377,7 +377,7 @@ impl Network {
             // Version Wcash cache roots whenever pre-launch consensus changes,
             // so an updated binary cannot silently trust state accepted by an
             // incompatible prototype.
-            Some(wcash_genesis::WcashNetwork::Testnet) => "wcashtestnet-v6".to_owned(),
+            Some(wcash_genesis::WcashNetwork::Testnet) => "wcashtestnet-v7".to_owned(),
             Some(wcash_genesis::WcashNetwork::Regtest) => "wcashregtest-v5".to_owned(),
             _ => self.to_string().to_ascii_lowercase(),
         }
@@ -538,7 +538,7 @@ impl zcash_protocol::consensus::Parameters for Network {
         if nu == zcash_protocol::consensus::NetworkUpgrade::Nu6_3 {
             match self.wcash_network() {
                 Some(wcash_genesis::WcashNetwork::Testnet) => {
-                    return zcash_protocol::consensus::BranchId::WcashTestnetV2;
+                    return zcash_protocol::consensus::BranchId::WcashTestnetV3;
                 }
                 Some(wcash_genesis::WcashNetwork::Regtest) => {
                     return zcash_protocol::consensus::BranchId::WcashRegtestV1;
