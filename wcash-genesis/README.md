@@ -43,41 +43,17 @@ Neither consensus validation nor the generator performs HTTP requests.
 
 ## Frozen Testnet-profile anchor
 
-The built-in engineering Testnet profile freezes Bitcoin mainnet block 965,900.
-No public Wcash Testnet is deployed. The frozen identity is:
+The public Testnet profile freezes Zcash Testnet block 4,362,016, hash
+`00000e289ad21d2feeb17e16585790ecabec94323c2ef22925534ad104de73ac`,
+with source timestamp `1789685930`. The Wcash genesis timestamp is
+`1789686000` (2026-09-17 23:00:00 UTC), and its complete frozen genesis ID is
+`6b66fff119977d36d9c989093b516a876dbf6596536791ff35bb4c581e3fda98`.
 
-```text
-hash:   0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851
-header: 00203220700b5cbd51c3511db177feb5891754ee7e3ec5f4849a010000000000000000000444905fd34cdb083f512a1957ec2c7ffedf3a7ff5098d1f20a5aed9c8484b46c5719e6a5e35021706442381
-time:   1788768709
-nBits:  0x1702355e
-nonce:  2166572038
-```
-
-At the frozen audit snapshot, the [Blockstream API](https://blockstream.info/api/block-height/965900)
-and [mempool.space API](https://mempool.space/api/block-height/965900)
-independently reported the same exact header, hash, height, and best-chain status
-at tip 966,011. [Blockchain.com](https://www.blockchain.com/explorer/blocks/btc/965900)
-independently agreed on the height, display hash, timestamp, compact target, and
-nonce. Counting the anchor block, this was 112 confirmations. A local
-reproduction double-SHA256 hashed the 80-byte header to the displayed hash,
-decoded `nBits`, and verified that the header hash satisfies the encoded Bitcoin
-target.
-
-Height 966,011 is provenance for this review only. It is frozen in a test vector
-and is never consulted as consensus or runtime input. Node consensus uses only
-the immutable anchor fields, Wcash network discriminator, genesis statement,
-commitment, and complete serialized Wcash genesis block.
-
-The Testnet profile uses Wcash Testnet v2 branch ID `0xa8d6c929` for NU6.3 /
-Ironwood transactions; retired Testnet v1 used `0xb3cfd27e`, and local Regtest
-uses the separate ID `0xc3a6678a`. They reject the standard Zcash NU6.3 ID and
-each other's Wcash ID. Every post-genesis
-transaction must be V6, so V1-V5 and wrong-domain transactions are invalid in
-both blocks and the mempool. A controlled local Regtest E2E has spent a private
-coinbase through its Wcash V6 domain, but that does not establish public-network
-wallet or pool-payout readiness. Testnet rewards have no value, and mainnet
-remains disabled.
+The source-chain byte identifies Zcash Testnet and the anchor commitment uses
+`WcashZecAnchorV1` personalization. The Testnet profile uses transaction branch
+ID `0x54ba2bfb`, P2P identity `Wcash/testnet/v7`, magic `49d2934b`, and cache
+namespace `wcashtestnet-v7`. These values prevent peers, state, and signed
+transactions from retired chains from entering this reset network.
 
 ## Fail-closed mainnet launch
 

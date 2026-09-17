@@ -16,7 +16,7 @@ max_connections_per_ip = 1
 
 [state]
 # Persistent by default. The database is isolated below the platform cache
-# root as `wcash/state/vN/wcashtestnet-v6`; it does not share Zcash, regtest,
+# root as `wcash/state/vN/wcashtestnet-v7`; it does not share Zcash, regtest,
 # or state produced by incompatible pre-launch Wcash builds.
 ephemeral = false
 

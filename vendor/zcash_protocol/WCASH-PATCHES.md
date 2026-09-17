@@ -20,11 +20,11 @@ Wcash makes three consensus-critical extensions:
 - The ID gives Wcash Testnet v1 a signature and transaction-hash domain that is
   distinct from Zcash NU6.3 (`0x37a5165b`) while retaining NU6.3 / Ironwood
   protocol semantics.
-- `BranchId::WcashTestnetV2` is `0xa8d6c929`. It is the first four bytes, in
+- `BranchId::WcashTestnetV3` is `0x54ba2bfb`. It is the first four bytes, in
   display order, of SHA-256 over the exact UTF-8 string
-  `Wcash/NU6.3/Ironwood/v1` (full digest
-  `a8d6c929bd7103673d9deb302f34b0120334f488c8e44e92066ee5b04a797599`).
-  Testnet v2 selects this domain so transactions signed for the retired v1
+  `Wcash/NU6.3/Ironwood/v2` (full digest
+  `54ba2bfb975e2d4964492570f58d6e3132e7f15da57c063163aef8e44a2f4caa`).
+  Testnet v3 selects this domain so transactions signed for the retired v1
   chain cannot be replayed on the reset chain.
 - `BranchId::WcashRegtestV1` is `0xc3a6678a`. It is the first four bytes, in
   display order, of SHA-256 over the exact UTF-8 string
@@ -35,7 +35,7 @@ Wcash makes three consensus-critical extensions:
 - `Parameters::branch_id_for_upgrade` lets an independent network select its
   branch ID without changing any standard Zcash mapping.
 
-These identifiers are frozen for Wcash Testnet v1, Testnet v2, and local
+These identifiers are frozen for Wcash Testnet v1, Testnet v3, and local
 Regtest only. A future Wcash mainnet must allocate and review a different
 branch ID; it must not reuse any non-production ID.
 

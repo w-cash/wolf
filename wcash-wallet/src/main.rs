@@ -1049,7 +1049,7 @@ mod tests {
                 "protocol_version": 2,
                 "network": "testnet",
                 "genesis_hash": "22".repeat(32),
-                "branch_id": "a8d6c929",
+                "branch_id": "54ba2bfb",
                 "account_id": "20000000-0000-4000-8000-000000000002",
                 "collector_payout_commitment": "33".repeat(32),
                 "fund_source": "ironwood",

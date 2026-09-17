@@ -42,7 +42,7 @@ pub const WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 100] =
 /// 965,900. Its Wcash-network discriminator is separately committed in the
 /// header's anchor commitment.
 pub const WCASH_TESTNET_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 100] =
-    b"06/Sep/2026 Wcash (WEC) BTC #965900 0000000000000000000056b59ff5f4af3ca8b47837f2eac5d83a271c3e6b9851";
+    b"17/Sep/2026 W.cash ZECtest #4362016 00000e289ad21d2feeb17e16585790ecabec94323c2ef22925534ad104de73ac";
 
 /// Returns true for one of the exact, frozen genesis coinbase scripts.
 ///

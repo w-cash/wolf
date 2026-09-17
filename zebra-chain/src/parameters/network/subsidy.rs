@@ -32,16 +32,33 @@ use constants::{
 /// Wcash starts at 6.25 whole units per mined block: WEC on Mainnet and TWC on testing networks.
 pub(crate) const WCASH_INITIAL_BLOCK_SUBSIDY: u64 = 625_000_000;
 
+/// Wcash Testnet reaches its full initial subsidy at this height.
+///
+/// Heights from genesis through this height use a linear subsidy ramp. This is
+/// intentionally different from Zcash's midpoint-adjusted slow-start formula.
+pub(crate) const WCASH_TESTNET_SLOW_START_INTERVAL: Height = Height(40_000);
+
+/// The Wcash Testnet halving schedule is delayed by half its slow-start interval.
+pub(crate) const WCASH_TESTNET_SLOW_START_SHIFT: Height = Height(20_000);
+
 /// Wcash halves every 1,680,000 blocks, approximately four years at 75 seconds per block.
 ///
 /// Together with the 6.25-unit initial subsidy, this interval keeps total
 /// scheduled issuance below the 21 million WEC Mainnet monetary-base hard cap.
 pub(crate) const WCASH_HALVING_INTERVAL: HeightDiff = 1_680_000;
 
-/// The first Wcash block paid at half the initial subsidy.
+/// The first Wcash Regtest block paid at half the initial subsidy.
 ///
 /// Heights 1 through 1,680,000 inclusive form the initial-subsidy era; genesis has no subsidy.
-pub(crate) const WCASH_FIRST_HALVING_HEIGHT: Height = Height(1_680_001);
+pub(crate) const WCASH_REGTEST_FIRST_HALVING_HEIGHT: Height = Height(1_680_001);
+
+/// The first Wcash Testnet block paid at half the initial subsidy.
+///
+/// Following Zcash's slow-start compensation principle, Wcash Testnet delays
+/// its halving schedule by half the slow-start interval. Wcash uses 75-second
+/// blocks from height 1, so its calculation has no 150-second pre-Blossom era:
+/// 1,680,000 + 20,000 = 1,700,000.
+pub(crate) const WCASH_TESTNET_FIRST_HALVING_HEIGHT: Height = Height(1_700_000);
 
 /// The funding stream receiver categories.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -252,7 +269,11 @@ pub trait ParameterSubsidy {
 impl ParameterSubsidy for Network {
     fn height_for_first_halving(&self) -> Height {
         if self.uses_wcash_consensus() {
-            return WCASH_FIRST_HALVING_HEIGHT;
+            return if self.is_wcash_testnet() {
+                WCASH_TESTNET_FIRST_HALVING_HEIGHT
+            } else {
+                WCASH_REGTEST_FIRST_HALVING_HEIGHT
+            };
         }
 
         // First halving on Mainnet is at Canopy
@@ -336,9 +357,12 @@ pub fn height_for_halving(halving: u32, network: &Network) -> Option<Height> {
     }
 
     if network.uses_wcash_consensus() {
-        let height = halving
-            .checked_mul(WCASH_HALVING_INTERVAL.try_into().ok()?)?
-            .checked_add(1)?;
+        let height = halving.checked_mul(WCASH_HALVING_INTERVAL.try_into().ok()?)?;
+        let height = if network.is_wcash_testnet() {
+            height.checked_add(WCASH_TESTNET_SLOW_START_SHIFT.0)?
+        } else {
+            height.checked_add(1)?
+        };
         return Height::try_from(height).ok();
     }
 
@@ -472,7 +496,13 @@ pub fn halving_divisor(height: Height, network: &Network) -> Option<u64> {
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 pub fn halving(height: Height, network: &Network) -> u32 {
     if network.uses_wcash_consensus() {
-        return height.0.saturating_sub(1) / (WCASH_HALVING_INTERVAL as u32);
+        let schedule_height = if network.is_wcash_testnet() {
+            height.0.saturating_sub(WCASH_TESTNET_SLOW_START_SHIFT.0)
+        } else {
+            height.0.saturating_sub(1)
+        };
+
+        return schedule_height / (WCASH_HALVING_INTERVAL as u32);
     }
 
     let slow_start_shift = network.slow_start_shift();
@@ -505,6 +535,17 @@ pub fn halving(height: Height, network: &Network) -> u32 {
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 pub fn block_subsidy(height: Height, net: &Network) -> Result<Amount<NonNegative>, SubsidyError> {
     if net.uses_wcash_consensus() {
+        if net.is_wcash_testnet() && height <= WCASH_TESTNET_SLOW_START_INTERVAL {
+            // Multiplication before division implements the consensus rule
+            // floor(6.25 TWC * height / 40,000) in atomic units.
+            let amount = WCASH_INITIAL_BLOCK_SUBSIDY
+                .checked_mul(u64::from(height))
+                .expect("Wcash Testnet slow-start heights fit in u64")
+                / u64::from(WCASH_TESTNET_SLOW_START_INTERVAL);
+
+            return Ok(Amount::try_from(amount)?);
+        }
+
         if height == Height::MIN {
             return Ok(Amount::zero());
         }

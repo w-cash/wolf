@@ -118,7 +118,7 @@ impl Creator {
             | BranchId::Nu6
             | BranchId::Nu6_1
             | BranchId::Nu6_2 => (V5_TX_VERSION, V5_VERSION_GROUP_ID),
-            BranchId::Nu6_3 | BranchId::WcashTestnetV1 | BranchId::WcashTestnetV2 | BranchId::WcashRegtestV1 => {
+            BranchId::Nu6_3 | BranchId::WcashTestnetV1 | BranchId::WcashTestnetV3 | BranchId::WcashRegtestV1 => {
                 (V6_TX_VERSION, V6_VERSION_GROUP_ID)
             }
             #[cfg(zcash_unstable = "nu7")]
@@ -396,7 +396,7 @@ mod tests {
         );
 
         let pczt = Creator::new(
-            BranchId::WcashTestnetV2.into(),
+            BranchId::WcashTestnetV3.into(),
             10_000_000,
             133,
             Some([0; 32]),
@@ -409,7 +409,7 @@ mod tests {
         assert_eq!(pczt.global.version_group_id, V6_VERSION_GROUP_ID);
         assert_eq!(
             pczt.global.consensus_branch_id,
-            u32::from(BranchId::WcashTestnetV2)
+            u32::from(BranchId::WcashTestnetV3)
         );
 
         let pczt = Creator::new(

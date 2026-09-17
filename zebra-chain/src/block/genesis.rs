@@ -14,7 +14,7 @@ use crate::{
 
 /// Frozen display-order block ID of the public Wcash Testnet genesis block.
 pub const WCASH_TESTNET_GENESIS_HASH: &str =
-    "efffff94fbd682f4a55e0abdb74048208491b7312ce917324ea333953d640ed7";
+    "6b66fff119977d36d9c989093b516a876dbf6596536791ff35bb4c581e3fda98";
 
 /// Genesis block for Regtest, copied from zcashd via `getblock 0 0` RPC method
 pub fn regtest_genesis_block() -> Arc<Block> {
@@ -47,7 +47,7 @@ pub fn wcash_regtest_genesis_block() -> Arc<Block> {
 ///
 /// The complete block is deterministically derived from immutable fields and
 /// checked against a byte-for-byte source vector in this module's tests. Its
-/// Bitcoin anchor is testnet-specific, and mainnet remains disabled.
+/// Zcash Testnet anchor is testnet-specific, and mainnet remains disabled.
 pub fn wcash_testnet_genesis_block() -> Arc<Block> {
     let bytes = <Vec<u8>>::from_hex(include_str!("genesis/block-wcash-testnet-0.txt").trim())
         .expect("the frozen Wcash Testnet genesis vector is valid hex");
@@ -66,7 +66,7 @@ fn independently_constructed_wcash_testnet_genesis_block() -> Arc<Block> {
 
     wcash_genesis_block(
         wcash_genesis::TESTNET_ANCHOR,
-        wcash_genesis::PUBLIC_TESTNET_BITCOIN_TIME,
+        wcash_genesis::PUBLIC_TESTNET_GENESIS_TIME,
         transparent::WCASH_TESTNET_GENESIS_COINBASE_SCRIPT_SIG,
         Some(difficulty_threshold),
     )
@@ -74,7 +74,7 @@ fn independently_constructed_wcash_testnet_genesis_block() -> Arc<Block> {
 
 fn wcash_genesis_block(
     anchor: wcash_genesis::BitcoinAnchor,
-    bitcoin_time: u32,
+    genesis_time: u32,
     coinbase_script: &[u8],
     difficulty_threshold: Option<CompactDifficulty>,
 ) -> Arc<Block> {
@@ -108,7 +108,7 @@ fn wcash_genesis_block(
     header.version = WCASH_BLOCK_WIRE_VERSION;
     header.merkle_root = merkle_root;
     header.commitment_bytes = anchor.commitment().into();
-    header.time = chrono::DateTime::from_timestamp(i64::from(bitcoin_time), 0)
+    header.time = chrono::DateTime::from_timestamp(i64::from(genesis_time), 0)
         .expect("the Wcash genesis timestamp is representable");
     if let Some(difficulty_threshold) = difficulty_threshold {
         header.difficulty_threshold = difficulty_threshold;

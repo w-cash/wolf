@@ -5477,7 +5477,7 @@ mod tests {
         assert_ne!(expected, [0; 32]);
         assert_eq!(
             hex::encode(expected),
-            "a8ad6e22de8424ee0503c5f8d735ed0cb364bbb438748adf24eaabfff80737d1"
+            "a6ab619aacd3ff79800463a11ccfa4fc4627c96b9327128cc961ecd6cae54309"
         );
 
         let first = build_payout_wallet_observation(snapshot.clone(), 1_000, 1_240);

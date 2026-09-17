@@ -18,7 +18,7 @@ use crate::{
                 POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
             },
             funding_stream_address_period, FundingStreamReceiver, FundingStreamRecipient,
-            FundingStreams,
+            FundingStreams, WCASH_TESTNET_SLOW_START_INTERVAL,
         },
         Network, NetworkKind, NetworkUpgrade,
     },
@@ -1125,7 +1125,9 @@ impl Parameters {
     ///
     /// NU6.3 activates at height 1. The inherited Zcash damped retarget is
     /// active from launch, and a gap strictly greater than six 75-second target
-    /// spacings permits one proof-of-work-limit block for testnet liveness.
+    /// spacings permits one proof-of-work-limit block for testnet liveness. The
+    /// block subsidy ramps linearly from zero at genesis to 6.25 TWC at height
+    /// 40,000, without Zcash's midpoint adjustment.
     pub(super) fn new_wcash_testnet() -> Result<Self, ParametersBuilderError> {
         let genesis = block::genesis::wcash_testnet_genesis_block();
         assert_eq!(
@@ -1143,7 +1145,7 @@ impl Parameters {
             .with_disable_pow(false)
             .with_minimum_difficulty_start_height(Some(Height(1)))
             .with_unshielded_coinbase_spends(false)
-            .with_slow_start_interval(Height::MIN)
+            .with_slow_start_interval(WCASH_TESTNET_SLOW_START_INTERVAL)
             .disable_temporary_orchard_disabling_soft_fork()
             .with_activation_heights(ConfiguredActivationHeights {
                 nu6_3: Some(1),

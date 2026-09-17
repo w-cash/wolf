@@ -13,11 +13,13 @@ use crate::{
         subsidy::{
             block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, founders_reward,
             founders_reward_address, funding_stream_values, halving, halving_divisor,
-            height_for_halving, miner_subsidy, ParameterSubsidy as _, WCASH_FIRST_HALVING_HEIGHT,
-            WCASH_HALVING_INTERVAL, WCASH_INITIAL_BLOCK_SUBSIDY,
+            height_for_halving, miner_subsidy, ParameterSubsidy as _, WCASH_HALVING_INTERVAL,
+            WCASH_INITIAL_BLOCK_SUBSIDY, WCASH_REGTEST_FIRST_HALVING_HEIGHT,
+            WCASH_TESTNET_FIRST_HALVING_HEIGHT, WCASH_TESTNET_SLOW_START_INTERVAL,
+            WCASH_TESTNET_SLOW_START_SHIFT,
         },
         ConsensusBranchId, NetworkUpgrade, WCASH_REGTEST_V1_BRANCH_ID, WCASH_TESTNET_V1_BRANCH_ID,
-        WCASH_TESTNET_V2_BRANCH_ID,
+        WCASH_TESTNET_V3_BRANCH_ID,
     },
     serialization::DateTime32,
     work::difficulty::ParameterDifficulty as _,
@@ -109,6 +111,11 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
         Amount::<NonNegative>::zero(),
         "Wcash genesis contributes no scheduled issuance"
     );
+    assert_eq!(
+        testnet.slow_start_interval(),
+        WCASH_TESTNET_SLOW_START_INTERVAL
+    );
+    assert_eq!(testnet.slow_start_shift(), WCASH_TESTNET_SLOW_START_SHIFT);
 
     assert_ne!(testnet, regtest);
     assert_ne!(testnet.to_string(), regtest.to_string());
@@ -126,14 +133,14 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
     );
     assert_eq!(
         ConsensusBranchId::current(&testnet, Height(1)),
-        Some(WCASH_TESTNET_V2_BRANCH_ID)
+        Some(WCASH_TESTNET_V3_BRANCH_ID)
     );
     assert_eq!(
         ConsensusBranchId::current(&regtest, Height(1)),
         Some(WCASH_REGTEST_V1_BRANCH_ID)
     );
     assert_eq!(
-        NetworkUpgrade::try_from(u32::from(WCASH_TESTNET_V2_BRANCH_ID)),
+        NetworkUpgrade::try_from(u32::from(WCASH_TESTNET_V3_BRANCH_ID)),
         Ok(NetworkUpgrade::Nu6_3)
     );
     assert_eq!(
@@ -145,7 +152,7 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
             &testnet,
             zcash_protocol::consensus::BlockHeight::from_u32(1),
         ),
-        zcash_protocol::consensus::BranchId::WcashTestnetV2
+        zcash_protocol::consensus::BranchId::WcashTestnetV3
     );
     assert_eq!(
         zcash_protocol::consensus::BranchId::for_height(
@@ -154,8 +161,8 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
         ),
         zcash_protocol::consensus::BranchId::WcashRegtestV1
     );
-    assert_ne!(WCASH_TESTNET_V2_BRANCH_ID, WCASH_TESTNET_V1_BRANCH_ID);
-    assert_ne!(WCASH_TESTNET_V2_BRANCH_ID, WCASH_REGTEST_V1_BRANCH_ID);
+    assert_ne!(WCASH_TESTNET_V3_BRANCH_ID, WCASH_TESTNET_V1_BRANCH_ID);
+    assert_ne!(WCASH_TESTNET_V3_BRANCH_ID, WCASH_REGTEST_V1_BRANCH_ID);
 
     for zcash in zcash_networks {
         assert!(!zcash.uses_wcash_consensus());
@@ -164,6 +171,77 @@ fn wcash_testnet_has_frozen_isolated_network_identity() -> Result<(), Report> {
         assert_ne!(testnet.genesis_hash(), zcash.genesis_hash());
         assert_ne!(testnet.default_port(), zcash.default_port());
     }
+
+    Ok(())
+}
+
+#[test]
+fn wcash_testnet_uses_linear_slow_start_subsidy() -> Result<(), Report> {
+    let testnet = Network::new_wcash_testnet();
+
+    for (height, expected_atomic_units) in [
+        (0, 0),
+        (1, 15_625),
+        (10_000, 156_250_000),
+        (20_000, 312_500_000),
+        (30_000, 468_750_000),
+        (39_999, 624_984_375),
+        (40_000, 625_000_000),
+        (40_001, 625_000_000),
+    ] {
+        let expected_subsidy = Amount::<NonNegative>::try_from(expected_atomic_units)?;
+        assert_eq!(
+            block_subsidy(Height(height), &testnet)?,
+            expected_subsidy,
+            "unexpected Wcash Testnet subsidy at height {height}"
+        );
+        assert_eq!(
+            miner_subsidy(Height(height), &testnet, expected_subsidy)?,
+            expected_subsidy,
+            "the miner must receive the entire Wcash Testnet subsidy at height {height}"
+        );
+    }
+
+    // The Wcash rule is the direct integer formula requested for every ramp
+    // height, without Zcash's midpoint adjustment.
+    for height in 0..=WCASH_TESTNET_SLOW_START_INTERVAL.0 {
+        let expected_atomic_units = WCASH_INITIAL_BLOCK_SUBSIDY * u64::from(height)
+            / u64::from(WCASH_TESTNET_SLOW_START_INTERVAL);
+        assert_eq!(
+            block_subsidy(Height(height), &testnet)?,
+            Amount::<NonNegative>::try_from(expected_atomic_units)?,
+            "linear slow-start formula changed at height {height}"
+        );
+    }
+
+    let full_subsidy = Amount::<NonNegative>::try_from(WCASH_INITIAL_BLOCK_SUBSIDY)?;
+    let half_subsidy = Amount::<NonNegative>::try_from(WCASH_INITIAL_BLOCK_SUBSIDY / 2)?;
+    assert_eq!(
+        block_subsidy(
+            (WCASH_TESTNET_FIRST_HALVING_HEIGHT - 1)
+                .expect("the first halving has a previous height"),
+            &testnet,
+        )?,
+        full_subsidy
+    );
+    assert_eq!(
+        block_subsidy(WCASH_TESTNET_FIRST_HALVING_HEIGHT, &testnet)?,
+        half_subsidy
+    );
+    assert_eq!(block_subsidy(Height(3_379_999), &testnet)?, half_subsidy);
+    assert_eq!(
+        block_subsidy(Height(3_380_000), &testnet)?,
+        Amount::<NonNegative>::try_from(WCASH_INITIAL_BLOCK_SUBSIDY / 4)?
+    );
+    assert_eq!(
+        height_for_halving(1, &testnet),
+        Some(WCASH_TESTNET_FIRST_HALVING_HEIGHT)
+    );
+    assert_eq!(height_for_halving(2, &testnet), Some(Height(3_380_000)));
+    assert_eq!(
+        testnet.height_for_first_halving(),
+        WCASH_TESTNET_FIRST_HALVING_HEIGHT
+    );
 
     Ok(())
 }
@@ -295,18 +373,18 @@ fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
     assert_eq!(block_subsidy(Height(1), &network)?, initial_subsidy);
     assert_eq!(block_subsidy(Height(1_680_000), &network)?, initial_subsidy);
     assert_eq!(
-        block_subsidy(WCASH_FIRST_HALVING_HEIGHT, &network)?,
+        block_subsidy(WCASH_REGTEST_FIRST_HALVING_HEIGHT, &network)?,
         halved_subsidy
     );
     assert_eq!(halving(Height(1_680_000), &network), 0);
-    assert_eq!(halving(WCASH_FIRST_HALVING_HEIGHT, &network), 1);
+    assert_eq!(halving(WCASH_REGTEST_FIRST_HALVING_HEIGHT, &network), 1);
     assert_eq!(
         height_for_halving(1, &network),
-        Some(WCASH_FIRST_HALVING_HEIGHT)
+        Some(WCASH_REGTEST_FIRST_HALVING_HEIGHT)
     );
     assert_eq!(
         network.height_for_first_halving(),
-        WCASH_FIRST_HALVING_HEIGHT
+        WCASH_REGTEST_FIRST_HALVING_HEIGHT
     );
     assert_eq!(
         network.post_blossom_halving_interval(),
