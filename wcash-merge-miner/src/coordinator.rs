@@ -556,6 +556,7 @@ impl NativeMiningSupervisor {
         // retries cache-capacity neutral even during a prolonged parent outage.
         self.retry_pending_candidate_retirement()?;
         zcash_identity?;
+        zcash.relay_observer_blocks_to_work_nodes()?;
         self.initial_outbox_recovery_complete
             .store(true, Ordering::Release);
 
