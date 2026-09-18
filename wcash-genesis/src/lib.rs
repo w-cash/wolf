@@ -46,9 +46,6 @@ pub const GENESIS_TIMESTAMP_TEXT: &str = "06/Sep/2026 Wcash (WEC)";
 /// Human-readable timestamp prefix for the public Wcash Testnet genesis.
 pub const PUBLIC_TESTNET_GENESIS_TIMESTAMP_TEXT: &str = "17/Sep/2026 W.cash";
 
-/// Bitcoin mainnet height designated for a possible Wcash mainnet anchor.
-pub const DESIGNATED_MAINNET_BITCOIN_HEIGHT: u32 = 965_954;
-
 /// Zcash Testnet height frozen into the public Wcash Testnet genesis.
 pub const PUBLIC_TESTNET_ZCASH_HEIGHT: u32 = 4_362_016;
 
@@ -57,6 +54,12 @@ pub const PUBLIC_TESTNET_ZCASH_TIME: u32 = 1_789_685_930;
 
 /// Timestamp of the Wcash public Testnet genesis block.
 pub const PUBLIC_TESTNET_GENESIS_TIME: u32 = 1_789_686_000;
+
+/// Announced Wcash Mainnet genesis time: 18 September 2026, 22:00 UTC.
+///
+/// The external Zcash anchor remains fail-closed until a sufficiently
+/// confirmed block at or before this launch boundary is reviewed and frozen.
+pub const PUBLIC_MAINNET_GENESIS_TIME: u32 = 1_789_768_800;
 
 /// Bitcoin mainnet height frozen into the local Wcash regtest genesis.
 pub const LOCAL_REGTEST_BITCOIN_HEIGHT: u32 = 965_910;
@@ -78,13 +81,19 @@ pub const MIN_PUBLIC_ANCHOR_CONFIRMATIONS: u32 = 100;
 ///
 /// This bootstrap limit is exactly 50 times the target encoded by the observed
 /// Zcash Testnet compact target `0x1e00f414`. It intentionally creates many
-/// Wcash-only AuxPoW blocks per Zcash parent block so the public testnet can
+/// Wcash-only `AuxPoW` blocks per Zcash parent block so the public testnet can
 /// exercise the same target asymmetry expected in production. Normal adjustment
 /// can harden the target as aggregate hash rate grows, but cannot soften it
 /// below this launch limit.
 pub const PUBLIC_TESTNET_POW_LIMIT_BITS: u32 = 0x1e2f_abe8;
 
-/// Version of the fixed-width Bitcoin anchor encoding.
+/// Canonical compact `nBits` value for the Wcash Mainnet launch `PoW` limit.
+///
+/// Mainnet starts from the same ASIC-tested launch ceiling as public Testnet;
+/// the normal damped retarget then hardens difficulty as hash rate arrives.
+pub const PUBLIC_MAINNET_POW_LIMIT_BITS: u32 = PUBLIC_TESTNET_POW_LIMIT_BITS;
+
+/// Version of the fixed-width external-chain anchor encoding.
 pub const ANCHOR_ENCODING_VERSION: u8 = 1;
 
 /// Length of a canonical encoded external anchor.
@@ -98,6 +107,7 @@ pub const ZCASH_ANCHOR_PERSONALIZATION: &[u8; 16] = b"WcashZecAnchorV1";
 
 const BITCOIN_MAINNET_SOURCE_ID: u8 = 0;
 const ZCASH_TESTNET_SOURCE_ID: u8 = 1;
+const ZCASH_MAINNET_SOURCE_ID: u8 = 2;
 const RESERVED_BYTE: u8 = 0;
 const BITCOIN_HEADER_LEN: usize = 80;
 const BITCOIN_MAINNET_POW_LIMIT: [u8; 32] = [
@@ -437,6 +447,8 @@ pub enum AnchorSource {
     BitcoinMainnet = BITCOIN_MAINNET_SOURCE_ID,
     /// Zcash Testnet.
     ZcashTestnet = ZCASH_TESTNET_SOURCE_ID,
+    /// Zcash Mainnet.
+    ZcashMainnet = ZCASH_MAINNET_SOURCE_ID,
 }
 
 impl TryFrom<u8> for AnchorSource {
@@ -446,6 +458,7 @@ impl TryFrom<u8> for AnchorSource {
         match value {
             BITCOIN_MAINNET_SOURCE_ID => Ok(Self::BitcoinMainnet),
             ZCASH_TESTNET_SOURCE_ID => Ok(Self::ZcashTestnet),
+            ZCASH_MAINNET_SOURCE_ID => Ok(Self::ZcashMainnet),
             other => Err(AnchorDecodeError::UnknownSourceChain(other)),
         }
     }
@@ -571,14 +584,19 @@ impl BitcoinAnchor {
     /// Returns the deterministic ASCII text to embed in the genesis coinbase.
     #[must_use]
     pub fn genesis_statement(self) -> String {
-        let (prefix, source) = match self.source {
-            AnchorSource::BitcoinMainnet => (GENESIS_TIMESTAMP_TEXT, "BTC"),
-            AnchorSource::ZcashTestnet => (PUBLIC_TESTNET_GENESIS_TIMESTAMP_TEXT, "ZECtest"),
-        };
-        format!(
-            "{prefix} {source} #{} {}",
-            self.bitcoin_height, self.bitcoin_block_hash
-        )
+        match self.source {
+            AnchorSource::BitcoinMainnet => format!(
+                "{GENESIS_TIMESTAMP_TEXT} BTC #{} {}",
+                self.bitcoin_height, self.bitcoin_block_hash
+            ),
+            AnchorSource::ZcashTestnet => format!(
+                "{PUBLIC_TESTNET_GENESIS_TIMESTAMP_TEXT} ZECtest #{} {}",
+                self.bitcoin_height, self.bitcoin_block_hash
+            ),
+            AnchorSource::ZcashMainnet => {
+                format!("ZEC #{} {}", self.bitcoin_height, self.bitcoin_block_hash)
+            }
+        }
     }
 
     /// Returns the 32-byte Wcash genesis commitment for this anchor.
@@ -586,7 +604,7 @@ impl BitcoinAnchor {
     pub fn commitment(self) -> [u8; 32] {
         let personalization = match self.source {
             AnchorSource::BitcoinMainnet => BITCOIN_ANCHOR_PERSONALIZATION,
-            AnchorSource::ZcashTestnet => ZCASH_ANCHOR_PERSONALIZATION,
+            AnchorSource::ZcashTestnet | AnchorSource::ZcashMainnet => ZCASH_ANCHOR_PERSONALIZATION,
         };
         let hash = Params::new()
             .hash_length(32)
@@ -716,7 +734,7 @@ impl fmt::Display for PublicNetworkDisabled {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "Wcash {} is disabled because no reviewed Bitcoin anchor is frozen",
+            "Wcash {} is disabled because no reviewed external-chain anchor is frozen",
             self.network
         )
     }
@@ -838,6 +856,7 @@ mod tests {
     const LOCAL_REGTEST_BITCOIN_DISPLAY_HASH: &str =
         "00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146";
     const LOCAL_REGTEST_BITCOIN_BITS: u32 = 0x1702_355e;
+    const OBSERVED_ZCASH_TESTNET_BITS: u32 = 0x1e00_f414;
     const PUBLIC_TESTNET_ZCASH_DISPLAY_HASH: &str =
         "00000e289ad21d2feeb17e16585790ecabec94323c2ef22925534ad104de73ac";
     const TESTNET_ENCODING: &str =
@@ -911,7 +930,6 @@ mod tests {
             ])
         );
 
-        const OBSERVED_ZCASH_TESTNET_BITS: u32 = 0x1e00_f414;
         assert_eq!(
             PUBLIC_TESTNET_POW_LIMIT_BITS >> 24,
             OBSERVED_ZCASH_TESTNET_BITS >> 24
@@ -1002,7 +1020,36 @@ mod tests {
         let error = select_anchor(WcashNetwork::Mainnet, None)
             .expect_err("mainnet must stay unavailable before its anchor has enough confirmations");
         assert_eq!(error.network(), WcashNetwork::Mainnet);
-        assert_eq!(DESIGNATED_MAINNET_BITCOIN_HEIGHT, 965_954);
+    }
+
+    #[test]
+    fn mainnet_launch_time_and_pow_limit_are_frozen() {
+        assert_eq!(PUBLIC_MAINNET_GENESIS_TIME, 1_789_768_800);
+        assert_eq!(PUBLIC_MAINNET_POW_LIMIT_BITS, 0x1e2f_abe8);
+        assert_eq!(
+            decode_compact_target(PUBLIC_MAINNET_POW_LIMIT_BITS),
+            decode_compact_target(PUBLIC_TESTNET_POW_LIMIT_BITS)
+        );
+    }
+
+    #[test]
+    fn mainnet_zcash_anchor_format_is_ready_but_not_activated() {
+        let candidate = BitcoinAnchor::frozen(
+            WcashNetwork::Mainnet,
+            AnchorSource::ZcashMainnet,
+            3_488_000,
+            [0xab; 32],
+        );
+
+        assert_eq!(
+            candidate.genesis_statement(),
+            concat!(
+                "ZEC #3488000 ",
+                "abababababababababababababababababababababababababababababababab"
+            )
+        );
+        assert_eq!(BitcoinAnchor::decode(&candidate.encode()), Ok(candidate));
+        assert!(select_anchor(WcashNetwork::Mainnet, None).is_err());
     }
 
     #[test]
@@ -1073,7 +1120,7 @@ mod tests {
         for (index, value, expected) in [
             (0, 2, AnchorDecodeError::UnknownVersion(2)),
             (1, 3, AnchorDecodeError::UnknownWcashNetwork(3)),
-            (2, 2, AnchorDecodeError::UnknownSourceChain(2)),
+            (2, 3, AnchorDecodeError::UnknownSourceChain(3)),
             (3, 1, AnchorDecodeError::NonZeroReservedByte(1)),
         ] {
             let mut encoding = REGTEST_ANCHOR.encode();

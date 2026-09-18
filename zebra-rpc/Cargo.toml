@@ -30,6 +30,13 @@ exclude = ["*.proto"]
 # Experimental internal miner support
 internal-miner = []
 
+# Select the Wcash monetary and consensus profile for standalone RPC builds.
+wcash-consensus = [
+    "zebra-chain/wcash-consensus",
+    "zebra-consensus/wcash-consensus",
+    "zebra-network/wcash-consensus",
+]
+
 # Test-only features
 proptest-impl = [
     "proptest",

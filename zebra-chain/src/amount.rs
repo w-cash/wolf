@@ -610,13 +610,15 @@ pub const COIN: i64 = 100_000_000;
 #[cfg(not(feature = "wcash-consensus"))]
 pub const MAX_MONEY: i64 = 21_000_000 * COIN;
 
-/// The Wcash monetary-base hard cap, in zatoshis.
+/// The Wcash implementation's finite technical monetary bound, in atomic units.
 ///
-/// The scheduled subsidy remains below this bound because each halving drops
-/// fractional zatoshi. Consensus also rejects any chain value-pool total above
-/// this limit.
+/// Wcash Mainnet has a permanent tail subsidy, so this is not an economic
+/// supply cap. It leaves checked signed-integer headroom while allowing more
+/// than 46 billion WEC, over two thousand times the inherited 21-million limit.
+/// The 0.375 WEC tail would take roughly 292,000 target years to reach it.
+/// Individual transactions retain the inherited, separately enforced limit.
 #[cfg(feature = "wcash-consensus")]
-pub const MAX_MONEY: i64 = 21_000_000 * COIN;
+pub const MAX_MONEY: i64 = i64::MAX / 2;
 
 /// Maximum value supported by the inherited Zcash transaction libraries for a
 /// single transaction.

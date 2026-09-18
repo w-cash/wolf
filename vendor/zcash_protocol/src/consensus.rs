@@ -757,6 +757,9 @@ pub enum BranchId {
     /// transaction signature domain distinct from Zcash and every retired
     /// Wcash Testnet.
     WcashTestnetV3,
+    /// Wcash Mainnet v1 rules, which use NU6.3 / Ironwood semantics with a
+    /// transaction signature domain independent from Zcash and Wcash Testnet.
+    WcashMainnetV1,
     /// Wcash Regtest v1 rules, which use NU6.3 / Ironwood semantics with a
     /// local-network transaction signature domain.
     WcashRegtestV1,
@@ -786,6 +789,7 @@ impl TryFrom<u32> for BranchId {
             0x37a5_165b => Ok(BranchId::Nu6_3),
             0xb3cf_d27e => Ok(BranchId::WcashTestnetV1),
             0x54ba_2bfb => Ok(BranchId::WcashTestnetV3),
+            0xd9c6_a7ee => Ok(BranchId::WcashMainnetV1),
             0xc3a6_678a => Ok(BranchId::WcashRegtestV1),
             #[cfg(zcash_unstable = "nu7")]
             0xffff_ffff => Ok(BranchId::Nu7),
@@ -810,6 +814,7 @@ impl From<BranchId> for u32 {
             BranchId::Nu6_3 => 0x37a5_165b,
             BranchId::WcashTestnetV1 => 0xb3cf_d27e,
             BranchId::WcashTestnetV3 => 0x54ba_2bfb,
+            BranchId::WcashMainnetV1 => 0xd9c6_a7ee,
             BranchId::WcashRegtestV1 => 0xc3a6_678a,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => 0xffff_ffff,
@@ -853,6 +858,7 @@ impl BranchId {
             BranchId::Nu6_3 => NetworkUpgrade::Nu6_3,
             BranchId::WcashTestnetV1
             | BranchId::WcashTestnetV3
+            | BranchId::WcashMainnetV1
             | BranchId::WcashRegtestV1 => NetworkUpgrade::Nu6_3,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => NetworkUpgrade::Nu7,
@@ -917,6 +923,7 @@ impl BranchId {
             BranchId::Nu6_3
             | BranchId::WcashTestnetV1
             | BranchId::WcashTestnetV3
+            | BranchId::WcashMainnetV1
             | BranchId::WcashRegtestV1 => params
                 .activation_height(NetworkUpgrade::Nu6_3)
                 .filter(|_| params.branch_id_for_upgrade(NetworkUpgrade::Nu6_3) == *self)
@@ -947,6 +954,7 @@ impl BranchId {
             BranchId::Nu6_3
             | BranchId::WcashTestnetV1
             | BranchId::WcashTestnetV3
+            | BranchId::WcashMainnetV1
             | BranchId::WcashRegtestV1 => true,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => false,
@@ -962,6 +970,7 @@ impl BranchId {
             BranchId::Nu6_3
             | BranchId::WcashTestnetV1
             | BranchId::WcashTestnetV3
+            | BranchId::WcashMainnetV1
             | BranchId::WcashRegtestV1 => true,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => true,
@@ -977,6 +986,7 @@ impl BranchId {
             BranchId::Nu6_3
             | BranchId::WcashTestnetV1
             | BranchId::WcashTestnetV3
+            | BranchId::WcashMainnetV1
             | BranchId::WcashRegtestV1 => true,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => true,
@@ -992,7 +1002,7 @@ impl BranchId {
             Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => None,
             Nu5 | Nu6 | Nu6_1 => Some(OrchardProtocolRevision::InsecureV1),
             Nu6_2 => Some(OrchardProtocolRevision::V2),
-            Nu6_3 | WcashTestnetV1 | WcashTestnetV3 | WcashRegtestV1 => {
+            Nu6_3 | WcashTestnetV1 | WcashTestnetV3 | WcashMainnetV1 | WcashRegtestV1 => {
                 Some(OrchardProtocolRevision::V3)
             }
             #[cfg(zcash_unstable = "nu7")]
@@ -1046,6 +1056,7 @@ pub mod testing {
             BranchId::Nu6_3,
             BranchId::WcashTestnetV1,
             BranchId::WcashTestnetV3,
+            BranchId::WcashMainnetV1,
             BranchId::WcashRegtestV1,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7,
@@ -1137,6 +1148,26 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct WcashMainnetV1;
+
+    impl Parameters for WcashMainnetV1 {
+        fn network_type(&self) -> NetworkType {
+            NetworkType::Main
+        }
+
+        fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
+            (nu == NetworkUpgrade::Nu6_3).then_some(BlockHeight::from_u32(1))
+        }
+
+        fn branch_id_for_upgrade(&self, nu: NetworkUpgrade) -> BranchId {
+            match nu {
+                NetworkUpgrade::Nu6_3 => BranchId::WcashMainnetV1,
+                _ => nu.branch_id(),
+            }
+        }
+    }
+
     #[test]
     fn nu_ordering() {
         for i in 1..UPGRADES_IN_ORDER.len() {
@@ -1177,6 +1208,11 @@ mod tests {
             Ok(BranchId::WcashTestnetV3)
         );
         assert_eq!(u32::from(BranchId::WcashTestnetV3), 0x54ba_2bfb);
+        assert_eq!(
+            BranchId::try_from(0xd9c6_a7ee),
+            Ok(BranchId::WcashMainnetV1)
+        );
+        assert_eq!(u32::from(BranchId::WcashMainnetV1), 0xd9c6_a7ee);
         assert_eq!(
             BranchId::try_from(0xc3a6_678a),
             Ok(BranchId::WcashRegtestV1)
@@ -1248,6 +1284,34 @@ mod tests {
     }
 
     #[test]
+    fn wcash_mainnet_v1_has_an_independent_transaction_domain() {
+        let params = WcashMainnetV1;
+
+        assert_eq!(
+            BranchId::for_height(&params, BlockHeight::from_u32(0)),
+            BranchId::Sprout
+        );
+        assert_eq!(
+            BranchId::for_height(&params, BlockHeight::from_u32(1)),
+            BranchId::WcashMainnetV1
+        );
+        assert_eq!(
+            BranchId::WcashMainnetV1.network_upgrade(),
+            Some(NetworkUpgrade::Nu6_3)
+        );
+        assert!(BranchId::WcashMainnetV1.height_bounds(&params).is_some());
+        assert!(BranchId::Nu6_3.height_bounds(&params).is_none());
+        assert_ne!(
+            u32::from(BranchId::WcashMainnetV1),
+            u32::from(BranchId::WcashTestnetV3)
+        );
+        assert_ne!(
+            u32::from(BranchId::WcashMainnetV1),
+            u32::from(BranchId::WcashRegtestV1)
+        );
+    }
+
+    #[test]
     fn orchard_protocol_revision() {
         use super::OrchardProtocolRevision;
 
@@ -1274,6 +1338,10 @@ mod tests {
         );
         assert_eq!(
             BranchId::WcashTestnetV3.orchard_protocol_revision(),
+            Some(OrchardProtocolRevision::V3)
+        );
+        assert_eq!(
+            BranchId::WcashMainnetV1.orchard_protocol_revision(),
             Some(OrchardProtocolRevision::V3)
         );
         assert_eq!(

@@ -262,6 +262,9 @@ impl Config {
     pub fn initial_peer_hostnames(&self) -> IndexSet<String> {
         match &self.network {
             Network::Mainnet => self.initial_mainnet_peers.clone(),
+            Network::Testnet(_params) if self.network.is_wcash_mainnet() => {
+                self.initial_mainnet_peers.clone()
+            }
             Network::Testnet(_params) => self.initial_testnet_peers.clone(),
         }
     }
@@ -768,9 +771,14 @@ impl From<Config> for DConfig {
         }: Config,
     ) -> Self {
         let dnetwork = if network.uses_wcash_consensus() {
-            let name = match (network.is_wcash_testnet(), network.is_wcash_regtest()) {
-                (true, false) => "WcashTestnet",
-                (false, true) => "WcashRegtest",
+            let name = match (
+                network.is_wcash_mainnet(),
+                network.is_wcash_testnet(),
+                network.is_wcash_regtest(),
+            ) {
+                (true, false, false) => "WcashMainnet",
+                (false, true, false) => "WcashTestnet",
+                (false, false, true) => "WcashRegtest",
                 _ => unreachable!("enabled Wcash consensus has a supported built-in network"),
             };
             DNetwork::Wcash(name.to_string())
@@ -866,7 +874,9 @@ impl<'de> Deserialize<'de> for Config {
                     ));
                 }
 
-                if name.eq_ignore_ascii_case("WcashTestnet") {
+                if name.eq_ignore_ascii_case("WcashMainnet") {
+                    Network::try_new_wcash_mainnet().map_err(de::Error::custom)?
+                } else if name.eq_ignore_ascii_case("WcashTestnet") {
                     Network::new_wcash_testnet()
                 } else if name.eq_ignore_ascii_case("WcashRegtest")
                     || name.eq_ignore_ascii_case("Wcash")
@@ -877,7 +887,7 @@ impl<'de> Deserialize<'de> for Config {
                     Network::new_wcash_regtest()
                 } else {
                     return Err(de::Error::custom(format!(
-                        "unknown network {name:?}; expected WcashTestnet or WcashRegtest"
+                        "unknown network {name:?}; expected WcashMainnet, WcashTestnet, or WcashRegtest"
                     )));
                 }
             }

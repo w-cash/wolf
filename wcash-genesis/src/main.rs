@@ -44,9 +44,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             reject_extra_arguments(arguments)?;
             println!("project: Wcash");
             println!(
-                "mainnet: {} (disabled); designated Bitcoin anchor height {}",
-                wcash_genesis::WcashNetwork::Mainnet.currency_ticker(),
-                wcash_genesis::DESIGNATED_MAINNET_BITCOIN_HEIGHT
+                "mainnet: {} (disabled); awaiting a confirmed Zcash Mainnet anchor",
+                wcash_genesis::WcashNetwork::Mainnet.currency_ticker()
             );
             println!(
                 "testnet: {} (valueless); enabled for mining interoperability; Zcash Testnet block {} anchor",

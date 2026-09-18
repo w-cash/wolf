@@ -7,7 +7,9 @@ use std::{
 use chrono::{DateTime, Duration, LocalResult, TimeZone, Utc};
 
 use crate::{
-    amount::{Amount, DeferredPoolBalanceChange, NonNegative, MAX_SINGLE_TRANSACTION_VALUE},
+    amount::{
+        Amount, DeferredPoolBalanceChange, NonNegative, MAX_MONEY, MAX_SINGLE_TRANSACTION_VALUE,
+    },
     block::{
         serialize::MAX_BLOCK_BYTES, Block, BlockTimeError, Commitment::*, Hash, Header, Height,
     },
@@ -149,9 +151,10 @@ fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
     let max_output: Amount<NonNegative> = MAX_SINGLE_TRANSACTION_VALUE
         .try_into()
         .expect("the single-transaction limit is a valid amount");
-    // Two maximum library-compatible transparent outputs exceed the aggregate
-    // monetary cap under both the Zcash and Wcash consensus profiles, so
-    // `value_balance` returns `Err`.
+    let output_count = usize::try_from(MAX_MONEY / MAX_SINGLE_TRANSACTION_VALUE + 1)
+        .expect("the number of outputs fits in usize");
+    // Enough individually library-compatible outputs exceed the selected
+    // profile's aggregate monetary bound, so `value_balance` returns `Err`.
     let coinbase = Transaction::test_v1(
         vec![transparent::Input::Coinbase {
             height: Height(1),
@@ -159,10 +162,11 @@ fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
             data: vec![0],
             sequence: 0xFFFF_FFFF,
         }],
-        vec![
-            transparent::Output::new(max_output, transparent::Script::new(&[])),
-            transparent::Output::new(max_output, transparent::Script::new(&[])),
-        ],
+        std::iter::repeat_with(|| {
+            transparent::Output::new(max_output, transparent::Script::new(&[]))
+        })
+        .take(output_count)
+        .collect(),
         LockTime::unlocked(),
     );
     let utxos = HashMap::new();

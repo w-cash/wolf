@@ -87,6 +87,7 @@ wcash-consensus = [
     "zebra-chain/wcash-consensus",
     "zebra-consensus/wcash-consensus",
     "zebra-network/wcash-consensus",
+    "zebra-rpc/wcash-consensus",
 ]
 
 # Experimental elasticsearch indexing

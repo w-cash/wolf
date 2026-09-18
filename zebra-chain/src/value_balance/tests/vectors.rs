@@ -1,7 +1,7 @@
 //! Fixed test vectors for value balances.
 
 use crate::{
-    amount::{Amount, NegativeAllowed, NonNegative, MAX_MONEY},
+    amount::{Amount, NegativeAllowed, NonNegative, COIN, MAX_MONEY},
     value_balance::{ValueBalance, ValueBalanceError},
 };
 
@@ -59,6 +59,34 @@ fn total_over_max_money_is_rejected() {
         .expect_err("a total exceeding MAX_MONEY must be rejected");
 
     assert!(matches!(error, ValueBalanceError::Total(_)));
+}
+
+/// Wcash Mainnet's Option B issuance exceeds the inherited 21-million-coin
+/// Zcash bound, while each transaction remains subject to its separate limit.
+#[cfg(feature = "wcash-consensus")]
+#[test]
+fn wcash_chain_value_pool_can_cross_twenty_one_million() {
+    let legacy_boundary = 21_000_000_i64 * COIN;
+    let mut chain = ValueBalance::<NonNegative>::zero();
+    chain.set_transparent_value_balance(ValueBalance::from_transparent_amount(
+        Amount::try_from(legacy_boundary).expect("the legacy boundary is representable"),
+    ));
+
+    let chain = chain
+        .add_chain_value_pool_change(ValueBalance::from_ironwood_amount(
+            Amount::<NegativeAllowed>::try_from(1).expect("one atom is representable"),
+        ))
+        .expect("Wcash aggregate accounting permits issuance above 21 million coins");
+
+    assert_eq!(chain.transparent_amount().zatoshis(), legacy_boundary);
+    assert_eq!(chain.ironwood_amount().zatoshis(), 1);
+    assert_eq!(
+        chain
+            .total()
+            .expect("the aggregate Wcash balance remains within its technical bound")
+            .zatoshis(),
+        legacy_boundary + 1
+    );
 }
 
 /// Check that the ironwood value balance is included in a transaction's

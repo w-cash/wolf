@@ -1,6 +1,6 @@
 //! Serializes and deserializes transparent data.
 
-use std::io;
+use std::{io, sync::OnceLock};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use zcash_script::{opcode::Evaluable, pattern};
@@ -38,8 +38,8 @@ pub const WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 100] =
 
 /// The exact public Wcash-testnet genesis statement.
 ///
-/// This statement commits to the independently checked Bitcoin mainnet block
-/// 965,900. Its Wcash-network discriminator is separately committed in the
+/// This statement commits to the independently checked Zcash Testnet block
+/// 4,362,016. Its Wcash-network discriminator is separately committed in the
 /// header's anchor commitment.
 pub const WCASH_TESTNET_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 100] =
     b"17/Sep/2026 W.cash ZECtest #4362016 00000e289ad21d2feeb17e16585790ecabec94323c2ef22925534ad104de73ac";
@@ -49,9 +49,19 @@ pub const WCASH_TESTNET_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 100] =
 /// No prefix, partial, or runtime-supplied match is accepted. Treating an
 /// ordinary height-zero-looking script as genesis would bypass BIP-34 parsing.
 pub(crate) fn is_genesis_coinbase_script(script_sig: &[u8]) -> bool {
+    static WCASH_MAINNET_GENESIS_SCRIPT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    let wcash_mainnet_script = WCASH_MAINNET_GENESIS_SCRIPT.get_or_init(|| {
+        wcash_genesis::select_anchor(wcash_genesis::WcashNetwork::Mainnet, None)
+            .ok()
+            .map(|anchor| anchor.genesis_statement().into_bytes())
+    });
+
     script_sig == GENESIS_COINBASE_SCRIPT_SIG
         || script_sig == WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG
         || script_sig == WCASH_TESTNET_GENESIS_COINBASE_SCRIPT_SIG
+        || wcash_mainnet_script
+            .as_deref()
+            .is_some_and(|mainnet_script| script_sig == mainnet_script)
 }
 
 /// Parses the BIP-34 block-height prefix of a non-genesis coinbase script and returns the height

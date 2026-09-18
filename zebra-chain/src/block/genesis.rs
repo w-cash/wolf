@@ -16,6 +16,47 @@ use crate::{
 pub const WCASH_TESTNET_GENESIS_HASH: &str =
     "6b66fff119977d36d9c989093b516a876dbf6596536791ff35bb4c581e3fda98";
 
+/// Returns the Wcash Mainnet genesis block after its reviewed Zcash anchor is
+/// frozen in `wcash-genesis`.
+///
+/// # Errors
+///
+/// Mainnet remains unavailable until the release source freezes that anchor.
+pub fn wcash_mainnet_genesis_block() -> Result<Arc<Block>, wcash_genesis::PublicNetworkDisabled> {
+    let anchor = wcash_genesis::select_anchor(wcash_genesis::WcashNetwork::Mainnet, None)?;
+    Ok(wcash_mainnet_genesis_block_for_anchor(anchor))
+}
+
+fn wcash_mainnet_genesis_block_for_anchor(anchor: wcash_genesis::BitcoinAnchor) -> Arc<Block> {
+    let difficulty_threshold = CompactDifficulty::from_bytes_in_display_order(
+        &wcash_genesis::PUBLIC_MAINNET_POW_LIMIT_BITS.to_be_bytes(),
+    )
+    .expect("the Wcash Mainnet proof-of-work limit is canonical");
+    let statement = anchor.genesis_statement();
+
+    wcash_genesis_block(
+        anchor,
+        wcash_genesis::PUBLIC_MAINNET_GENESIS_TIME,
+        statement.as_bytes(),
+        Some(difficulty_threshold),
+    )
+}
+
+/// Returns a deterministic Wcash Mainnet block for cross-crate integration
+/// tests while the production anchor gate is still closed.
+#[cfg(any(test, feature = "proptest-impl"))]
+pub fn wcash_mainnet_genesis_block_for_tests() -> Arc<Block> {
+    let mut encoded = [0_u8; wcash_genesis::ANCHOR_ENCODING_LEN];
+    encoded[0] = wcash_genesis::ANCHOR_ENCODING_VERSION;
+    encoded[1] = wcash_genesis::WcashNetwork::Mainnet as u8;
+    encoded[2] = wcash_genesis::AnchorSource::ZcashMainnet as u8;
+    encoded[4..8].copy_from_slice(&3_488_200_u32.to_le_bytes());
+    encoded[8..].copy_from_slice(&[0x42; 32]);
+    let anchor = wcash_genesis::BitcoinAnchor::decode(&encoded)
+        .expect("the test-only Mainnet anchor encoding is canonical");
+    wcash_mainnet_genesis_block_for_anchor(anchor)
+}
+
 /// Genesis block for Regtest, copied from zcashd via `getblock 0 0` RPC method
 pub fn regtest_genesis_block() -> Arc<Block> {
     let regtest_genesis_block_bytes =
@@ -32,7 +73,7 @@ pub fn regtest_genesis_block() -> Arc<Block> {
 ///
 /// Its coinbase text and header commitment bind the local chain to the frozen
 /// Bitcoin block in [`wcash_genesis::REGTEST_ANCHOR`]. Public Wcash Testnet
-/// uses its own separately reviewed and frozen Bitcoin anchor; Wcash mainnet
+/// uses its own separately reviewed and frozen Zcash Testnet anchor; Wcash mainnet
 /// remains disabled.
 pub fn wcash_regtest_genesis_block() -> Arc<Block> {
     wcash_genesis_block(
@@ -131,6 +172,35 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn wcash_mainnet_genesis_plumbing_is_deterministic_and_zero_supply() {
+        assert!(wcash_mainnet_genesis_block().is_err());
+
+        let block = wcash_mainnet_genesis_block_for_tests();
+        assert_eq!(block.coinbase_height(), Some(crate::block::Height::MIN));
+        assert_eq!(block.header.version, WCASH_BLOCK_WIRE_VERSION);
+        assert_eq!(
+            block.header.time.timestamp(),
+            i64::from(wcash_genesis::PUBLIC_MAINNET_GENESIS_TIME)
+        );
+        assert_eq!(
+            block.header.difficulty_threshold.to_string(),
+            format!("{:08x}", wcash_genesis::PUBLIC_MAINNET_POW_LIMIT_BITS)
+        );
+        let inputs = block.transactions[0].inputs();
+        let statement = inputs[0].miner_data().expect("genesis input is a coinbase");
+        assert!(statement.starts_with(b"ZEC #3488200 "));
+        assert_eq!(block.transactions[0].outputs()[0].value.zatoshis(), 0);
+        assert_eq!(
+            block
+                .chain_value_pool_change(&HashMap::new(), DeferredPoolBalanceChange::zero())
+                .expect("the genesis value-pool change is defined"),
+            ValueBalance::<NegativeAllowed>::zero()
+        );
+        assert_ne!(block.hash(), wcash_testnet_genesis_block().hash());
+        assert_ne!(block.hash(), wcash_regtest_genesis_block().hash());
+    }
 
     #[test]
     fn wcash_regtest_genesis_is_deterministic_and_round_trips() {

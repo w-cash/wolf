@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 use zebra_chain::{
-    amount::{Amount, MAX_WCASH_COINBASE_VALUE},
+    amount::{Amount, DeferredPoolBalanceChange, MAX_WCASH_COINBASE_VALUE},
     block,
     chain_sync_status::MockSyncStatus,
     chain_tip::NoChainTip,
@@ -26,7 +26,10 @@ use zebra_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 use zebra_chain::{
     block::Height,
     parameters::{
-        subsidy::FundingStreamReceiver::{Deferred, Ecc, MajorGrants, ZcashFoundation},
+        subsidy::{
+            block_subsidy,
+            FundingStreamReceiver::{Deferred, Ecc, MajorGrants, ZcashFoundation},
+        },
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
         Network, NetworkUpgrade,
     },
@@ -70,6 +73,12 @@ fn wcash_testnet_allows_genesis_only_mining_bootstrap() {
     assert!(
         check_synced_to_tip(&Network::Mainnet, NoChainTip, MockSyncStatus::default(),).is_err()
     );
+    assert!(check_synced_to_tip(
+        &Network::new_wcash_mainnet_for_tests(),
+        NoChainTip,
+        MockSyncStatus::default(),
+    )
+    .is_err());
 }
 
 #[tokio::test]
@@ -1216,6 +1225,94 @@ fn wcash_coinbase_supports_transparent_and_private_payouts() {
             SubsidyError::WcashCoinbaseValueTooLarge
         ))
     ));
+}
+
+/// Mainnet templates and consensus validation must agree on the exact Option B
+/// reward for both supported payout modes, including fees and one-atom claim
+/// mismatches.
+#[test]
+fn wcash_mainnet_templates_match_exact_coinbase_validation() {
+    use zebra_chain::parameters::subsidy::SubsidyError;
+    use zebra_consensus::error::{BlockError, TransactionError};
+
+    let net = Network::new_wcash_mainnet_for_tests();
+    assert!(net.uses_wcash_consensus() && net.is_wcash_mainnet());
+    let height = Height(40_001);
+    let subsidy = block_subsidy(height, &net).expect("Mainnet subsidy is defined");
+    assert_eq!(subsidy.zatoshis(), 2_199_023_255);
+
+    for address_type in [MinerAddressType::Transparent, MinerAddressType::Unified] {
+        let address = default_miner_address_for_network(&net, &address_type)
+            .expect("Wcash Mainnet supports this payout mode");
+        let miner_params = MinerParams::new(
+            &net,
+            Config {
+                miner_address: Some(address.parse().expect("generated address parses")),
+                ..Default::default()
+            },
+        )
+        .expect("the Mainnet miner address belongs to Wcash");
+
+        for fee_atoms in [0_i64, 1] {
+            let fees = Amount::try_from(fee_atoms).expect("fee is representable");
+            let template = TransactionTemplate::new_coinbase(&net, height, &miner_params, fees)
+                .expect("Mainnet coinbase template is buildable");
+            let coinbase: Transaction = template
+                .data
+                .as_ref()
+                .zcash_deserialize_into()
+                .expect("Mainnet coinbase deserializes");
+            let expected_claim = subsidy.zatoshis() + fee_atoms;
+
+            match address_type {
+                MinerAddressType::Transparent => {
+                    assert_eq!(coinbase.outputs().len(), 1);
+                    assert_eq!(coinbase.outputs()[0].value().zatoshis(), expected_claim);
+                    assert!(coinbase.ironwood_actions().next().is_none());
+                }
+                MinerAddressType::Unified => {
+                    assert!(coinbase.outputs().is_empty());
+                    assert!(coinbase.ironwood_actions().next().is_some());
+                    assert_eq!(
+                        coinbase
+                            .ironwood_value_balance()
+                            .ironwood_amount()
+                            .zatoshis(),
+                        -expected_claim
+                    );
+                }
+                MinerAddressType::Sapling => unreachable!("Sapling is not a Wcash payout mode"),
+            }
+
+            zebra_consensus::miner_fees_are_valid(
+                &coinbase,
+                height,
+                fees,
+                subsidy,
+                DeferredPoolBalanceChange::zero(),
+                &net,
+            )
+            .expect("the generated claim is accepted by Mainnet consensus");
+
+            if fee_atoms == 1 {
+                for wrong_fee in [0_i64, 2] {
+                    assert_eq!(
+                        zebra_consensus::miner_fees_are_valid(
+                            &coinbase,
+                            height,
+                            Amount::try_from(wrong_fee).expect("fee is representable"),
+                            subsidy,
+                            DeferredPoolBalanceChange::zero(),
+                            &net,
+                        ),
+                        Err(BlockError::Transaction(TransactionError::Subsidy(
+                            SubsidyError::InvalidMinerFees,
+                        )))
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Once scheduled issuance reaches zero, both supported Wcash payout modes remain buildable.

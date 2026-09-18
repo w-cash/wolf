@@ -118,7 +118,7 @@ impl Creator {
             | BranchId::Nu6
             | BranchId::Nu6_1
             | BranchId::Nu6_2 => (V5_TX_VERSION, V5_VERSION_GROUP_ID),
-            BranchId::Nu6_3 | BranchId::WcashTestnetV1 | BranchId::WcashTestnetV3 | BranchId::WcashRegtestV1 => {
+            BranchId::Nu6_3 | BranchId::WcashTestnetV1 | BranchId::WcashTestnetV3 | BranchId::WcashMainnetV1 | BranchId::WcashRegtestV1 => {
                 (V6_TX_VERSION, V6_VERSION_GROUP_ID)
             }
             #[cfg(zcash_unstable = "nu7")]
