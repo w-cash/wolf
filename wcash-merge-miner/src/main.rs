@@ -59,6 +59,9 @@ const ZCASH_TEMPLATE_RPC_USERNAME: &str = "ZCASH_TEMPLATE_RPC_USERNAME";
 const ZCASH_TEMPLATE_RPC_PASSWORD: &str = "ZCASH_TEMPLATE_RPC_PASSWORD";
 const ZCASH_VALIDATOR_RPC_USERNAME: &str = "ZCASH_VALIDATOR_RPC_USERNAME";
 const ZCASH_VALIDATOR_RPC_PASSWORD: &str = "ZCASH_VALIDATOR_RPC_PASSWORD";
+const ZCASH_BROADCAST_RPC_URL: &str = "ZCASH_BROADCAST_RPC_URL";
+const ZCASH_BROADCAST_RPC_USERNAME: &str = "ZCASH_BROADCAST_RPC_USERNAME";
+const ZCASH_BROADCAST_RPC_PASSWORD: &str = "ZCASH_BROADCAST_RPC_PASSWORD";
 const WCASH_STRATUM_PASSWORD: &str = "WCASH_STRATUM_PASSWORD";
 const WCASH_WORKER_CREDENTIALS: &str = "WCASH_WORKER_CREDENTIALS";
 const WCASH_SHARE_TARGET: &str = "WCASH_SHARE_TARGET";
@@ -121,6 +124,12 @@ only be supplied through these optional, paired environment variables:
   WCASH_RPC_USERNAME / WCASH_RPC_PASSWORD
   ZCASH_TEMPLATE_RPC_USERNAME / ZCASH_TEMPLATE_RPC_PASSWORD
   ZCASH_VALIDATOR_RPC_USERNAME / ZCASH_VALIDATOR_RPC_PASSWORD
+  ZCASH_BROADCAST_RPC_URL and optional paired
+  ZCASH_BROADCAST_RPC_USERNAME / ZCASH_BROADCAST_RPC_PASSWORD
+
+ZCASH_BROADCAST_RPC_URL selects an independently peered standard Zebra node.
+It receives exact winning blocks through `submitblock` but never supplies work
+or participates in proposal validation.
 
 Every native command requires WCASH_EXPECTED_GENESIS_HASH,
 ZCASH_EXPECTED_GENESIS_HASH (64 hex characters in conventional RPC display
@@ -1841,6 +1850,8 @@ struct EndpointSummary {
     zcash_template_authenticated: bool,
     zcash_validator_label: String,
     zcash_validator_authenticated: bool,
+    zcash_broadcast_label: Option<String>,
+    zcash_broadcast_authenticated: bool,
     zcash_network: String,
     wcash_payout_address_source: &'static str,
     zcash_payout_address_source: &'static str,
@@ -1875,6 +1886,11 @@ fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredN
         ZCASH_VALIDATOR_RPC_USERNAME,
         ZCASH_VALIDATOR_RPC_PASSWORD,
     )?;
+    let broadcast_node = optional_endpoint_from_env(
+        ZCASH_BROADCAST_RPC_URL,
+        ZCASH_BROADCAST_RPC_USERNAME,
+        ZCASH_BROADCAST_RPC_PASSWORD,
+    )?;
     let expected_wcash_genesis_hash = required_display_hash_env(WCASH_EXPECTED_GENESIS_HASH)?;
     let expected_zcash_genesis_hash = required_display_hash_env(ZCASH_EXPECTED_GENESIS_HASH)?;
     let expected_zcash_network = required_zcash_network_env()?;
@@ -1890,6 +1906,12 @@ fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredN
         zcash_template_authenticated,
         zcash_validator_label: validator_node.label().to_string(),
         zcash_validator_authenticated,
+        zcash_broadcast_label: broadcast_node
+            .as_ref()
+            .map(|(endpoint, _)| endpoint.label().to_string()),
+        zcash_broadcast_authenticated: broadcast_node
+            .as_ref()
+            .is_some_and(|(_, authenticated)| *authenticated),
         zcash_network: expected_zcash_network.to_string(),
         wcash_payout_address_source: WCASH_PAYOUT_ADDRESS,
         zcash_payout_address_source: ZCASH_PAYOUT_ADDRESS,
@@ -1901,6 +1923,9 @@ fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredN
         expected_zcash_genesis_hash,
         expected_parent_payout_address,
     )?;
+    if let Some((broadcast_node, _)) = broadcast_node {
+        zcash = zcash.with_broadcast_nodes(vec![broadcast_node])?;
+    }
     if allow_lagging_parent_validator {
         zcash = zcash.allow_lagging_proposal_validators_on_testnet()?;
         eprintln!(
@@ -2015,6 +2040,34 @@ fn endpoint_from_env(
     }
     let authenticated = username.is_some();
     Ok((RpcEndpoint::new(url, username, password)?, authenticated))
+}
+
+fn optional_endpoint_from_env(
+    url_name: &'static str,
+    username_name: &'static str,
+    password_name: &'static str,
+) -> Result<Option<(RpcEndpoint, bool)>, MinerError> {
+    let url = optional_env(url_name)?;
+    let username = optional_env(username_name)?;
+    let password = optional_env(password_name)?;
+    if username.is_some() != password.is_some() {
+        return Err(MinerError::RpcConfiguration(format!(
+            "set both {username_name} and {password_name}, or neither"
+        )));
+    }
+    let Some(url) = url else {
+        if username.is_some() {
+            return Err(MinerError::RpcConfiguration(format!(
+                "{username_name} and {password_name} require {url_name}"
+            )));
+        }
+        return Ok(None);
+    };
+    let authenticated = username.is_some();
+    Ok(Some((
+        RpcEndpoint::new(&url, username, password)?,
+        authenticated,
+    )))
 }
 
 fn optional_env(name: &'static str) -> Result<Option<String>, MinerError> {
@@ -2210,6 +2263,15 @@ fn native_preflight(
                 "credential_source": format!(
                     "{ZCASH_VALIDATOR_RPC_USERNAME} + {ZCASH_VALIDATOR_RPC_PASSWORD}"
                 ),
+            },
+            "zcash_broadcast": {
+                "configured": endpoints.zcash_broadcast_label.is_some(),
+                "endpoint": endpoints.zcash_broadcast_label,
+                "authenticated": endpoints.zcash_broadcast_authenticated,
+                "credential_source": format!(
+                    "{ZCASH_BROADCAST_RPC_USERNAME} + {ZCASH_BROADCAST_RPC_PASSWORD}"
+                ),
+                "role": "standard_submitblock_only",
             },
             "template_and_validator_are_distinct": true,
             "proposal_gate": "passed",
