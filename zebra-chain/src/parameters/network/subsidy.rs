@@ -13,6 +13,7 @@
 //! `Network` and `block::Height`.
 
 pub(crate) mod constants;
+pub mod wcash_mainnet;
 
 use std::collections::HashMap;
 
@@ -269,7 +270,11 @@ pub trait ParameterSubsidy {
 impl ParameterSubsidy for Network {
     fn height_for_first_halving(&self) -> Height {
         if self.uses_wcash_consensus() {
-            return if self.is_wcash_testnet() {
+            return if self.is_wcash_mainnet() {
+                // Wcash Mainnet has a smooth emission curve and a permanent
+                // tail subsidy, so no finite height is a first halving.
+                Height::MAX
+            } else if self.is_wcash_testnet() {
                 WCASH_TESTNET_FIRST_HALVING_HEIGHT
             } else {
                 WCASH_REGTEST_FIRST_HALVING_HEIGHT
@@ -354,6 +359,12 @@ pub fn funding_stream_address_period<N: ParameterSubsidy>(height: Height, networ
 pub fn height_for_halving(halving: u32, network: &Network) -> Option<Height> {
     if halving == 0 {
         return Some(Height(0));
+    }
+
+    // Wcash Mainnet uses a smooth remaining-emission curve followed by a
+    // permanent tail subsidy. It has no scheduled halving heights.
+    if network.is_wcash_mainnet() {
+        return None;
     }
 
     if network.uses_wcash_consensus() {
@@ -495,6 +506,12 @@ pub fn halving_divisor(height: Height, network: &Network) -> Option<u64> {
 ///
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 pub fn halving(height: Height, network: &Network) -> u32 {
+    // Wcash Mainnet does not use halvings. Keep this legacy helper neutral so
+    // callers cannot accidentally apply a discontinuous subsidy schedule.
+    if network.is_wcash_mainnet() {
+        return 0;
+    }
+
     if network.uses_wcash_consensus() {
         let schedule_height = if network.is_wcash_testnet() {
             height.0.saturating_sub(WCASH_TESTNET_SLOW_START_SHIFT.0)
@@ -534,6 +551,10 @@ pub fn halving(height: Height, network: &Network) -> u32 {
 ///
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 pub fn block_subsidy(height: Height, net: &Network) -> Result<Amount<NonNegative>, SubsidyError> {
+    if net.is_wcash_mainnet() {
+        return wcash_mainnet::block_subsidy(height);
+    }
+
     if net.uses_wcash_consensus() {
         if net.is_wcash_testnet() && height <= WCASH_TESTNET_SLOW_START_INTERVAL {
             // Multiplication before division implements the consensus rule

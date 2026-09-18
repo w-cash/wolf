@@ -55,6 +55,12 @@ pub const PUBLIC_TESTNET_ZCASH_TIME: u32 = 1_789_685_930;
 /// Timestamp of the Wcash public Testnet genesis block.
 pub const PUBLIC_TESTNET_GENESIS_TIME: u32 = 1_789_686_000;
 
+/// Announced Wcash Mainnet genesis time: 18 September 2026, 22:00 UTC.
+///
+/// The external Zcash anchor remains fail-closed until a sufficiently
+/// confirmed block at or before this launch boundary is reviewed and frozen.
+pub const PUBLIC_MAINNET_GENESIS_TIME: u32 = 1_789_768_800;
+
 /// Bitcoin mainnet height frozen into the local Wcash regtest genesis.
 pub const LOCAL_REGTEST_BITCOIN_HEIGHT: u32 = 965_910;
 
@@ -80,6 +86,12 @@ pub const MIN_PUBLIC_ANCHOR_CONFIRMATIONS: u32 = 100;
 /// can harden the target as aggregate hash rate grows, but cannot soften it
 /// below this launch limit.
 pub const PUBLIC_TESTNET_POW_LIMIT_BITS: u32 = 0x1e2f_abe8;
+
+/// Canonical compact `nBits` value for the Wcash Mainnet launch `PoW` limit.
+///
+/// Mainnet starts from the same ASIC-tested launch ceiling as public Testnet;
+/// the normal damped retarget then hardens difficulty as hash rate arrives.
+pub const PUBLIC_MAINNET_POW_LIMIT_BITS: u32 = PUBLIC_TESTNET_POW_LIMIT_BITS;
 
 /// Version of the fixed-width external-chain anchor encoding.
 pub const ANCHOR_ENCODING_VERSION: u8 = 1;
@@ -1008,6 +1020,16 @@ mod tests {
         let error = select_anchor(WcashNetwork::Mainnet, None)
             .expect_err("mainnet must stay unavailable before its anchor has enough confirmations");
         assert_eq!(error.network(), WcashNetwork::Mainnet);
+    }
+
+    #[test]
+    fn mainnet_launch_time_and_pow_limit_are_frozen() {
+        assert_eq!(PUBLIC_MAINNET_GENESIS_TIME, 1_789_768_800);
+        assert_eq!(PUBLIC_MAINNET_POW_LIMIT_BITS, 0x1e2f_abe8);
+        assert_eq!(
+            decode_compact_target(PUBLIC_MAINNET_POW_LIMIT_BITS),
+            decode_compact_target(PUBLIC_TESTNET_POW_LIMIT_BITS)
+        );
     }
 
     #[test]

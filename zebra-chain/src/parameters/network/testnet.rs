@@ -17,8 +17,10 @@ use crate::{
                 BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
                 POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
             },
-            funding_stream_address_period, FundingStreamReceiver, FundingStreamRecipient,
-            FundingStreams, WCASH_TESTNET_SLOW_START_INTERVAL,
+            funding_stream_address_period,
+            wcash_mainnet::SLOW_START_BLOCKS as WCASH_MAINNET_SLOW_START_BLOCKS,
+            FundingStreamReceiver, FundingStreamRecipient, FundingStreams,
+            WCASH_TESTNET_SLOW_START_INTERVAL,
         },
         Network, NetworkKind, NetworkUpgrade,
     },
@@ -29,11 +31,12 @@ use crate::{
 use super::magic::Magic;
 
 /// Reserved network names that should not be allowed for configured Testnets.
-pub const RESERVED_NETWORK_NAMES: [&str; 9] = [
+pub const RESERVED_NETWORK_NAMES: [&str; 10] = [
     "Mainnet",
     "Testnet",
     "Regtest",
     "Wcash",
+    "WcashMainnet",
     "WcashTestnet",
     "WcashRegtest",
     "MainnetKind",
@@ -58,6 +61,10 @@ const WCASH_REGTEST_NETWORK_MAGIC: Magic =
 /// The deterministic public Wcash Testnet P2P network magic.
 const WCASH_TESTNET_NETWORK_MAGIC: Magic =
     Magic(wcash_genesis::network_identity(wcash_genesis::WcashNetwork::Testnet).p2p_magic());
+
+/// The deterministic Wcash Mainnet P2P network magic.
+const WCASH_MAINNET_NETWORK_MAGIC: Magic =
+    Magic(wcash_genesis::network_identity(wcash_genesis::WcashNetwork::Mainnet).p2p_magic());
 
 /// The block hash of the Testnet genesis block, `zcash-cli -testnet getblockhash 0`
 const TESTNET_GENESIS_HASH: &str =
@@ -592,6 +599,7 @@ impl ParametersBuilder {
         if [
             magics::MAINNET,
             magics::REGTEST,
+            WCASH_MAINNET_NETWORK_MAGIC,
             WCASH_REGTEST_NETWORK_MAGIC,
             WCASH_TESTNET_NETWORK_MAGIC,
         ]
@@ -1168,6 +1176,64 @@ impl Parameters {
             network_magic: WCASH_TESTNET_NETWORK_MAGIC,
             ..parameters
         })
+    }
+
+    /// Creates the built-in Wcash Mainnet parameters after its reviewed
+    /// external-chain anchor is frozen.
+    pub(super) fn new_wcash_mainnet() -> Result<Self, wcash_genesis::PublicNetworkDisabled> {
+        let genesis = block::genesis::wcash_mainnet_genesis_block()?;
+        Ok(Self::wcash_mainnet_parameters(genesis))
+    }
+
+    /// Creates a fully wired Wcash Mainnet profile for integration tests while
+    /// the production anchor selection remains fail-closed.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub(super) fn new_wcash_mainnet_for_tests() -> Self {
+        Self::wcash_mainnet_parameters(block::genesis::wcash_mainnet_genesis_block_for_tests())
+    }
+
+    fn wcash_mainnet_parameters(genesis: Arc<block::Block>) -> Self {
+        let built = (|| {
+            Ok::<_, ParametersBuilderError>(
+                Self::build()
+                    .with_genesis_hash(genesis.hash())?
+                    .with_target_difficulty_limit(U256::from_big_endian(&[
+                        0x00, 0x00, 0x2f, 0xab, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    ]))?
+                    .with_disable_pow(false)
+                    .with_minimum_difficulty_start_height(None)
+                    .with_unshielded_coinbase_spends(false)
+                    .with_slow_start_interval(Height(WCASH_MAINNET_SLOW_START_BLOCKS))
+                    .disable_temporary_orchard_disabling_soft_fork()
+                    .with_activation_heights(ConfiguredActivationHeights {
+                        nu6_3: Some(1),
+                        ..Default::default()
+                    })?
+                    .clear_funding_streams()
+                    .with_lockbox_disbursements(Vec::new())
+                    .with_checkpoints(false)?
+                    .finish(),
+            )
+        })();
+        let parameters = match built {
+            Ok(parameters) => parameters,
+            Err(error) => panic!("built-in Wcash Mainnet parameters are invalid: {error}"),
+        };
+
+        assert_eq!(
+            genesis.header.difficulty_threshold,
+            parameters.target_difficulty_limit.to_compact(),
+            "Wcash Mainnet genesis nBits must equal its configured proof-of-work limit"
+        );
+
+        Self {
+            consensus_flavor: ConsensusFlavor::Wcash(wcash_genesis::WcashNetwork::Mainnet),
+            network_name: "WcashMainnet".to_string(),
+            network_magic: WCASH_MAINNET_NETWORK_MAGIC,
+            ..parameters
+        }
     }
 
     /// Creates the built-in local Wcash Regtest parameters.

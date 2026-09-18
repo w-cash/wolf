@@ -199,6 +199,24 @@ impl Network {
         )
     }
 
+    /// Creates the built-in Wcash Mainnet network after its reviewed Zcash
+    /// anchor is frozen in the release source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error while the production anchor gate is closed.
+    pub fn try_new_wcash_mainnet() -> Result<Self, wcash_genesis::PublicNetworkDisabled> {
+        Ok(Self::new_configured_testnet(
+            testnet::Parameters::new_wcash_mainnet()?,
+        ))
+    }
+
+    /// Creates a fully wired Wcash Mainnet profile for integration tests.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn new_wcash_mainnet_for_tests() -> Self {
+        Self::new_configured_testnet(testnet::Parameters::new_wcash_mainnet_for_tests())
+    }
+
     /// Creates the built-in local Wcash Regtest network.
     ///
     /// Its anchored genesis block and network magic are local-development values. A shared testnet
@@ -232,6 +250,11 @@ impl Network {
     /// Returns true only for the built-in public Wcash Testnet.
     pub fn is_wcash_testnet(&self) -> bool {
         self.wcash_network() == Some(wcash_genesis::WcashNetwork::Testnet)
+    }
+
+    /// Returns true only for the built-in Wcash Mainnet.
+    pub fn is_wcash_mainnet(&self) -> bool {
+        self.wcash_network() == Some(wcash_genesis::WcashNetwork::Mainnet)
     }
 
     /// Returns true only for the built-in local Wcash Regtest.
@@ -284,6 +307,7 @@ impl Network {
     pub fn kind(&self) -> NetworkKind {
         match self {
             Network::Mainnet => NetworkKind::Mainnet,
+            Network::Testnet(_) if self.is_wcash_mainnet() => NetworkKind::Mainnet,
             Network::Testnet(params) if params.is_regtest() => NetworkKind::Regtest,
             Network::Testnet(_) => NetworkKind::Testnet,
         }
@@ -295,6 +319,7 @@ impl Network {
     pub fn t_addr_kind(&self) -> NetworkKind {
         match self {
             Network::Mainnet => NetworkKind::Mainnet,
+            Network::Testnet(_) if self.is_wcash_mainnet() => NetworkKind::Mainnet,
             Network::Testnet(_) => NetworkKind::Testnet,
         }
     }
@@ -317,6 +342,10 @@ impl Network {
             return !height.is_min();
         }
 
+        if self.is_wcash_mainnet() {
+            return true;
+        }
+
         match self {
             Network::Mainnet => true,
             // TODO: Move `TESTNET_MAX_TIME_START_HEIGHT` to a field on testnet::Parameters (#8364)
@@ -328,6 +357,7 @@ impl Network {
     pub fn default_port(&self) -> u16 {
         match self {
             Network::Mainnet => 8233,
+            Network::Testnet(_params) if self.is_wcash_mainnet() => 48233,
             Network::Testnet(_params) if self.is_wcash_testnet() => 38233,
             Network::Testnet(_params) if self.is_wcash_regtest() => 28233,
             // TODO: Add a `default_port` field to `testnet::Parameters` to return here. (zcashd uses 18344 for Regtest)
@@ -343,7 +373,7 @@ impl Network {
         match self.wcash_network()? {
             wcash_genesis::WcashNetwork::Testnet => Some(38232),
             wcash_genesis::WcashNetwork::Regtest => Some(28232),
-            wcash_genesis::WcashNetwork::Mainnet => None,
+            wcash_genesis::WcashNetwork::Mainnet => Some(48232),
         }
     }
 
@@ -379,13 +409,14 @@ impl Network {
             // incompatible prototype.
             Some(wcash_genesis::WcashNetwork::Testnet) => "wcashtestnet-v7".to_owned(),
             Some(wcash_genesis::WcashNetwork::Regtest) => "wcashregtest-v5".to_owned(),
+            Some(wcash_genesis::WcashNetwork::Mainnet) => "wcashmainnet-v1".to_owned(),
             _ => self.to_string().to_ascii_lowercase(),
         }
     }
 
     /// Returns `true` if this network is a testing network.
     pub fn is_a_test_network(&self) -> bool {
-        *self != Network::Mainnet
+        self.kind() != NetworkKind::Mainnet
     }
 
     /// Returns the Sapling activation height for this network.
@@ -508,6 +539,8 @@ impl FromStr for Network {
         match string.to_lowercase().as_str() {
             "mainnet" => Ok(Network::Mainnet),
             "testnet" => Ok(Network::new_default_testnet()),
+            "wcashmainnet" => Network::try_new_wcash_mainnet()
+                .map_err(|error| InvalidNetworkError(error.to_string())),
             _ => Err(InvalidNetworkError(string.to_owned())),
         }
     }
@@ -544,7 +577,7 @@ impl zcash_protocol::consensus::Parameters for Network {
                     return zcash_protocol::consensus::BranchId::WcashRegtestV1;
                 }
                 Some(wcash_genesis::WcashNetwork::Mainnet) => {
-                    panic!("Wcash Mainnet has no activated transaction signature domain")
+                    return zcash_protocol::consensus::BranchId::WcashMainnetV1;
                 }
                 None => {}
             }

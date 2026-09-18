@@ -78,6 +78,7 @@ fn wcash_domains_require_v6() {
     for branch in [
         BranchId::WcashTestnetV1,
         BranchId::WcashTestnetV3,
+        BranchId::WcashMainnetV1,
         BranchId::WcashRegtestV1,
     ] {
         assert_eq!(TxVersion::suggested_for_branch(branch), TxVersion::V6);

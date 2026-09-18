@@ -153,6 +153,31 @@ fn wcash_network_config_round_trip() {
 }
 
 #[test]
+fn wcash_mainnet_config_is_serializable_but_anchor_gated() {
+    let network = Network::new_wcash_mainnet_for_tests();
+    let config = Config {
+        listen_addr: "[::]:48233".parse().expect("hard-coded address is valid"),
+        network: network.clone(),
+        initial_mainnet_peers: ["203.0.113.20:48233".to_string()].into(),
+        initial_testnet_peers: ["203.0.113.30:38233".to_string()].into(),
+        ..Config::default()
+    };
+
+    assert_eq!(
+        config.initial_peer_hostnames(),
+        config.initial_mainnet_peers,
+        "Wcash Mainnet must use its dedicated mainnet peer field"
+    );
+    let encoded = toml::to_string(&config).expect("Wcash Mainnet config serializes");
+    assert!(encoded.contains("network = \"WcashMainnet\""));
+    let error = toml::from_str::<Config>(&encoded)
+        .expect_err("production Mainnet parsing stays disabled before anchor freeze");
+    assert!(error
+        .to_string()
+        .contains("no reviewed external-chain anchor"));
+}
+
+#[test]
 fn wcash_networks_reject_zcash_seed_inheritance() {
     for (network, seed) in [
         ("WcashTestnet", "dnsseed.testnet.z.cash:18233"),
@@ -180,14 +205,20 @@ fn wcash_peer_cache_paths_are_network_isolated() {
     let regtest = cache
         .peer_cache_file_path(&Network::new_wcash_regtest())
         .expect("custom peer cache is enabled");
+    let mainnet = cache
+        .peer_cache_file_path(&Network::new_wcash_mainnet_for_tests())
+        .expect("custom peer cache is enabled");
     let zcash = cache
         .peer_cache_file_path(&Network::new_default_testnet())
         .expect("custom peer cache is enabled");
 
     assert_ne!(testnet, regtest);
+    assert_ne!(mainnet, testnet);
+    assert_ne!(mainnet, regtest);
     assert_ne!(testnet, zcash);
     assert!(testnet.ends_with("wcashtestnet-v7.peers"));
     assert!(regtest.ends_with("wcashregtest-v5.peers"));
+    assert!(mainnet.ends_with("wcashmainnet-v1.peers"));
 }
 
 #[test]

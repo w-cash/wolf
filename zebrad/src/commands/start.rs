@@ -95,7 +95,8 @@ use tracing_futures::Instrument;
 use zebra_chain::{
     block::{
         genesis::{
-            regtest_genesis_block, wcash_regtest_genesis_block, wcash_testnet_genesis_block,
+            regtest_genesis_block, wcash_mainnet_genesis_block, wcash_regtest_genesis_block,
+            wcash_testnet_genesis_block,
         },
         Block,
     },
@@ -146,7 +147,12 @@ pub struct StartCmd {
 /// project-owned seeds at launch, so both built-in Wcash networks must seed the
 /// exact genesis selected by their consensus parameters before peer sync starts.
 fn locally_seeded_genesis_block(network: &Network) -> Option<Arc<Block>> {
-    if network.is_wcash_testnet() {
+    if network.is_wcash_mainnet() {
+        Some(
+            wcash_mainnet_genesis_block()
+                .expect("a constructed Wcash Mainnet profile has a frozen genesis anchor"),
+        )
+    } else if network.is_wcash_testnet() {
         Some(wcash_testnet_genesis_block())
     } else if network.is_wcash_regtest() {
         Some(wcash_regtest_genesis_block())
@@ -1031,7 +1037,7 @@ impl config::Override<ZebradConfig> for StartCmd {
         #[cfg(feature = "wcash-consensus")]
         if !config.network.network.uses_wcash_consensus() {
             return Err(std::io::Error::other(
-                "this Wcash consensus build only supports network = 'WcashTestnet' or 'WcashRegtest'; inherited Zcash networks use different consensus rules",
+                "this Wcash consensus build only supports network = 'WcashMainnet', 'WcashTestnet', or 'WcashRegtest'; inherited Zcash networks use different consensus rules",
             )
             .into());
         }

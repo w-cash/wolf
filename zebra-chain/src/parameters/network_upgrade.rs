@@ -79,6 +79,7 @@ impl TryFrom<u32> for NetworkUpgrade {
         if [
             WCASH_TESTNET_V1_BRANCH_ID,
             WCASH_TESTNET_V3_BRANCH_ID,
+            WCASH_MAINNET_V1_BRANCH_ID,
             WCASH_REGTEST_V1_BRANCH_ID,
         ]
         .map(u32::from)
@@ -173,6 +174,13 @@ pub const WCASH_TESTNET_V1_BRANCH_ID: ConsensusBranchId = ConsensusBranchId(0xb3
 /// This is the first four display-order bytes of SHA-256 over
 /// `Wcash/NU6.3/Ironwood/v2`. It prevents replay from retired Wcash testnets.
 pub const WCASH_TESTNET_V3_BRANCH_ID: ConsensusBranchId = ConsensusBranchId(0x54ba_2bfb);
+
+/// The transaction signature domain for Wcash Mainnet v1.
+///
+/// This is the first four display-order bytes of SHA-256 over
+/// `Wcash/mainnet/NU6.3/Ironwood/v1`. It prevents transaction replay from
+/// Zcash and every Wcash test or regression network.
+pub const WCASH_MAINNET_V1_BRANCH_ID: ConsensusBranchId = ConsensusBranchId(0xd9c6_a7ee);
 
 /// The transaction signature domain for Wcash Regtest v1.
 ///
@@ -595,7 +603,9 @@ impl ConsensusBranchId {
                 Some(wcash_genesis::WcashNetwork::Regtest) => {
                     return Some(WCASH_REGTEST_V1_BRANCH_ID);
                 }
-                Some(wcash_genesis::WcashNetwork::Mainnet) => return None,
+                Some(wcash_genesis::WcashNetwork::Mainnet) => {
+                    return Some(WCASH_MAINNET_V1_BRANCH_ID);
+                }
                 None => {}
             }
         }

@@ -18,8 +18,8 @@ use crate::{
             WCASH_TESTNET_FIRST_HALVING_HEIGHT, WCASH_TESTNET_SLOW_START_INTERVAL,
             WCASH_TESTNET_SLOW_START_SHIFT,
         },
-        ConsensusBranchId, NetworkUpgrade, WCASH_REGTEST_V1_BRANCH_ID, WCASH_TESTNET_V1_BRANCH_ID,
-        WCASH_TESTNET_V3_BRANCH_ID,
+        ConsensusBranchId, NetworkKind, NetworkUpgrade, WCASH_MAINNET_V1_BRANCH_ID,
+        WCASH_REGTEST_V1_BRANCH_ID, WCASH_TESTNET_V1_BRANCH_ID, WCASH_TESTNET_V3_BRANCH_ID,
     },
     serialization::DateTime32,
     work::difficulty::ParameterDifficulty as _,
@@ -28,7 +28,11 @@ use crate::{
 #[test]
 fn compiled_consensus_profile_is_mutually_exclusive() {
     let zcash = Network::Mainnet;
-    let wcash_networks = [Network::new_wcash_testnet(), Network::new_wcash_regtest()];
+    let wcash_networks = [
+        Network::new_wcash_mainnet_for_tests(),
+        Network::new_wcash_testnet(),
+        Network::new_wcash_regtest(),
+    ];
 
     assert_eq!(
         zcash.is_compatible_with_compiled_consensus(),
@@ -57,6 +61,65 @@ fn compiled_consensus_profile_is_mutually_exclusive() {
             );
         }
     }
+}
+
+#[test]
+fn wcash_mainnet_profile_is_fully_wired_but_production_anchor_is_fail_closed() -> Result<(), Report>
+{
+    assert!(Network::try_new_wcash_mainnet().is_err());
+
+    let mainnet = Network::new_wcash_mainnet_for_tests();
+    assert!(mainnet.uses_wcash_consensus());
+    assert!(mainnet.is_wcash_mainnet());
+    assert!(!mainnet.is_wcash_testnet());
+    assert!(!mainnet.is_wcash_regtest());
+    assert!(!mainnet.is_a_test_network());
+    assert_eq!(mainnet.kind(), NetworkKind::Mainnet);
+    assert_eq!(mainnet.t_addr_kind(), NetworkKind::Mainnet);
+    assert_eq!(mainnet.to_string(), "WcashMainnet");
+    assert_eq!(mainnet.lowercase_name(), "wcashmainnet-v1");
+    assert_eq!(mainnet.default_port(), 48233);
+    assert_eq!(mainnet.wcash_default_rpc_port(), Some(48232));
+    assert_eq!(
+        mainnet.magic().0,
+        wcash_genesis::network_identity(wcash_genesis::WcashNetwork::Mainnet).p2p_magic()
+    );
+    assert_eq!(
+        mainnet.target_difficulty_limit().to_compact().to_string(),
+        format!("{:08x}", wcash_genesis::PUBLIC_MAINNET_POW_LIMIT_BITS)
+    );
+    assert_eq!(
+        block_subsidy(Height::MIN, &mainnet)?,
+        Amount::<NonNegative>::zero()
+    );
+    assert_eq!(
+        block_subsidy(Height(40_000), &mainnet)?.zatoshis(),
+        2_199_023_255
+    );
+    assert_eq!(
+        block_subsidy(Height(40_001), &mainnet)?.zatoshis(),
+        2_199_023_255
+    );
+    assert_eq!(ConsensusBranchId::current(&mainnet, Height::MIN), None);
+    assert_eq!(
+        ConsensusBranchId::current(&mainnet, Height(1)),
+        Some(WCASH_MAINNET_V1_BRANCH_ID)
+    );
+    assert_eq!(
+        NetworkUpgrade::try_from(u32::from(WCASH_MAINNET_V1_BRANCH_ID)),
+        Ok(NetworkUpgrade::Nu6_3)
+    );
+    assert_ne!(WCASH_MAINNET_V1_BRANCH_ID, WCASH_TESTNET_V3_BRANCH_ID);
+    assert_ne!(WCASH_MAINNET_V1_BRANCH_ID, WCASH_REGTEST_V1_BRANCH_ID);
+    assert_eq!(
+        zcash_protocol::consensus::BranchId::for_height(
+            &mainnet,
+            zcash_protocol::consensus::BlockHeight::from_u32(1),
+        ),
+        zcash_protocol::consensus::BranchId::WcashMainnetV1
+    );
+
+    Ok(())
 }
 
 #[test]
@@ -409,15 +472,9 @@ fn wcash_consensus_parameters_and_issuance() -> Result<(), Report> {
     assert_eq!(per_block_era_sum, 1_249_999_989);
     let scheduled_supply = per_block_era_sum * (WCASH_HALVING_INTERVAL as u64);
     assert_eq!(scheduled_supply, 2_099_999_981_520_000);
-    assert_eq!(MAX_MONEY, 21_000_000 * crate::amount::COIN);
-    assert_eq!(
-        u64::try_from(MAX_MONEY).expect("MAX_MONEY is positive") - scheduled_supply,
-        18_480_000
-    );
     assert!(
-        per_block_era_sum * (u64::try_from(WCASH_HALVING_INTERVAL).unwrap() + 1)
-            > u64::try_from(MAX_MONEY).expect("MAX_MONEY is positive"),
-        "increasing the halving interval by one block must exceed the hard cap"
+        u64::try_from(MAX_MONEY).expect("MAX_MONEY is positive") > scheduled_supply,
+        "the Wcash technical amount bound must exceed the legacy Regtest schedule"
     );
     assert!(Amount::<NonNegative>::try_from(MAX_MONEY).is_ok());
     assert!(Amount::<NonNegative>::try_from(MAX_MONEY + 1).is_err());

@@ -9,15 +9,20 @@ use rand::{seq::IteratorRandom, thread_rng};
 use std::sync::Arc;
 
 use crate::{
-    amount::MAX_MONEY,
     block::{Block, Height, MAX_BLOCK_BYTES},
     orchard,
     parameters::Network,
-    primitives::{x25519, zcash_primitives::PrecomputedTxData, Groth16Proof},
+    primitives::zcash_primitives::PrecomputedTxData,
     serialization::{SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
-    sprout,
     transaction::sighash::SigHasher,
     transparent::Script,
+};
+
+#[cfg(not(feature = "wcash-consensus"))]
+use crate::{
+    amount::MAX_MONEY,
+    primitives::{x25519, Groth16Proof},
+    sprout,
     value_balance::ValueBalanceError,
 };
 
@@ -1654,6 +1659,7 @@ fn expiry_height_preserves_out_of_range_values() {
 /// monetary range must report a value-balance error, not a zero Sprout balance.
 /// Each `vpub_new` is individually valid; only the aggregate is out of range.
 #[test]
+#[cfg(not(feature = "wcash-consensus"))]
 fn sprout_aggregate_value_balance_out_of_range_is_rejected() {
     let _init_guard = zebra_test::init();
 
