@@ -1584,12 +1584,12 @@ fn reconcile_zcash_pool_winner(
         .as_ref()
         .is_some_and(|report| !report.relays_succeeded())
     {
-        // Retain the exact bytes for another ordered reconciliation attempt,
-        // but never stop share admission or job rotation for a broadcast-only
-        // dependency.
+        // Retain the exact bytes for another ordered reconciliation attempt.
+        // A new parent job must not build past a block until the independent
+        // standard relay has confirmed that exact block on its best chain.
         return Err(PoolWinnerReconciliationError::new(
             MinerError::WinnerSubmissionDeferred { chain: "Zcash" },
-            false,
+            true,
         ));
     }
     let noncanonical = requires_submission

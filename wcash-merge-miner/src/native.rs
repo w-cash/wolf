@@ -178,8 +178,9 @@ pub struct NativeZcashConfig {
     template_node: RpcEndpoint,
     /// Independent nodes that must all accept the exact proposal.
     proposal_validators: Vec<RpcEndpoint>,
-    /// Standard Zebra nodes used only to broadcast solved blocks to an
-    /// independent public peer set. They never supply templates or votes.
+    /// Standard Zebra nodes used to broadcast solved blocks to an independent
+    /// public peer set and gate new work on exact best-tip convergence. They
+    /// never supply templates or proposal-validation votes.
     broadcast_nodes: Vec<RpcEndpoint>,
     /// Exact standard Zcash network whose subsidy schedule is enforced locally.
     expected_parent_network: NativeZcashNetwork,
@@ -244,7 +245,8 @@ impl NativeZcashConfig {
     }
 
     /// Adds standard `submitblock` broadcast endpoints. These endpoints are
-    /// deliberately excluded from template construction and proposal quorum.
+    /// deliberately excluded from template construction and proposal quorum,
+    /// but must converge before the next generation can be admitted.
     pub fn with_broadcast_nodes(
         mut self,
         broadcast_nodes: Vec<RpcEndpoint>,
@@ -715,15 +717,25 @@ impl NativeZcashProvider {
             .into_iter()
             .filter(|node| seen.insert(node.label().to_string()))
             .collect::<Vec<_>>();
-        let outcomes = thread::scope(|scope| {
-            nodes
+        let (outcomes, relay_outcomes) = thread::scope(|scope| {
+            let authoritative = nodes
                 .into_iter()
                 .map(|node| {
                     scope.spawn(move || {
                         submit_parent_to_node(node, block_bytes, height, expected_hash)
                     })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let relays = self
+                .broadcast_nodes
+                .iter()
+                .map(|node| {
+                    scope.spawn(move || {
+                        submit_parent_to_broadcast_node(node, block_bytes, height, expected_hash)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let outcomes = authoritative
                 .into_iter()
                 .map(|handle| match handle.join() {
                     Ok(outcome) => outcome,
@@ -732,16 +744,19 @@ impl NativeZcashProvider {
                         reason: "submission worker panicked".to_string(),
                     },
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let relay_outcomes = relays
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(outcome) => outcome,
+                    Err(_) => ParentRelayOutcome::Unavailable {
+                        endpoint: "parent relay worker".to_string(),
+                        reason: "submission worker panicked".to_string(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            (outcomes, relay_outcomes)
         });
-        // Broadcast to standard nodes only after the exact bytes reach the
-        // authoritative local nodes. This lane uses standard RPCs exclusively,
-        // so unmodified Zebra peers can carry the block into a separate peer set.
-        let relay_outcomes = self
-            .broadcast_nodes
-            .iter()
-            .map(|node| submit_parent_to_broadcast_node(node, block_bytes))
-            .collect();
         Ok(ParentSubmissionReport {
             outcomes,
             relay_outcomes,
@@ -776,9 +791,11 @@ impl NativeZcashProvider {
         height: u32,
         expected_hash: &str,
     ) -> Vec<Result<Option<u32>, MinerError>> {
-        let mut nodes = Vec::with_capacity(self.proposal_validators.len() + 1);
+        let mut nodes =
+            Vec::with_capacity(self.proposal_validators.len() + self.broadcast_nodes.len() + 1);
         nodes.push(&self.template_node);
         nodes.extend(self.proposal_validators.iter());
+        nodes.extend(self.broadcast_nodes.iter());
         thread::scope(|scope| {
             nodes
                 .into_iter()
@@ -858,11 +875,16 @@ impl NativeZcashProvider {
             for validator in &self.proposal_validators {
                 self.proposal_validator_matches_or_lags(validator, job)?;
             }
+            for broadcaster in &self.broadcast_nodes {
+                self.require_tip(broadcaster, job)?;
+            }
             return Ok(());
         }
-        let mut nodes = Vec::with_capacity(self.proposal_validators.len() + 1);
+        let mut nodes =
+            Vec::with_capacity(self.proposal_validators.len() + self.broadcast_nodes.len() + 1);
         nodes.push(&self.template_node);
         nodes.extend(self.proposal_validators.iter());
+        nodes.extend(self.broadcast_nodes.iter());
         let checks = thread::scope(|scope| {
             nodes
                 .into_iter()
@@ -889,13 +911,17 @@ impl NativeZcashProvider {
         let tip_height = job.parent_height().checked_sub(1).ok_or_else(|| {
             MinerError::InvalidParentTemplate("parent height must be positive".to_string())
         })?;
-        let actual_height: u32 = node.call("getblockcount", json!([]))?;
-        let actual: String = node.call("getbestblockhash", json!([]))?;
-        if actual_height != tip_height || !actual.eq_ignore_ascii_case(job.parent_tip_display()) {
+        let actual = native_chain_tip_on_node(node)?;
+        let expected_hash = job.parent_proposal.header.previous_block_hash.0;
+        if actual.height != tip_height || actual.block_hash_le != expected_hash {
             return Err(MinerError::ParentTipMismatch {
                 expected: format!("{} at height {tip_height}", job.parent_tip_display()),
                 endpoint: node.label().to_string(),
-                actual: format!("{actual} at height {actual_height}"),
+                actual: format!(
+                    "{} at height {}",
+                    display_hex(actual.block_hash_le),
+                    actual.height
+                ),
             });
         }
         Ok(())
@@ -1665,11 +1691,13 @@ impl ParentSubmissionReport {
     }
 }
 
-/// Result from a standard Zebra endpoint that participates only in block
-/// broadcast, never template selection or proposal validation.
+/// Result from a standard Zebra endpoint that broadcasts blocks and provides
+/// an independent exact-tip delivery fence, never template selection or
+/// proposal validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParentRelayOutcome {
-    /// The node accepted the block or reported that it already had it.
+    /// The node accepted or already knew the block and confirmed it on its
+    /// best chain.
     Delivered {
         /// Credential-free endpoint label.
         endpoint: String,
@@ -1946,12 +1974,29 @@ fn submit_parent_to_node(
 fn submit_parent_to_broadcast_node(
     node: &ZebraRpcClient,
     block_bytes: &[u8],
+    height: u32,
+    expected_hash: &str,
 ) -> ParentRelayOutcome {
     let endpoint = node.label().to_string();
-    classify_parent_broadcast_response(
-        endpoint,
+    let outcome = classify_parent_broadcast_response(
+        endpoint.clone(),
         node.call_value("submitblock", json!([hex::encode(block_bytes)])),
-    )
+    );
+    if !matches!(outcome, ParentRelayOutcome::Delivered { .. }) {
+        return outcome;
+    }
+    match parent_confirmation_depth_on_node(node, height, expected_hash) {
+        Ok(Some(_)) => ParentRelayOutcome::Delivered { endpoint },
+        Ok(None) => ParentRelayOutcome::Unavailable {
+            endpoint,
+            reason: "submitted block is not yet confirmed on the relay best chain".to_string(),
+        },
+        Err(error) if is_transient_parent_rpc_failure(&error) => ParentRelayOutcome::Unavailable {
+            endpoint,
+            reason: error.to_string(),
+        },
+        Err(_) => ParentRelayOutcome::InvalidResponse { endpoint },
+    }
 }
 
 fn classify_parent_broadcast_response(
@@ -2403,6 +2448,9 @@ mod tests {
                     Err(error) => panic!("tip recheck accept failed: {error}"),
                 }
             };
+            stream
+                .set_nonblocking(false)
+                .expect("blocking accepted stream");
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("bounded request read");
