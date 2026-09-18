@@ -644,7 +644,7 @@ impl PoolBackendShareValidationError {
 #[derive(Debug, Error)]
 pub enum PoolBackendActorError {
     /// The authoritative journal could not be read or durably updated.
-    #[error("pool backend journal operation failed")]
+    #[error("pool backend journal operation failed: {0}")]
     Journal(#[from] PoolBackendJournalError),
 
     /// Journal identity could not form a complete listener authority.
