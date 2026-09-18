@@ -32,7 +32,7 @@ pub fn regtest_genesis_block() -> Arc<Block> {
 ///
 /// Its coinbase text and header commitment bind the local chain to the frozen
 /// Bitcoin block in [`wcash_genesis::REGTEST_ANCHOR`]. Public Wcash Testnet
-/// uses its own separately reviewed and frozen Bitcoin anchor; Wcash mainnet
+/// uses its own separately reviewed and frozen Zcash Testnet anchor; Wcash mainnet
 /// remains disabled.
 pub fn wcash_regtest_genesis_block() -> Arc<Block> {
     wcash_genesis_block(

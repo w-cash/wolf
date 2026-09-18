@@ -38,8 +38,8 @@ pub const WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 100] =
 
 /// The exact public Wcash-testnet genesis statement.
 ///
-/// This statement commits to the independently checked Bitcoin mainnet block
-/// 965,900. Its Wcash-network discriminator is separately committed in the
+/// This statement commits to the independently checked Zcash Testnet block
+/// 4,362,016. Its Wcash-network discriminator is separately committed in the
 /// header's anchor commitment.
 pub const WCASH_TESTNET_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 100] =
     b"17/Sep/2026 W.cash ZECtest #4362016 00000e289ad21d2feeb17e16585790ecabec94323c2ef22925534ad104de73ac";
