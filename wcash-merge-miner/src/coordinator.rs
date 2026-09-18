@@ -1580,6 +1580,18 @@ fn reconcile_zcash_pool_winner(
         }
         _ => None,
     };
+    if submission
+        .as_ref()
+        .is_some_and(|report| !report.relays_succeeded())
+    {
+        // Retain the exact bytes for another ordered reconciliation attempt,
+        // but never stop share admission or job rotation for a broadcast-only
+        // dependency.
+        return Err(PoolWinnerReconciliationError::new(
+            MinerError::WinnerSubmissionDeferred { chain: "Zcash" },
+            false,
+        ));
+    }
     let noncanonical = requires_submission
         && matches!(tip_position, ParentWinnerTipPosition::Overtaken)
         || submission
@@ -2023,11 +2035,14 @@ fn submit_pending_winner_with(
             )
         }
         WinnerChain::Zcash => {
-            let _submission = zcash.submit_parent_bytes(
+            let submission = zcash.submit_parent_bytes(
                 &winner.block_bytes,
                 winner.height,
                 &winner.block_hash_display,
             );
+            if !matches!(submission, Ok(ref report) if report.relays_succeeded()) {
+                return WinnerObservation::Unavailable;
+            }
             match zcash.parent_confirmation_depth(winner.height, &winner.block_hash_display) {
                 Ok(Some(confirmations)) => WinnerObservation::Present { confirmations },
                 Ok(None) => WinnerObservation::Absent,

@@ -178,6 +178,9 @@ pub struct NativeZcashConfig {
     template_node: RpcEndpoint,
     /// Independent nodes that must all accept the exact proposal.
     proposal_validators: Vec<RpcEndpoint>,
+    /// Standard Zebra nodes used only to broadcast solved blocks to an
+    /// independent public peer set. They never supply templates or votes.
+    broadcast_nodes: Vec<RpcEndpoint>,
     /// Exact standard Zcash network whose subsidy schedule is enforced locally.
     expected_parent_network: NativeZcashNetwork,
     /// Expected parent genesis hash in conventional RPC display order.
@@ -200,6 +203,7 @@ impl fmt::Debug for NativeZcashConfig {
             .debug_struct("NativeZcashConfig")
             .field("template_node", &self.template_node)
             .field("proposal_validators", &self.proposal_validators)
+            .field("broadcast_nodes", &self.broadcast_nodes)
             .field("expected_parent_network", &self.expected_parent_network)
             .field("expected_genesis_hash", &self.expected_genesis_hash)
             .field("expected_parent_payout_commitment", &"[REDACTED]")
@@ -227,6 +231,7 @@ impl NativeZcashConfig {
         let config = Self {
             template_node,
             proposal_validators,
+            broadcast_nodes: Vec::new(),
             expected_parent_network,
             expected_genesis_hash,
             expected_parent_payout_commitment,
@@ -236,6 +241,17 @@ impl NativeZcashConfig {
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Adds standard `submitblock` broadcast endpoints. These endpoints are
+    /// deliberately excluded from template construction and proposal quorum.
+    pub fn with_broadcast_nodes(
+        mut self,
+        broadcast_nodes: Vec<RpcEndpoint>,
+    ) -> Result<Self, MinerError> {
+        self.broadcast_nodes = broadcast_nodes;
+        self.validate()?;
+        Ok(self)
     }
 
     /// Allows Testnet work to remain live while an independent proposal
@@ -276,13 +292,22 @@ impl NativeZcashConfig {
                 "lagging proposal validators may be tolerated only on Zcash Testnet".to_string(),
             ));
         }
-        let mut endpoints = HashSet::with_capacity(self.proposal_validators.len() + 1);
+        let mut endpoints =
+            HashSet::with_capacity(self.proposal_validators.len() + self.broadcast_nodes.len() + 1);
         endpoints.insert(self.template_node.label().to_string());
         for validator in &self.proposal_validators {
             if !endpoints.insert(validator.label().to_string()) {
                 return Err(MinerError::RpcConfiguration(format!(
                     "template and proposal-validation endpoints must be unique; duplicate {}",
                     validator.label()
+                )));
+            }
+        }
+        for broadcaster in &self.broadcast_nodes {
+            if !endpoints.insert(broadcaster.label().to_string()) {
+                return Err(MinerError::RpcConfiguration(format!(
+                    "template, proposal-validation, and broadcast endpoints must be unique; duplicate {}",
+                    broadcaster.label()
                 )));
             }
         }
@@ -328,6 +353,7 @@ impl NativeZcashConfig {
 pub struct NativeZcashProvider {
     template_node: ZebraRpcClient,
     proposal_validators: Vec<ZebraRpcClient>,
+    broadcast_nodes: Vec<ZebraRpcClient>,
     parent_network: NativeZcashNetwork,
     expected_parent_network: Network,
     expected_parent_payout_commitment: [u8; 32],
@@ -374,9 +400,15 @@ impl NativeZcashProvider {
             .into_iter()
             .map(|endpoint| ZebraRpcClient::new(endpoint, config.rpc_timeout))
             .collect::<Result<Vec<_>, _>>()?;
+        let broadcast_nodes = config
+            .broadcast_nodes
+            .into_iter()
+            .map(|endpoint| ZebraRpcClient::new(endpoint, config.rpc_timeout))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             template_node,
             proposal_validators,
+            broadcast_nodes,
             parent_network,
             expected_parent_network,
             expected_parent_payout_commitment,
@@ -702,7 +734,18 @@ impl NativeZcashProvider {
                 })
                 .collect::<Vec<_>>()
         });
-        Ok(ParentSubmissionReport { outcomes })
+        // Broadcast to standard nodes only after the exact bytes reach the
+        // authoritative local nodes. This lane uses standard RPCs exclusively,
+        // so unmodified Zebra peers can carry the block into a separate peer set.
+        let relay_outcomes = self
+            .broadcast_nodes
+            .iter()
+            .map(|node| submit_parent_to_broadcast_node(node, block_bytes))
+            .collect();
+        Ok(ParentSubmissionReport {
+            outcomes,
+            relay_outcomes,
+        })
     }
 
     /// Returns the conservative best-chain confirmation depth reported for an
@@ -865,6 +908,25 @@ impl NativeZcashProvider {
         self.require_node_genesis(&self.template_node, expected_genesis_hash)?;
         for validator in &self.proposal_validators {
             self.require_node_genesis(validator, expected_genesis_hash)?;
+        }
+        for broadcaster in &self.broadcast_nodes {
+            self.require_standard_node_genesis(broadcaster, expected_genesis_hash)?;
+        }
+        Ok(())
+    }
+
+    fn require_standard_node_genesis(
+        &self,
+        node: &ZebraRpcClient,
+        expected_genesis_hash: &str,
+    ) -> Result<(), MinerError> {
+        let actual: String = node.call("getblockhash", json!([0]))?;
+        if !actual.eq_ignore_ascii_case(expected_genesis_hash) {
+            return Err(MinerError::NetworkIdentityMismatch {
+                expected: expected_genesis_hash.to_string(),
+                endpoint: node.label().to_string(),
+                actual,
+            });
         }
         Ok(())
     }
@@ -1563,6 +1625,7 @@ impl ValidatedNativeShare {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParentSubmissionReport {
     outcomes: Vec<ParentNodeOutcome>,
+    relay_outcomes: Vec<ParentRelayOutcome>,
 }
 
 impl ParentSubmissionReport {
@@ -1578,6 +1641,19 @@ impl ParentSubmissionReport {
             .any(|outcome| matches!(outcome, ParentNodeOutcome::Accepted { .. }))
     }
 
+    /// Returns true when every configured standard broadcast node accepted or
+    /// already knew the exact block bytes.
+    pub fn relays_succeeded(&self) -> bool {
+        self.relay_outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, ParentRelayOutcome::Delivered { .. }))
+    }
+
+    /// Returns the standard broadcast-only node outcomes.
+    pub fn relay_outcomes(&self) -> &[ParentRelayOutcome] {
+        &self.relay_outcomes
+    }
+
     /// All pinned nodes independently retained this exact valid noncanonical
     /// block. This is healthy outbox monitoring, never confirmation evidence.
     pub(crate) fn is_known_side_chain(&self) -> bool {
@@ -1587,6 +1663,36 @@ impl ParentSubmissionReport {
                 .iter()
                 .all(|outcome| matches!(outcome, ParentNodeOutcome::KnownSideChain { .. }))
     }
+}
+
+/// Result from a standard Zebra endpoint that participates only in block
+/// broadcast, never template selection or proposal validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParentRelayOutcome {
+    /// The node accepted the block or reported that it already had it.
+    Delivered {
+        /// Credential-free endpoint label.
+        endpoint: String,
+    },
+    /// The node returned a standard submitblock rejection reason.
+    Rejected {
+        /// Credential-free endpoint label.
+        endpoint: String,
+        /// Node-provided rejection reason.
+        reason: String,
+    },
+    /// The node could not be reached.
+    Unavailable {
+        /// Credential-free endpoint label.
+        endpoint: String,
+        /// Sanitized transport failure.
+        reason: String,
+    },
+    /// The node returned a malformed or permanently incompatible response.
+    InvalidResponse {
+        /// Credential-free endpoint label.
+        endpoint: String,
+    },
 }
 
 /// Per-node outcome for a parent winner broadcast.
@@ -1832,6 +1938,40 @@ fn submit_parent_to_node(
         },
         Err(error) => ParentNodeOutcome::Unavailable {
             endpoint: node.label().to_string(),
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn submit_parent_to_broadcast_node(
+    node: &ZebraRpcClient,
+    block_bytes: &[u8],
+) -> ParentRelayOutcome {
+    let endpoint = node.label().to_string();
+    classify_parent_broadcast_response(
+        endpoint,
+        node.call_value("submitblock", json!([hex::encode(block_bytes)])),
+    )
+}
+
+fn classify_parent_broadcast_response(
+    endpoint: String,
+    response: Result<Value, MinerError>,
+) -> ParentRelayOutcome {
+    match response {
+        Ok(Value::Null) => ParentRelayOutcome::Delivered { endpoint },
+        Ok(Value::String(reason)) if reason.eq_ignore_ascii_case("duplicate") => {
+            ParentRelayOutcome::Delivered { endpoint }
+        }
+        Ok(Value::String(reason)) => ParentRelayOutcome::Rejected { endpoint, reason },
+        Ok(_) => ParentRelayOutcome::InvalidResponse { endpoint },
+        Err(
+            MinerError::RpcProtocol(_)
+            | MinerError::RpcResponseTooLarge(_)
+            | MinerError::RpcConfiguration(_),
+        ) => ParentRelayOutcome::InvalidResponse { endpoint },
+        Err(error) => ParentRelayOutcome::Unavailable {
+            endpoint,
             reason: error.to_string(),
         },
     }
@@ -2805,6 +2945,7 @@ mod tests {
             template_node: RpcEndpoint::new("http://127.0.0.1:8232", None, None)
                 .expect("loopback endpoint"),
             proposal_validators: Vec::new(),
+            broadcast_nodes: Vec::new(),
             expected_parent_network: network,
             expected_genesis_hash: genesis,
             expected_parent_payout_commitment: parent_payout_address_commitment(
@@ -2818,6 +2959,52 @@ mod tests {
             NativeZcashProvider::connect(bypass_attempt).is_err(),
             "the provider must revalidate configs even when an in-crate caller bypasses new()"
         );
+    }
+
+    #[test]
+    fn broadcast_nodes_are_distinct_and_never_replace_proposal_quorum() {
+        let template =
+            RpcEndpoint::new("http://127.0.0.1:8232", None, None).expect("template endpoint");
+        let validator =
+            RpcEndpoint::new("http://127.0.0.1:8233", None, None).expect("validator endpoint");
+        let network = NativeZcashNetwork::Regtest;
+        let genesis = network.consensus_parameters().genesis_hash().to_string();
+        let payout: ZcashAddress = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
+            .parse()
+            .expect("valid testnet address");
+        let config = NativeZcashConfig::new(
+            template.clone(),
+            vec![validator.clone()],
+            network,
+            genesis,
+            payout,
+        )
+        .expect("valid proposal quorum");
+
+        assert!(config.clone().with_broadcast_nodes(vec![template]).is_err());
+        assert!(config.with_broadcast_nodes(vec![validator]).is_err());
+    }
+
+    #[test]
+    fn standard_broadcast_accepts_only_null_or_duplicate() {
+        let endpoint = "http://127.0.0.1:18252".to_string();
+        for response in [Value::Null, Value::String("duplicate".to_string())] {
+            assert!(matches!(
+                classify_parent_broadcast_response(endpoint.clone(), Ok(response)),
+                ParentRelayOutcome::Delivered { .. }
+            ));
+        }
+        assert!(matches!(
+            classify_parent_broadcast_response(
+                endpoint.clone(),
+                Ok(Value::String("rejected".to_string()))
+            ),
+            ParentRelayOutcome::Rejected { .. }
+        ));
+        assert!(matches!(
+            classify_parent_broadcast_response(endpoint, Ok(json!({"unexpected": true}))),
+            ParentRelayOutcome::InvalidResponse { .. }
+        ));
     }
 
     #[test]
