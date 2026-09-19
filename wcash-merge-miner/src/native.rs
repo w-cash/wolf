@@ -608,14 +608,25 @@ impl NativeZcashProvider {
 
         // Prove the local node is on the observer's canonical prefix before
         // relaying anything. An equal-height mismatch is never repaired here.
-        let observer_prefix: String = observer.call("getblockhash", json!([node_tip.height]))?;
+        let observer_prefix: String = observer
+            .call("getblockhash", json!([node_tip.height]))
+            .map_err(|error| reclassify_observer_lookup_tip_race(observer, observer_tip, error))?;
         if !observer_prefix.eq_ignore_ascii_case(&display_hex(node_tip.block_hash_le)) {
             return Err(parent_tip_mismatch(observer_tip, node, node_tip));
         }
 
         for height in (node_tip.height + 1)..=observer_tip.height {
-            let expected_hash: String = observer.call("getblockhash", json!([height]))?;
-            let raw_hex: String = observer.call("getblock", json!([expected_hash, 0]))?;
+            let expected_hash: String =
+                observer
+                    .call("getblockhash", json!([height]))
+                    .map_err(|error| {
+                        reclassify_observer_lookup_tip_race(observer, observer_tip, error)
+                    })?;
+            let raw_hex: String = observer
+                .call("getblock", json!([expected_hash, 0]))
+                .map_err(|error| {
+                    reclassify_observer_lookup_tip_race(observer, observer_tip, error)
+                })?;
             let block_bytes = decode_template_bytes(
                 &raw_hex,
                 "observer canonical parent block",
@@ -1187,6 +1198,37 @@ fn parent_tip_mismatch(
             display_hex(actual.block_hash_le),
             actual.height
         ),
+    }
+}
+
+/// Reclassifies an observer lookup failure as a transient tip race only when a
+/// fresh authoritative tip query proves that the observer moved after the
+/// relay snapshot was taken.
+///
+/// Zebra returns RPC `-1` when a requested height is now above its tip and
+/// `-5` when a block hash disappeared during a reorganization. Those replies
+/// are safe to retry only after proving an actual tip change. A stable tip, an
+/// unrelated RPC error, or a failed recheck preserves the original error and
+/// therefore remains fail-closed.
+fn reclassify_observer_lookup_tip_race(
+    observer: &ZebraRpcClient,
+    expected: NativeChainTip,
+    error: MinerError,
+) -> MinerError {
+    let lookup_can_race = matches!(
+        &error,
+        MinerError::RpcError {
+            code: Some(-1 | -5),
+            ..
+        }
+    );
+    if !lookup_can_race {
+        return error;
+    }
+
+    match native_chain_tip_on_node(observer) {
+        Ok(actual) if actual != expected => parent_tip_mismatch(expected, observer, actual),
+        Ok(_) | Err(_) => error,
     }
 }
 
@@ -2774,6 +2816,66 @@ pub(crate) mod tests {
             );
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn observer_lookup_race_retries_only_after_a_proven_tip_change() {
+        let expected_hash = "11".repeat(32);
+        let changed_hash = "42".repeat(32);
+        let expected_block_hash: block::Hash =
+            parse_template_hex(&expected_hash, "expected observer tip").unwrap();
+        let expected = NativeChainTip {
+            block_hash_le: expected_block_hash.0,
+            height: 100,
+        };
+
+        for code in [-1, -5] {
+            let (provider, server) = parent_tip_recheck_server(Some(Ok(json!({
+                "blocks": 101,
+                "bestblockhash": changed_hash,
+            }))));
+            let error = reclassify_observer_lookup_tip_race(
+                &provider.proposal_validators[0],
+                expected,
+                MinerError::RpcError {
+                    endpoint: "observer".to_string(),
+                    code: Some(code),
+                    message: "lookup raced the observer tip".to_string(),
+                },
+            );
+            assert!(matches!(
+                error,
+                MinerError::ParentTipMismatch { actual, .. }
+                    if actual == format!("{changed_hash} at height 101")
+            ));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn observer_lookup_error_stays_fatal_when_the_tip_is_stable() {
+        let expected_hash = "11".repeat(32);
+        let expected_block_hash: block::Hash =
+            parse_template_hex(&expected_hash, "expected observer tip").unwrap();
+        let expected = NativeChainTip {
+            block_hash_le: expected_block_hash.0,
+            height: 100,
+        };
+        let (provider, server) = parent_tip_recheck_server(Some(Ok(json!({
+            "blocks": expected.height,
+            "bestblockhash": expected_hash,
+        }))));
+        let error = reclassify_observer_lookup_tip_race(
+            &provider.proposal_validators[0],
+            expected,
+            MinerError::RpcError {
+                endpoint: "observer".to_string(),
+                code: Some(-1),
+                message: "unexpected stable-tip lookup failure".to_string(),
+            },
+        );
+        assert!(matches!(error, MinerError::RpcError { code: Some(-1), .. }));
+        server.join().unwrap();
     }
 
     #[test]
