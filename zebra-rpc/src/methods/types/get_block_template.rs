@@ -1221,6 +1221,15 @@ where
         return Ok(());
     }
 
+    // A new Wcash mainnet has no existing peers or post-genesis blocks to prove
+    // that it is close to the tip. Permit exactly the first template after the
+    // locally verified genesis block. Once block 1 is committed, its current
+    // timestamp lets the normal stale-tip and sync-status checks protect every
+    // later template, including after restarts or network partitions.
+    if network.is_wcash_mainnet() && latest_chain_tip.best_tip_height() == Some(block::Height(0)) {
+        return Ok(());
+    }
+
     // The tip estimate may not be the same as the one coming from the state
     // but this is ok for an estimate
     let (estimated_distance_to_chain_tip, local_tip_height) = latest_chain_tip

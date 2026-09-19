@@ -62,6 +62,9 @@ const ZCASH_VALIDATOR_RPC_PASSWORD: &str = "ZCASH_VALIDATOR_RPC_PASSWORD";
 const ZCASH_BROADCAST_RPC_URL: &str = "ZCASH_BROADCAST_RPC_URL";
 const ZCASH_BROADCAST_RPC_USERNAME: &str = "ZCASH_BROADCAST_RPC_USERNAME";
 const ZCASH_BROADCAST_RPC_PASSWORD: &str = "ZCASH_BROADCAST_RPC_PASSWORD";
+const ZCASH_OBSERVER_RPC_URL: &str = "ZCASH_OBSERVER_RPC_URL";
+const ZCASH_OBSERVER_RPC_USERNAME: &str = "ZCASH_OBSERVER_RPC_USERNAME";
+const ZCASH_OBSERVER_RPC_PASSWORD: &str = "ZCASH_OBSERVER_RPC_PASSWORD";
 const WCASH_STRATUM_PASSWORD: &str = "WCASH_STRATUM_PASSWORD";
 const WCASH_WORKER_CREDENTIALS: &str = "WCASH_WORKER_CREDENTIALS";
 const WCASH_SHARE_TARGET: &str = "WCASH_SHARE_TARGET";
@@ -126,10 +129,16 @@ only be supplied through these optional, paired environment variables:
   ZCASH_VALIDATOR_RPC_USERNAME / ZCASH_VALIDATOR_RPC_PASSWORD
   ZCASH_BROADCAST_RPC_URL and optional paired
   ZCASH_BROADCAST_RPC_USERNAME / ZCASH_BROADCAST_RPC_PASSWORD
+  ZCASH_OBSERVER_RPC_URL and optional paired
+  ZCASH_OBSERVER_RPC_USERNAME / ZCASH_OBSERVER_RPC_PASSWORD
 
 ZCASH_BROADCAST_RPC_URL selects an independently peered standard Zebra node.
 It receives exact winning blocks through `submitblock` but never supplies work
 or participates in proposal validation.
+
+ZCASH_OBSERVER_RPC_URL selects a read-only standard Zebra node connected to
+public peers. Solved blocks are never submitted to it. Its exact tip gates new
+work and winner accounting so local nodes cannot self-confirm a private fork.
 
 Every native command requires WCASH_EXPECTED_GENESIS_HASH,
 ZCASH_EXPECTED_GENESIS_HASH (64 hex characters in conventional RPC display
@@ -1852,6 +1861,8 @@ struct EndpointSummary {
     zcash_validator_authenticated: bool,
     zcash_broadcast_label: Option<String>,
     zcash_broadcast_authenticated: bool,
+    zcash_observer_label: Option<String>,
+    zcash_observer_authenticated: bool,
     zcash_network: String,
     wcash_payout_address_source: &'static str,
     zcash_payout_address_source: &'static str,
@@ -1891,6 +1902,11 @@ fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredN
         ZCASH_BROADCAST_RPC_USERNAME,
         ZCASH_BROADCAST_RPC_PASSWORD,
     )?;
+    let observer_node = optional_endpoint_from_env(
+        ZCASH_OBSERVER_RPC_URL,
+        ZCASH_OBSERVER_RPC_USERNAME,
+        ZCASH_OBSERVER_RPC_PASSWORD,
+    )?;
     let expected_wcash_genesis_hash = required_display_hash_env(WCASH_EXPECTED_GENESIS_HASH)?;
     let expected_zcash_genesis_hash = required_display_hash_env(ZCASH_EXPECTED_GENESIS_HASH)?;
     let expected_zcash_network = required_zcash_network_env()?;
@@ -1912,6 +1928,12 @@ fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredN
         zcash_broadcast_authenticated: broadcast_node
             .as_ref()
             .is_some_and(|(_, authenticated)| *authenticated),
+        zcash_observer_label: observer_node
+            .as_ref()
+            .map(|(endpoint, _)| endpoint.label().to_string()),
+        zcash_observer_authenticated: observer_node
+            .as_ref()
+            .is_some_and(|(_, authenticated)| *authenticated),
         zcash_network: expected_zcash_network.to_string(),
         wcash_payout_address_source: WCASH_PAYOUT_ADDRESS,
         zcash_payout_address_source: ZCASH_PAYOUT_ADDRESS,
@@ -1925,6 +1947,9 @@ fn configure_native(arguments: &NativeConnectionArguments) -> Result<ConfiguredN
     )?;
     if let Some((broadcast_node, _)) = broadcast_node {
         zcash = zcash.with_broadcast_nodes(vec![broadcast_node])?;
+    }
+    if let Some((observer_node, _)) = observer_node {
+        zcash = zcash.with_observer_nodes(vec![observer_node])?;
     }
     if allow_lagging_parent_validator {
         zcash = zcash.allow_lagging_proposal_validators_on_testnet()?;
@@ -2272,6 +2297,15 @@ fn native_preflight(
                     "{ZCASH_BROADCAST_RPC_USERNAME} + {ZCASH_BROADCAST_RPC_PASSWORD}"
                 ),
                 "role": "standard_submitblock_only",
+            },
+            "zcash_observer": {
+                "configured": endpoints.zcash_observer_label.is_some(),
+                "endpoint": endpoints.zcash_observer_label,
+                "authenticated": endpoints.zcash_observer_authenticated,
+                "credential_source": format!(
+                    "{ZCASH_OBSERVER_RPC_USERNAME} + {ZCASH_OBSERVER_RPC_PASSWORD}"
+                ),
+                "role": "read_only_public_tip_fence",
             },
             "template_and_validator_are_distinct": true,
             "proposal_gate": "passed",
