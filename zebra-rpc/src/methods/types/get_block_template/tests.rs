@@ -14,7 +14,7 @@ use zebra_chain::{
     amount::{Amount, DeferredPoolBalanceChange, MAX_WCASH_COINBASE_VALUE},
     block,
     chain_sync_status::MockSyncStatus,
-    chain_tip::NoChainTip,
+    chain_tip::{mock::MockChainTip, NoChainTip},
     history_tree::HistoryTree,
 };
 
@@ -57,12 +57,12 @@ use super::{
     MinerParams, WcashAuxRequest,
 };
 
-/// A clean Wcash Testnet node must be able to serve its first mining template
-/// after locally committing genesis, even before project-owned seed peers
-/// exist. This is the existing test-network bootstrap policy; mainnet's stale
-/// tip protection remains fail-closed.
+/// A clean Wcash network must be able to serve its first mining template after
+/// locally committing genesis, even before project-owned seed peers exist.
+/// Mainnet receives this exception only at height zero; its stale-tip protection
+/// is restored as soon as block one is committed.
 #[test]
-fn wcash_testnet_allows_genesis_only_mining_bootstrap() {
+fn wcash_networks_allow_safe_genesis_mining_bootstrap() {
     assert!(check_synced_to_tip(
         &Network::new_wcash_testnet(),
         NoChainTip,
@@ -73,9 +73,21 @@ fn wcash_testnet_allows_genesis_only_mining_bootstrap() {
     assert!(
         check_synced_to_tip(&Network::Mainnet, NoChainTip, MockSyncStatus::default(),).is_err()
     );
+
+    let (mainnet_tip, mainnet_tip_sender) = MockChainTip::new();
+    mainnet_tip_sender.send_best_tip_height(Height(0));
+    mainnet_tip_sender.send_estimated_distance_to_network_chain_tip(Some(126));
     assert!(check_synced_to_tip(
         &Network::new_wcash_mainnet_for_tests(),
-        NoChainTip,
+        mainnet_tip.clone(),
+        MockSyncStatus::default(),
+    )
+    .is_ok());
+
+    mainnet_tip_sender.send_best_tip_height(Height(1));
+    assert!(check_synced_to_tip(
+        &Network::new_wcash_mainnet_for_tests(),
+        mainnet_tip,
         MockSyncStatus::default(),
     )
     .is_err());
