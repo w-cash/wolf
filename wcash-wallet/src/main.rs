@@ -93,6 +93,7 @@ enum CliError {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum CliNetwork {
+    Mainnet,
     Testnet,
     Regtest,
 }
@@ -100,6 +101,7 @@ enum CliNetwork {
 impl From<CliNetwork> for WalletNetwork {
     fn from(value: CliNetwork) -> Self {
         match value {
+            CliNetwork::Mainnet => Self::Mainnet,
             CliNetwork::Testnet => Self::Testnet,
             CliNetwork::Regtest => Self::Regtest,
         }
@@ -110,7 +112,7 @@ impl From<CliNetwork> for WalletNetwork {
 #[derive(Debug, Parser)]
 #[command(name = "wcash-wallet", version, about)]
 struct Cli {
-    /// Wcash chain identity. Mainnet is intentionally unsupported.
+    /// Wcash chain identity.
     #[arg(long, value_enum)]
     network: CliNetwork,
     /// Persistent SQLite wallet path, required by wallet database commands.

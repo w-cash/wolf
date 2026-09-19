@@ -4,13 +4,12 @@ use serde::{Deserialize, Serialize};
 use zcash_protocol::consensus::{BranchId, NetworkType};
 use zebra_chain::parameters::Network;
 
-/// A public Wcash network supported by the testnet wallet.
-///
-/// Mainnet is intentionally absent until its genesis and transaction domain are
-/// frozen and independently reviewed.
+/// A Wcash network with a frozen genesis and transaction domain.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WalletNetwork {
+    /// Public Wcash Mainnet.
+    Mainnet,
     /// Public Wcash Testnet.
     Testnet,
     /// Local Wcash Regtest.
@@ -21,6 +20,8 @@ impl WalletNetwork {
     /// Returns Zebra's consensus parameters for this network.
     pub fn parameters(self) -> Network {
         match self {
+            Self::Mainnet => Network::try_new_wcash_mainnet()
+                .expect("frozen Wcash Mainnet parameters must be available"),
             Self::Testnet => Network::new_wcash_testnet(),
             Self::Regtest => Network::new_wcash_regtest(),
         }
@@ -29,6 +30,7 @@ impl WalletNetwork {
     /// Returns the address-network discriminator used by Wcash encodings.
     pub fn address_network(self) -> NetworkType {
         match self {
+            Self::Mainnet => NetworkType::Main,
             Self::Testnet => NetworkType::Test,
             Self::Regtest => NetworkType::Regtest,
         }
@@ -37,6 +39,7 @@ impl WalletNetwork {
     /// Returns this network's transaction signature and transaction-ID domain.
     pub const fn branch_id(self) -> BranchId {
         match self {
+            Self::Mainnet => BranchId::WcashMainnetV1,
             Self::Testnet => BranchId::WcashTestnetV3,
             Self::Regtest => BranchId::WcashRegtestV1,
         }
@@ -55,6 +58,7 @@ impl WalletNetwork {
     /// Returns a stable domain byte used by the wallet seed KDF.
     pub(crate) const fn domain_byte(self) -> u8 {
         match self {
+            Self::Mainnet => 3,
             Self::Testnet => 1,
             Self::Regtest => 2,
         }
@@ -63,6 +67,7 @@ impl WalletNetwork {
     /// Returns the stable network identifier persisted in wallet databases.
     pub(crate) const fn database_identity_name(self) -> &'static str {
         match self {
+            Self::Mainnet => "wcash-mainnet",
             Self::Testnet => "wcash-testnet",
             Self::Regtest => "wcash-regtest",
         }
@@ -76,6 +81,18 @@ mod tests {
 
     #[test]
     fn supported_networks_have_disjoint_consensus_identity() {
+        assert_ne!(
+            WalletNetwork::Mainnet.genesis_hash(),
+            WalletNetwork::Testnet.genesis_hash()
+        );
+        assert_ne!(
+            WalletNetwork::Mainnet.address_network(),
+            WalletNetwork::Testnet.address_network()
+        );
+        assert_ne!(
+            WalletNetwork::Mainnet.branch_id(),
+            WalletNetwork::Testnet.branch_id()
+        );
         assert_ne!(
             WalletNetwork::Testnet.genesis_hash(),
             WalletNetwork::Regtest.genesis_hash()
@@ -92,7 +109,11 @@ mod tests {
 
     #[test]
     fn wcash_launch_parameters_expose_cumulative_shielded_activations() {
-        for network in [WalletNetwork::Testnet, WalletNetwork::Regtest] {
+        for network in [
+            WalletNetwork::Mainnet,
+            WalletNetwork::Testnet,
+            WalletNetwork::Regtest,
+        ] {
             let parameters = network.parameters();
             let launch = Some(BlockHeight::from_u32(1));
             assert_eq!(

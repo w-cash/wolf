@@ -289,12 +289,28 @@ mod tests {
     #[test]
     fn fixed_master_seed_has_stable_wcash_addresses() {
         let master_seed = SecretVec::new((0u8..32).collect());
+        let mainnet = derive_wallet_spending_key(&master_seed, WalletNetwork::Mainnet, 0)
+            .unwrap()
+            .to_unified_full_viewing_key();
         let testnet = derive_wallet_spending_key(&master_seed, WalletNetwork::Testnet, 0)
             .unwrap()
             .to_unified_full_viewing_key();
         let regtest = derive_wallet_spending_key(&master_seed, WalletNetwork::Regtest, 0)
             .unwrap()
             .to_unified_full_viewing_key();
+
+        let mainnet_address = encode_orchard_receiver(&mainnet, WalletNetwork::Mainnet).unwrap();
+        assert!(mainnet_address.starts_with("wu1"));
+        assert!(decode_recipient(&mainnet_address, WalletNetwork::Mainnet).is_ok());
+        assert!(matches!(
+            decode_recipient(&mainnet_address, WalletNetwork::Testnet),
+            Err(WalletAddressError::WrongNetwork)
+        ));
+        assert!(
+            encode_transparent_coinbase_receiver(&mainnet, WalletNetwork::Mainnet)
+                .unwrap()
+                .starts_with('W')
+        );
 
         assert_eq!(
             encode_orchard_receiver(&testnet, WalletNetwork::Testnet).unwrap(),

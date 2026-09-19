@@ -85,9 +85,12 @@ mod tests {
         let first = derive_wallet_seed(&master, WalletNetwork::Testnet).unwrap();
         let second = derive_wallet_seed(&master, WalletNetwork::Testnet).unwrap();
         let regtest = derive_wallet_seed(&master, WalletNetwork::Regtest).unwrap();
+        let mainnet = derive_wallet_seed(&master, WalletNetwork::Mainnet).unwrap();
 
         assert_eq!(first.expose_secret(), second.expose_secret());
         assert_ne!(first.expose_secret(), regtest.expose_secret());
+        assert_ne!(first.expose_secret(), mainnet.expose_secret());
+        assert_ne!(regtest.expose_secret(), mainnet.expose_secret());
         assert_ne!(first.expose_secret(), master.expose_secret());
         assert_eq!(first.expose_secret().len(), 64);
     }

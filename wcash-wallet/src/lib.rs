@@ -1,4 +1,4 @@
-//! Experimental local wallet for Wcash Testnet and Regtest.
+//! Experimental local wallet for Wcash Mainnet, Testnet, and Regtest.
 //!
 //! This crate deliberately builds on the audited `librustzcash` wallet stack.
 //! It adds Wcash chain and address separation at the boundary, while leaving
