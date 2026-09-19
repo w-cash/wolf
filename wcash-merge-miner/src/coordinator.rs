@@ -556,6 +556,7 @@ impl NativeMiningSupervisor {
         // retries cache-capacity neutral even during a prolonged parent outage.
         self.retry_pending_candidate_retirement()?;
         zcash_identity?;
+        zcash.relay_observer_blocks_to_work_nodes()?;
         self.initial_outbox_recovery_complete
             .store(true, Ordering::Release);
 
@@ -1145,11 +1146,9 @@ fn validate_wcash_payout_configuration(
     let network = match payout.network() {
         NetworkType::Test => Network::new_wcash_testnet(),
         NetworkType::Regtest => Network::new_wcash_regtest(),
-        NetworkType::Main => {
-            return Err(MinerError::InvalidRequest(
-                "Wcash mainnet payouts are disabled".to_string(),
-            ))
-        }
+        NetworkType::Main => Network::try_new_wcash_mainnet().map_err(|error| {
+            MinerError::InvalidRequest(format!("Wcash mainnet payouts are unavailable: {error}"))
+        })?,
     };
     if !network
         .genesis_hash()
@@ -5857,7 +5856,7 @@ mod tests {
         assert_invalid_wcash_payout(
             &mainnet.encode(),
             &Network::Mainnet.genesis_hash().to_string(),
-            "mainnet payouts are disabled",
+            "mainnet payouts are unavailable",
         );
     }
 

@@ -47,6 +47,7 @@ use crate::{
 
 const HEADER_INPUT_BYTES: usize = 108;
 const PARENT_BLOCK_LIMIT: usize = 2_000_000;
+const MAX_OBSERVER_RELAY_BLOCKS: u32 = 32;
 
 /// Strict local projection of the parent fields used to build an exact job.
 ///
@@ -182,6 +183,10 @@ pub struct NativeZcashConfig {
     /// public peer set and gate new work on exact best-tip convergence. They
     /// never supply templates or proposal-validation votes.
     broadcast_nodes: Vec<RpcEndpoint>,
+    /// Read-only standard Zebra nodes that follow public peers but never
+    /// receive locally solved blocks. They fence work and accounting against
+    /// a locally self-confirming private fork.
+    observer_nodes: Vec<RpcEndpoint>,
     /// Exact standard Zcash network whose subsidy schedule is enforced locally.
     expected_parent_network: NativeZcashNetwork,
     /// Expected parent genesis hash in conventional RPC display order.
@@ -205,6 +210,7 @@ impl fmt::Debug for NativeZcashConfig {
             .field("template_node", &self.template_node)
             .field("proposal_validators", &self.proposal_validators)
             .field("broadcast_nodes", &self.broadcast_nodes)
+            .field("observer_nodes", &self.observer_nodes)
             .field("expected_parent_network", &self.expected_parent_network)
             .field("expected_genesis_hash", &self.expected_genesis_hash)
             .field("expected_parent_payout_commitment", &"[REDACTED]")
@@ -233,6 +239,7 @@ impl NativeZcashConfig {
             template_node,
             proposal_validators,
             broadcast_nodes: Vec::new(),
+            observer_nodes: Vec::new(),
             expected_parent_network,
             expected_genesis_hash,
             expected_parent_payout_commitment,
@@ -252,6 +259,18 @@ impl NativeZcashConfig {
         broadcast_nodes: Vec<RpcEndpoint>,
     ) -> Result<Self, MinerError> {
         self.broadcast_nodes = broadcast_nodes;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Adds read-only public-chain observers. Observers participate in exact
+    /// tip and confirmation fences, but solved bytes are never submitted to
+    /// them, preserving an uncontaminated view of the public peer network.
+    pub fn with_observer_nodes(
+        mut self,
+        observer_nodes: Vec<RpcEndpoint>,
+    ) -> Result<Self, MinerError> {
+        self.observer_nodes = observer_nodes;
         self.validate()?;
         Ok(self)
     }
@@ -294,8 +313,12 @@ impl NativeZcashConfig {
                 "lagging proposal validators may be tolerated only on Zcash Testnet".to_string(),
             ));
         }
-        let mut endpoints =
-            HashSet::with_capacity(self.proposal_validators.len() + self.broadcast_nodes.len() + 1);
+        let mut endpoints = HashSet::with_capacity(
+            self.proposal_validators.len()
+                + self.broadcast_nodes.len()
+                + self.observer_nodes.len()
+                + 1,
+        );
         endpoints.insert(self.template_node.label().to_string());
         for validator in &self.proposal_validators {
             if !endpoints.insert(validator.label().to_string()) {
@@ -310,6 +333,14 @@ impl NativeZcashConfig {
                 return Err(MinerError::RpcConfiguration(format!(
                     "template, proposal-validation, and broadcast endpoints must be unique; duplicate {}",
                     broadcaster.label()
+                )));
+            }
+        }
+        for observer in &self.observer_nodes {
+            if !endpoints.insert(observer.label().to_string()) {
+                return Err(MinerError::RpcConfiguration(format!(
+                    "template, proposal-validation, broadcast, and observer endpoints must be unique; duplicate {}",
+                    observer.label()
                 )));
             }
         }
@@ -356,6 +387,7 @@ pub struct NativeZcashProvider {
     template_node: ZebraRpcClient,
     proposal_validators: Vec<ZebraRpcClient>,
     broadcast_nodes: Vec<ZebraRpcClient>,
+    observer_nodes: Vec<ZebraRpcClient>,
     parent_network: NativeZcashNetwork,
     expected_parent_network: Network,
     expected_parent_payout_commitment: [u8; 32],
@@ -407,10 +439,16 @@ impl NativeZcashProvider {
             .into_iter()
             .map(|endpoint| ZebraRpcClient::new(endpoint, config.rpc_timeout))
             .collect::<Result<Vec<_>, _>>()?;
+        let observer_nodes = config
+            .observer_nodes
+            .into_iter()
+            .map(|endpoint| ZebraRpcClient::new(endpoint, config.rpc_timeout))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             template_node,
             proposal_validators,
             broadcast_nodes,
+            observer_nodes,
             parent_network,
             expected_parent_network,
             expected_parent_payout_commitment,
@@ -504,6 +542,134 @@ impl NativeZcashProvider {
         );
 
         Ok(prepared)
+    }
+
+    /// Relays already-validated public blocks from the read-only observer to
+    /// the local work nodes before a new mining generation is prepared.
+    ///
+    /// Zebra deliberately delays ordinary peer gossip. That delay is useful on
+    /// the public network, but it would leave an ASIC hashing stale work while
+    /// the observer already knows the canonical tip. The observer remains
+    /// read-only: blocks flow out of it and are submitted only to the local
+    /// template and proposal-validation nodes, which independently perform all
+    /// normal consensus checks.
+    pub fn relay_observer_blocks_to_work_nodes(&self) -> Result<(), MinerError> {
+        let Some(observer) = self.observer_nodes.first() else {
+            return Ok(());
+        };
+        let observer_tip = native_chain_tip_on_node(observer)?;
+        for other in self.observer_nodes.iter().skip(1) {
+            let actual = native_chain_tip_on_node(other)?;
+            if actual != observer_tip {
+                return Err(parent_tip_mismatch(observer_tip, other, actual));
+            }
+        }
+
+        let mut work_nodes = Vec::with_capacity(self.proposal_validators.len() + 1);
+        work_nodes.push(&self.template_node);
+        work_nodes.extend(self.proposal_validators.iter());
+
+        for node in work_nodes {
+            self.relay_observer_blocks_to_node(observer, observer_tip, node)?;
+        }
+        Ok(())
+    }
+
+    fn relay_observer_blocks_to_node(
+        &self,
+        observer: &ZebraRpcClient,
+        observer_tip: NativeChainTip,
+        node: &ZebraRpcClient,
+    ) -> Result<(), MinerError> {
+        let node_tip = native_chain_tip_on_node(node)?;
+        if node_tip == observer_tip {
+            return Ok(());
+        }
+        if node_tip.height >= observer_tip.height {
+            return Err(parent_tip_mismatch(observer_tip, node, node_tip));
+        }
+
+        let relay_count = observer_tip.height - node_tip.height;
+        if relay_count > MAX_OBSERVER_RELAY_BLOCKS {
+            return Err(MinerError::ParentTipMismatch {
+                expected: format!(
+                    "{} at height {}",
+                    display_hex(observer_tip.block_hash_le),
+                    observer_tip.height
+                ),
+                endpoint: node.label().to_string(),
+                actual: format!(
+                    "{} at height {}; observer relay gap {relay_count} exceeds {MAX_OBSERVER_RELAY_BLOCKS}",
+                    display_hex(node_tip.block_hash_le),
+                    node_tip.height
+                ),
+            });
+        }
+
+        // Prove the local node is on the observer's canonical prefix before
+        // relaying anything. An equal-height mismatch is never repaired here.
+        let observer_prefix: String = observer.call("getblockhash", json!([node_tip.height]))?;
+        if !observer_prefix.eq_ignore_ascii_case(&display_hex(node_tip.block_hash_le)) {
+            return Err(parent_tip_mismatch(observer_tip, node, node_tip));
+        }
+
+        for height in (node_tip.height + 1)..=observer_tip.height {
+            let expected_hash: String = observer.call("getblockhash", json!([height]))?;
+            let raw_hex: String = observer.call("getblock", json!([expected_hash, 0]))?;
+            let block_bytes = decode_template_bytes(
+                &raw_hex,
+                "observer canonical parent block",
+                PARENT_BLOCK_LIMIT,
+            )?;
+            let block: Block =
+                block_bytes
+                    .as_slice()
+                    .zcash_deserialize_into()
+                    .map_err(|error| {
+                        MinerError::RpcProtocol(format!(
+                            "observer returned an invalid canonical parent block: {error}"
+                        ))
+                    })?;
+            if block.zcash_serialize_to_vec()? != block_bytes
+                || !display_hex(block.hash().0).eq_ignore_ascii_case(&expected_hash)
+            {
+                return Err(MinerError::RpcProtocol(
+                    "observer canonical parent block bytes do not match their requested hash"
+                        .to_string(),
+                ));
+            }
+
+            // The exact response text is advisory; authoritative acceptance is
+            // proved below by querying the block hash at this height.
+            let _ = node.call_value("submitblock", json!([raw_hex]))?;
+            let mut accepted = false;
+            for _ in 0..20 {
+                match node.call::<String>("getblockhash", json!([height])) {
+                    Ok(accepted_hash) => {
+                        if !accepted_hash.eq_ignore_ascii_case(&expected_hash) {
+                            let actual = native_chain_tip_on_node(node)?;
+                            return Err(parent_tip_mismatch(observer_tip, node, actual));
+                        }
+                        accepted = true;
+                        break;
+                    }
+                    Err(MinerError::RpcError { code: Some(-1), .. }) => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if !accepted {
+                let actual = native_chain_tip_on_node(node)?;
+                return Err(parent_tip_mismatch(observer_tip, node, actual));
+            }
+        }
+
+        let actual = native_chain_tip_on_node(node)?;
+        if actual != observer_tip {
+            return Err(parent_tip_mismatch(observer_tip, node, actual));
+        }
+        Ok(())
     }
 
     fn validate_parent_proposal(
@@ -791,11 +957,16 @@ impl NativeZcashProvider {
         height: u32,
         expected_hash: &str,
     ) -> Vec<Result<Option<u32>, MinerError>> {
-        let mut nodes =
-            Vec::with_capacity(self.proposal_validators.len() + self.broadcast_nodes.len() + 1);
+        let mut nodes = Vec::with_capacity(
+            self.proposal_validators.len()
+                + self.broadcast_nodes.len()
+                + self.observer_nodes.len()
+                + 1,
+        );
         nodes.push(&self.template_node);
         nodes.extend(self.proposal_validators.iter());
         nodes.extend(self.broadcast_nodes.iter());
+        nodes.extend(self.observer_nodes.iter());
         thread::scope(|scope| {
             nodes
                 .into_iter()
@@ -820,9 +991,11 @@ impl NativeZcashProvider {
     /// Returns one exact tip only when every pinned parent node reports the
     /// same atomic blockchain snapshot.
     pub(crate) fn consistent_chain_tip(&self) -> Result<NativeChainTip, MinerError> {
-        let mut nodes = Vec::with_capacity(self.proposal_validators.len() + 1);
+        let mut nodes =
+            Vec::with_capacity(self.proposal_validators.len() + self.observer_nodes.len() + 1);
         nodes.push(&self.template_node);
         nodes.extend(self.proposal_validators.iter());
+        nodes.extend(self.observer_nodes.iter());
         let tips = thread::scope(|scope| {
             nodes
                 .into_iter()
@@ -878,13 +1051,21 @@ impl NativeZcashProvider {
             for broadcaster in &self.broadcast_nodes {
                 self.require_tip(broadcaster, job)?;
             }
+            for observer in &self.observer_nodes {
+                self.require_tip(observer, job)?;
+            }
             return Ok(());
         }
-        let mut nodes =
-            Vec::with_capacity(self.proposal_validators.len() + self.broadcast_nodes.len() + 1);
+        let mut nodes = Vec::with_capacity(
+            self.proposal_validators.len()
+                + self.broadcast_nodes.len()
+                + self.observer_nodes.len()
+                + 1,
+        );
         nodes.push(&self.template_node);
         nodes.extend(self.proposal_validators.iter());
         nodes.extend(self.broadcast_nodes.iter());
+        nodes.extend(self.observer_nodes.iter());
         let checks = thread::scope(|scope| {
             nodes
                 .into_iter()
@@ -938,6 +1119,9 @@ impl NativeZcashProvider {
         for broadcaster in &self.broadcast_nodes {
             self.require_standard_node_genesis(broadcaster, expected_genesis_hash)?;
         }
+        for observer in &self.observer_nodes {
+            self.require_standard_node_genesis(observer, expected_genesis_hash)?;
+        }
         Ok(())
     }
 
@@ -983,6 +1167,26 @@ impl NativeZcashProvider {
             )));
         }
         Ok(())
+    }
+}
+
+fn parent_tip_mismatch(
+    expected: NativeChainTip,
+    node: &ZebraRpcClient,
+    actual: NativeChainTip,
+) -> MinerError {
+    MinerError::ParentTipMismatch {
+        expected: format!(
+            "{} at height {}",
+            display_hex(expected.block_hash_le),
+            expected.height
+        ),
+        endpoint: node.label().to_string(),
+        actual: format!(
+            "{} at height {}",
+            display_hex(actual.block_hash_le),
+            actual.height
+        ),
     }
 }
 
@@ -2994,6 +3198,7 @@ mod tests {
                 .expect("loopback endpoint"),
             proposal_validators: Vec::new(),
             broadcast_nodes: Vec::new(),
+            observer_nodes: Vec::new(),
             expected_parent_network: network,
             expected_genesis_hash: genesis,
             expected_parent_payout_commitment: parent_payout_address_commitment(
@@ -3010,7 +3215,7 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_nodes_are_distinct_and_never_replace_proposal_quorum() {
+    fn relay_and_observer_nodes_are_distinct_and_never_replace_proposal_quorum() {
         let template =
             RpcEndpoint::new("http://127.0.0.1:8232", None, None).expect("template endpoint");
         let validator =
@@ -3029,8 +3234,32 @@ mod tests {
         )
         .expect("valid proposal quorum");
 
-        assert!(config.clone().with_broadcast_nodes(vec![template]).is_err());
-        assert!(config.with_broadcast_nodes(vec![validator]).is_err());
+        let broadcaster =
+            RpcEndpoint::new("http://127.0.0.1:8234", None, None).expect("broadcast endpoint");
+        let observer =
+            RpcEndpoint::new("http://127.0.0.1:8235", None, None).expect("observer endpoint");
+
+        assert!(config
+            .clone()
+            .with_broadcast_nodes(vec![template.clone()])
+            .is_err());
+        assert!(config
+            .clone()
+            .with_broadcast_nodes(vec![validator.clone()])
+            .is_err());
+        assert!(config.clone().with_observer_nodes(vec![template]).is_err());
+        assert!(config.clone().with_observer_nodes(vec![validator]).is_err());
+        assert!(config
+            .clone()
+            .with_broadcast_nodes(vec![broadcaster.clone()])
+            .and_then(|config| config.with_observer_nodes(vec![broadcaster]))
+            .is_err());
+        assert!(config
+            .with_broadcast_nodes(vec![
+                RpcEndpoint::new("http://127.0.0.1:8234", None, None).expect("broadcast endpoint"),
+            ])
+            .and_then(|config| config.with_observer_nodes(vec![observer]))
+            .is_ok());
     }
 
     #[test]
