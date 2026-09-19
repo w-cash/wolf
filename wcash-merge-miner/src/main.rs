@@ -951,9 +951,11 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
         }
 
         if let Some(previous) = active.take() {
-            let shares_tips =
-                pool_backend_generations_share_tips(&previous.retained.descriptor(), &descriptor);
-            if shares_tips {
+            let shares_a_tip = pool_backend_generations_share_any_tip(
+                &previous.retained.descriptor(),
+                &descriptor,
+            );
+            if shares_a_tip {
                 let close_after = previous
                     .retained
                     .remaining_lifetime()
@@ -1085,12 +1087,25 @@ fn is_retryable_winner_reconciliation_error(error: &MinerError) -> bool {
         || is_retryable_native_preparation_error(error)
 }
 
-fn pool_backend_generations_share_tips(
+fn pool_backend_generations_share_any_tip(
     previous: &wcash_pool_protocol::JobDescriptor,
     replacement: &wcash_pool_protocol::JobDescriptor,
 ) -> bool {
-    previous.wcash_previous_hash_le == replacement.wcash_previous_hash_le
-        && previous.zcash_previous_hash_le == replacement.zcash_previous_hash_le
+    pool_backend_tips_share_any(
+        &previous.wcash_previous_hash_le,
+        &previous.zcash_previous_hash_le,
+        &replacement.wcash_previous_hash_le,
+        &replacement.zcash_previous_hash_le,
+    )
+}
+
+fn pool_backend_tips_share_any(
+    previous_wcash: &wcash_pool_protocol::Hex32,
+    previous_zcash: &wcash_pool_protocol::Hex32,
+    replacement_wcash: &wcash_pool_protocol::Hex32,
+    replacement_zcash: &wcash_pool_protocol::Hex32,
+) -> bool {
+    previous_wcash == replacement_wcash || previous_zcash == replacement_zcash
 }
 
 fn reap_draining_pool_backend_generations(
@@ -2482,6 +2497,27 @@ fn ensure_no_more(mut arguments: impl Iterator<Item = String>) -> Result<(), Min
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_backend_grace_requires_at_least_one_unchanged_tip() {
+        let wcash_a = wcash_pool_protocol::Hex32::new([0x11; 32]);
+        let wcash_b = wcash_pool_protocol::Hex32::new([0x12; 32]);
+        let zcash_a = wcash_pool_protocol::Hex32::new([0x21; 32]);
+        let zcash_b = wcash_pool_protocol::Hex32::new([0x22; 32]);
+
+        assert!(pool_backend_tips_share_any(
+            &wcash_a, &zcash_a, &wcash_a, &zcash_a
+        ));
+        assert!(pool_backend_tips_share_any(
+            &wcash_a, &zcash_a, &wcash_b, &zcash_a
+        ));
+        assert!(pool_backend_tips_share_any(
+            &wcash_a, &zcash_a, &wcash_a, &zcash_b
+        ));
+        assert!(!pool_backend_tips_share_any(
+            &wcash_a, &zcash_a, &wcash_b, &zcash_b
+        ));
+    }
 
     fn arguments(values: &[&str]) -> impl Iterator<Item = String> {
         values

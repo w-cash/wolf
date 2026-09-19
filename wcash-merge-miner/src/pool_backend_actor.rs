@@ -941,10 +941,6 @@ impl PoolBackendActor {
             .checked_add(Duration::from_millis(u64::from(descriptor.max_age_ms)))
             .ok_or(PoolBackendActorError::DeadlineOverflow)?;
         let tip_change = changed_tip_reason(&state, &descriptor);
-        if tip_change.is_none() && state.current.is_some() && state.recent.len() >= MAX_RECENT_JOBS
-        {
-            return Err(PoolBackendActorError::RecentJobCapacity);
-        }
 
         state
             .durable_jobs
@@ -957,6 +953,18 @@ impl PoolBackendActor {
         if let Some(reason) = tip_change {
             close_jobs_for_tip_change(&mut state, reason)?;
         } else if state.current.is_some() {
+            // A one-chain rollover leaves the old generation useful on the
+            // unchanged chain. Keep it for bounded grace, but discard older
+            // generations that no longer overlap either replacement tip.
+            close_nonoverlapping_recent_jobs(&mut state, &descriptor)?;
+            while state.recent.len() >= MAX_RECENT_JOBS {
+                let oldest = state
+                    .recent
+                    .front()
+                    .cloned()
+                    .ok_or(PoolBackendActorError::RecentJobCapacity)?;
+                close_retained_job(&mut state, &oldest)?;
+            }
             state
                 .recent
                 .try_reserve(1)
@@ -1758,21 +1766,48 @@ fn changed_tip_reason(
     state: &ActorState,
     descriptor: &JobDescriptor,
 ) -> Option<JobInvalidationReason> {
-    if state
-        .live_jobs
-        .values()
-        .any(|job| job.descriptor.wcash_previous_hash_le != descriptor.wcash_previous_hash_le)
-    {
-        Some(JobInvalidationReason::WcashTipChanged)
-    } else if state
-        .live_jobs
-        .values()
-        .any(|job| job.descriptor.zcash_previous_hash_le != descriptor.zcash_previous_hash_le)
-    {
-        Some(JobInvalidationReason::ZcashTipChanged)
-    } else {
-        None
+    let current = state
+        .current
+        .as_ref()
+        .and_then(|job_id| state.live_jobs.get(job_id))?;
+    let wcash_changed =
+        current.descriptor.wcash_previous_hash_le != descriptor.wcash_previous_hash_le;
+    let zcash_changed =
+        current.descriptor.zcash_previous_hash_le != descriptor.zcash_previous_hash_le;
+
+    // If exactly one parent changed, the frozen generation can still produce
+    // a winner for the chain whose parent did not change. Only a simultaneous
+    // two-chain rollover makes it immediately useless on both networks.
+    match (wcash_changed, zcash_changed) {
+        (true, true) => Some(JobInvalidationReason::WcashTipChanged),
+        _ => None,
     }
+}
+
+fn descriptors_share_any_tip(left: &JobDescriptor, right: &JobDescriptor) -> bool {
+    left.wcash_previous_hash_le == right.wcash_previous_hash_le
+        || left.zcash_previous_hash_le == right.zcash_previous_hash_le
+}
+
+fn close_nonoverlapping_recent_jobs(
+    state: &mut ActorState,
+    descriptor: &JobDescriptor,
+) -> Result<(), PoolBackendActorError> {
+    let obsolete: Vec<_> = state
+        .recent
+        .iter()
+        .filter(|job_id| {
+            state
+                .live_jobs
+                .get(*job_id)
+                .is_none_or(|job| !descriptors_share_any_tip(&job.descriptor, descriptor))
+        })
+        .cloned()
+        .collect();
+    for job_id in obsolete {
+        close_retained_job(state, &job_id)?;
+    }
+    Ok(())
 }
 
 fn close_jobs_for_tip_change(
@@ -2318,6 +2353,21 @@ mod tests {
         descriptor.zcash_previous_hash_le = previous.zcash_previous_hash_le.clone();
         let mut header_input = *descriptor.header_input.as_bytes();
         header_input[4..36].copy_from_slice(previous.zcash_previous_hash_le.as_bytes());
+        descriptor.header_input = Hex108::new(header_input);
+        descriptor
+    }
+
+    fn job_after_wcash_tip_change(byte: u8, previous: &JobDescriptor) -> JobDescriptor {
+        let mut descriptor = job_on_same_tips(byte, previous);
+        descriptor.wcash_previous_hash_le = Hex32::new([byte.wrapping_add(9); 32]);
+        descriptor
+    }
+
+    fn job_after_zcash_tip_change(byte: u8, previous: &JobDescriptor) -> JobDescriptor {
+        let mut descriptor = job_on_same_tips(byte, previous);
+        descriptor.zcash_previous_hash_le = Hex32::new([byte.wrapping_add(10); 32]);
+        let mut header_input = *descriptor.header_input.as_bytes();
+        header_input[4..36].copy_from_slice(descriptor.zcash_previous_hash_le.as_bytes());
         descriptor.header_input = Hex108::new(header_input);
         descriptor
     }
@@ -3352,6 +3402,107 @@ mod tests {
                 ..
             } if job.job_id == second.job_id && recent.is_empty()
         ));
+    }
+
+    #[test]
+    fn one_chain_tip_change_keeps_old_work_for_bounded_grace() {
+        for replacement_kind in ["wcash", "zcash"] {
+            let directory = private_temp_dir();
+            let path = directory.path().join("actor.journal");
+            let config = config();
+            let clock = Arc::new(TestClock::new());
+            let actor = actor(&path, &config, Arc::clone(&clock));
+            let first = job(1);
+            let replacement = match replacement_kind {
+                "wcash" => job_after_wcash_tip_change(2, &first),
+                "zcash" => job_after_zcash_tip_change(2, &first),
+                _ => unreachable!(),
+            };
+
+            actor
+                .activate_job(
+                    Arc::new(TestRetainedJob::new(first.clone())),
+                    Duration::from_secs(5),
+                )
+                .expect("activate first job");
+            actor
+                .activate_job(
+                    Arc::new(TestRetainedJob::new(replacement.clone())),
+                    Duration::from_secs(5),
+                )
+                .expect("retain old job across one-chain rollover");
+
+            assert!(matches!(
+                snapshot(&actor, 0),
+                BackendMessage::JobSnapshot {
+                    event_seq: 3,
+                    current: Some(AcceptableJob { job, .. }),
+                    recent,
+                    ..
+                } if job.job_id == replacement.job_id
+                    && recent.len() == 1
+                    && recent[0].job.job_id == first.job_id
+                    && recent[0].accept_for_ms == 5_000
+            ));
+
+            let accepted = actor
+                .dispatch(
+                    uuid(20),
+                    Some(3),
+                    BackendRequestKind::SubmitShare,
+                    submit_request(2, &first),
+                )
+                .expect("old generation remains admissible during grace");
+            assert!(matches!(
+                accepted.last(),
+                Some(BackendMessage::ShareCommitted {
+                    replayed: false,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn rapid_one_chain_rotations_evict_only_oldest_bounded_grace_job() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("actor.journal");
+        let config = config();
+        let actor = actor(&path, &config, Arc::new(TestClock::new()));
+        let first = job(1);
+        let second = job_after_wcash_tip_change(2, &first);
+        let third = job_after_wcash_tip_change(3, &second);
+        let fourth = job_after_wcash_tip_change(4, &third);
+
+        for descriptor in [&first, &second, &third, &fourth] {
+            actor
+                .activate_job(
+                    Arc::new(TestRetainedJob::new(descriptor.clone())),
+                    Duration::from_secs(5),
+                )
+                .expect("rapid one-chain rotation remains bounded");
+        }
+
+        assert!(matches!(
+            snapshot(&actor, 0),
+            BackendMessage::JobSnapshot {
+                current: Some(AcceptableJob { job, .. }),
+                recent,
+                ..
+            } if job.job_id == fourth.job_id
+                && recent.len() == MAX_RECENT_JOBS
+                && recent[0].job.job_id == third.job_id
+                && recent[1].job.job_id == second.job_id
+        ));
+        let stale = actor
+            .dispatch(
+                uuid(20),
+                Some(8),
+                BackendRequestKind::SubmitShare,
+                submit_request(2, &first),
+            )
+            .expect_err("oldest grace job is evicted at the hard cap");
+        assert_eq!(stale, stale_job());
     }
 
     #[test]
