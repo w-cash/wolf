@@ -2569,7 +2569,7 @@ fn decode_template_bytes(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
@@ -2627,6 +2627,23 @@ mod tests {
             },
             template,
         )
+    }
+
+    pub(crate) fn zip301_rotation_fixture(job_byte: u8) -> NativePreparedJob {
+        let job = PreparedJob::new([job_byte; 32], Target::MAX, JobConfig::default())
+            .expect("valid native job fixture");
+        NativePreparedJob {
+            job,
+            parent_proposal: zebra_chain::block::genesis::wcash_regtest_genesis_block()
+                .as_ref()
+                .clone(),
+            proposal_bytes: Vec::new(),
+            parent_network: NativeZcashNetwork::Regtest,
+            parent_target: Target::MAX,
+            parent_tip_display: "00".repeat(32),
+            parent_height: 1,
+            parent_reward_zatoshis: 0,
+        }
     }
 
     fn parent_tip_recheck_server(

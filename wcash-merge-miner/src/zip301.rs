@@ -286,6 +286,7 @@ impl std::fmt::Debug for Zip301Config {
 pub struct Zip301LoopbackListener {
     listener: TcpListener,
     generation_active: AtomicBool,
+    sessions: Arc<PersistentSessions>,
 }
 
 impl Zip301LoopbackListener {
@@ -302,6 +303,7 @@ impl Zip301LoopbackListener {
         Ok(Self {
             listener,
             generation_active: AtomicBool::new(false),
+            sessions: Arc::new(PersistentSessions::new()),
         })
     }
 
@@ -318,7 +320,7 @@ impl Zip301LoopbackListener {
         processor: Arc<dyn ShareProcessor>,
     ) -> Result<(), MinerError> {
         let (listener, _generation) = self.begin_generation()?;
-        serve_zip301_generation(listener, job, config, processor)
+        serve_persistent_generation(listener, &self.sessions, job, config, processor)
     }
 
     fn begin_generation(&self) -> Result<(TcpListener, Zip301GenerationGuard<'_>), MinerError> {
@@ -335,6 +337,54 @@ impl Zip301LoopbackListener {
         let listener = self.listener.try_clone()?;
         Ok((listener, generation))
     }
+}
+
+impl Drop for Zip301LoopbackListener {
+    fn drop(&mut self) {
+        self.sessions.stop.store(true, Ordering::Release);
+        let mut workers = self
+            .sessions
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for worker in workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct PersistentSessions {
+    stop: AtomicBool,
+    current: Mutex<Option<Arc<ServerState>>>,
+    policy: Mutex<Option<PersistentPolicy>>,
+    next_nonce: AtomicU32,
+    workers: Mutex<Vec<thread::JoinHandle<()>>>,
+}
+
+impl PersistentSessions {
+    fn new() -> Self {
+        Self {
+            stop: AtomicBool::new(false),
+            current: Mutex::new(None),
+            policy: Mutex::new(None),
+            next_nonce: AtomicU32::new(1),
+            workers: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn current(&self) -> Option<Arc<ServerState>> {
+        self.current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+#[derive(Clone)]
+struct PersistentPolicy {
+    authentication: Zip301Config,
+    clients: ConnectionLimiter,
+    authentications: ConnectionLimiter,
 }
 
 impl std::fmt::Debug for Zip301LoopbackListener {
@@ -377,8 +427,25 @@ pub fn serve_zip301_loopback(
     Zip301LoopbackListener::bind(bind)?.serve(job, config, processor)
 }
 
-fn serve_zip301_generation(
+fn new_server_state(
+    job: NativePreparedJob,
+    config: Zip301Config,
+    processor: Arc<dyn ShareProcessor>,
+) -> Arc<ServerState> {
+    Arc::new(ServerState {
+        job: Arc::new(job),
+        duplicates: Mutex::new(DuplicateCache::new(config.maximum_clients)),
+        validations: ConnectionLimiter::new(config.maximum_parallel_validations),
+        config,
+        processor,
+        shutdown: Arc::new(AtomicBool::new(false)),
+        shutdown_reason: Arc::new(Mutex::new(None)),
+    })
+}
+
+fn serve_persistent_generation(
     listener: TcpListener,
+    sessions: &Arc<PersistentSessions>,
     job: NativePreparedJob,
     config: Zip301Config,
     processor: Arc<dyn ShareProcessor>,
@@ -390,54 +457,93 @@ fn serve_zip301_generation(
         job.parent_network(),
         config.testnet_parent_target_sampling,
     )?;
-    let maximum_clients = config.maximum_clients;
-    let maximum_parallel_authentications = config.maximum_parallel_authentications;
-    let maximum_parallel_validations = config.maximum_parallel_validations;
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_reason = Arc::new(Mutex::new(None));
-    let state = Arc::new(ServerState {
-        job: Arc::new(job),
-        config,
-        processor,
-        next_nonce: AtomicU32::new(1),
-        duplicates: Mutex::new(DuplicateCache::new(maximum_clients)),
-        authentications: ConnectionLimiter::new(maximum_parallel_authentications),
-        validations: ConnectionLimiter::new(maximum_parallel_validations),
-        shutdown: Arc::clone(&shutdown),
-        shutdown_reason: Arc::clone(&shutdown_reason),
-    });
+    let policy = {
+        let mut configured = sessions
+            .policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = configured.as_ref() {
+            if existing.authentication.maximum_clients != config.maximum_clients
+                || existing.authentication.maximum_parallel_authentications
+                    != config.maximum_parallel_authentications
+            {
+                return Err(MinerError::InvalidRequest(
+                    "persistent ZIP-301 connection policy changed between jobs".to_string(),
+                ));
+            }
+        } else {
+            *configured = Some(PersistentPolicy {
+                clients: ConnectionLimiter::new(config.maximum_clients),
+                authentications: ConnectionLimiter::new(config.maximum_parallel_authentications),
+                authentication: config.clone(),
+            });
+        }
+        configured
+            .as_ref()
+            .expect("policy was just installed")
+            .clone()
+    };
+    let state = new_server_state(job, config, processor);
+    {
+        let mut current = sessions
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.is_some() {
+            return Err(MinerError::InvalidRequest(
+                "persistent ZIP-301 job is already active".to_string(),
+            ));
+        }
+        *current = Some(Arc::clone(&state));
+    }
     let monitor_state = Arc::clone(&state);
-    let monitor_shutdown = Arc::clone(&shutdown);
-    let monitor_reason = Arc::clone(&shutdown_reason);
     let monitor = thread::Builder::new()
         .name("wcash-job-monitor".to_string())
         .spawn(move || {
-            while !monitor_shutdown.load(Ordering::Acquire) {
+            while !monitor_state.shutdown.load(Ordering::Acquire) {
                 thread::sleep(JOB_MONITOR_INTERVAL);
-                if monitor_shutdown.load(Ordering::Acquire) {
+                if monitor_state.shutdown.load(Ordering::Acquire) {
                     break;
                 }
                 if let Err(error) = monitor_state.processor.check_job_health() {
-                    *monitor_reason
+                    *monitor_state
+                        .shutdown_reason
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
-                    monitor_shutdown.store(true, Ordering::Release);
+                    monitor_state.shutdown.store(true, Ordering::Release);
                     break;
                 }
             }
-        })?;
-    let result = serve_listener(
-        listener,
-        state,
-        ConnectionLimiter::new(maximum_clients),
-        Arc::clone(&shutdown),
-    );
-    shutdown.store(true, Ordering::Release);
-    monitor
-        .join()
+        });
+    let monitor = match monitor {
+        Ok(monitor) => monitor,
+        Err(error) => {
+            sessions
+                .current
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            return Err(error.into());
+        }
+    };
+    let result = serve_persistent_listener(listener, sessions, &policy, &state);
+    state.shutdown.store(true, Ordering::Release);
+    let monitor_result = monitor.join();
+    sessions
+        .current
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    // Existing sockets remain open, but an in-flight validation must finish
+    // before the coordinator can retire the proposal-validated generation.
+    while Arc::strong_count(&state) > 1 {
+        thread::sleep(VALIDATION_RETRY_DELAY);
+    }
+    monitor_result
         .map_err(|_| MinerError::InvalidRequest("native job monitor panicked".to_string()))?;
     result?;
-    if let Some(error) = shutdown_reason
+    if let Some(error) = state
+        .shutdown_reason
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take()
@@ -478,33 +584,34 @@ struct ServerState {
     job: Arc<NativePreparedJob>,
     config: Zip301Config,
     processor: Arc<dyn ShareProcessor>,
-    next_nonce: AtomicU32,
     duplicates: Mutex<DuplicateCache>,
-    authentications: ConnectionLimiter,
     validations: ConnectionLimiter,
     shutdown: Arc<AtomicBool>,
     shutdown_reason: Arc<Mutex<Option<MinerError>>>,
 }
 
-fn serve_listener(
+fn serve_persistent_listener(
     listener: TcpListener,
-    state: Arc<ServerState>,
-    limiter: ConnectionLimiter,
-    shutdown: Arc<AtomicBool>,
+    sessions: &Arc<PersistentSessions>,
+    policy: &PersistentPolicy,
+    state: &Arc<ServerState>,
 ) -> Result<(), MinerError> {
-    let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
-    let mut listener_result = Ok(());
-    while !shutdown.load(Ordering::Acquire) {
-        let mut index = 0;
-        while index < workers.len() {
-            if workers[index].is_finished() {
-                let worker = workers.swap_remove(index);
-                let _ = worker.join();
-            } else {
-                index += 1;
+    while !state.shutdown.load(Ordering::Acquire) && !sessions.stop.load(Ordering::Acquire) {
+        {
+            let mut workers = sessions
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    let worker = workers.swap_remove(index);
+                    let _ = worker.join();
+                } else {
+                    index += 1;
+                }
             }
         }
-
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -522,54 +629,75 @@ fn serve_listener(
             {
                 continue;
             }
-            Err(error) => {
-                listener_result = Err(error.into());
-                break;
-            }
+            Err(error) => return Err(error.into()),
         };
         if stream.set_nonblocking(false).is_err() {
             continue;
         }
-        let Some(permit) = limiter.try_acquire() else {
+        let Some(permit) = policy.clients.try_acquire() else {
             drop(stream);
             continue;
         };
-        let state = Arc::clone(&state);
-        let worker = match thread::Builder::new()
+        let worker_sessions = Arc::clone(sessions);
+        let policy = policy.clone();
+        let worker = thread::Builder::new()
             .name("wcash-zip301-client".to_string())
             .spawn(move || {
                 let _permit = permit;
-                let _result = serve_connection(stream, state);
-            }) {
-            Ok(worker) => worker,
-            Err(error) => {
-                listener_result = Err(error.into());
-                break;
-            }
-        };
-        workers.push(worker);
+                let _ = serve_persistent_connection(stream, &worker_sessions, &policy);
+            })?;
+        sessions
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(worker);
     }
-
-    // Do not let process shutdown interrupt an accepted winner between its
-    // durable outbox write and either chain submission.
-    for worker in workers {
-        let _ = worker.join();
-    }
-    listener_result
+    Ok(())
 }
 
-fn serve_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Result<(), MinerError> {
+fn send_current_job(
+    stream: &mut TcpStream,
+    sessions: &PersistentSessions,
+    authorized: &HashMap<String, AuthenticatedWorker>,
+    notified_job_id: &mut Option<String>,
+) -> Result<(), MinerError> {
+    if authorized.is_empty() {
+        return Ok(());
+    }
+    let Some(state) = sessions.current() else {
+        return Ok(());
+    };
+    if state.shutdown.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let job_id = state.job.job().job_id();
+    if notified_job_id.as_deref() == Some(job_id) {
+        return Ok(());
+    }
+    write_message(stream, &set_target(state.config.share_target))?;
+    write_message(stream, &notify(&state.job, true))?;
+    *notified_job_id = Some(job_id.to_string());
+    Ok(())
+}
+
+fn serve_persistent_connection(
+    mut stream: TcpStream,
+    sessions: &PersistentSessions,
+    policy: &PersistentPolicy,
+) -> Result<(), MinerError> {
     stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
     let read_stream = stream.try_clone()?;
     let mut reader = BufReader::new(read_stream);
-    let nonce_1 = allocate_session_nonce(&state.next_nonce)?;
+    let nonce_1 = allocate_session_nonce(&sessions.next_nonce)?;
     let mut subscribed = false;
     let mut authorized = HashMap::new();
+    let mut notified_job_id = None;
     let mut authorization_policy = AuthorizationPolicy::new(Instant::now());
     let mut submission_rate = SubmissionRateLimiter::new(Instant::now());
 
-    while !state.shutdown.load(Ordering::Acquire) {
+    while !sessions.stop.load(Ordering::Acquire) {
+        send_current_job(&mut stream, sessions, &authorized, &mut notified_job_id)?;
         let frame = match read_frame(&mut reader) {
             Ok(Some(frame)) => frame,
             Ok(None) => break,
@@ -637,14 +765,16 @@ fn serve_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Result<()
                         break;
                     }
                 }
-                match authorize(params, &state.config, &state.authentications) {
+                match authorize(params, &policy.authentication, &policy.authentications) {
                     Ok(worker) => match insert_authorized_worker(&mut authorized, worker) {
-                        Ok(new_worker) => {
+                        Ok(_) => {
                             write_message(&mut stream, &rpc_success(id, Value::Bool(true)))?;
-                            if new_worker {
-                                write_message(&mut stream, &set_target(state.config.share_target))?;
-                                write_message(&mut stream, &notify(&state.job, true))?;
-                            }
+                            send_current_job(
+                                &mut stream,
+                                sessions,
+                                &authorized,
+                                &mut notified_job_id,
+                            )?;
                         }
                         Err(message) => {
                             write_message(&mut stream, &rpc_error(id, 24, message))?;
@@ -660,17 +790,14 @@ fn serve_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Result<()
                     write_message(&mut stream, &rpc_error(id, 25, "not subscribed"))?;
                 } else {
                     write_message(&mut stream, &rpc_success(id, Value::Bool(true)))?;
-                    write_message(&mut stream, &set_target(state.config.share_target))?;
+                    if let Some(state) = sessions.current() {
+                        if !state.shutdown.load(Ordering::Acquire) {
+                            write_message(&mut stream, &set_target(state.config.share_target))?;
+                        }
+                    }
                 }
             }
             "mining.extranonce.subscribe" => {
-                // NiceHash-derived clients commonly probe this Bitcoin Stratum
-                // extension after authorization. ZIP-301 puts the server nonce
-                // prefix in the block-header nonce rather than the coinbase, and
-                // this listener rotates it by reconnecting, so changing it on an
-                // active connection is deliberately unsupported. Return the
-                // extension's documented negative response instead of treating a
-                // harmless capability probe as an unknown method.
                 write_message(&mut stream, &unsupported_extension(id))?;
             }
             "mining.submit" => {
@@ -684,6 +811,10 @@ fn serve_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Result<()
                     if !submission_rate.try_acquire(Instant::now()) {
                         return Err(SubmitError::other("submission rate limit exceeded"));
                     }
+                    let state = sessions.current().ok_or_else(|| SubmitError {
+                        code: 21,
+                        message: "no active job".to_string(),
+                    })?;
                     submit(&state, &authorized, nonce_1, params)
                 })?;
             }
@@ -773,6 +904,12 @@ fn submit(
     nonce_1: [u8; NONCE_1_BYTES],
     params: &Value,
 ) -> Result<(), SubmitError> {
+    if state.shutdown.load(Ordering::Acquire) {
+        return Err(SubmitError {
+            code: 21,
+            message: "active job was retired".to_string(),
+        });
+    }
     let params = params
         .as_array()
         .filter(|params| params.len() == 5)
@@ -1545,6 +1682,14 @@ impl Drop for ConnectionPermit {
 mod tests {
     use super::*;
 
+    struct NoopProcessor;
+
+    impl ShareProcessor for NoopProcessor {
+        fn process(&self, _worker: &str, _share: &ValidatedNativeShare) -> Result<(), MinerError> {
+            Ok(())
+        }
+    }
+
     struct EventWriter<'a> {
         bytes: Vec<u8>,
         events: &'a std::cell::RefCell<Vec<&'static str>>,
@@ -1617,6 +1762,120 @@ mod tests {
         drop(second_client);
         drop(second_generation);
         drop(second_guard);
+    }
+
+    #[test]
+    fn authenticated_socket_receives_next_job_without_reconnect() {
+        let listener = Arc::new(
+            Zip301LoopbackListener::bind("127.0.0.1:0".parse().expect("loopback address"))
+                .expect("bind listener"),
+        );
+        let address = listener.local_addr().expect("listener address");
+        let config =
+            Zip301Config::new(Target::MAX, "rotation-test-password").expect("valid password");
+        let first = crate::native::tests::zip301_rotation_fixture(0x41);
+        let first_job_id = first.job().job_id().to_string();
+        let first_listener = Arc::clone(&listener);
+        let first_config = config.clone();
+        let first_server = thread::spawn(move || {
+            first_listener.serve(first, first_config, Arc::new(NoopProcessor))
+        });
+
+        let mut stream = TcpStream::connect(address).expect("connect miner");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(8)))
+            .expect("bounded read");
+        stream
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"miner.asic\",\"rotation-test-password\"]}\n")
+            .expect("subscribe and authorize");
+        let mut reader = BufReader::new(stream.try_clone().expect("read socket"));
+        let mut first_notify = false;
+        while !first_notify {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).expect("read first job"), 0);
+            let message: Value = serde_json::from_str(&line).expect("JSON response");
+            first_notify = message["method"] == "mining.notify";
+            if first_notify {
+                assert_eq!(message["params"][0], first_job_id);
+            }
+        }
+
+        {
+            let state = listener.sessions.current().expect("first active job");
+            *state.shutdown_reason.lock().expect("rotation reason lock") = Some(
+                MinerError::StaleNativeJob("test generation rotation".to_string()),
+            );
+            state.shutdown.store(true, Ordering::Release);
+        }
+        assert!(matches!(
+            first_server.join().expect("first server thread"),
+            Err(MinerError::StaleNativeJob(_))
+        ));
+
+        let second = crate::native::tests::zip301_rotation_fixture(0x42);
+        let second_job_id = second.job().job_id().to_string();
+        assert_ne!(first_job_id, second_job_id);
+        let second_listener = Arc::clone(&listener);
+        let second_server =
+            thread::spawn(move || second_listener.serve(second, config, Arc::new(NoopProcessor)));
+        let mut second_notify = false;
+        while !second_notify {
+            let mut line = String::new();
+            assert_ne!(
+                reader.read_line(&mut line).expect("socket remained open"),
+                0
+            );
+            let message: Value = serde_json::from_str(&line).expect("JSON response");
+            second_notify = message["method"] == "mining.notify";
+            if second_notify {
+                assert_eq!(message["params"][0], second_job_id);
+                assert_eq!(message["params"][7], true);
+            }
+        }
+        stream
+            .write_all(b"{\"id\":3,\"method\":\"mining.suggest_target\",\"params\":[]}\n")
+            .expect("same socket accepts another request");
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                reader.read_line(&mut line).expect("same socket responds"),
+                0
+            );
+            let message: Value = serde_json::from_str(&line).expect("JSON response");
+            if message["id"] == 3 {
+                assert_eq!(message["result"], true);
+                break;
+            }
+        }
+        write_message(
+            &mut stream,
+            &json!({
+                "id": 4,
+                "method": "mining.submit",
+                "params": ["miner.asic", first_job_id, "00", "00", "00"],
+            }),
+        )
+        .expect("submit retired job on retained socket");
+        loop {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).expect("read stale response"), 0);
+            let message: Value = serde_json::from_str(&line).expect("JSON response");
+            if message["id"] == 4 {
+                assert_eq!(message["error"][0], 21);
+                break;
+            }
+        }
+        {
+            let state = listener.sessions.current().expect("second active job");
+            *state.shutdown_reason.lock().expect("rotation reason lock") = Some(
+                MinerError::StaleNativeJob("test generation rotation".to_string()),
+            );
+            state.shutdown.store(true, Ordering::Release);
+        }
+        assert!(matches!(
+            second_server.join().expect("second server thread"),
+            Err(MinerError::StaleNativeJob(_))
+        ));
     }
 
     #[test]

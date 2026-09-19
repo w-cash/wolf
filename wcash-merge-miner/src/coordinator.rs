@@ -5856,7 +5856,7 @@ mod tests {
         assert_invalid_wcash_payout(
             &mainnet.encode(),
             &Network::Mainnet.genesis_hash().to_string(),
-            "mainnet payouts are unavailable",
+            "network does not match",
         );
     }
 
