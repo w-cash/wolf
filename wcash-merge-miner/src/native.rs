@@ -1201,15 +1201,16 @@ fn parent_tip_mismatch(
     }
 }
 
-/// Reclassifies an observer lookup failure as a transient tip race only when a
-/// fresh authoritative tip query proves that the observer moved after the
-/// relay snapshot was taken.
+/// Reclassifies an observer lookup failure as a transient snapshot race.
 ///
 /// Zebra returns RPC `-1` when a requested height is now above its tip and
-/// `-5` when a block hash disappeared during a reorganization. Those replies
-/// are safe to retry only after proving an actual tip change. A stable tip, an
-/// unrelated RPC error, or a failed recheck preserves the original error and
-/// therefore remains fail-closed.
+/// `-5` when a block hash disappeared during a reorganization. Every lookup
+/// passed to this helper is bounded by the observer tip snapshot taken before
+/// the relay. The observer can publish the new tip through
+/// `getblockchaininfo` just before the indexed block becomes available, so a
+/// second tip query can legitimately return the same snapshot. Retrying these
+/// two call-specific lookup failures is safe: no block bytes are accepted
+/// without their hash, canonical-prefix, and independent-node checks.
 fn reclassify_observer_lookup_tip_race(
     observer: &ZebraRpcClient,
     expected: NativeChainTip,
@@ -1228,7 +1229,11 @@ fn reclassify_observer_lookup_tip_race(
 
     match native_chain_tip_on_node(observer) {
         Ok(actual) if actual != expected => parent_tip_mismatch(expected, observer, actual),
-        Ok(_) | Err(_) => error,
+        Ok(_) | Err(_) => MinerError::StaleNativeJob(format!(
+            "observer lookup raced its height-index snapshot at {} height {}: {error}",
+            observer.label(),
+            expected.height,
+        )),
     }
 }
 
@@ -2853,7 +2858,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn observer_lookup_error_stays_fatal_when_the_tip_is_stable() {
+    fn observer_lookup_snapshot_gap_retries_when_the_tip_is_stable() {
         let expected_hash = "11".repeat(32);
         let expected_block_hash: block::Hash =
             parse_template_hex(&expected_hash, "expected observer tip").unwrap();
@@ -2874,7 +2879,8 @@ pub(crate) mod tests {
                 message: "unexpected stable-tip lookup failure".to_string(),
             },
         );
-        assert!(matches!(error, MinerError::RpcError { code: Some(-1), .. }));
+        assert!(matches!(error, MinerError::StaleNativeJob(message)
+            if message.contains("height-index snapshot") && message.contains("height 100")));
         server.join().unwrap();
     }
 
