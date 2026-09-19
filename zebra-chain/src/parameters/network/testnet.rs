@@ -1185,8 +1185,7 @@ impl Parameters {
         Ok(Self::wcash_mainnet_parameters(genesis))
     }
 
-    /// Creates a fully wired Wcash Mainnet profile for integration tests while
-    /// the production anchor selection remains fail-closed.
+    /// Creates a Wcash Mainnet profile using a fixed test-only genesis vector.
     #[cfg(any(test, feature = "proptest-impl"))]
     pub(super) fn new_wcash_mainnet_for_tests() -> Self {
         Self::wcash_mainnet_parameters(block::genesis::wcash_mainnet_genesis_block_for_tests())

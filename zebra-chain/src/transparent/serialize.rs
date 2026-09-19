@@ -31,8 +31,7 @@ pub const GENESIS_COINBASE_SCRIPT_SIG: [u8; 77] = [
 /// The exact local Wcash-regtest genesis statement.
 ///
 /// This local vector commits to the independently checked Bitcoin block
-/// 965,910. Public Wcash Testnet has a separate frozen statement below; Wcash
-/// mainnet remains disabled.
+/// 965,910. Public Wcash Testnet and Mainnet have separate frozen statements.
 pub const WCASH_REGTEST_GENESIS_COINBASE_SCRIPT_SIG: &[u8; 100] =
     b"06/Sep/2026 Wcash (WEC) BTC #965910 00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146";
 

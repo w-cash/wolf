@@ -153,8 +153,8 @@ fn wcash_network_config_round_trip() {
 }
 
 #[test]
-fn wcash_mainnet_config_is_serializable_but_anchor_gated() {
-    let network = Network::new_wcash_mainnet_for_tests();
+fn wcash_mainnet_config_round_trips_with_frozen_anchor() {
+    let network = Network::try_new_wcash_mainnet().expect("mainnet anchor is frozen");
     let config = Config {
         listen_addr: "[::]:48233".parse().expect("hard-coded address is valid"),
         network: network.clone(),
@@ -170,11 +170,9 @@ fn wcash_mainnet_config_is_serializable_but_anchor_gated() {
     );
     let encoded = toml::to_string(&config).expect("Wcash Mainnet config serializes");
     assert!(encoded.contains("network = \"WcashMainnet\""));
-    let error = toml::from_str::<Config>(&encoded)
-        .expect_err("production Mainnet parsing stays disabled before anchor freeze");
-    assert!(error
-        .to_string()
-        .contains("no reviewed external-chain anchor"));
+    let decoded: Config = toml::from_str(&encoded).expect("frozen Mainnet config parses");
+    assert_eq!(decoded.network, network);
+    assert_eq!(decoded.initial_mainnet_peers, config.initial_mainnet_peers);
 }
 
 #[test]

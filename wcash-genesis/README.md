@@ -62,31 +62,32 @@ ID `0x54ba2bfb`, P2P identity `Wcash/testnet/v7`, magic `49d2934b`, and cache
 namespace `wcashtestnet-v7`. These values prevent peers, state, and signed
 transactions from retired chains from entering this reset network.
 
-## Fail-closed mainnet launch
+## Mainnet genesis anchor
 
-Wcash Mainnet will use a confirmed Zcash Mainnet block, but no height or hash
-is frozen by this source tree. Mainnet therefore returns an error from
-`select_anchor`; command-line input cannot activate or replace it. The source
-already reserves a distinct Zcash Mainnet discriminator and its required
-coinbase statement format without activating a placeholder anchor.
+The source freezes Zcash Mainnet block 3,488,810, hash
+`0000000000463e4317bf50101ab176fe592298888a432f71d71f2fad04755e49`,
+mined on 19 September 2026 at 11:56:49 UTC. Wcash Mainnet genesis has a fixed
+timestamp of 19 September 2026 at 12:00:00 UTC. Its coinbase statement is
+`Wcash Mainnet ZEC #3488810` followed by that hash. The Wcash genesis block ID
+is frozen in `zebra-chain`. Command-line input cannot replace this anchor.
 
-Freezing a public anchor requires a reviewed source release that does all of
-the following:
+The source anchor alone does not declare a public mainnet launch. The release
+procedure requires all of the following before operating a public network:
 
 1. Waits for at least 100 Zcash confirmations after the selected block.
 2. Obtains the height, hash, and exact header from a locally validated Zcash
    Mainnet node and at least two independent block-data providers.
 3. Recomputes the Zcash block ID from the exact header, checks its target and
    proof of work, and confirms all sources agree on byte order.
-4. Replaces the mainnet `None` anchor constant in `src/lib.rs` with
-   the reviewed height and raw digest bytes.
-5. Freezes the encoding, statement, commitment, and complete Wcash genesis
+4. Confirms the frozen height and raw digest bytes in `src/lib.rs` match the
+   reviewed Zcash block.
+5. Checks the frozen encoding, statement, commitment, and complete Wcash genesis
    block as test vectors reproduced by a second implementation.
 6. Releases the same source and reproducible binary to every participant.
 
 Checking an isolated source header is not proof of its claimed height,
-confirmations, or best-chain membership. This is why command-line input can
-never activate or replace a public Wcash anchor.
+confirmations, or best-chain membership. These checks must be completed against
+the live Zcash chain before launch.
 
 ## Local testing
 

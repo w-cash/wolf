@@ -55,11 +55,21 @@ pub const PUBLIC_TESTNET_ZCASH_TIME: u32 = 1_789_685_930;
 /// Timestamp of the Wcash public Testnet genesis block.
 pub const PUBLIC_TESTNET_GENESIS_TIME: u32 = 1_789_686_000;
 
-/// Announced Wcash Mainnet genesis time: 18 September 2026, 22:00 UTC.
+/// Frozen Wcash Mainnet genesis time: 19 September 2026, 12:00 UTC.
 ///
-/// The external Zcash anchor remains fail-closed until a sufficiently
-/// confirmed block at or before this launch boundary is reviewed and frozen.
-pub const PUBLIC_MAINNET_GENESIS_TIME: u32 = 1_789_768_800;
+/// The anchored Zcash Mainnet block was mined at 11:56:49 UTC, before this
+/// launch boundary.
+pub const PUBLIC_MAINNET_GENESIS_TIME: u32 = 1_789_819_200;
+
+/// Zcash Mainnet height frozen into the public Wcash Mainnet genesis.
+pub const PUBLIC_MAINNET_ZCASH_HEIGHT: u32 = 3_488_810;
+
+/// Timestamp of the anchored Zcash Mainnet block: 19 September 2026, 11:56:49 UTC.
+pub const PUBLIC_MAINNET_ZCASH_TIME: u32 = 1_789_819_009;
+
+/// Explorer-format hash of the anchored Zcash Mainnet block.
+pub const PUBLIC_MAINNET_ZCASH_DISPLAY_HASH: &str =
+    "0000000000463e4317bf50101ab176fe592298888a432f71d71f2fad04755e49";
 
 /// Bitcoin mainnet height frozen into the local Wcash regtest genesis.
 pub const LOCAL_REGTEST_BITCOIN_HEIGHT: u32 = 965_910;
@@ -593,9 +603,10 @@ impl BitcoinAnchor {
                 "{PUBLIC_TESTNET_GENESIS_TIMESTAMP_TEXT} ZECtest #{} {}",
                 self.bitcoin_height, self.bitcoin_block_hash
             ),
-            AnchorSource::ZcashMainnet => {
-                format!("ZEC #{} {}", self.bitcoin_height, self.bitcoin_block_hash)
-            }
+            AnchorSource::ZcashMainnet => format!(
+                "Wcash Mainnet ZEC #{} {}",
+                self.bitcoin_height, self.bitcoin_block_hash
+            ),
         }
     }
 
@@ -712,9 +723,19 @@ pub const TESTNET_ANCHOR: BitcoinAnchor = BitcoinAnchor::frozen(
     ],
 );
 
-// This `None` value is the fail-closed mainnet activation gate. A reviewed
-// release must replace it with the announced anchor only after confirmation.
-const MAINNET_ANCHOR: Option<BitcoinAnchor> = None;
+/// The independently verified Zcash Mainnet block frozen into public Wcash Mainnet.
+///
+/// The hash bytes are raw digest order, the reverse of the explorer display hash.
+pub const MAINNET_ANCHOR: BitcoinAnchor = BitcoinAnchor::frozen(
+    WcashNetwork::Mainnet,
+    AnchorSource::ZcashMainnet,
+    PUBLIC_MAINNET_ZCASH_HEIGHT,
+    [
+        0x49, 0x5e, 0x75, 0x04, 0xad, 0x2f, 0x1f, 0xd7, 0x71, 0x2f, 0x43, 0x8a, 0x88, 0x98, 0x22,
+        0x59, 0xfe, 0x76, 0xb1, 0x1a, 0x10, 0x50, 0xbf, 0x17, 0x43, 0x3e, 0x46, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ],
+);
 
 /// Error returned when no reviewed anchor is frozen for a Wcash network.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -744,8 +765,8 @@ impl Error for PublicNetworkDisabled {}
 
 /// Selects the consensus anchor for a Wcash network.
 ///
-/// An override is honored only on regtest. Mainnet stays disabled until a
-/// reviewed source release freezes its announced anchor.
+/// An override is honored only on regtest. Mainnet always uses its frozen
+/// Zcash Mainnet anchor.
 ///
 /// # Errors
 ///
@@ -755,10 +776,7 @@ pub const fn select_anchor(
     regtest_override: Option<RegtestAnchorOverride>,
 ) -> Result<BitcoinAnchor, PublicNetworkDisabled> {
     match network {
-        WcashNetwork::Mainnet => match MAINNET_ANCHOR {
-            Some(anchor) => Ok(anchor),
-            None => Err(PublicNetworkDisabled { network }),
-        },
+        WcashNetwork::Mainnet => Ok(MAINNET_ANCHOR),
         WcashNetwork::Testnet => Ok(TESTNET_ANCHOR),
         WcashNetwork::Regtest => match regtest_override {
             Some(anchor_override) => Ok(anchor_override.anchor()),
@@ -1016,15 +1034,33 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_stays_fail_closed() {
-        let error = select_anchor(WcashNetwork::Mainnet, None)
-            .expect_err("mainnet must stay unavailable before its anchor has enough confirmations");
-        assert_eq!(error.network(), WcashNetwork::Mainnet);
+    fn public_mainnet_anchor_vectors_are_frozen() {
+        let anchor = select_anchor(WcashNetwork::Mainnet, None)
+            .expect("public mainnet has a frozen Zcash Mainnet anchor");
+        assert_eq!(anchor, MAINNET_ANCHOR);
+        assert_eq!(anchor.source(), AnchorSource::ZcashMainnet);
+        assert_eq!(anchor.bitcoin_height(), PUBLIC_MAINNET_ZCASH_HEIGHT);
+        assert_eq!(
+            anchor.bitcoin_block_hash().to_string(),
+            PUBLIC_MAINNET_ZCASH_DISPLAY_HASH
+        );
+        assert_eq!(
+            anchor.genesis_statement(),
+            concat!(
+                "Wcash Mainnet ZEC #3488810 ",
+                "0000000000463e4317bf50101ab176fe592298888a432f71d71f2fad04755e49"
+            )
+        );
+        assert_eq!(anchor.genesis_statement().len(), 91);
+        assert_eq!(BitcoinAnchor::decode(&anchor.encode()), Ok(anchor));
+        assert_ne!(anchor.commitment(), TESTNET_ANCHOR.commitment());
     }
 
     #[test]
     fn mainnet_launch_time_and_pow_limit_are_frozen() {
-        assert_eq!(PUBLIC_MAINNET_GENESIS_TIME, 1_789_768_800);
+        assert_eq!(PUBLIC_MAINNET_GENESIS_TIME, 1_789_819_200);
+        assert_eq!(PUBLIC_MAINNET_ZCASH_TIME, 1_789_819_009);
+        assert!(PUBLIC_MAINNET_ZCASH_TIME < PUBLIC_MAINNET_GENESIS_TIME);
         assert_eq!(PUBLIC_MAINNET_POW_LIMIT_BITS, 0x1e2f_abe8);
         assert_eq!(
             decode_compact_target(PUBLIC_MAINNET_POW_LIMIT_BITS),
@@ -1033,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_zcash_anchor_format_is_ready_but_not_activated() {
+    fn mainnet_zcash_anchor_format_and_selection_are_ready() {
         let candidate = BitcoinAnchor::frozen(
             WcashNetwork::Mainnet,
             AnchorSource::ZcashMainnet,
@@ -1044,12 +1080,15 @@ mod tests {
         assert_eq!(
             candidate.genesis_statement(),
             concat!(
-                "ZEC #3488000 ",
+                "Wcash Mainnet ZEC #3488000 ",
                 "abababababababababababababababababababababababababababababababab"
             )
         );
         assert_eq!(BitcoinAnchor::decode(&candidate.encode()), Ok(candidate));
-        assert!(select_anchor(WcashNetwork::Mainnet, None).is_err());
+        assert_eq!(
+            select_anchor(WcashNetwork::Mainnet, None),
+            Ok(MAINNET_ANCHOR)
+        );
     }
 
     #[test]
@@ -1068,7 +1107,11 @@ mod tests {
         assert_eq!(first.bitcoin_height(), 42);
         assert_ne!(first.commitment(), REGTEST_ANCHOR.commitment());
 
-        assert!(select_anchor(WcashNetwork::Mainnet, Some(anchor_override)).is_err());
+        assert_eq!(
+            select_anchor(WcashNetwork::Mainnet, Some(anchor_override)),
+            Ok(MAINNET_ANCHOR),
+            "a local override must not replace the frozen mainnet anchor"
+        );
         assert_eq!(
             select_anchor(WcashNetwork::Testnet, Some(anchor_override)),
             Ok(TESTNET_ANCHOR),

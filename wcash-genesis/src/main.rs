@@ -18,6 +18,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| "show-regtest".to_owned());
 
     match command.as_str() {
+        "show-mainnet" => {
+            reject_extra_arguments(arguments)?;
+            print_anchor(wcash_genesis::MAINNET_ANCHOR);
+        }
         "show-testnet" => {
             reject_extra_arguments(arguments)?;
             print_anchor(wcash_genesis::TESTNET_ANCHOR);
@@ -44,8 +48,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             reject_extra_arguments(arguments)?;
             println!("project: Wcash");
             println!(
-                "mainnet: {} (disabled); awaiting a confirmed Zcash Mainnet anchor",
-                wcash_genesis::WcashNetwork::Mainnet.currency_ticker()
+                "mainnet: {} enabled; Zcash Mainnet block {} anchor",
+                wcash_genesis::WcashNetwork::Mainnet.currency_ticker(),
+                wcash_genesis::PUBLIC_MAINNET_ZCASH_HEIGHT,
             );
             println!(
                 "testnet: {} (valueless); enabled for mining interoperability; Zcash Testnet block {} anchor",
@@ -95,5 +100,5 @@ fn encode_hex(bytes: impl IntoIterator<Item = u8>) -> String {
 }
 
 fn usage() -> &'static str {
-    "usage: wcash-genesis [show-testnet | show-regtest | status | derive-regtest HEIGHT HEADER_HEX]"
+    "usage: wcash-genesis [show-mainnet | show-testnet | show-regtest | status | derive-regtest HEIGHT HEADER_HEX]"
 }

@@ -12,16 +12,15 @@ use crate::{
     work::equihash::{Solution, WCASH_BLOCK_WIRE_VERSION},
 };
 
+/// Frozen display-order block ID of the public Wcash Mainnet genesis block.
+pub const WCASH_MAINNET_GENESIS_HASH: &str =
+    "5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48";
+
 /// Frozen display-order block ID of the public Wcash Testnet genesis block.
 pub const WCASH_TESTNET_GENESIS_HASH: &str =
     "6b66fff119977d36d9c989093b516a876dbf6596536791ff35bb4c581e3fda98";
 
-/// Returns the Wcash Mainnet genesis block after its reviewed Zcash anchor is
-/// frozen in `wcash-genesis`.
-///
-/// # Errors
-///
-/// Mainnet remains unavailable until the release source freezes that anchor.
+/// Returns the Wcash Mainnet genesis block using its frozen Zcash anchor.
 pub fn wcash_mainnet_genesis_block() -> Result<Arc<Block>, wcash_genesis::PublicNetworkDisabled> {
     let anchor = wcash_genesis::select_anchor(wcash_genesis::WcashNetwork::Mainnet, None)?;
     Ok(wcash_mainnet_genesis_block_for_anchor(anchor))
@@ -42,8 +41,8 @@ fn wcash_mainnet_genesis_block_for_anchor(anchor: wcash_genesis::BitcoinAnchor) 
     )
 }
 
-/// Returns a deterministic Wcash Mainnet block for cross-crate integration
-/// tests while the production anchor gate is still closed.
+/// Returns a deterministic Wcash Mainnet block with a separate test-only anchor
+/// for cross-crate integration tests.
 #[cfg(any(test, feature = "proptest-impl"))]
 pub fn wcash_mainnet_genesis_block_for_tests() -> Arc<Block> {
     let mut encoded = [0_u8; wcash_genesis::ANCHOR_ENCODING_LEN];
@@ -73,8 +72,7 @@ pub fn regtest_genesis_block() -> Arc<Block> {
 ///
 /// Its coinbase text and header commitment bind the local chain to the frozen
 /// Bitcoin block in [`wcash_genesis::REGTEST_ANCHOR`]. Public Wcash Testnet
-/// uses its own separately reviewed and frozen Zcash Testnet anchor; Wcash mainnet
-/// remains disabled.
+/// and Mainnet use their own separately frozen Zcash anchors.
 pub fn wcash_regtest_genesis_block() -> Arc<Block> {
     wcash_genesis_block(
         wcash_genesis::REGTEST_ANCHOR,
@@ -88,7 +86,7 @@ pub fn wcash_regtest_genesis_block() -> Arc<Block> {
 ///
 /// The complete block is deterministically derived from immutable fields and
 /// checked against a byte-for-byte source vector in this module's tests. Its
-/// Zcash Testnet anchor is testnet-specific, and mainnet remains disabled.
+/// Zcash Testnet anchor is testnet-specific and cannot select Mainnet.
 pub fn wcash_testnet_genesis_block() -> Arc<Block> {
     let bytes = <Vec<u8>>::from_hex(include_str!("genesis/block-wcash-testnet-0.txt").trim())
         .expect("the frozen Wcash Testnet genesis vector is valid hex");
@@ -175,9 +173,8 @@ mod tests {
 
     #[test]
     fn wcash_mainnet_genesis_plumbing_is_deterministic_and_zero_supply() {
-        assert!(wcash_mainnet_genesis_block().is_err());
-
-        let block = wcash_mainnet_genesis_block_for_tests();
+        let block = wcash_mainnet_genesis_block().expect("the mainnet anchor is frozen");
+        assert_eq!(block.hash().to_string(), WCASH_MAINNET_GENESIS_HASH);
         assert_eq!(block.coinbase_height(), Some(crate::block::Height::MIN));
         assert_eq!(block.header.version, WCASH_BLOCK_WIRE_VERSION);
         assert_eq!(
@@ -190,7 +187,10 @@ mod tests {
         );
         let inputs = block.transactions[0].inputs();
         let statement = inputs[0].miner_data().expect("genesis input is a coinbase");
-        assert!(statement.starts_with(b"ZEC #3488200 "));
+        assert_eq!(
+            statement,
+            wcash_genesis::MAINNET_ANCHOR.genesis_statement().as_bytes()
+        );
         assert_eq!(block.transactions[0].outputs()[0].value.zatoshis(), 0);
         assert_eq!(
             block

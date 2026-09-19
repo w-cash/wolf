@@ -64,11 +64,14 @@ fn compiled_consensus_profile_is_mutually_exclusive() {
 }
 
 #[test]
-fn wcash_mainnet_profile_is_fully_wired_but_production_anchor_is_fail_closed() -> Result<(), Report>
-{
-    assert!(Network::try_new_wcash_mainnet().is_err());
-
-    let mainnet = Network::new_wcash_mainnet_for_tests();
+fn wcash_mainnet_profile_is_fully_wired_with_frozen_anchor() -> Result<(), Report> {
+    let mainnet = Network::try_new_wcash_mainnet().expect("mainnet anchor is frozen");
+    assert_eq!(
+        mainnet.genesis_hash(),
+        crate::block::genesis::wcash_mainnet_genesis_block()
+            .expect("mainnet genesis is frozen")
+            .hash()
+    );
     assert!(mainnet.uses_wcash_consensus());
     assert!(mainnet.is_wcash_mainnet());
     assert!(!mainnet.is_wcash_testnet());
