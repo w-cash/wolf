@@ -181,7 +181,7 @@ enum Command {
         /// Optional raw memo bytes as hexadecimal (maximum 512 bytes).
         #[arg(long)]
         memo_hex: Option<String>,
-        /// Required confirmations; public Testnet requires at least 100.
+        /// Required confirmations; public Wcash networks require at least 100.
         #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..))]
         confirmations: u32,
         /// Permit fewer than 100 confirmations on isolated Regtest only.
@@ -217,11 +217,11 @@ enum Command {
         #[arg(long)]
         txid: String,
     },
-    /// Print the seedless identity required by the native Testnet payout protocol.
+    /// Print the seedless identity required by the native payout protocol.
     PayoutIdentity,
-    /// Print a short-lived, tip-attested Testnet collector observation.
+    /// Print a short-lived, tip-attested collector observation.
     PayoutObserve,
-    /// Atomically sign or recover one exact Testnet payout request read from stdin.
+    /// Atomically sign or recover one exact payout request read from stdin.
     PayoutSign {
         /// Absolute owner-private seed credential file; contents are never printed or logged.
         #[arg(

@@ -310,8 +310,8 @@ pub enum WalletServiceError {
     /// A numeric height calculation overflowed.
     #[error("height calculation overflow")]
     HeightOverflow,
-    /// Pool settlement is deliberately unavailable outside the public Wcash Testnet.
-    #[error("idempotent pool payout signing is enabled only on Wcash Testnet")]
+    /// Pool settlement is enabled only on the frozen public Wcash Mainnet and Testnet domains.
+    #[error("idempotent pool payout signing is enabled only on a frozen public Wcash network")]
     PayoutNetworkUnsupported,
     /// A previously journaled batch identifier was presented with different facts.
     #[error("payout batch {batch_id} conflicts with its durable request binding")]
@@ -512,7 +512,7 @@ pub struct TransferRecipient {
 pub struct PayoutWalletIdentity {
     /// Native payout protocol and durable journal schema version.
     pub protocol_version: u32,
-    /// The only network on which pool payout signing is currently enabled.
+    /// The frozen public network selected for pool payout signing.
     pub network: WalletNetwork,
     /// Frozen Wcash genesis block identifier in conventional display order.
     pub genesis_hash: String,
@@ -604,7 +604,7 @@ pub struct PayoutBatchRequest {
     pub identity: PayoutWalletIdentity,
     /// Ordered, non-empty payout allocations.
     pub outputs: Vec<PayoutBatchOutput>,
-    /// Required note confirmations; public Testnet requires at least 100.
+    /// Required note confirmations; public Wcash networks require at least 100.
     pub confirmations: u32,
     /// Maximum ZIP 317 fee authorized by the pool, in zatoshis.
     pub max_fee_zat: u64,
@@ -2744,7 +2744,7 @@ pub fn payout_wallet_identity(
     path: impl AsRef<Path>,
     network: WalletNetwork,
 ) -> Result<PayoutWalletIdentity, WalletServiceError> {
-    require_payout_testnet(network)?;
+    require_payout_network(network)?;
     let path = path.as_ref();
     let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
     let mut wallet = open_wallet_database(path, network)?;
@@ -2772,7 +2772,7 @@ pub async fn payout_wallet_observation(
     path: impl AsRef<Path>,
     network: WalletNetwork,
 ) -> Result<PayoutWalletObservation, WalletServiceError> {
-    require_payout_testnet(network)?;
+    require_payout_network(network)?;
     ensure_client_network(client, network)?;
     let path = path.as_ref();
     require_existing_wallet_file(path)?;
@@ -2896,7 +2896,7 @@ pub fn recover_signed_payout_batch(
     network: WalletNetwork,
     lookup: &PayoutBatchLookup,
 ) -> Result<Option<SignedPayoutBatch>, WalletServiceError> {
-    require_payout_testnet(network)?;
+    require_payout_network(network)?;
     let batch_id = canonical_uuid("batch_id", &lookup.batch_id)?;
     let request_commitment = canonical_hex32("request_commitment", &lookup.request_commitment)?;
     let path = path.as_ref();
@@ -2954,7 +2954,7 @@ pub async fn broadcast_signed_payout_batch(
     network: WalletNetwork,
     request: &PayoutBatchInspectionRequest,
 ) -> Result<PayoutBroadcastResult, WalletServiceError> {
-    require_payout_testnet(network)?;
+    require_payout_network(network)?;
     ensure_client_network(client, network)?;
     let stored = inspect_signed_payout_batch(path, network, request)?;
     let raw = hex::decode(&stored.raw_transaction_hex).map_err(|_| {
@@ -2997,7 +2997,7 @@ pub async fn create_idempotent_payout_batch(
     master_seed: &SecretVec<u8>,
     request: PayoutBatchRequest,
 ) -> Result<SignedPayoutBatch, WalletServiceError> {
-    require_payout_testnet(network)?;
+    require_payout_network(network)?;
     ensure_client_network(client, network)?;
     let path = path.as_ref();
     let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
@@ -3070,12 +3070,12 @@ pub async fn create_idempotent_payout_batch(
     })
 }
 
-fn require_payout_testnet(network: WalletNetwork) -> Result<(), WalletServiceError> {
+fn require_payout_network(network: WalletNetwork) -> Result<(), WalletServiceError> {
     #[cfg(feature = "regtest-payout")]
     if network == WalletNetwork::Regtest {
         return Ok(());
     }
-    if network == WalletNetwork::Testnet {
+    if matches!(network, WalletNetwork::Mainnet | WalletNetwork::Testnet) {
         Ok(())
     } else {
         Err(WalletServiceError::PayoutNetworkUnsupported)
@@ -5657,7 +5657,7 @@ mod tests {
     }
 
     #[test]
-    fn payout_request_validation_is_testnet_only_canonical_and_ironwood_only() {
+    fn payout_request_validation_is_canonical_and_ironwood_only() {
         let directory = tempfile::tempdir().unwrap();
         let wallet_path = directory.path().join("wallet.sqlite");
         let account = create_wallet_accounts(&wallet_path, WalletNetwork::Testnet, 1)
@@ -5669,7 +5669,7 @@ mod tests {
 
         #[cfg(not(feature = "regtest-payout"))]
         assert!(matches!(
-            require_payout_testnet(WalletNetwork::Regtest),
+            require_payout_network(WalletNetwork::Regtest),
             Err(WalletServiceError::PayoutNetworkUnsupported)
         ));
         let mut bad = request.clone();
@@ -5703,10 +5703,44 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn mainnet_payout_requires_mainnet_identity_and_addresses() {
+        require_payout_network(WalletNetwork::Mainnet).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("mainnet-wallet.sqlite");
+        let account = create_wallet_accounts(&wallet_path, WalletNetwork::Mainnet, 1)
+            .pop()
+            .unwrap();
+        let account_id = Uuid::parse_str(&account.account_id).unwrap();
+        let collector = test_collector_payout_commitment(&account);
+        let mut request = test_payout_request(&account);
+        request.identity =
+            expected_payout_identity(WalletNetwork::Mainnet, account_id, collector, true);
+
+        prepare_payout_request(&request, WalletNetwork::Mainnet, account_id, collector).unwrap();
+        assert!(
+            prepare_payout_request(&request, WalletNetwork::Testnet, account_id, collector)
+                .is_err()
+        );
+
+        let testnet_account = create_wallet_accounts(
+            &directory.path().join("testnet-wallet.sqlite"),
+            WalletNetwork::Testnet,
+            1,
+        )
+        .pop()
+        .unwrap();
+        request.outputs[0].canonical_address = testnet_account.address;
+        assert!(
+            prepare_payout_request(&request, WalletNetwork::Mainnet, account_id, collector)
+                .is_err()
+        );
+    }
+
     #[cfg(feature = "regtest-payout")]
     #[test]
     fn regtest_payout_requires_its_own_wallet_identity_and_addresses() {
-        require_payout_testnet(WalletNetwork::Regtest).unwrap();
+        require_payout_network(WalletNetwork::Regtest).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let wallet_path = directory.path().join("regtest-wallet.sqlite");
         let account = create_wallet_accounts(&wallet_path, WalletNetwork::Regtest, 1)
