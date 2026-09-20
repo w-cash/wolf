@@ -3899,6 +3899,20 @@ async fn create_signed_payout_transfer_in_open_wallet(
 
     let target_height = BlockHeight::from(proposal.min_target_height());
     let target_height_u32: u32 = target_height.into();
+    let expiry_height_u32 = match target_height_u32.checked_add(expiry_delta) {
+        Some(height) if height <= u32::from(Height::MAX_EXPIRY_HEIGHT) => height,
+        None => {
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::HeightOverflow);
+        }
+        Some(_) => {
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::InvalidRequest(format!(
+                "transaction expiry height must not exceed {}",
+                u32::from(Height::MAX_EXPIRY_HEIGHT)
+            )));
+        }
+    };
     let anchor_height = match proposal.steps().first().anchor_height() {
         Some(height) => height,
         None => {
@@ -3928,7 +3942,13 @@ async fn create_signed_payout_transfer_in_open_wallet(
             return Err(error);
         }
     };
-    if let Err(error) = revalidate_exact_chain_tip(client, expected_chain).await {
+    // Mining may extend the best chain while the deterministic proposal is
+    // being assembled. Accept that ordinary forward progress only when both
+    // the proposal tip and its anchor remain canonical and the transaction is
+    // still below expiry. The same check runs again after proof generation.
+    if let Err(error) =
+        revalidate_canonical_ancestors(client, expected_chain, expiry_height_u32).await
+    {
         let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
         return Err(error);
     }
@@ -4031,20 +4051,6 @@ async fn create_signed_payout_transfer_in_open_wallet(
         })
         .collect::<Vec<_>>();
 
-    let expiry_height_u32 = match target_height_u32.checked_add(expiry_delta) {
-        Some(height) if height <= u32::from(Height::MAX_EXPIRY_HEIGHT) => height,
-        None => {
-            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::HeightOverflow);
-        }
-        Some(_) => {
-            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::InvalidRequest(format!(
-                "transaction expiry height must not exceed {}",
-                u32::from(Height::MAX_EXPIRY_HEIGHT)
-            )));
-        }
-    };
     let prover = LocalTxProver::bundled();
     let fee_zat = proposal.steps().first().balance().fee_required().into_u64();
     if let Some(batch) = payout_batch {
