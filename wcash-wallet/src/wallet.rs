@@ -3742,7 +3742,7 @@ async fn create_signed_payout_transfer_in_open_wallet(
     // transfers retain the upstream privacy-oriented oldest-first policy.
     if let Some(batch) = payout_batch {
         let (target_height, _) = wallet
-            .get_target_and_anchor_heights(confirmation_count)
+            .get_target_and_anchor_heights(confirmations_policy.trusted())
             .map_err(database_error)?
             .ok_or(WalletServiceError::NotSynchronized)?;
         let unlocked_policy = LockedInputPolicy::Exclude;
@@ -3920,7 +3920,8 @@ async fn create_signed_payout_transfer_in_open_wallet(
             return Err(WalletServiceError::NonIronwoodProposal);
         }
     };
-    let current_heights = match wallet.get_target_and_anchor_heights(confirmation_count) {
+    let current_heights = match wallet.get_target_and_anchor_heights(confirmations_policy.trusted())
+    {
         Ok(Some(heights)) => heights,
         Ok(None) => {
             let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
