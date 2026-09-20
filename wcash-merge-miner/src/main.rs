@@ -1084,6 +1084,20 @@ fn wait_for_pool_backend_retry(
 
 fn is_retryable_winner_reconciliation_error(error: &MinerError) -> bool {
     matches!(error, MinerError::WinnerSubmissionDeferred { .. })
+        // Winner reconciliation is observational and the exact winner bytes
+        // are already durable. Zebra can briefly publish a new
+        // `getblockchaininfo` tip before its height/hash index serves the
+        // matching `getblockhash` or `getblock` lookup. Defer that pass rather
+        // than terminating the whole Stratum backend. Keep these broad RPC
+        // codes fatal during job preparation, where they are not sufficient
+        // evidence that retrying is safe.
+        || matches!(
+            error,
+            MinerError::RpcError {
+                code: Some(-1 | -5),
+                ..
+            }
+        )
         || is_retryable_native_preparation_error(error)
 }
 
@@ -2919,6 +2933,16 @@ mod tests {
         assert!(is_retryable_winner_reconciliation_error(
             &MinerError::WinnerSubmissionDeferred { chain: "Wcash" }
         ));
+        for code in [-1, -5] {
+            assert!(
+                is_retryable_winner_reconciliation_error(&rpc_error(Some(code))),
+                "winner reconciliation RPC code {code} must preserve the durable winner and retry"
+            );
+            assert!(
+                !is_retryable_native_preparation_error(&rpc_error(Some(code))),
+                "job preparation RPC code {code} must remain fail closed"
+            );
+        }
         assert!(!is_retryable_winner_reconciliation_error(
             &MinerError::InvalidParentTemplate("authoritative winner rejection".to_string())
         ));
