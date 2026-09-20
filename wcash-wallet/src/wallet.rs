@@ -2825,7 +2825,13 @@ fn read_payout_observation_snapshot(
     require_transparent_recovery_complete(&mut wallet)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
-    let summary = wallet_balance_summary(&wallet, public_confirmation_policy())?;
+    let summary = wallet_balance_summary(
+        &wallet,
+        payout_confirmation_policy(
+            NonZeroU32::new(COINBASE_SHIELDING_MATURITY)
+                .expect("the consensus coinbase maturity is nonzero"),
+        )?,
+    )?;
     if !summary.synchronized
         || summary.chain_tip_height == 0
         || summary.fully_scanned_height != summary.chain_tip_height
@@ -3649,7 +3655,7 @@ async fn create_signed_payout_transfer_in_open_wallet(
     ensure_no_legacy_pool_balances(wallet)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
-    let confirmations_policy = ConfirmationsPolicy::new_symmetrical(confirmation_count, false);
+    let confirmations_policy = payout_confirmation_policy(confirmation_count)?;
     let summary = wallet
         .get_wallet_summary(confirmations_policy)
         .map_err(database_error)?
@@ -5315,6 +5321,22 @@ fn public_confirmation_policy() -> ConfirmationsPolicy {
     )
 }
 
+/// Pool payouts keep externally received mining rewards behind the consensus
+/// coinbase maturity floor while allowing wallet-owned shielded change to be
+/// reused after the ZIP 315 default of three confirmations.
+///
+/// `ConfirmationsPolicy` classifies internal change as trusted and coinbase
+/// rewards received at the collector's external address as untrusted. Keeping
+/// those thresholds separate prevents a short payout cadence from weakening
+/// the 100-block maturity rule for newly mined funds.
+fn payout_confirmation_policy(
+    untrusted: NonZeroU32,
+) -> Result<ConfirmationsPolicy, WalletServiceError> {
+    let trusted = NonZeroU32::new(3).expect("the trusted confirmation floor is nonzero");
+    ConfirmationsPolicy::new(trusted.min(untrusted), untrusted, false)
+        .map_err(|_| WalletServiceError::UnsafeConfirmations)
+}
+
 fn only_account(account_ids: &[AccountUuid]) -> Result<AccountUuid, WalletServiceError> {
     if let [account_id] = account_ids {
         Ok(*account_id)
@@ -6221,6 +6243,15 @@ mod tests {
                 .get(),
             LOCAL_CONFIRMATIONS
         );
+    }
+
+    #[test]
+    fn payout_policy_reuses_only_wallet_owned_change_before_coinbase_maturity() {
+        let policy =
+            payout_confirmation_policy(NonZeroU32::new(COINBASE_SHIELDING_MATURITY).unwrap())
+                .unwrap();
+        assert_eq!(u32::from(policy.trusted()), 3);
+        assert_eq!(u32::from(policy.untrusted()), COINBASE_SHIELDING_MATURITY);
     }
 
     #[test]
