@@ -109,8 +109,9 @@ fn default_config_uses_ipv6() {
         assert_eq!(config.network, Network::new_wcash_testnet());
         assert!(config.network.uses_wcash_consensus());
         assert!(!config.network.is_regtest());
-        assert!(config.initial_mainnet_peers.is_empty());
+        assert_eq!(config.initial_mainnet_peers.len(), 3);
         assert!(config.initial_testnet_peers.is_empty());
+        assert!(config.initial_peer_hostnames().is_empty());
     }
 }
 
@@ -173,6 +174,29 @@ fn wcash_mainnet_config_round_trips_with_frozen_anchor() {
     let decoded: Config = toml::from_str(&encoded).expect("frozen Mainnet config parses");
     assert_eq!(decoded.network, network);
     assert_eq!(decoded.initial_mainnet_peers, config.initial_mainnet_peers);
+}
+
+#[test]
+fn wcash_mainnet_uses_its_own_seed_peers_unless_overridden() {
+    let minimal: Config =
+        toml::from_str("network = 'WcashMainnet'").expect("minimal Wcash Mainnet config parses");
+    assert_eq!(
+        minimal.initial_peer_hostnames(),
+        [
+            "node.w.cash:48233".to_string(),
+            "187.124.113.200:48233".to_string(),
+            "2.24.93.205:48233".to_string(),
+        ]
+        .into(),
+    );
+
+    let overridden: Config =
+        toml::from_str("network = 'WcashMainnet'\ninitial_mainnet_peers = ['other.example:48233']")
+            .expect("Wcash Mainnet seed override parses");
+    assert_eq!(
+        overridden.initial_peer_hostnames(),
+        ["other.example:48233".to_string()].into(),
+    );
 }
 
 #[test]

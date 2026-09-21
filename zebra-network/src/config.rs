@@ -67,6 +67,12 @@ const ZCASH_TESTNET_SEED_PEERS: [&str; 3] = [
     "testnet.seeder.zfnd.org:18233",
 ];
 
+const WCASH_MAINNET_SEED_PEERS: [&str; 3] = [
+    "node.w.cash:48233",
+    "187.124.113.200:48233",
+    "2.24.93.205:48233",
+];
+
 /// Configuration for networking code.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, default, into = "DConfig")]
@@ -585,7 +591,10 @@ impl Default for Config {
         let (listen_addr, network, initial_mainnet_peers, initial_testnet_peers) = (
             "[::]:38233",
             Network::new_wcash_testnet(),
-            IndexSet::new(),
+            WCASH_MAINNET_SEED_PEERS
+                .into_iter()
+                .map(String::from)
+                .collect(),
             IndexSet::new(),
         );
 
@@ -839,13 +848,22 @@ impl<'de> Deserialize<'de> for Config {
         } = DConfig::deserialize(deserializer)?;
 
         let is_built_in_wcash = matches!(&dnetwork, DNetwork::Wcash(_));
+        let is_wcash_mainnet = matches!(
+            &dnetwork,
+            DNetwork::Wcash(name) if name.eq_ignore_ascii_case("WcashMainnet")
+        );
         let Config {
             initial_mainnet_peers: default_mainnet_peers,
             initial_testnet_peers: default_testnet_peers,
             ..
         } = Config::default();
         let initial_mainnet_peers = initial_mainnet_peers.unwrap_or_else(|| {
-            if is_built_in_wcash {
+            if is_wcash_mainnet {
+                WCASH_MAINNET_SEED_PEERS
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            } else if is_built_in_wcash {
                 IndexSet::new()
             } else {
                 default_mainnet_peers
