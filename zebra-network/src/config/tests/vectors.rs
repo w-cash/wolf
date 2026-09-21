@@ -109,7 +109,7 @@ fn default_config_uses_ipv6() {
         assert_eq!(config.network, Network::new_wcash_testnet());
         assert!(config.network.uses_wcash_consensus());
         assert!(!config.network.is_regtest());
-        assert_eq!(config.initial_mainnet_peers.len(), 3);
+        assert_eq!(config.initial_mainnet_peers.len(), 4);
         assert!(config.initial_testnet_peers.is_empty());
         assert!(config.initial_peer_hostnames().is_empty());
     }
@@ -186,6 +186,7 @@ fn wcash_mainnet_uses_its_own_seed_peers_unless_overridden() {
             "node.w.cash:48233".to_string(),
             "187.124.113.200:48233".to_string(),
             "2.24.93.205:48233".to_string(),
+            "5.183.8.145:48233".to_string(),
         ]
         .into(),
     );
