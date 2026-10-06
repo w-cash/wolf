@@ -2865,10 +2865,7 @@ mod tests {
         // scan, but the dedicated submission retry pass has not restarted.
         let unsettled_pending = audit.next(&actor, 4).unwrap();
         assert_eq!(unsettled_pending.snapshot().unwrap().share_id(), &pending);
-        assert_eq!(
-            unsettled_pending.delay(),
-            WINNER_HISTORICAL_STEP_INTERVAL
-        );
+        assert_eq!(unsettled_pending.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
         let end = audit.next(&actor, 4).unwrap();
         assert!(end.completes_pass());
         let restarted = audit.next(&actor, 4).unwrap();

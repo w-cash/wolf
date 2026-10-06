@@ -40,7 +40,10 @@ pub const JOURNAL_FORMAT_VERSION: u16 = 2;
 pub const MAX_JOURNAL_EVENTS: usize = 1_000_000;
 
 /// Maximum total size of a journal, including its header and newlines.
-pub const MAX_JOURNAL_BYTES: u64 = 1024 * 1024 * 1024;
+// Winner records retain exact block bytes until their lifecycle is durable.
+// The live mainnet journal passed 1 GiB during the slow-start workload, so
+// retain a bounded 4 GiB runway until planned journal rollover is available.
+pub const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Maximum size of one header or event line, including its newline.
 pub const MAX_JOURNAL_RECORD_BYTES: usize = 10 * 1024 * 1024;
