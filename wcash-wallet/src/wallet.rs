@@ -1,7 +1,7 @@
 //! SQLite-backed Wcash wallet operations.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     fs::{self, File, OpenOptions},
     future::Future,
@@ -28,18 +28,21 @@ use wcash_zcash_aux::child_payout_address_commitment;
 use zcash_client_backend::{
     data_api::wallet::{
         create_proposed_transactions, decrypt_and_store_transaction,
-        input_selection::{GreedyInputSelector, SpendPolicy},
+        input_selection::{
+            GreedyInputSelector, LockFilter, LockedInputPolicy, NonEmptyBTreeSet, SpendPolicy,
+        },
         propose_shielding_coinbase, propose_transfer, unlock_proposal_inputs, ConfirmationsPolicy,
         LockRequest, SpendingKeys,
     },
     data_api::{
-        Account, AccountBirthday, NullifierQuery, OutputStatusFilter, TransactionDataRequest,
-        TransactionStatusFilter, TransactionsInvolvingAddress, WalletRead, WalletWrite,
+        Account, AccountBirthday, InputSource, MaxSpendMode, NullifierQuery, OutputLockStore,
+        OutputStatusFilter, TargetValue, TransactionDataRequest, TransactionStatusFilter,
+        TransactionsInvolvingAddress, WalletRead, WalletWrite,
     },
     decrypt_transaction,
     fees::{standard::SingleOutputChangeStrategy, DustOutputPolicy, StandardFeeRule},
     proto::proposal::Proposal as ProposalProto,
-    wallet::{LockOwner, Note as WalletNote, OvkPolicy},
+    wallet::{LockOwner, Note as WalletNote, OutputRef, OvkPolicy},
     zip321::{Payment, TransactionRequest},
     TransferType,
 };
@@ -89,6 +92,12 @@ pub const PAYOUT_OBSERVATION_VALIDITY_SECS: u64 = 4 * 60;
 pub const MAX_EXPIRY_DELTA: u32 = 100;
 /// Maximum note-lock lifetime accepted by the wallet.
 pub const MAX_LOCK_FOR_BLOCKS: u32 = 1_000;
+/// Fee headroom while choosing a compact payout input set. The signed transaction remains bound
+/// by the payout request's `max_fee_zat`; this reserve only prevents input preselection from
+/// stopping before ZIP 317 fees can be calculated.
+const PAYOUT_SELECTION_MIN_FEE_RESERVE_ZAT: u64 = 10_000_000;
+/// Maximum Ironwood inputs preselected for one payout, leaving room below the block-size limit.
+const MAX_PAYOUT_IRONWOOD_INPUTS: usize = 600;
 /// Maximum transparent coinbase inputs swept by one shielding transaction.
 pub const MAX_COINBASE_SHIELDING_INPUTS: usize = 100;
 /// Maximum locally-created transactions returned by one recovery page.
@@ -310,8 +319,8 @@ pub enum WalletServiceError {
     /// A numeric height calculation overflowed.
     #[error("height calculation overflow")]
     HeightOverflow,
-    /// Pool settlement is deliberately unavailable outside the public Wcash Testnet.
-    #[error("idempotent pool payout signing is enabled only on Wcash Testnet")]
+    /// Pool settlement is enabled only on the frozen public Wcash Mainnet and Testnet domains.
+    #[error("idempotent pool payout signing is enabled only on a frozen public Wcash network")]
     PayoutNetworkUnsupported,
     /// A previously journaled batch identifier was presented with different facts.
     #[error("payout batch {batch_id} conflicts with its durable request binding")]
@@ -512,7 +521,7 @@ pub struct TransferRecipient {
 pub struct PayoutWalletIdentity {
     /// Native payout protocol and durable journal schema version.
     pub protocol_version: u32,
-    /// The only network on which pool payout signing is currently enabled.
+    /// The frozen public network selected for pool payout signing.
     pub network: WalletNetwork,
     /// Frozen Wcash genesis block identifier in conventional display order.
     pub genesis_hash: String,
@@ -604,7 +613,7 @@ pub struct PayoutBatchRequest {
     pub identity: PayoutWalletIdentity,
     /// Ordered, non-empty payout allocations.
     pub outputs: Vec<PayoutBatchOutput>,
-    /// Required note confirmations; public Testnet requires at least 100.
+    /// Required note confirmations; public Wcash networks require at least 100.
     pub confirmations: u32,
     /// Maximum ZIP 317 fee authorized by the pool, in zatoshis.
     pub max_fee_zat: u64,
@@ -2744,7 +2753,7 @@ pub fn payout_wallet_identity(
     path: impl AsRef<Path>,
     network: WalletNetwork,
 ) -> Result<PayoutWalletIdentity, WalletServiceError> {
-    require_payout_testnet(network)?;
+    require_payout_network(network)?;
     let path = path.as_ref();
     let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
     let mut wallet = open_wallet_database(path, network)?;
@@ -2772,7 +2781,7 @@ pub async fn payout_wallet_observation(
     path: impl AsRef<Path>,
     network: WalletNetwork,
 ) -> Result<PayoutWalletObservation, WalletServiceError> {
-    require_payout_testnet(network)?;
+    require_payout_network(network)?;
     ensure_client_network(client, network)?;
     let path = path.as_ref();
     require_existing_wallet_file(path)?;
@@ -2816,7 +2825,13 @@ fn read_payout_observation_snapshot(
     require_transparent_recovery_complete(&mut wallet)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
-    let summary = wallet_balance_summary(&wallet, public_confirmation_policy())?;
+    let summary = wallet_balance_summary(
+        &wallet,
+        payout_confirmation_policy(
+            NonZeroU32::new(COINBASE_SHIELDING_MATURITY)
+                .expect("the consensus coinbase maturity is nonzero"),
+        )?,
+    )?;
     if !summary.synchronized
         || summary.chain_tip_height == 0
         || summary.fully_scanned_height != summary.chain_tip_height
@@ -2896,7 +2911,7 @@ pub fn recover_signed_payout_batch(
     network: WalletNetwork,
     lookup: &PayoutBatchLookup,
 ) -> Result<Option<SignedPayoutBatch>, WalletServiceError> {
-    require_payout_testnet(network)?;
+    require_payout_network(network)?;
     let batch_id = canonical_uuid("batch_id", &lookup.batch_id)?;
     let request_commitment = canonical_hex32("request_commitment", &lookup.request_commitment)?;
     let path = path.as_ref();
@@ -2954,7 +2969,7 @@ pub async fn broadcast_signed_payout_batch(
     network: WalletNetwork,
     request: &PayoutBatchInspectionRequest,
 ) -> Result<PayoutBroadcastResult, WalletServiceError> {
-    require_payout_testnet(network)?;
+    require_payout_network(network)?;
     ensure_client_network(client, network)?;
     let stored = inspect_signed_payout_batch(path, network, request)?;
     let raw = hex::decode(&stored.raw_transaction_hex).map_err(|_| {
@@ -2997,7 +3012,7 @@ pub async fn create_idempotent_payout_batch(
     master_seed: &SecretVec<u8>,
     request: PayoutBatchRequest,
 ) -> Result<SignedPayoutBatch, WalletServiceError> {
-    require_payout_testnet(network)?;
+    require_payout_network(network)?;
     ensure_client_network(client, network)?;
     let path = path.as_ref();
     let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
@@ -3070,12 +3085,12 @@ pub async fn create_idempotent_payout_batch(
     })
 }
 
-fn require_payout_testnet(network: WalletNetwork) -> Result<(), WalletServiceError> {
+fn require_payout_network(network: WalletNetwork) -> Result<(), WalletServiceError> {
     #[cfg(feature = "regtest-payout")]
     if network == WalletNetwork::Regtest {
         return Ok(());
     }
-    if network == WalletNetwork::Testnet {
+    if matches!(network, WalletNetwork::Mainnet | WalletNetwork::Testnet) {
         Ok(())
     } else {
         Err(WalletServiceError::PayoutNetworkUnsupported)
@@ -3640,7 +3655,7 @@ async fn create_signed_payout_transfer_in_open_wallet(
     ensure_no_legacy_pool_balances(wallet)?;
     let account_ids = wallet.get_account_ids().map_err(database_error)?;
     let account_id = only_account(&account_ids)?;
-    let confirmations_policy = ConfirmationsPolicy::new_symmetrical(confirmation_count, false);
+    let confirmations_policy = payout_confirmation_policy(confirmation_count)?;
     let summary = wallet
         .get_wallet_summary(confirmations_policy)
         .map_err(database_error)?
@@ -3714,10 +3729,105 @@ async fn create_signed_payout_transfer_in_open_wallet(
         DustOutputPolicy::default(),
     );
     let selector = GreedyInputSelector::new();
-    let spend_policy = SpendPolicy::shielded_pools([ShieldedPool::Ironwood]);
-    let lock_owner = LockOwner::new(random_lock_owner());
+    let lock_owner = payout_batch
+        .map(payout_lock_owner)
+        .unwrap_or_else(|| LockOwner::new(random_lock_owner()));
+    let mut prelocked_outputs = Vec::new();
+    let mut spend_policy = SpendPolicy::shielded_pools([ShieldedPool::Ironwood]);
+
+    // Slow-start coinbase rewards arrive as many small notes. Selecting them oldest-first can
+    // exceed the consensus transaction-size limit even when a smaller set of newer, larger notes
+    // covers the same payout. For an authenticated payout only, pre-lock the largest mature notes
+    // and tell the generic selector to consume that owner-scoped tier first. Ordinary wallet
+    // transfers retain the upstream privacy-oriented oldest-first policy.
+    if let Some(batch) = payout_batch {
+        let (target_height, _) = wallet
+            .get_target_and_anchor_heights(confirmations_policy.trusted())
+            .map_err(database_error)?
+            .ok_or(WalletServiceError::NotSynchronized)?;
+        let unlocked_policy = LockedInputPolicy::Exclude;
+        let mut notes = wallet
+            .select_spendable_notes(
+                account_id,
+                TargetValue::AllFunds(MaxSpendMode::MaxSpendable),
+                &[ShieldedPool::Ironwood],
+                target_height,
+                confirmations_policy,
+                &[],
+                LockFilter::Policy(&unlocked_policy),
+            )
+            .map_err(database_error)?
+            .take_ironwood();
+        notes.sort_by(|left, right| {
+            let left_value = left.note_value().map(|value| value.into_u64()).unwrap_or(0);
+            let right_value = right
+                .note_value()
+                .map(|value| value.into_u64())
+                .unwrap_or(0);
+            right_value.cmp(&left_value).then_with(|| {
+                right
+                    .note_commitment_tree_position()
+                    .cmp(&left.note_commitment_tree_position())
+            })
+        });
+
+        let payment_total = recipients.iter().try_fold(0u64, |total, recipient| {
+            total.checked_add(recipient.amount_zat).ok_or_else(|| {
+                WalletServiceError::InvalidRequest("payout amount overflow".to_owned())
+            })
+        })?;
+        let selection_target = payment_total
+            .checked_add(batch.max_fee_zat.max(PAYOUT_SELECTION_MIN_FEE_RESERVE_ZAT))
+            .ok_or_else(|| {
+                WalletServiceError::InvalidRequest("payout amount overflow".to_owned())
+            })?;
+        let mut selected_value = 0u64;
+        for note in notes.into_iter().take(MAX_PAYOUT_IRONWOOD_INPUTS) {
+            selected_value = selected_value
+                .checked_add(
+                    note.note_value()
+                        .map_err(|error| {
+                            WalletServiceError::Proposal(format!(
+                                "invalid Ironwood note value: {error}"
+                            ))
+                        })?
+                        .into_u64(),
+                )
+                .ok_or_else(|| {
+                    WalletServiceError::Proposal("Ironwood note value overflow".to_owned())
+                })?;
+            prelocked_outputs.push(OutputRef::new(
+                *note.txid(),
+                PoolType::IRONWOOD,
+                u32::from(note.output_index()),
+            ));
+            if selected_value >= selection_target {
+                break;
+            }
+        }
+        if selected_value < selection_target {
+            return Err(WalletServiceError::Proposal(format!(
+                "payout needs more than {MAX_PAYOUT_IRONWOOD_INPUTS} Ironwood inputs; compact the payout wallet before retrying"
+            )));
+        }
+
+        wallet
+            .lock_outputs(
+                &prelocked_outputs,
+                lock_owner,
+                target_height + lock_for_blocks,
+            )
+            .map_err(|error| {
+                WalletServiceError::Proposal(format!(
+                    "could not reserve compact payout inputs: {error}"
+                ))
+            })?;
+        spend_policy = spend_policy.with_locked_input_policy(LockedInputPolicy::PreferLocked(
+            NonEmptyBTreeSet::singleton(lock_owner),
+        ));
+    }
     let parameters = network.parameters();
-    let proposal =
+    let proposal_result =
         propose_transfer::<_, _, _, _, zcash_client_sqlite::wallet::commitment_tree::Error>(
             wallet,
             &parameters,
@@ -3729,8 +3839,41 @@ async fn create_signed_payout_transfer_in_open_wallet(
             &spend_policy,
             Some(LockRequest::new(lock_owner, lock_for_blocks)),
             Some(TxVersion::V6),
-        )
-        .map_err(|error| WalletServiceError::Proposal(format!("{error:?}")))?;
+        );
+    let proposal = match proposal_result {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            for output in &prelocked_outputs {
+                let _ = wallet.unlock_output(output, lock_owner);
+            }
+            return Err(WalletServiceError::Proposal(format!("{error:?}")));
+        }
+    };
+
+    if !prelocked_outputs.is_empty() {
+        let used_outputs = proposal
+            .steps()
+            .iter()
+            .flat_map(|step| step.shielded_inputs())
+            .flat_map(|inputs| inputs.notes())
+            .map(|note| {
+                OutputRef::new(
+                    *note.txid(),
+                    PoolType::Shielded(note.note().pool()),
+                    u32::from(note.output_index()),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        for output in prelocked_outputs
+            .iter()
+            .filter(|output| !used_outputs.contains(output))
+        {
+            if let Err(error) = wallet.unlock_output(output, lock_owner) {
+                let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
+                return Err(database_error(error));
+            }
+        }
+    }
 
     if proposal.steps().len() != 1
         || proposal.steps().first().transaction_request() != &expected_request
@@ -3756,6 +3899,20 @@ async fn create_signed_payout_transfer_in_open_wallet(
 
     let target_height = BlockHeight::from(proposal.min_target_height());
     let target_height_u32: u32 = target_height.into();
+    let expiry_height_u32 = match target_height_u32.checked_add(expiry_delta) {
+        Some(height) if height <= u32::from(Height::MAX_EXPIRY_HEIGHT) => height,
+        None => {
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::HeightOverflow);
+        }
+        Some(_) => {
+            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
+            return Err(WalletServiceError::InvalidRequest(format!(
+                "transaction expiry height must not exceed {}",
+                u32::from(Height::MAX_EXPIRY_HEIGHT)
+            )));
+        }
+    };
     let anchor_height = match proposal.steps().first().anchor_height() {
         Some(height) => height,
         None => {
@@ -3763,7 +3920,8 @@ async fn create_signed_payout_transfer_in_open_wallet(
             return Err(WalletServiceError::NonIronwoodProposal);
         }
     };
-    let current_heights = match wallet.get_target_and_anchor_heights(confirmation_count) {
+    let current_heights = match wallet.get_target_and_anchor_heights(confirmations_policy.trusted())
+    {
         Ok(Some(heights)) => heights,
         Ok(None) => {
             let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
@@ -3785,7 +3943,13 @@ async fn create_signed_payout_transfer_in_open_wallet(
             return Err(error);
         }
     };
-    if let Err(error) = revalidate_exact_chain_tip(client, expected_chain).await {
+    // Mining may extend the best chain while the deterministic proposal is
+    // being assembled. Accept that ordinary forward progress only when both
+    // the proposal tip and its anchor remain canonical and the transaction is
+    // still below expiry. The same check runs again after proof generation.
+    if let Err(error) =
+        revalidate_canonical_ancestors(client, expected_chain, expiry_height_u32).await
+    {
         let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
         return Err(error);
     }
@@ -3888,20 +4052,6 @@ async fn create_signed_payout_transfer_in_open_wallet(
         })
         .collect::<Vec<_>>();
 
-    let expiry_height_u32 = match target_height_u32.checked_add(expiry_delta) {
-        Some(height) if height <= u32::from(Height::MAX_EXPIRY_HEIGHT) => height,
-        None => {
-            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::HeightOverflow);
-        }
-        Some(_) => {
-            let _ = unlock_proposal_inputs(wallet, &proposal, lock_owner);
-            return Err(WalletServiceError::InvalidRequest(format!(
-                "transaction expiry height must not exceed {}",
-                u32::from(Height::MAX_EXPIRY_HEIGHT)
-            )));
-        }
-    };
     let prover = LocalTxProver::bundled();
     let fee_zat = proposal.steps().first().balance().fee_required().into_u64();
     if let Some(batch) = payout_batch {
@@ -4915,6 +5065,14 @@ fn random_lock_owner() -> [u8; 32] {
     }
 }
 
+fn payout_lock_owner(batch: &PreparedPayoutBatch) -> LockOwner {
+    let mut hasher = Sha256::new();
+    hasher.update(b"WcashPayoutInputLockV1");
+    hasher.update(batch.batch_id.as_bytes());
+    hasher.update(batch.request_commitment);
+    LockOwner::new(hasher.finalize().into())
+}
+
 fn persisted_transactions_require_review<'a>(
     txids: impl IntoIterator<Item = &'a zcash_protocol::TxId>,
     reason: impl Into<String>,
@@ -5168,6 +5326,22 @@ fn public_confirmation_policy() -> ConfirmationsPolicy {
             .expect("the consensus coinbase maturity is nonzero"),
         false,
     )
+}
+
+/// Pool payouts keep externally received mining rewards behind the consensus
+/// coinbase maturity floor while allowing wallet-owned shielded change to be
+/// reused after the ZIP 315 default of three confirmations.
+///
+/// `ConfirmationsPolicy` classifies internal change as trusted and coinbase
+/// rewards received at the collector's external address as untrusted. Keeping
+/// those thresholds separate prevents a short payout cadence from weakening
+/// the 100-block maturity rule for newly mined funds.
+fn payout_confirmation_policy(
+    untrusted: NonZeroU32,
+) -> Result<ConfirmationsPolicy, WalletServiceError> {
+    let trusted = NonZeroU32::new(3).expect("the trusted confirmation floor is nonzero");
+    ConfirmationsPolicy::new(trusted.min(untrusted), untrusted, false)
+        .map_err(|_| WalletServiceError::UnsafeConfirmations)
 }
 
 fn only_account(account_ids: &[AccountUuid]) -> Result<AccountUuid, WalletServiceError> {
@@ -5657,7 +5831,7 @@ mod tests {
     }
 
     #[test]
-    fn payout_request_validation_is_testnet_only_canonical_and_ironwood_only() {
+    fn payout_request_validation_is_canonical_and_ironwood_only() {
         let directory = tempfile::tempdir().unwrap();
         let wallet_path = directory.path().join("wallet.sqlite");
         let account = create_wallet_accounts(&wallet_path, WalletNetwork::Testnet, 1)
@@ -5669,7 +5843,7 @@ mod tests {
 
         #[cfg(not(feature = "regtest-payout"))]
         assert!(matches!(
-            require_payout_testnet(WalletNetwork::Regtest),
+            require_payout_network(WalletNetwork::Regtest),
             Err(WalletServiceError::PayoutNetworkUnsupported)
         ));
         let mut bad = request.clone();
@@ -5703,10 +5877,44 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn mainnet_payout_requires_mainnet_identity_and_addresses() {
+        require_payout_network(WalletNetwork::Mainnet).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("mainnet-wallet.sqlite");
+        let account = create_wallet_accounts(&wallet_path, WalletNetwork::Mainnet, 1)
+            .pop()
+            .unwrap();
+        let account_id = Uuid::parse_str(&account.account_id).unwrap();
+        let collector = test_collector_payout_commitment(&account);
+        let mut request = test_payout_request(&account);
+        request.identity =
+            expected_payout_identity(WalletNetwork::Mainnet, account_id, collector, true);
+
+        prepare_payout_request(&request, WalletNetwork::Mainnet, account_id, collector).unwrap();
+        assert!(
+            prepare_payout_request(&request, WalletNetwork::Testnet, account_id, collector)
+                .is_err()
+        );
+
+        let testnet_account = create_wallet_accounts(
+            &directory.path().join("testnet-wallet.sqlite"),
+            WalletNetwork::Testnet,
+            1,
+        )
+        .pop()
+        .unwrap();
+        request.outputs[0].canonical_address = testnet_account.address;
+        assert!(
+            prepare_payout_request(&request, WalletNetwork::Mainnet, account_id, collector)
+                .is_err()
+        );
+    }
+
     #[cfg(feature = "regtest-payout")]
     #[test]
     fn regtest_payout_requires_its_own_wallet_identity_and_addresses() {
-        require_payout_testnet(WalletNetwork::Regtest).unwrap();
+        require_payout_network(WalletNetwork::Regtest).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let wallet_path = directory.path().join("regtest-wallet.sqlite");
         let account = create_wallet_accounts(&wallet_path, WalletNetwork::Regtest, 1)
@@ -6042,6 +6250,15 @@ mod tests {
                 .get(),
             LOCAL_CONFIRMATIONS
         );
+    }
+
+    #[test]
+    fn payout_policy_reuses_only_wallet_owned_change_before_coinbase_maturity() {
+        let policy =
+            payout_confirmation_policy(NonZeroU32::new(COINBASE_SHIELDING_MATURITY).unwrap())
+                .unwrap();
+        assert_eq!(u32::from(policy.trusted()), 3);
+        assert_eq!(u32::from(policy.untrusted()), COINBASE_SHIELDING_MATURITY);
     }
 
     #[test]
