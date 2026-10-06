@@ -40,7 +40,7 @@ use crate::{
 // and job-tip RPCs at ASIC submission rates. New winners still receive their
 // immediate first attempt; the durable historical cursor advances at this
 // deliberately slower cadence.
-const WINNER_HISTORICAL_STEP_INTERVAL: Duration = Duration::from_secs(1);
+const WINNER_HISTORICAL_STEP_INTERVAL: Duration = Duration::from_millis(100);
 const WINNER_SUBMISSION_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CONSECUTIVE_FIRST_ATTEMPTS: u8 = 8;
 
@@ -283,6 +283,7 @@ impl PoolBackendLiveWinnerScheduler {
 pub struct PoolBackendWinnerAuditScheduler {
     journal_stream: Option<CanonicalUuid>,
     submission_after: Option<PoolBackendWinnerKey>,
+    submission_pass_complete: bool,
     unsettled_after: Option<PoolBackendWinnerKey>,
     matured_after: Option<PoolBackendWinnerKey>,
 }
@@ -303,18 +304,21 @@ impl PoolBackendWinnerAuditScheduler {
         }
         self.journal_stream = Some(journal_stream);
 
-        if let Some(snapshot) = actor.next_submission_required_winner_snapshot_before(
-            self.submission_after.as_ref(),
-            before_ordinal,
-        )? {
-            self.submission_after = Some(snapshot.key());
-            return Ok(PoolBackendWinnerWork {
-                snapshot: Some(snapshot),
-                completes_pass: false,
-                delay: WINNER_SUBMISSION_RETRY_INTERVAL,
-            });
+        if !self.submission_pass_complete {
+            if let Some(snapshot) = actor.next_submission_required_winner_snapshot_before(
+                self.submission_after.as_ref(),
+                before_ordinal,
+            )? {
+                self.submission_after = Some(snapshot.key());
+                return Ok(PoolBackendWinnerWork {
+                    snapshot: Some(snapshot),
+                    completes_pass: false,
+                    delay: WINNER_SUBMISSION_RETRY_INTERVAL,
+                });
+            }
+            self.submission_after = None;
+            self.submission_pass_complete = true;
         }
-        self.submission_after = None;
 
         let (snapshot, completes_pass, delay) = match actor
             .next_unsettled_winner_snapshot_before(self.unsettled_after.as_ref(), before_ordinal)?
@@ -325,6 +329,11 @@ impl PoolBackendWinnerAuditScheduler {
             }
             None => {
                 self.unsettled_after = None;
+                // A submission retry pass and an unsettled lifecycle pass form
+                // one fair audit round. Do not restart the submission pass for
+                // every unsettled winner: a small permanent retry backlog would
+                // otherwise multiply RPC load and delay reward maturity.
+                self.submission_pass_complete = false;
                 let snapshot = actor.next_matured_winner_snapshot_before(
                     self.matured_after.as_ref(),
                     before_ordinal,
@@ -2830,6 +2839,40 @@ mod tests {
         let next = expanded.next(&actor, 2).unwrap();
         assert_eq!(next.snapshot().unwrap().share_id(), &second);
         assert_eq!(next.delay(), WINNER_SUBMISSION_RETRY_INTERVAL);
+    }
+
+    #[test]
+    fn split_audit_lane_does_not_restart_submission_retries_for_each_unsettled_winner() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("split-audit-fair-round.jsonl");
+        let config = config();
+        let (journal, observed) = scheduler_journal(&path, &config, 3);
+        let pending = append_scheduler_pending(&journal, 4);
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+        let mut audit = PoolBackendWinnerAuditScheduler::default();
+
+        let first = audit.next(&actor, 4).unwrap();
+        assert_eq!(first.snapshot().unwrap().share_id(), &pending);
+        assert_eq!(first.delay(), WINNER_SUBMISSION_RETRY_INTERVAL);
+
+        for expected in observed.iter().take(3) {
+            let work = audit.next(&actor, 4).unwrap();
+            assert_eq!(work.snapshot().unwrap().share_id(), expected);
+            assert_eq!(work.delay(), WINNER_HISTORICAL_STEP_INTERVAL);
+        }
+
+        // The pending proof remains part of the general unsettled lifecycle
+        // scan, but the dedicated submission retry pass has not restarted.
+        let unsettled_pending = audit.next(&actor, 4).unwrap();
+        assert_eq!(unsettled_pending.snapshot().unwrap().share_id(), &pending);
+        assert_eq!(
+            unsettled_pending.delay(),
+            WINNER_HISTORICAL_STEP_INTERVAL
+        );
+        let end = audit.next(&actor, 4).unwrap();
+        assert!(end.completes_pass());
+        let restarted = audit.next(&actor, 4).unwrap();
+        assert_eq!(restarted.snapshot().unwrap().share_id(), &pending);
     }
 
     fn identity() -> WorkerIdentity {
