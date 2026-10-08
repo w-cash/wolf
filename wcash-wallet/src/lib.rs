@@ -15,8 +15,9 @@ mod sync;
 mod wallet;
 
 pub use address::{
-    decode_recipient, encode_orchard_receiver, encode_transparent_coinbase_receiver,
-    validate_wcash_address, ValidatedWcashAddress, WalletAddressError, WcashReceiverKind,
+    decode_payout_recipient, decode_recipient, encode_orchard_receiver,
+    encode_transparent_coinbase_receiver, validate_wcash_address, PayoutRecipient,
+    ValidatedWcashAddress, WalletAddressError, WcashReceiverKind,
 };
 pub use cache::{MemoryBlockCache, MemoryBlockCacheError};
 pub use identity::WalletDatabaseIdentityError;

@@ -143,6 +143,41 @@ pub fn decode_recipient(
     Ok(address)
 }
 
+/// A payout receiver decoded by the authoritative Wcash parser.
+#[derive(Clone, Debug)]
+pub enum PayoutRecipient {
+    /// Private payment through the Ironwood pool.
+    Ironwood(Box<UnifiedAddress>),
+    /// Public pay-to-public-key-hash payment.
+    TransparentP2pkh(TransparentAddress),
+}
+
+/// Decodes a canonical Ironwood or P2PKH destination for the exact network.
+pub fn decode_payout_recipient(
+    encoded: &str,
+    network: WalletNetwork,
+) -> Result<PayoutRecipient, WalletAddressError> {
+    let address = WcashAddress::try_from_encoded(encoded)?;
+    if address.network() != network.address_network() {
+        return Err(WalletAddressError::WrongNetwork);
+    }
+    if address.encode() != encoded {
+        return Err(WalletAddressError::InvalidUnified(
+            "noncanonical payout address",
+        ));
+    }
+    match address.kind() {
+        WcashAddressKind::Unified(_) => decode_recipient(encoded, network)
+            .map(|address| PayoutRecipient::Ironwood(Box::new(address))),
+        WcashAddressKind::P2pkh(bytes) => Ok(PayoutRecipient::TransparentP2pkh(
+            TransparentAddress::PublicKeyHash(*bytes),
+        )),
+        _ => Err(WalletAddressError::InvalidUnified(
+            "payout requires Ironwood or P2PKH",
+        )),
+    }
+}
+
 /// Parses and canonically classifies one Wcash address for `network`.
 ///
 /// Zcash addresses and Wcash addresses from another network are rejected. This
@@ -284,6 +319,42 @@ mod tests {
             validate_wcash_address(&zcash.encode(&network.parameters()), network),
             Err(WalletAddressError::Parse(WcashAddressParseError::NotWcash))
         ));
+    }
+
+    #[test]
+    fn payout_p2pkh_parsing_is_canonical_and_network_exact() {
+        let networks = [
+            WalletNetwork::Mainnet,
+            WalletNetwork::Testnet,
+            WalletNetwork::Regtest,
+        ];
+        for network in networks {
+            let address =
+                WcashAddress::from_transparent_p2pkh(network.address_network(), [7; 20]).encode();
+            assert!(matches!(
+                decode_payout_recipient(&address, network),
+                Ok(PayoutRecipient::TransparentP2pkh(
+                    TransparentAddress::PublicKeyHash(_)
+                ))
+            ));
+            for other in networks {
+                if other != network {
+                    assert!(decode_payout_recipient(&address, other).is_err());
+                }
+            }
+            for unsupported in [
+                WcashAddress::from_transparent_p2sh(network.address_network(), [7; 20]).encode(),
+                WcashAddress::from_tex(network.address_network(), [7; 20]).encode(),
+                format!(" {address}"),
+                format!("{address}\n"),
+                zcash_keys::encoding::encode_transparent_address_p(
+                    &network.parameters(),
+                    &TransparentAddress::PublicKeyHash([7; 20]),
+                ),
+            ] {
+                assert!(decode_payout_recipient(&unsupported, network).is_err());
+            }
+        }
     }
 
     #[test]
