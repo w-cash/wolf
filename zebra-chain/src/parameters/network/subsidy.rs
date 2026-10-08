@@ -30,7 +30,7 @@ use constants::{
     POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
 };
 
-/// Wcash starts at 6.25 whole units per mined block: WEC on Mainnet and TWC on testing networks.
+/// Full initial testing-network subsidy, in zatoshi.
 pub(crate) const WCASH_INITIAL_BLOCK_SUBSIDY: u64 = 625_000_000;
 
 /// Wcash Testnet reaches its full initial subsidy at this height.
@@ -42,10 +42,11 @@ pub(crate) const WCASH_TESTNET_SLOW_START_INTERVAL: Height = Height(40_000);
 /// The Wcash Testnet halving schedule is delayed by half its slow-start interval.
 pub(crate) const WCASH_TESTNET_SLOW_START_SHIFT: Height = Height(20_000);
 
-/// Wcash halves every 1,680,000 blocks, approximately four years at 75 seconds per block.
+/// Wcash testing networks halve every 1,680,000 blocks, approximately four
+/// years at 75 seconds per block.
 ///
-/// Together with the 6.25-unit initial subsidy, this interval keeps total
-/// scheduled issuance below the 21 million WEC Mainnet monetary-base hard cap.
+/// Mainnet uses a separate smooth-decay schedule with a permanent tail; it has
+/// no halvings and no fixed economic supply cap.
 pub(crate) const WCASH_HALVING_INTERVAL: HeightDiff = 1_680_000;
 
 /// The first Wcash Regtest block paid at half the initial subsidy.

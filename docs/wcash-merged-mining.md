@@ -300,15 +300,15 @@ Rotating more than 16 accepted child candidates also covers release of confirmed
 winners beyond the coordinator's bounded active-candidate cache. Transparent
 maturity is not overridden.
 
-No public Wcash Testnet or community pool is deployed. A community-facing pool
-still needs project-operated seeds, an independently reviewed consensus
-specification, multi-node soak and reorg tests, vendor ASIC interoperability,
-and an operated TLS/variable-difficulty edge with durable accounting, payouts,
-and reorg-safe shielded settlement. The wallet provides an isolated,
-Testnet-only, crash-idempotent batch signing and exact-byte broadcast boundary,
-but it requires one exclusive writer per database and is not that operated pool
-ledger. After an ambiguous post-sign outcome, operators must recover the exact
-batch and rebroadcast the same bytes rather than create a replacement. Wcash
-mainnet remains disabled.
-Do not call this engineering profile production-ready or use it with funds of
-real value.
+Mainnet, Testnet and Regtest profiles are implemented; see the
+[network reference](wcash-consensus.md). These local scenarios do not establish
+the status of a public deployment. A community-facing pool needs separate
+evidence for seeds, consensus review, multi-node soak and reorg behavior, ASIC
+interoperability, and its TLS/variable-difficulty edge, accounting and settlement.
+
+The wallet's supported networks, crash-idempotent batch signing and exact-byte
+broadcast boundary are described in the [wallet guide](wcash-wallet-payout.md).
+It requires one exclusive writer per database and is not the operated pool
+ledger. After an ambiguous post-sign outcome, recover the exact batch and
+rebroadcast the same bytes rather than create a replacement. Do not promote
+experimental components based only on these local results.

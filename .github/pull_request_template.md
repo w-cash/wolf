@@ -43,7 +43,7 @@
 ### PR Checklist
 
 - [ ] The PR title follows [conventional commits](https://www.conventionalcommits.org/) format: `type(scope): description`
-- [ ] The PR follows the [contribution guidelines](https://github.com/ZcashFoundation/zebra/blob/main/CONTRIBUTING.md).
-- [ ] This change was discussed in an issue or with the team beforehand.
+- [ ] The PR follows the [Wcash contribution guidelines](https://github.com/w-cash/wolf/blob/main/CONTRIBUTING.md).
+- [ ] Scope was acknowledged by a Wcash maintainer, or this is a direct maintainer request.
 - [ ] The solution is tested.
 - [ ] The documentation and changelogs are up to date.

@@ -329,10 +329,11 @@ The E2E proves only those deterministic local, single-writer wallet lifecycles.
 It does not prove general or production wallet interoperability,
 vendor-by-vendor ASIC interoperability, public variable-difficulty behavior,
 payout correctness, Internet-facing security, public-network or long-running
-reorg behavior, or independent consensus-review results. No public Wcash
-Testnet, public pool, payout, or settlement service is deployed. No physical
-ASIC model or firmware is certified, and Wcash mainnet remains disabled. Those
-remain community-pool and network release gates.
+reorg behavior, or independent consensus-review results. Mainnet is implemented;
+see the [network reference](wcash-consensus.md) and
+[node guide](wcash-node.md). These local tests do not establish the deployment,
+availability or readiness of any public node, pool, payout service or physical
+ASIC. Operators need separate evidence for those claims.
 
 Wcash payment namespaces are disjoint from Zcash: Unified `wu...`, transparent
 `W...`, and transparent-source-only TEX `wtex...`, with separate testnet and

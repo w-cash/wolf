@@ -1,15 +1,16 @@
 //! # Wcash node
 //!
 //! Wcash is a privacy-focused proof-of-work cryptocurrency node written in Rust
-//! and based on the Zebra codebase. Its mined coinbase value is created in the
-//! Ironwood shielded pool, and its child blocks are authorized by Zcash-parent
-//! Equihash AuxPoW.
+//! and based on the Zebra codebase. A mined coinbase uses one explicit payout
+//! mode: a transparent Wcash address or a private Ironwood recipient. Child
+//! blocks are authorized by Zcash-parent Equihash AuxPoW.
 //!
-//! This source tree enables a public engineering `WcashTestnet` and an isolated
-//! `WcashRegtest`. Testnet has a frozen identity and genesis for AuxPoW and pool
-//! interoperability. Post-genesis transactions are V6-only and use an exact
-//! Wcash-specific signature domain; inherited Zcash domains are rejected.
-//! Mainnet remains disabled.
+//! This source tree implements `WcashMainnet`, `WcashTestnet`, and isolated
+//! `WcashRegtest` profiles. Each has a frozen identity and genesis for AuxPoW
+//! and pool interoperability. Post-genesis transactions are V6-only and use an
+//! exact network-specific Wcash signature domain; inherited Zcash domains are
+//! rejected. Source support does not by itself certify a deployed service or
+//! release as independently reviewed or production-ready.
 //!
 //! Wcash retains Zebra's modular crates and much of its Zcash validation code.
 //! The upstream architecture and crate names are preserved where changing them

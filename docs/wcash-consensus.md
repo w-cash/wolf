@@ -1,175 +1,197 @@
 # Wcash consensus snapshot
 
-This document describes the rules currently implemented on the built-in Wcash
-Testnet and regtest networks. It is an implementation snapshot for review, not
-a claim that mainnet or community-pool infrastructure is production ready.
+This document describes the built-in Wcash Mainnet, Testnet and Regtest rules
+implemented in this source tree. Mainnet has a frozen genesis and an enabled
+consensus profile. A source snapshot does not establish which binary a public
+service runs, whether an endpoint is healthy, or whether a release has completed
+independent security review. Verify those separately before operating a node,
+wallet or pool.
 
-`WEC` denotes the future mainnet currency. Testnet and regtest balances use the
-valueless display ticker `TWC` (Test Wcash). The ticker is not serialized by
-consensus: amounts remain integer zatoshi, and the frozen testing genesis
-statement remains unchanged; a new testnet target produces a new genesis hash.
+Mainnet uses `WEC`; Testnet and Regtest use the valueless display ticker `TWC`
+(Test Wcash). One unit is exactly 100,000,000 zatoshi on every network. Consensus
+uses integer amounts, not floating-point coin values. Tickers are presentation
+metadata and do not change a frozen genesis.
 
-## Activation status
+## Network identity and activation
 
-`Network::new_wcash_testnet()` and `Network::new_wcash_regtest()` activate Wcash
-consensus. Each has a distinct genesis block, P2P magic, default P2P/RPC ports,
-and peer-cache domain. Both activate NU6.3 at height 1 and use the Ironwood
-transaction format for every mined block.
+`Network::try_new_wcash_mainnet()`, `Network::new_wcash_testnet()` and
+`Network::new_wcash_regtest()` select distinct genesis blocks, transaction
+domains, P2P identities and state/cache namespaces. All three activate NU6.3 /
+Ironwood at height 1. The inherited genesis transaction is a special height-zero
+case with one zero-valued transparent output and no spendable supply.
 
-The built-in Testnet profile freezes Zcash Testnet block 4,362,016, hash
+| Property | Mainnet | Testnet | Regtest |
+| --- | --- | --- | --- |
+| Node configuration name | `WcashMainnet` | `WcashTestnet` | `WcashRegtest` |
+| P2P identity | `Wcash/mainnet/v1` | `Wcash/testnet/v7` | `Wcash/regtest/v5` |
+| P2P magic, byte order as sent | `c1e0dc1b` | `49d2934b` | `4c237261` |
+| Default P2P port | 48233 | 38233 | 28233 |
+| Recommended loopback RPC port | 48232 | 38232 | 28232 |
+| State/cache network namespace | `wcashmainnet-v1` | `wcashtestnet-v7` | `wcashregtest-v5` |
+| Transaction branch ID | `d9c6a7ee` | `54ba2bfb` | `c3a6678a` |
+
+RPC is disabled until configured; the recommended ports do not open listeners.
+Wcash profiles do not inherit Zcash DNS seeds. Verify the network identity of
+every peer, wallet service and mining backend selected for a network.
+
+Mainnet freezes Zcash Mainnet block 3,488,810, hash
+`0000000000463e4317bf50101ab176fe592298888a432f71d71f2fad04755e49`.
+Its Wcash genesis timestamp is 2026-09-19 12:00:00 UTC (`1789819200`), and its
+display-order genesis hash is
+`5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48`.
+
+Testnet freezes Zcash Testnet block 4,362,016, hash
 `00000e289ad21d2feeb17e16585790ecabec94323c2ef22925534ad104de73ac`.
-Its Wcash genesis time is 2026-09-17 23:00:00 UTC and its complete genesis ID is
+Its Wcash genesis timestamp is 2026-09-17 23:00:00 UTC (`1789686000`), and its
+display-order genesis hash is
 `6b66fff119977d36d9c989093b516a876dbf6596536791ff35bb4c581e3fda98`.
-Its `Wcash/testnet/v7` P2P magic is `49d2934b`; its default P2P and recommended
-loopback RPC ports remain 38233 and 38232. It never inherits Zcash DNS seeds.
+The transaction domain is named Testnet v3 while its P2P/cache identity is v7;
+these are separate version identifiers. Match the full identity, not a version
+suffix or service hostname alone.
 
-The designated mainnet reference is Bitcoin height 965,954, but that anchor is
-intentionally not frozen and mainnet fails closed. Local regtest anchors its
-deterministic genesis statement to Bitcoin mainnet block 965,910, hash
+Regtest freezes Bitcoin Mainnet block 965,910, hash
 `00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146`.
-
-The frozen local-regtest genesis block ID is
+Its display-order Wcash genesis hash is
 `70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c`.
-Its `Wcash/regtest/v5` P2P magic is `4c237261`.
-
-The Testnet source freezes the exact Bitcoin header and hash, verifies its proof
-of work, records sufficient confirmations, and reproduces the complete genesis
-bytes in reviewed test vectors. Runtime network access never selects or replaces
-a consensus anchor.
-
-At audit tip 966,011, Blockstream and mempool.space agreed on the exact header,
-hash, height, and best-chain status; Blockchain.com independently agreed on the
-decoded timestamp, compact target, and nonce. Local SHA256d and `nBits` checks
-reproduced the hash and verified its work. The audit tip is frozen provenance,
-not a consensus or runtime input.
+The exact Bitcoin header is retained as a local test vector. Public Mainnet and
+Testnet instead use their separately frozen Zcash anchors. Consensus never
+fetches an external chain to choose or replace an anchor at runtime; anchor
+overrides are restricted to Regtest.
 
 ### Transaction version and replay domain
 
-Wcash Testnet v3 uses consensus branch ID `0x54ba2bfb`; retired Testnet v1 used
-`0xb3cfd27e`, and isolated Wcash Regtest uses the separate ID `0xc3a6678a`.
-The active testing domains select NU6.3 / Ironwood semantics, while standard
-Zcash NU6.3 keeps `0x37a5165b`. The selected Wcash ID is carried in every
-post-genesis version-6 transaction and is used by transaction IDs,
-signature hashes, shielded authorization, parsing, block checks, and
-chain-history commitments. Validators compare the exact network-specific ID
-rather than treating the shared NU6.3 feature set as sufficient.
+Every post-genesis Wcash transaction must use version 6 and its selected
+network's branch ID. That ID participates in transaction IDs, signature hashes,
+shielded authorization, parsing, block checks and chain-history commitments.
+Validators compare the exact domain rather than treating shared NU6.3 features
+as sufficient.
 
-Wcash rejects every post-genesis V1-V5 transaction. In particular, V4 has no
-embedded branch ID and V5 belongs to an inherited Zcash domain, so neither is a
-valid compatibility path. Testnet-domain and regtest-domain Wcash transactions
-reject each other. Wcash-domain V6 transactions are rejected on Zcash Mainnet
-and Testnet, and Zcash-domain V6 transactions are rejected on Wcash. Both the
-block and mempool verifier paths enforce the same checks.
-
-This makes value-transfer testing possible without relying on P2P
-magic or address prefixes for replay protection. A controlled local Regtest E2E
-has mined three private coinbases, scanned them into the experimental wallet,
-signed and broadcast a one-TWC Wcash-domain transfer, observed its exact bytes
-and fee in the mempool and block template, mined it through AuxPoW, and rescanned
-the recipient and private change. A second isolated Regtest lifecycle mined 101
-transparent coinbases, rejected shielding before maturity, made the height-1
-reward spendable only for the height-101 transaction, and mined that exact
-shielding transaction through AuxPoW. Only the private-transfer phase uses the
-explicit Regtest-only one-confirmation override; transparent coinbase maturity
-remains 100 blocks. The public Testnet wallet policy remains 100 confirmations.
-Testnet coins remain test-only, and these local results are not a public-network
-or production-wallet claim.
+Wcash rejects post-genesis V1–V5 transactions and inherited Zcash domains.
+Mainnet, Testnet and Regtest reject each other's transaction domains; Wcash V6
+transactions are also rejected by the standard Zcash verifier. Standard Zcash
+NU6.3 uses `37a5165b`, while retired Wcash Testnet v1 used `b3cfd27e`. P2P magic
+and address prefixes are additional network separation, not substitutes for
+transaction-domain checks. Both block and mempool verification enforce these
+rules.
 
 ## Monetary policy
 
-Wcash uses Zcash's monetary precision without modification: one WEC on mainnet,
-or one TWC on Testnet and regtest, is exactly 100,000,000 zatoshi. The smallest
-consensus amount is therefore 0.00000001 WEC or TWC. Amounts are encoded and
-validated as integer zatoshi; consensus never uses floating-point coin values.
+### Mainnet: slow start, smooth decay and permanent tail
 
-Genesis at height 0 has no subsidy. Heights 1 through 1,680,000 inclusive each
-create 6.25 TWC on the testing networks; the future mainnet amount is 6.25 WEC.
-The first halved block is height 1,680,001, and every later era contains exactly
-1,680,000 blocks. At the 75-second target, each era is approximately four
-years. Subsidies are integer zatoshi values and each era uses a right shift, so
-fractional zatoshi are discarded.
-
-The inherited genesis transaction contains one zero-valued transparent output.
-It creates no spendable coins, and the chain supply at height 0 is exactly zero.
-
-The last non-zero subsidy is 1 zatoshi at height 50,400,000. Subsidy is zero
-from height 50,400,001 onward. Summing every era gives exactly:
+Mainnet has no halvings and no fixed economic maximum supply. The normative
+integer recurrence is in
+[`wcash_mainnet.rs`](../zebra-chain/src/parameters/network/subsidy/wcash_mainnet.rs).
+All values below are atomic zatoshi unless stated otherwise:
 
 ```text
-2,099,999,981,520,000 zatoshi
-= 20,999,999.81520000 WEC or TWC, according to network
+M = 1,844,674,407,370,955
+RAMP_PEAK = 2,199,023,255
+TAIL = 37,500,000
+
+height 0..40,000:
+  subsidy = floor(RAMP_PEAK * height / 40,000)
+  curve counter = 0
+
+height >40,000:
+  subsidy = max(floor(5 * (M - parent curve counter) / 4,194,304), TAIL)
+  next curve counter = min(M, parent curve counter + subsidy)
 ```
 
-Wcash enforces a 21,000,000-WEC mainnet monetary-base hard cap and the same
-2,100,000,000,000,000-zatoshi ceiling on testing networks, where it is displayed
-as 21,000,000 TWC. Integer-zatoshi halving truncation makes exact scheduled
-subsidy issuance 0.18480000 WEC or TWC lower than the ceiling. Transaction fees
-are transfers of existing value and do not increase supply.
+Genesis therefore has zero subsidy. Height 40,000 reaches 21.99023255 WEC;
+height 40,001 pays the same amount before the smooth decline. Ramp issuance is
+real supply but is excluded from the curve counter. `M` is an emission parameter,
+not a supply cap. The first canonical tail block is height 3,455,360; its reward
+and every later reward is 0.375 WEC. Fees transfer existing value and never
+advance the curve counter. Each coinbase must claim exactly subsidy plus fees.
 
-Wcash has no slow start, founders reward, funding stream, deferred pool,
-lockbox disbursement, premine, or developer tax. The complete subsidy plus fees
-belongs to the miner coinbase and is subject to the coinbase payout-mode rules below.
+### Testing networks: separate halving schedules
 
-## Block timing and difficulty
+Testnet and Regtest retain testing schedules which must not be used to describe
+Mainnet. Their implementation is in
+[`subsidy.rs`](../zebra-chain/src/parameters/network/subsidy.rs).
 
-The target spacing is 75 seconds. Regtest deliberately uses its fixed
-proof-of-work limit. The built-in Testnet profile starts at compact target
-`0x1e2fabe8` (expanded target `00002fabe80000…`). This bootstrap target is
-exactly 50 times the target encoded by the observed Zcash Testnet compact target
-`0x1e00f414`, deliberately exercising Wcash-only AuxPoW winners. Testnet uses
-the inherited damped 17-block retarget from launch. A
-candidate strictly more than 450 seconds after its predecessor may use the
-same Testnet proof-of-work limit; exactly 450 seconds does not trigger the rule.
-The limit is a test-only asymmetry profile and is not a proposed mainnet launch
-target.
-The maximum block-time rule is enforced from height 1, and template construction
-evaluates both rules using the candidate height, including the height-1 boundary.
-These public-testnet boundary conditions have frozen unit tests, but long-running
-multi-node difficulty and timestamp behavior still requires adversarial soak
-testing before a mainnet design is selected.
+| Rule | Testnet | Regtest |
+| --- | --- | --- |
+| Genesis subsidy | 0 | 0 |
+| Slow start | `floor(625,000,000 * height / 40,000)` zatoshi through height 40,000 | None |
+| Full initial subsidy | 6.25 TWC | 6.25 TWC from height 1 |
+| First halved block | 1,700,000 | 1,680,001 |
+| Later halving interval | 1,680,000 blocks | 1,680,000 blocks |
 
-The compact difficulty field in the Wcash header is authoritative for Wcash.
-The Zcash parent header's `nBits` is retained only as diagnostic data and cannot
-allow a miner to choose an easier Wcash target.
+After Testnet's ramp, the subsidy is `625,000,000 >> k`, where
+`k = floor(max(height - 20,000, 0) / 1,680,000)`. Regtest uses
+`k = floor(max(height - 1, 0) / 1,680,000)` for non-genesis blocks. Right shifts
+discard fractional zatoshi. Neither testing schedule has Mainnet's permanent
+tail.
+
+### Value bounds and allocation
+
+The `wcash-consensus` build uses `i64::MAX / 2` as the finite technical aggregate
+amount bound, leaving checked-arithmetic headroom for the permanent tail. This
+is distinct from economic supply policy. Some inherited transaction-library
+value types retain a separate 21-million-unit bound, and Wcash explicitly uses
+that smaller bound for total coinbase input. It is not a general cap on every
+balanced non-coinbase transaction under the Wcash aggregate bound. The
+non-Wcash build retains Zcash's aggregate 21-million-unit limit. See
+[`amount.rs`](../zebra-chain/src/amount.rs); changing a transaction bound to match
+a website's supply label would change a different rule.
+
+Wcash profiles clear founders rewards, funding streams and lockbox
+disbursements. The complete subsidy plus fees belongs to the miner coinbase,
+subject to the payout-mode rules below. This allocation rule does not establish
+who mined the initial supply or the fairness of an operational launch.
+
+## Block timing, difficulty and AuxPoW
+
+The target spacing is 75 seconds. Mainnet and Testnet start at compact
+proof-of-work limit `0x1e2fabe8` and use the inherited damped 17-block retarget.
+The launch ceiling is 50 times the target encoded by the reference Zcash
+Testnet compact target `0x1e00f414`. Regtest uses its fixed proof-of-work limit.
+
+Only Testnet permits a proof-of-work-limit block when the candidate timestamp
+is strictly more than 450 seconds after its predecessor; exactly 450 seconds
+does not trigger that exception. Mainnet has no such minimum-difficulty
+exception. Maximum block-time enforcement applies from height 1 on Testnet and
+throughout Mainnet. Template construction uses the candidate height, including
+the height-1 boundary.
+
+Wcash validates Equihash `(200, 9)` AuxPoW against its own child target. The
+Wcash header's compact difficulty is authoritative for Wcash; a parent header's
+`nBits` cannot select an easier child target. A proof meeting Wcash's target
+need not meet Zcash's target or appear in Zcash's chain. The coordinator checks
+parent-target qualification and submits to each chain independently. See
+[`wcash-merged-mining.md`](wcash-merged-mining.md).
 
 ## Coinbase payout modes
 
-For every height above genesis, a Wcash coinbase can use either of two explicit
-payout modes:
+For every height above genesis, a Wcash coinbase can pay either an explicit
+transparent Wcash address or a Wcash Unified Address with an Orchard receiver
+for private Ironwood note encryption. The template builder never invents a
+runtime payout address. It rejects inherited Zcash and wrong-network addresses;
+standalone Sapling and TEX addresses are not coinbase destinations. Transparent
+and Ironwood miner payouts cannot be mixed in one coinbase.
 
-- a transparent Wcash address, which is the recommended default for existing
-  pool integration; or
-- a Wcash Unified Address containing an Orchard receiver, which routes the
-  reward into Ironwood with private note encryption.
+Transparent and Ironwood are the active value pools. Consensus rejects Sprout,
+Sapling and legacy Orchard components in Wcash transactions. The Orchard
+receiver payload in a Unified Address is used to address Ironwood; this does
+not activate the legacy Orchard value pool.
 
-The template builder selects the mode from the address supplied by the pool.
-It never inserts a hard-coded runtime payout address, and it rejects inherited
-Zcash addresses and wrong-network Wcash addresses. Standalone Sapling and TEX
-destinations are not coinbase payout modes. Consensus rejects Sprout, Sapling,
-and legacy Orchard components in every Wcash transaction; transparent and
-Ironwood components remain active. Transparent and Ironwood miner payouts
-cannot be mixed in one Wcash coinbase.
+Transparent coinbases mature after 100 blocks. A transaction spending them must
+not create transparent outputs, so a pool must shield such value before later
+transparent settlement. Optional Ironwood coinbase encryption uses no outgoing
+viewing key, and consensus rejects outputs recoverable with Zcash's conventional
+all-zero outgoing viewing key. Gross subsidy, fees and shielded value balances
+remain auditable; parent-pool metadata can create off-chain correlation.
 
-Transparent coinbase outputs retain Zcash's public-network spend policy: they
-mature after 100 blocks, and a transaction spending them must not create any
-transparent outputs. A pool therefore shields matured coinbase value before
-ordinary settlement. The included experimental wallet exposes a seed-derived
-transparent P2PKH coinbase address and can build a bounded, one-shot transaction
-that shields only mature, fully classified coinbase outputs into the same
-wallet's Ironwood receiver. It is not an automatic pool-shielding, payout, or
-settlement service.
+The native coordinator can verify an exact private recipient by trial-decrypting
+every Ironwood action with a configured read-only incoming viewing key. That
+capability cannot spend funds but is privacy-sensitive and belongs in a
+protected file. This check does not remove the need to protect the node, RPC
+credentials, configured payout address and pool signer.
 
-For the optional Ironwood mode, the builder passes no outgoing viewing key to
-note encryption and consensus rejects outputs recoverable with Zcash's
-conventional all-zero outgoing viewing key. This hides the reward recipient and
-note plaintext. A transparent reward is intentionally public. Neither mode
-hides the deterministic gross subsidy or transaction fees, and parent-pool
-metadata can create additional off-chain correlation.
+## Payment-address domains and wallet support
 
-## Payment-address domains
-
-Wcash reuses Zcash receiver payload formats, but not Zcash payment-address
-strings. Its deliberately separate, compact textual namespaces are:
+Wcash reuses receiver payload formats with separate textual namespaces:
 
 | Receiver | Mainnet | Testnet | Regtest |
 | --- | --- | --- | --- |
@@ -178,80 +200,69 @@ strings. Its deliberately separate, compact textual namespaces are:
 | Transparent P2PKH | `W1...` | `WT...` | `WR...` |
 | Transparent P2SH | `W3...` | `WU...` | `WS...` |
 
-The Testnet and regtest forms are active; the mainnet forms remain reserved.
-The former `ws...`, `wtestsapling...`, and `wregtestsapling...` namespaces are
-also reserved, but are deliberately rejected because Wcash does not activate
-Sapling. TEX is an encoding of a transparent P2PKH receiver, not another value
-pool.
-Unified Addresses include the Wcash human-readable part inside both the ZIP 316
-jumbling construction and the Bech32m checksum. Replacing the visible prefix of
-a Zcash address does not produce a valid Wcash address.
+All three networks have implemented address codecs. Former Sapling namespaces
+remain reserved and rejected. TEX encodes a transparent P2PKH receiver, not a
+separate value pool. Unified Addresses bind their Wcash human-readable part into
+both ZIP 316 jumbling and the Bech32m checksum; changing a Zcash string's visible
+prefix does not produce a valid Wcash address. Parse an address with the
+network-specific codec rather than classifying it by a prefix alone.
 
-Wcash RPC and mining interfaces require the Wcash namespace when Wcash
-consensus is active. A transparent Wcash address selects the normal public
-coinbase path. A Wcash Unified Address with an Orchard receiver explicitly
-selects a private Ironwood reward. Standalone Sapling, TEX, and inherited Zcash
-addresses are not valid Wcash coinbase destinations.
+The repository's `wcash-wallet` explicitly selects Mainnet, Testnet or Regtest.
+It derives addresses, synchronizes and inspects wallet state, shields mature
+transparent coinbases, signs Wcash V6 transactions and broadcasts persisted
+bytes. Its protocol-v2 payout signer supports Mainnet and Testnet; Regtest payout
+commands require the `regtest-payout` feature.
 
-The node implements payment-address parsing and encoding. The workspace also
-contains an experimental one-shot wallet for controlled Testnet and regtest
-operations. Its `derive-address` command reports both the private Unified
-Address and the related transparent P2PKH coinbase address. After synchronization
-has classified a coinbase and enforced its 100-block maturity, `shield-coinbase`
-can build and persist one Wcash-domain V6 transaction that sends the selected
-transparent inputs into the wallet's Ironwood receiver. The wallet also signs
-Ironwood transfers and broadcasts exact signed bytes. `list-pending` returns
-bounded, paginated recovery records containing the persisted transaction ID and
-exact signed bytes. After any ambiguous post-sign outcome, an operator must
-enumerate those pages, inspect transaction status, and rebroadcast the same bytes
-rather than construct a replacement. The wallet is restricted operationally to
-one exclusive writer per database. Its Testnet-only protocol-v2 payout boundary
-atomically binds one ordered batch request to exact signed bytes and makes exact
-retry idempotent. It deliberately does not implement automatic shielding, pool
-accounting, allocation eligibility, or reorg-safe settlement; see
-[`wcash-wallet-payout.md`](wcash-wallet-payout.md).
+The payout signer supports Ironwood-funded transfers to shielded Ironwood
+receivers and optional transparent P2PKH receivers (`W1...` on Mainnet).
+Transparent payouts expose recipient and amount and require an empty memo.
+P2SH/W3, TEX, inherited Zcash and wrong-network destinations are rejected by
+that payout interface even though some are recognized by other address codecs.
+Inputs and internal change remain Ironwood. This is a wallet capability change,
+not a change to coinbase maturity or the mandatory-shielding rule.
 
-The controlled-key private-transfer and transparent-coinbase shielding gates
-have passed in isolated Regtest. The transparent phase recovered all current
-UTXOs from a wallet initialized with a deliberately late birthday, exercised the
-100-block maturity boundary across 101 AuxPoW-mined blocks, and conserved exactly
-631.25 TWC across the transparent and Ironwood pools after shielding one
-coinbase. These deterministic local results do not establish general wallet
-interoperability, public Testnet operation, public reorg safety, or production
-payout safety. Key control must never be inferred from a syntactically valid
-payment address.
+Keep one exclusive writer per wallet database. The versioned signer atomically
+binds each ordered batch to its exact signed bytes. After an ambiguous outcome,
+recover and inspect the stored operation and transaction status; retry the same
+bytes instead of creating an unverified replacement. Generic pending operations
+are available through bounded, paginated `list-pending` records. The signer does
+not replace the pool's accounting, allocation eligibility or reorg-safe
+settlement. See [`wcash-wallet-payout.md`](wcash-wallet-payout.md).
 
-## Supply auditability
+## Validation and operational evidence
 
-Validators independently check the subsidy for the height, sum transaction
-fees, validate the selected payout mode, and require the post-NU6 coinbase
-output value to equal its input value exactly. Transparent outputs and
-Ironwood's value balance are both public transaction data. An auditor can
-reproduce cumulative scheduled issuance and pool balance changes without
-decrypting private reward notes.
+Source tests cover frozen identities, exact transaction domains, subsidy
+boundaries, AuxPoW and coinbase checks. The local
+[`wcash-testnet-e2e.sh`](../scripts/wcash-testnet-e2e.sh) exercises the built-in
+Testnet bootstrap and isolated Regtest private-transfer and transparent-coinbase
+shielding paths. Its Regtest assertions include 100-block coinbase maturity and
+631.25 TWC conserved across 101 blocks. Those are testing-network assertions and
+must not be substituted for Mainnet emission or current release evidence.
 
-## Inherited code and review boundary
+For a release, retain results tied to its exact revision, features and artifact
+digests. Verify public deployment, peers, synchronization, ASIC compatibility,
+multi-node/reorg behavior, backup recovery, payout accounting and independent
+review separately. The existence of source tests, a frozen identity or a
+running endpoint does not certify these properties. Report suspected
+vulnerabilities through [`SECURITY.md`](../SECURITY.md).
 
-Wcash currently reuses substantial Zebra and librustzcash consensus code,
-including NU6.3 transaction parsing and Ironwood proofs. Reuse does not make the
-fork automatically safe. Changes to block identity, AuxPoW validation,
-difficulty, monetary limits, coinbase encryption, network identity, and wallet
-interoperability require independent review and stable public test vectors.
+The `wcash-consensus` runtime accepts only Wcash network configurations. A
+separately built non-Wcash profile is used for standard Zcash nodes, including
+the parent validators in local tests. Wcash header wire version `0xd7430001`
+distinguishes its variable-length witness before a `Network` is available;
+its set high bit is forbidden in valid native Zcash headers.
 
-Header deserialization must select the variable-length Wcash witness before a
-`Network` value is available, so this fork reserves wire version `0xd7430001`.
-Its high bit is deliberately set, which native Zcash consensus forbids, making
-valid Zcash headers and Wcash headers unambiguous. The node runtime still rejects
-every inherited Zcash network configuration because Wcash uses different
-network and consensus rules; those definitions remain isolated in upstream
-library tests.
+## Source reference
 
-Wcash Testnet has a frozen identity for future public engineering
-interoperability, but no public Wcash Testnet is deployed. The controlled local
-Regtest private-transfer and transparent-shielding lifecycles have passed; the
-single-writer wallet remains experimental and is not a production or
-pool-settlement service. Project-operated seeds, a separately implemented
-pool-payout system, multi-node and pool soak and reorg testing, physical ASIC
-runs, and an external security/consensus audit remain required before any
-mainnet or community payout service. Mainnet remains disabled. See
+- [External anchors and P2P identities](../wcash-genesis/src/lib.rs)
+- [Frozen genesis blocks](../zebra-chain/src/block/genesis.rs)
+- [Network parameters, ports and namespaces](../zebra-chain/src/parameters/network.rs)
+- [Built-in consensus profiles](../zebra-chain/src/parameters/network/testnet.rs)
+- [Transaction branch IDs](../zebra-chain/src/parameters/network_upgrade.rs)
+- [Mainnet emission](../zebra-chain/src/parameters/network/subsidy/wcash_mainnet.rs)
+- [Testing-network subsidy](../zebra-chain/src/parameters/network/subsidy.rs)
+- [Wallet network selection](../wcash-wallet/src/network.rs)
+- [Private recipient verification](../wcash-merge-miner/src/coordinator.rs)
+
+For Testnet bootstrap and local test procedures, see
 [`wcash-testnet.md`](wcash-testnet.md).

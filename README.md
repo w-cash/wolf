@@ -1,162 +1,141 @@
 # Wcash
 
-Wcash is an experimental privacy-focused auxiliary proof-of-work chain written
-in Rust. It is based on the Zcash Foundation's Zebra `main` history through
-[`301d4d5a5`](https://github.com/ZcashFoundation/zebra/commit/301d4d5a5a2287fdcecab90e24df7ca15692e592),
-including the NU6.3 changes and the upstream fixes that restore
-coinbase-script-length, expiry-height, fallible Sprout aggregate value-balance,
-and non-coinbase null-prevout validation across the parser/verifier boundary. Wcash
-borrows Equihash `(200, 9)` work from a Zcash parent block while maintaining its
-own blocks, difficulty target, transactions, and shielded value pool.
+Wolf is the Rust node and protocol workspace for **Wcash (WEC)**, an independent
+Zcash-derived chain using Zcash Equihash `(200, 9)` auxiliary proof of work
+(AuxPoW). Wcash has its own genesis, transactions, difficulty and monetary policy.
+It is not ZEC, and mining at an unchanged Zcash pool does not automatically
+provide Wcash support.
 
-> **Development status:** this repository contains a frozen Wcash engineering
-> Testnet profile plus an isolated local regtest. No public Wcash Testnet node,
-> seed, or community pool is deployed. The software is not production ready,
-> Wcash mainnet remains disabled, and it must not be used with funds of real
-> value.
+This repository is a fork of [Zebra](https://github.com/ZcashFoundation/zebra).
+Many crate names and the executable, `zebrad`, retain their upstream names.
+**Build with `wcash-consensus` to select the Wcash node profile.** The default
+Zcash build and a Wcash build are not interchangeable.
 
-`WEC` is the mainnet ticker. The valueless Testnet and local regtest display
-ticker is `TWC` (Test Wcash). This is presentation metadata only: all networks
-continue to encode amounts as integer zatoshi with eight decimal places. The
-already-frozen Testnet and regtest genesis statements retain their historical
-`WEC` text, so this naming clarification does not change either genesis hash.
+> **Implementation and release status:** Mainnet, Testnet and local Regtest
+> profiles are implemented in this source tree. Mainnet has a frozen genesis and
+> its own emission implementation; it is not disabled. A source checkout, an
+> inherited Zebra version number or a successful local test does not establish
+> that a deployed service or wallet release is audited or ready for unrestricted
+> use. Verify the source, build profile and network of every artifact.
+> Testnet and Regtest coins are valueless `TWC`.
 
-The built-in Testnet and regtest profiles have separate Wcash-specific NU6.3
-transaction domains. Every post-genesis transaction must use version 6 and
-embed the exact branch ID selected by its Wcash network; inherited Zcash branch
-IDs, cross-network Wcash branch IDs, and legacy V1-V5 transactions are rejected.
-This removes the earlier consensus-level mining-only gate, but it does not by
-itself make either engineering profile or its wallet production ready.
+## Start here
 
-## Current consensus snapshot
-
-| Property | Current rule |
+| I want to… | Read |
 | --- | --- |
-| Parent proof of work | Zcash Equihash `(200, 9)` AuxPoW only |
-| Target block spacing | 75 seconds |
-| Currency ticker | Mainnet `WEC`; Testnet and regtest `TWC` |
-| Monetary precision | 8 decimal places, identical to Zcash; 1 WEC or 1 TWC = 100,000,000 zatoshi |
-| Initial subsidy | 6.25 WEC on mainnet, displayed as 6.25 TWC on testing networks, at heights 1 through 1,680,000 |
-| Halving | Every 1,680,000 blocks (about four years); first halved block is 1,680,001 |
-| Monetary cap | 21,000,000 WEC on mainnet; testing networks use the same schedule under the valueless TWC label |
-| Development allocation | None: no founders reward, funding stream, lockbox, or developer tax |
-| Coinbase destination | Explicit transparent Wcash address is the normal mode; private Ironwood payout is optional |
-| Active value pools | Transparent and Ironwood only; Sprout, Sapling, and legacy Orchard are rejected |
-| Public networks | Engineering Testnet profile implemented but not deployed; mainnet disabled |
-| Testnet transfers | Wcash-domain V6 only; inherited Zcash domains and V1-V5 rejected |
+| Understand Wcash and find ecosystem services | [w.cash](https://w.cash/) and the [documentation index](docs/README.md) |
+| Build and run a node | [Node operator guide](docs/wcash-node.md) |
+| Check network identity, supply and privacy rules | [Consensus reference](docs/wcash-consensus.md) |
+| Query a node from software or an AI agent | [Agent and integration guide](docs/wcash-agents.md) |
+| Contribute changes with a coding agent | [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Integrate merged mining | [Mining contract](docs/wcash-merged-mining.md) and [pool compatibility](docs/wcash-pool-compatibility.md) |
+| Exercise a disposable local network | [Local Regtest guide](docs/wcash-local.md) |
+| Use the included experimental wallet | [Wallet and payout boundary](docs/wcash-wallet-payout.md) |
+| Report a suspected vulnerability privately | [Security policy](SECURITY.md) |
 
-Pool-facing examples pay each post-genesis coinbase to an explicit Wcash
-transparent address, matching the operational model expected by established
-mining software. The node never invents an unsafe hard-coded payout address;
-the operator must supply one, and the address-type selector defaults to
-transparent. An operator can instead supply a Wcash Unified Address with an
-Orchard receiver to create a private Ironwood reward. Private Ironwood rewards
-remain unrecoverable with Zcash's conventional all-zero outgoing viewing key.
-Inherited Zcash addresses are rejected in both modes.
+For a consumer wallet, start at [wcashwallet.com](https://wcashwallet.com/) and
+check the platform's actual release and signing status. This workspace's
+`wcash-wallet` is an experimental operator/developer tool, not the desktop or
+mobile application's installation package.
 
-Aggregate issuance remains auditable in either mode. Subsidy and transaction
-fees are deterministic consensus inputs; transparent outputs are public, while
-the Ironwood value balance publicly commits to value entering the private pool.
-Private mode hides the reward recipient, not the protocol-defined gross reward
-amount, and parent-pool metadata can still create off-chain correlation.
-Transparent coinbase outputs mature after 100 blocks and must be shielded on
-their first spend, matching the inherited Zcash public-network policy.
+## Mainnet at a glance
 
-Payment addresses use Wcash-specific namespaces: Unified `wu...`, transparent
-`W...`, and transparent-source-only TEX `wtex...`, with distinct testnet and
-regtest variants. The former `ws...` Sapling namespace is permanently reserved
-and rejected. Wcash mining accepts a Wcash transparent address for the
-normal pool-integration path or a Wcash Unified Address with an Orchard receiver
-for an optional private Ironwood reward. It rejects inherited Zcash addresses.
-The node implements payment-address codecs, and the workspace contains an
-experimental one-shot wallet for controlled Testnet and regtest operations. It
-derives a private Wcash Unified Address and a transparent P2PKH coinbase address
-from the same seed, scans both histories into local SQLite, and can build a
-bounded transaction that shields only mature, fully classified coinbase outputs
-into its own Ironwood receiver. It also signs Wcash-domain V6 Ironwood transfers
-and broadcasts exact signed bytes. For public Testnet it also exposes a
-versioned, batch-idempotent pool signer: the complete ordered request binding
-and exact transaction bytes commit atomically in the wallet SQLite database,
-and uncertain broadcasts are retried only with those bytes. Seed input remains
-isolated in an owner-private credential file. This is a controlled single-writer
-signing boundary, not the pool ledger or reorg-safe settlement engine; see
-[`docs/wcash-wallet-payout.md`](docs/wcash-wallet-payout.md). Its current full local Regtest gate
-has mined three private coinbases, scanned and spent one TWC under the Wcash
-V6 domain, included the exact transaction in the mempool and block template,
-mined it through AuxPoW, and rescanned the recipient and private change. A
-separate phase mined 101 transparent coinbases through the same AuxPoW path,
-proved the 100-block maturity boundary and pre-maturity rejection, recovered all
-current UTXOs from a deliberately late wallet birthday, shielded one mature
-coinbase with its exact signed bytes in the mempool and template, and mined the
-shielding transaction at height 101. The run conserved the complete
-631.25-TWC supply across transparent and Ironwood pools and rotated far beyond
-the coordinator's 16-candidate cache bound. Only the private-transfer phase used
-the explicit Regtest-only one-confirmation override; transparent coinbase
-maturity was not shortened. The public Testnet wallet policy remains 100
-confirmations. The complete prefix table is in the
-[consensus snapshot](docs/wcash-consensus.md#payment-address-domains).
+This table describes implemented **Mainnet** rules. Testnet and Regtest have
+different identities and subsidy schedules; see the
+[network reference](docs/wcash-consensus.md).
 
-## Run the isolated local network
+| Property | Mainnet rule |
+| --- | --- |
+| Ticker and precision | `WEC`; 1 WEC = 100,000,000 integer atomic units (zatoshi) |
+| Target block spacing | 75 seconds; observed intervals vary |
+| Proof of work | Zcash Equihash `(200, 9)` with AuxPoW v2 |
+| Genesis | `5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48` |
+| Transaction domain | Wcash V6, Mainnet branch ID `0xd9c6a7ee` |
+| Emission | 40,000-block linear slow start, then integer smooth decay with a permanent 0.375-WEC tail |
+| Halvings and maximum supply | No Mainnet halvings and no fixed economic supply cap |
+| Protocol allocation | No founders reward, funding stream, lockbox or developer tax |
+| Active value pools | Transparent and Ironwood; Sprout, Sapling and legacy Orchard components are rejected |
+| Coinbase maturity | 100 blocks; transparent coinbase outputs must first be shielded |
 
-Install Rust 1.91 or newer plus the native build dependencies required by
-Zebra, then run:
+The exact recurrence is in
+[`wcash_mainnet.rs`](zebra-chain/src/parameters/network/subsidy/wcash_mainnet.rs).
+Its curve scale is not a supply cap, and its post-ramp counter excludes
+slow-start issuance. Do not substitute a floating-point approximation or a
+testing network's halving schedule.
+
+The same mining work is checked against each chain's own target. A valid Wcash
+block need not also be a Zcash block. Merged mining does not imply that all
+Zcash hashrate participates in Wcash.
+
+## Build the node
+
+Use the pinned [Rust toolchain](rust-toolchain.toml), committed lockfile and
+native prerequisites in the [node guide](docs/wcash-node.md). At the repository
+root:
+
+```sh
+cargo build --locked --release -p zebrad --bin zebrad \
+  --features wcash-consensus
+```
+
+The executable is `target/release/zebrad`. Keep Wcash and default Zcash builds
+in separate target directories when building both profiles. Do not infer the
+consensus profile from the executable name alone.
+
+For isolated synthetic-parent Regtest mining, the separate
+[`wcash-local.toml`](wcash-local.toml) fixture also requires `internal-miner`:
 
 ```sh
 cargo build --locked --release -p zebrad --bin zebrad \
   --features wcash-consensus,internal-miner
-cargo build --locked --release -p wcash-merge-miner --bin wcash-merge-miner
 ./target/release/zebrad -c wcash-local.toml start
 ```
 
-The supplied configuration binds P2P and RPC services to loopback, uses an
-ephemeral state database, enables the synthetic-parent internal miner, and
-disables RPC cookie authentication only on that loopback listener. Its miner
-address is a public test fixture; replace it with an address for which you
-control the keys before testing spendability.
+That fixture uses loopback listeners, ephemeral state, a public test payout
+address and disabled RPC cookie authentication for local testing. It is not a
+Mainnet configuration. Never reuse its test addresses, authentication bypass or
+ephemeral-state settings for funds or a public service.
 
-This local chain freezes Bitcoin mainnet block 965,910, hash
-`00000000000000000000bbbdb28d2ff098642c6fde0a5fd84a707c92d146b146`,
-which was the Blockstream tip snapshot selected for regtest genesis. It replaces
-the earlier local genesis and uses the `Wcash/regtest/v5` P2P identity.
+## Repository boundaries
 
-The native merge-mining coordinator can create a transparent or private Wcash candidate,
-request a commitment-aware Zcash template, obtain independent proposal
-validation, expose a ZIP-301 backend for Equihash ASIC interoperability testing,
-and durably submit winners to both nodes. It is intentionally loopback-only and
-is not a public pool edge:
+| Component | Purpose |
+| --- | --- |
+| `zebrad` and `zebra-*` crates | Node runtime, chain validation, networking, state and RPC |
+| `wcash-genesis` | Frozen network identities and external-chain anchors |
+| `wcash-zcash-aux` | AuxPoW serialization, commitments and vectors |
+| `wcash-merge-miner` | Template validation, mining coordination and durable backend tooling |
+| `wcash-wallet` | Experimental local wallet, inspection and controlled payout tooling |
 
-```sh
-cargo run --release -p wcash-merge-miner -- --help
-```
+The public [explorer](https://wcashexplorer.com/),
+[wallet applications](https://wcashwallet.com/) and
+[pool service](https://pool.zecwec.com/) are separate deployments. Their REST
+routes, account features, payout policies and availability are not the node's
+JSON-RPC contract. A working service URL does not identify its deployed commit.
 
-See:
+The [website specification](https://w.cash/whitepaper) is an additional reading
+aid. For reproducible integrations, record the Wolf commit, build features,
+genesis and transaction branch, and check implementation and tests. The
+[documentation index](docs/README.md) maps those sources and website responsibilities.
 
-- [Consensus and monetary policy](docs/wcash-consensus.md)
-- [Zcash merged-mining design](docs/wcash-merged-mining.md)
-- [Local regtest guide](docs/wcash-local.md)
-- [Testnet profile and operator boundary](docs/wcash-testnet.md)
+## Review and security
 
-## Release blockers
+Mainnet implementation does not substitute for release review. Consensus,
+wallet recovery, key handling, public endpoints, pool accounting and reorg-safe
+settlement need their own validation and responsible operators. Local Regtest
+results establish only the behavior actually exercised by that run.
 
-The mainnet Bitcoin anchor remains deliberately unset, so mainnet activation
-fails closed. The controlled private-transfer and transparent-coinbase shielding
-lifecycles have passed in isolated Regtest, but no public Testnet is deployed
-and those local results are not evidence that a community pool or value-bearing
-mainnet is ready. Promotion still requires an independently reviewed consensus
-specification and implementation, public-network operation under the
-100-confirmation wallet policy, adversarial multi-node soak and reorg testing,
-project-controlled seed infrastructure, physical ASIC interoperability, and a
-separately reviewed TLS, variable-difficulty, accounting, payout, settlement,
-and monitoring layer in front of the included loopback ZIP-301 service.
+Keep node RPC, mining capabilities, cookie files and spending material private.
+Do not publish suspected security flaws in a documentation PR; use
+[SECURITY.md](SECURITY.md). Non-sensitive improvements follow
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Upstream attribution and license
 
-Wcash is a fork of [Zebra](https://github.com/ZcashFoundation/zebra), the Zcash
-Foundation's independent Rust implementation of the Zcash protocol. Wcash is
-not represented as an official Zcash Foundation release or endorsement. The
-upstream source history and copyright notices are retained.
+Wcash retains Zebra's upstream history and copyright notices. It is not an
+official Zcash Foundation release or endorsement. Inherited Zcash documentation
+is useful for shared internals, but its network parameters and release artifacts
+are not Wcash instructions.
 
-This repository remains distributed under the MIT and Apache License 2.0 terms
-used by Zebra. Some inherited crates are MIT-only. See
-[LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE), and the individual
-crate manifests for details.
+This repository retains Zebra's MIT and Apache License 2.0 terms. Some inherited
+crates are MIT-only. See [LICENSE-MIT](LICENSE-MIT),
+[LICENSE-APACHE](LICENSE-APACHE), and individual crate manifests.

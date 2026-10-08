@@ -41,11 +41,11 @@ regtest genesis bytes and hashes do not rotate when user interfaces adopt
 
 Neither consensus validation nor the generator performs HTTP requests.
 
-A future Zcash Mainnet-backed Wcash Mainnet anchor uses exactly this coinbase
-format, with no date or project-name prefix:
+The frozen Zcash Mainnet-backed Wcash Mainnet anchor uses this coinbase
+statement format:
 
 ```text
-ZEC #<height> <64-character display hash>
+Wcash Mainnet ZEC #<height> <64-character display hash>
 ```
 
 ## Frozen Testnet-profile anchor
