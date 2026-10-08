@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 use wcash_zcash_aux::child_payout_address_commitment;
+use zcash_address::ToAddress;
 use zcash_client_backend::{
     data_api::wallet::{
         create_proposed_transactions, decrypt_and_store_transaction,
@@ -871,6 +872,24 @@ struct BoundIronwoodOutput {
     memo: MemoBytes,
     role: TransferOutputRole,
     pool: ShieldedPool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExpectedPaymentOutput {
+    Ironwood(BoundIronwoodOutput),
+    TransparentP2pkh {
+        receiver: zcash_transparent::address::TransparentAddress,
+        value_zat: u64,
+    },
+}
+
+impl ExpectedPaymentOutput {
+    fn pool(&self) -> PoolType {
+        match self {
+            Self::Ironwood(_) => PoolType::IRONWOOD,
+            Self::TransparentP2pkh { .. } => PoolType::Transparent,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3000,7 +3019,7 @@ pub async fn broadcast_signed_payout_batch(
     })
 }
 
-/// Creates exactly one durable Ironwood payout transaction for a pool batch.
+/// Creates one durable payout funded by Ironwood for a pool batch.
 ///
 /// The batch binding and exact signed bytes commit in the same SQLite
 /// transaction as librustzcash's wallet mutation. A retry with identical facts
@@ -3176,9 +3195,12 @@ fn prepare_payout_request(
     let mut allocation_ids = HashSet::with_capacity(request.outputs.len());
     let mut outputs = Vec::with_capacity(request.outputs.len());
     for output in &request.outputs {
-        if output.receiver_kind != crate::WcashReceiverKind::Ironwood {
+        if !matches!(
+            output.receiver_kind,
+            crate::WcashReceiverKind::Ironwood | crate::WcashReceiverKind::TransparentP2pkh
+        ) {
             return Err(WalletServiceError::InvalidRequest(
-                "every payout receiver_kind must be ironwood".to_owned(),
+                "payout receiver_kind must be ironwood or transparent_p2pkh".to_owned(),
             ));
         }
         let allocation_id = canonical_uuid("allocation_id", &output.allocation_id)?;
@@ -3188,11 +3210,11 @@ fn prepare_payout_request(
             ));
         }
         let validated = crate::validate_wcash_address(&output.canonical_address, network)?;
-        if validated.receiver_kind != crate::WcashReceiverKind::Ironwood
+        if validated.receiver_kind != output.receiver_kind
             || validated.canonical != output.canonical_address
         {
             return Err(WalletServiceError::InvalidRequest(
-                "payout address must be canonical and Ironwood-capable".to_owned(),
+                "payout address must be canonical and match receiver_kind".to_owned(),
             ));
         }
         if output.amount_zat == 0 || i64::try_from(output.amount_zat).is_err() {
@@ -3201,6 +3223,11 @@ fn prepare_payout_request(
             ));
         }
         let memo = canonical_hex("memo_hex", &output.memo_hex, 512)?;
+        if output.receiver_kind == crate::WcashReceiverKind::TransparentP2pkh && !memo.is_empty() {
+            return Err(WalletServiceError::InvalidRequest(
+                "transparent payouts require an empty memo".to_owned(),
+            ));
+        }
         outputs.push(PreparedPayoutOutput {
             allocation_id,
             canonical_address: output.canonical_address.clone(),
@@ -3413,7 +3440,11 @@ fn load_signed_payout_batch(
         let amount_zat = u64::try_from(amount_zat).map_err(|_| malformed())?;
         let validated =
             crate::validate_wcash_address(&canonical_address, network).map_err(|_| malformed())?;
-        if validated.receiver_kind != crate::WcashReceiverKind::Ironwood
+        if !matches!(
+            validated.receiver_kind,
+            crate::WcashReceiverKind::Ironwood | crate::WcashReceiverKind::TransparentP2pkh
+        ) || (validated.receiver_kind == crate::WcashReceiverKind::TransparentP2pkh
+            && !memo.is_empty())
             || validated.canonical != canonical_address
             || amount_zat == 0
         {
@@ -3428,7 +3459,7 @@ fn load_signed_payout_batch(
         outputs.push(PayoutBatchOutput {
             allocation_id: allocation_id.hyphenated().to_string(),
             canonical_address,
-            receiver_kind: crate::WcashReceiverKind::Ironwood,
+            receiver_kind: validated.receiver_kind,
             amount_zat,
             memo_hex: hex::encode(memo),
         });
@@ -3499,7 +3530,30 @@ fn load_signed_payout_batch(
         return Err(malformed());
     }
     let fee_zat = u64::try_from(fee_zat).map_err(|_| malformed())?;
-    if fee_zat > max_fee_zat {
+    let expected_transparent = outputs
+        .iter()
+        .filter_map(|output| {
+            match crate::decode_payout_recipient(&output.canonical_address, network) {
+                Ok(crate::PayoutRecipient::TransparentP2pkh(receiver)) => {
+                    Some(Ok(ExpectedPaymentOutput::TransparentP2pkh {
+                        receiver,
+                        value_zat: output.amount_zat,
+                    }))
+                }
+                Ok(crate::PayoutRecipient::Ironwood(_)) => None,
+                Err(_) => Some(Err(malformed())),
+            }
+        })
+        .collect::<Result<Vec<_>, WalletServiceError>>()?;
+    if fee_zat > max_fee_zat
+        || inspected
+            .fee_paid(|_| Ok::<_, zcash_protocol::value::BalanceError>(None))
+            .ok()
+            .flatten()
+            .map(Zatoshis::into_u64)
+            != Some(fee_zat)
+        || !transparent_payment_outputs_match(&inspected, &expected_transparent)
+    {
         return Err(malformed());
     }
     Ok(Some(SignedPayoutBatch {
@@ -3667,11 +3721,7 @@ async fn create_signed_payout_transfer_in_open_wallet(
     let prepared_payments = recipients
         .iter()
         .map(|recipient| {
-            let address = decode_recipient(&recipient.address, network)?;
-            let receiver = address
-                .orchard()
-                .copied()
-                .ok_or(WalletServiceError::NonIronwoodProposal)?;
+            let address = crate::decode_payout_recipient(&recipient.address, network)?;
             let amount = Zatoshis::from_u64(recipient.amount_zat)
                 .map_err(|error| WalletServiceError::InvalidRequest(error.to_string()))?;
             if amount == Zatoshis::ZERO {
@@ -3687,26 +3737,49 @@ async fn create_signed_payout_transfer_in_open_wallet(
                         .map_err(|error| WalletServiceError::InvalidRequest(error.to_string()))?,
                 )
             };
-            let expected_memo = memo.clone().unwrap_or_else(MemoBytes::empty);
-            let payment = Payment::new(
-                address.to_zcash_address(network.address_network()),
-                Some(amount),
-                memo,
-                None,
-                None,
-                vec![],
-            )
-            .map_err(|error| WalletServiceError::InvalidRequest(error.to_string()))?;
-            Ok((
-                payment,
-                BoundIronwoodOutput {
-                    receiver: receiver.to_raw_address_bytes(),
-                    value_zat: amount.into_u64(),
-                    memo: expected_memo,
-                    role: TransferOutputRole::Payment,
-                    pool: ShieldedPool::Ironwood,
-                },
-            ))
+            let (address, expected) = match address {
+                crate::PayoutRecipient::Ironwood(address) => {
+                    let receiver = address
+                        .orchard()
+                        .ok_or(WalletServiceError::NonIronwoodProposal)?;
+                    let expected = ExpectedPaymentOutput::Ironwood(BoundIronwoodOutput {
+                        receiver: receiver.to_raw_address_bytes(),
+                        value_zat: amount.into_u64(),
+                        memo: memo.clone().unwrap_or_else(MemoBytes::empty),
+                        role: TransferOutputRole::Payment,
+                        pool: ShieldedPool::Ironwood,
+                    });
+                    (
+                        address.to_zcash_address(network.address_network()),
+                        expected,
+                    )
+                }
+                crate::PayoutRecipient::TransparentP2pkh(receiver) => {
+                    if memo.is_some() {
+                        return Err(WalletServiceError::InvalidRequest(
+                            "transparent payouts require an empty memo".to_owned(),
+                        ));
+                    }
+                    let zcash_transparent::address::TransparentAddress::PublicKeyHash(bytes) =
+                        receiver
+                    else {
+                        return Err(WalletServiceError::NonIronwoodProposal);
+                    };
+                    (
+                        zcash_address::ZcashAddress::from_transparent_p2pkh(
+                            network.address_network(),
+                            bytes,
+                        ),
+                        ExpectedPaymentOutput::TransparentP2pkh {
+                            receiver,
+                            value_zat: amount.into_u64(),
+                        },
+                    )
+                }
+            };
+            let payment = Payment::new(address, Some(amount), memo, None, None, vec![])
+                .map_err(|error| WalletServiceError::InvalidRequest(error.to_string()))?;
+            Ok((payment, expected))
         })
         .collect::<Result<Vec<_>, WalletServiceError>>()?;
     let payments = prepared_payments
@@ -3885,8 +3958,12 @@ async fn create_signed_payout_transfer_in_open_wallet(
         || proposal
             .steps()
             .iter()
-            .flat_map(|step| step.payment_pools().values())
-            .any(|pool| *pool != PoolType::IRONWOOD)
+            .flat_map(|step| step.payment_pools().iter())
+            .any(|(index, pool)| {
+                expected_payment_outputs
+                    .get(*index)
+                    .is_none_or(|output| output.pool() != *pool)
+            })
         || proposal
             .steps()
             .iter()
@@ -4098,7 +4175,7 @@ async fn create_signed_payout_transfer_in_open_wallet(
             .ok()
             .flatten()
             .map(Zatoshis::into_u64);
-        let serialized_outputs_match = signed_transfer_outputs_match(
+        let serialized_outputs_match = signed_payout_outputs_match(
             &inspected,
             &parameters,
             account_id,
@@ -4111,7 +4188,6 @@ async fn create_signed_payout_transfer_in_open_wallet(
             expected_ironwood_actions,
         );
         if inspected.txid() != txid
-            || inspected.transparent_bundle().is_some()
             || u32::from(inspected.expiry_height()) != expiry_height_u32
             || actual_fee != Some(fee_zat)
             || !serialized_outputs_match
@@ -5084,6 +5160,76 @@ fn persisted_transactions_require_review<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn signed_payout_outputs_match(
+    transaction: &Transaction,
+    parameters: &Network,
+    account_id: AccountUuid,
+    stored_ufvk: &zcash_keys::keys::UnifiedFullViewingKey,
+    target_height: u32,
+    expected_payments: &[ExpectedPaymentOutput],
+    expected_change: &[BoundIronwoodOutput],
+    expected_nullifiers: &[[u8; 32]],
+    known_wallet_nullifiers: &[[u8; 32]],
+    expected_action_count: usize,
+) -> bool {
+    if !transparent_payment_outputs_match(transaction, expected_payments) {
+        return false;
+    }
+    let ironwood = expected_payments
+        .iter()
+        .filter_map(|output| match output {
+            ExpectedPaymentOutput::Ironwood(output) => Some(output.clone()),
+            ExpectedPaymentOutput::TransparentP2pkh { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    signed_transfer_outputs_match(
+        transaction,
+        parameters,
+        account_id,
+        stored_ufvk,
+        target_height,
+        &ironwood,
+        expected_change,
+        expected_nullifiers,
+        known_wallet_nullifiers,
+        expected_action_count,
+    )
+}
+
+fn transparent_payment_outputs_match(
+    transaction: &Transaction,
+    expected: &[ExpectedPaymentOutput],
+) -> bool {
+    let mut unmatched = expected
+        .iter()
+        .filter_map(|output| match output {
+            ExpectedPaymentOutput::TransparentP2pkh {
+                receiver,
+                value_zat,
+            } => Some((
+                zcash_transparent::address::Script::from(receiver.script()),
+                *value_zat,
+            )),
+            ExpectedPaymentOutput::Ironwood(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if let Some(bundle) = transaction.transparent_bundle() {
+        if !bundle.vin.is_empty() || bundle.vout.len() != unmatched.len() {
+            return false;
+        }
+        for output in &bundle.vout {
+            let Some(index) = unmatched.iter().position(|(script, value)| {
+                script == output.script_pubkey() && *value == output.value().into_u64()
+            }) else {
+                return false;
+            };
+            unmatched.swap_remove(index);
+        }
+    }
+    unmatched.is_empty()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn signed_transfer_outputs_match(
     transaction: &Transaction,
     parameters: &Network,
@@ -5519,6 +5665,10 @@ fn database_error(error: impl std::fmt::Debug) -> WalletServiceError {
 }
 
 #[cfg(test)]
+#[path = "wallet/legacy_v2_journal.rs"]
+mod legacy_v2_journal;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use zcash_client_backend::data_api::chain::ChainState;
@@ -5875,6 +6025,426 @@ mod tests {
             prepare_payout_request(&bad, WalletNetwork::Testnet, account_id, collector),
             Err(WalletServiceError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn w1_payout_request_binds_kind_canonical_address_and_empty_memo() {
+        let directory = tempfile::tempdir().unwrap();
+        for network in [
+            WalletNetwork::Mainnet,
+            WalletNetwork::Testnet,
+            WalletNetwork::Regtest,
+        ] {
+            let account = create_wallet_accounts(
+                &directory.path().join(format!("{network:?}.sqlite")),
+                network,
+                1,
+            )
+            .pop()
+            .unwrap();
+            let account_id = Uuid::parse_str(&account.account_id).unwrap();
+            let collector = test_collector_payout_commitment(&account);
+            let mut request = test_payout_request(&account);
+            request.identity = expected_payout_identity(network, account_id, collector, true);
+            for output in &mut request.outputs {
+                output.canonical_address = account.transparent_coinbase_address.clone();
+                output.receiver_kind = crate::WcashReceiverKind::TransparentP2pkh;
+                output.memo_hex.clear();
+            }
+            let prepared =
+                prepare_payout_request(&request, network, account_id, collector).unwrap();
+            let mut bad = request.clone();
+            bad.outputs[0].memo_hex = "00".to_owned();
+            assert!(prepare_payout_request(&bad, network, account_id, collector).is_err());
+            for kind in [
+                crate::WcashReceiverKind::Ironwood,
+                crate::WcashReceiverKind::TransparentP2sh,
+                crate::WcashReceiverKind::Tex,
+            ] {
+                let mut bad = request.clone();
+                bad.outputs[0].receiver_kind = kind;
+                assert!(prepare_payout_request(&bad, network, account_id, collector).is_err());
+            }
+            for mutate in 0..4 {
+                let mut changed = request.clone();
+                match mutate {
+                    0 => changed.outputs[0].amount_zat += 1,
+                    1 => changed.outputs[0].allocation_id = Uuid::from_u128(0x999).to_string(),
+                    2 => changed.request_commitment = "99".repeat(32),
+                    _ => {
+                        changed.outputs[0].canonical_address =
+                            zebra_chain::primitives::WcashAddress::from_transparent_p2pkh(
+                                network.address_network(),
+                                [9; 20],
+                            )
+                            .encode()
+                    }
+                }
+                let changed =
+                    prepare_payout_request(&changed, network, account_id, collector).unwrap();
+                assert_ne!(prepared.request_facts_digest, changed.request_facts_digest);
+            }
+        }
+    }
+
+    #[test]
+    fn w1_inspection_requires_exact_script_value_multiplicity_and_no_inputs() {
+        use zcash_transparent::{
+            address::{Script, TransparentAddress},
+            bundle::{Authorized, Bundle, TxIn, TxOut},
+        };
+        let receiver = TransparentAddress::PublicKeyHash([7; 20]);
+        let expected = vec![
+            ExpectedPaymentOutput::TransparentP2pkh {
+                receiver,
+                value_zat: 100
+            };
+            2
+        ];
+        let build = |outputs: Vec<(TransparentAddress, u64)>, with_input: bool| {
+            zcash_primitives::transaction::TransactionData::from_parts_v6(
+                WalletNetwork::Testnet.branch_id(),
+                0,
+                BlockHeight::from_u32(200),
+                Some(Bundle {
+                    vin: if with_input {
+                        vec![TxIn::<Authorized>::from_parts(
+                            OutPoint::new([1; 32], 0),
+                            Script::default(),
+                            u32::MAX,
+                        )]
+                    } else {
+                        vec![]
+                    },
+                    vout: outputs
+                        .into_iter()
+                        .map(|(address, value)| {
+                            TxOut::new(Zatoshis::from_u64(value).unwrap(), address.script().into())
+                        })
+                        .collect(),
+                    authorization: Authorized,
+                }),
+                None,
+                None,
+                None,
+            )
+            .freeze()
+            .unwrap()
+        };
+        assert!(transparent_payment_outputs_match(
+            &build(vec![(receiver, 100); 2], false),
+            &expected
+        ));
+        for outputs in [
+            vec![(receiver, 100)],
+            vec![(receiver, 100); 3],
+            vec![(receiver, 100), (receiver, 101)],
+            vec![
+                (receiver, 100),
+                (TransparentAddress::PublicKeyHash([8; 20]), 100),
+            ],
+            vec![
+                (receiver, 100),
+                (TransparentAddress::ScriptHash([7; 20]), 100),
+            ],
+        ] {
+            assert!(!transparent_payment_outputs_match(
+                &build(outputs, false),
+                &expected
+            ));
+        }
+        assert!(!transparent_payment_outputs_match(
+            &build(vec![(receiver, 100); 2], true),
+            &expected
+        ));
+        assert!(!transparent_payment_outputs_match(
+            &build(vec![(receiver, 100)], false),
+            &[]
+        ));
+    }
+
+    #[tokio::test]
+    async fn ironwood_to_p2pkh_v6_build_inspect_and_restart_recovery() {
+        payout_v2_build_inspect_and_restart_recovery(true).await;
+    }
+
+    #[tokio::test]
+    async fn old_ironwood_v2_journal_recovers_after_upgrade_and_restart() {
+        payout_v2_build_inspect_and_restart_recovery(false).await;
+    }
+
+    async fn payout_v2_build_inspect_and_restart_recovery(transparent: bool) {
+        use zcash_primitives::transaction::builder::{BuildConfig, Builder, BundlePadding};
+        use zcash_primitives::transaction::fees::zip317::FeeRule;
+        use zcash_transparent::{address::TransparentAddress, builder::TransparentSigningSet};
+        let network = WalletNetwork::Mainnet;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wallet.sqlite");
+        let account = create_wallet_accounts(&path, network, 1).pop().unwrap();
+        let usk = derive_wallet_spending_key(&SecretVec::new(vec![0x35; 32]), network, 0).unwrap();
+        let ufvk = usk.to_unified_full_viewing_key();
+        let fvk = ufvk.orchard().unwrap();
+        let rho = orchard::note::Rho::from_bytes(&[1; 32]).unwrap();
+        let rseed = (0u8..=255)
+            .find_map(|b| orchard::note::RandomSeed::from_bytes([b; 32], &rho).into_option())
+            .unwrap();
+        let note = orchard::Note::from_parts(
+            fvk.address_at(0u32, OrchardScope::External),
+            orchard::value::NoteValue::from_raw(100_000),
+            rho,
+            rseed,
+            orchard::note::NoteVersion::V3,
+        )
+        .unwrap();
+        let zero = orchard::tree::MerkleHashOrchard::from_bytes(&[0; 32]).unwrap();
+        let merkle_path = orchard::tree::MerklePath::from_parts(0, [zero; 32]);
+        let change = fvk.address_at(0u32, OrchardScope::Internal);
+        let receiver = TransparentAddress::PublicKeyHash([7; 20]);
+        let ironwood_receiver = *crate::decode_recipient(&account.address, network)
+            .unwrap()
+            .orchard()
+            .unwrap();
+        let fee_zat = if transparent { 15_000 } else { 10_000 };
+        let change_zat = 80_000 - fee_zat;
+        let mut builder = Builder::new(
+            network.parameters(),
+            BlockHeight::from_u32(200),
+            BuildConfig::Standard {
+                sapling_anchor: None,
+                orchard_anchor: None,
+                ironwood_anchor: Some(merkle_path.root(note.commitment().into())),
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
+            },
+        )
+        .with_expiry_height(BlockHeight::from_u32(220));
+        builder
+            .add_ironwood_spend::<FeeRule>(fvk.clone(), note, merkle_path)
+            .unwrap();
+        if transparent {
+            builder
+                .add_transparent_output(&receiver, Zatoshis::const_from_u64(20_000))
+                .unwrap();
+        } else {
+            builder
+                .add_ironwood_output::<FeeRule>(
+                    Some(fvk.to_ovk(OrchardScope::External)),
+                    ironwood_receiver,
+                    Zatoshis::const_from_u64(20_000),
+                    MemoBytes::empty(),
+                )
+                .unwrap();
+        }
+        builder
+            .add_ironwood_output::<FeeRule>(
+                Some(fvk.to_ovk(OrchardScope::Internal)),
+                change,
+                Zatoshis::from_u64(change_zat).unwrap(),
+                MemoBytes::empty(),
+            )
+            .unwrap();
+        let prover = LocalTxProver::bundled();
+        let built = builder
+            .build(
+                &TransparentSigningSet::new(),
+                &[],
+                &[orchard::keys::SpendAuthorizingKey::from(usk.orchard())],
+                OsRng,
+                &prover,
+                &prover,
+                &FeeRule::standard(),
+            )
+            .unwrap();
+        let transaction = built.transaction();
+        let mut raw = Vec::new();
+        transaction.write(&mut raw).unwrap();
+        let inspected = inspect_signed_transaction(&raw, network).unwrap();
+        assert_eq!(
+            inspected.version(),
+            zcash_primitives::transaction::TxVersion::V6
+        );
+        assert_eq!(
+            inspected
+                .fee_paid(|_| Ok::<_, zcash_protocol::value::BalanceError>(None))
+                .unwrap()
+                .unwrap()
+                .into_u64(),
+            fee_zat
+        );
+        let wallet = open_wallet_database(&path, network).unwrap();
+        let wallet_account = only_account(&wallet.get_account_ids().unwrap()).unwrap();
+        drop(wallet);
+        let expected = vec![if transparent {
+            ExpectedPaymentOutput::TransparentP2pkh {
+                receiver,
+                value_zat: 20_000,
+            }
+        } else {
+            ExpectedPaymentOutput::Ironwood(BoundIronwoodOutput {
+                receiver: ironwood_receiver.to_raw_address_bytes(),
+                value_zat: 20_000,
+                memo: MemoBytes::empty(),
+                role: TransferOutputRole::Payment,
+                pool: ShieldedPool::Ironwood,
+            })
+        }];
+        let expected_change = vec![BoundIronwoodOutput {
+            receiver: change.to_raw_address_bytes(),
+            value_zat: change_zat,
+            memo: MemoBytes::empty(),
+            role: TransferOutputRole::InternalChange,
+            pool: ShieldedPool::Ironwood,
+        }];
+        let nullifiers = [note.nullifier(fvk).to_bytes()];
+        assert!(signed_payout_outputs_match(
+            &inspected,
+            &network.parameters(),
+            wallet_account,
+            &ufvk,
+            200,
+            &expected,
+            &expected_change,
+            &nullifiers,
+            &nullifiers,
+            2
+        ));
+        let mut wrong_change = expected_change.clone();
+        wrong_change[0].value_zat += 1;
+        assert!(!signed_payout_outputs_match(
+            &inspected,
+            &network.parameters(),
+            wallet_account,
+            &ufvk,
+            200,
+            &expected,
+            &wrong_change,
+            &nullifiers,
+            &nullifiers,
+            2
+        ));
+        let mut request = test_payout_request(&account);
+        request.outputs.truncate(1);
+        if transparent {
+            request.outputs[0].canonical_address =
+                crate::address::encode_wcash_transparent_receiver(receiver, network);
+            request.outputs[0].receiver_kind = crate::WcashReceiverKind::TransparentP2pkh;
+        }
+        request.outputs[0].memo_hex.clear();
+        request.outputs[0].amount_zat = 20_000;
+        request.max_fee_zat = fee_zat;
+        let account_id = Uuid::parse_str(&account.account_id).unwrap();
+        request.identity = expected_payout_identity(
+            network,
+            account_id,
+            test_collector_payout_commitment(&account),
+            true,
+        );
+        // The Ironwood journal is created by the frozen pre-W1 implementation.
+        // Recovery below always runs the current implementation after reopening SQLite.
+        let prepare = if transparent {
+            prepare_payout_request
+        } else {
+            legacy_v2_journal::prepare_payout_request
+        };
+        let insert = if transparent {
+            insert_payout_batch_intent
+        } else {
+            legacy_v2_journal::insert_payout_batch_intent
+        };
+        let complete = if transparent {
+            complete_payout_batch
+        } else {
+            legacy_v2_journal::complete_payout_batch
+        };
+        let prepared = prepare(
+            &request,
+            network,
+            account_id,
+            test_collector_payout_commitment(&account),
+        )
+        .unwrap();
+        let signed = SignedTransaction {
+            txid: transaction.txid().to_string(),
+            raw_transaction_hex: hex::encode(&raw),
+            branch_id: network.branch_id_hex(),
+            target_height: 200,
+            expiry_height: 220,
+            fee_zat,
+            internal_change_receiver_verified: true,
+        };
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute("INSERT INTO transactions (txid, created, expiry_height, raw, target_height, min_observed_height) VALUES (?1, 0, 220, ?2, 200, 200)", params![transaction.txid().as_ref(), &raw]).unwrap();
+        drop(connection);
+        let mut wallet = open_wallet_database(&path, network).unwrap();
+        wallet
+            .transactionally_with_extension::<_, _, WalletServiceError>(|_, extension| {
+                insert(extension, &prepared)?;
+                let mut limited = prepared.clone();
+                limited.max_fee_zat = fee_zat - 1;
+                assert!(matches!(
+                    complete(extension, &limited, &signed, transaction.txid(), &raw),
+                    Err(WalletServiceError::PayoutFeeExceeded { .. })
+                ));
+                complete(extension, &prepared, &signed, transaction.txid(), &raw)
+            })
+            .unwrap();
+        drop(wallet);
+        for _ in 0..2 {
+            let mut reopened = open_wallet_database(&path, network).unwrap();
+            let recovered = reopened
+                .transactionally_with_extension(|_, extension| {
+                    load_signed_payout_batch(
+                        extension,
+                        network,
+                        prepared.batch_id,
+                        &request.identity,
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.raw_transaction_hex, signed.raw_transaction_hex);
+            assert_eq!(recovered.outputs, request.outputs);
+        }
+        let mut client = AttestedWcashClient::disconnected_for_test(network);
+        let seed = SecretVec::new(vec![0x35; 32]);
+        for _ in 0..2 {
+            let replay =
+                create_idempotent_payout_batch(&mut client, &path, network, &seed, request.clone())
+                    .await
+                    .unwrap();
+            assert_eq!(replay.raw_transaction_hex, signed.raw_transaction_hex);
+        }
+        for mutation in 0..5 {
+            let mut changed = request.clone();
+            match mutation {
+                0 => changed.outputs[0].amount_zat += 1,
+                1 => changed.outputs[0].allocation_id = Uuid::from_u128(999).to_string(),
+                2 => changed.request_commitment = "22".repeat(32),
+                3 => {
+                    changed.outputs[0].receiver_kind = crate::WcashReceiverKind::TransparentP2pkh;
+                    changed.outputs[0].canonical_address =
+                        crate::address::encode_wcash_transparent_receiver(
+                            TransparentAddress::PublicKeyHash([8; 20]),
+                            network,
+                        )
+                }
+                _ => {
+                    if transparent {
+                        changed.outputs[0].canonical_address = account.address.clone();
+                        changed.outputs[0].receiver_kind = crate::WcashReceiverKind::Ironwood;
+                    } else {
+                        changed.outputs[0].canonical_address =
+                            crate::address::encode_wcash_transparent_receiver(receiver, network);
+                        changed.outputs[0].receiver_kind =
+                            crate::WcashReceiverKind::TransparentP2pkh;
+                    }
+                }
+            }
+            assert!(matches!(
+                create_idempotent_payout_batch(&mut client, &path, network, &seed, changed).await,
+                Err(WalletServiceError::PayoutBatchConflict { .. })
+            ));
+        }
     }
 
     #[test]

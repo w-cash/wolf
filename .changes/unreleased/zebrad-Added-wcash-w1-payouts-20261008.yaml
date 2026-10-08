@@ -1,0 +1,4 @@
+project: zebrad
+kind: Added
+body: "Support Wcash P2PKH payout outputs funded by Ironwood, with exact script/value inspection, empty transparent memos, Ironwood change, seedless capability reporting, and compatible version-2 journal recovery."
+time: 2026-10-08T00:00:00.000000000Z

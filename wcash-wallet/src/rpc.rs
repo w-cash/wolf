@@ -1653,9 +1653,18 @@ pub fn inspect_signed_transaction(
         ));
     }
     if let Some(transparent) = transaction.transparent_bundle() {
-        if transparent.is_coinbase() || transparent.vin.is_empty() || !transparent.vout.is_empty() {
+        let shielding = !transparent.vin.is_empty() && transparent.vout.is_empty();
+        let payout = transparent.vin.is_empty()
+            && !transparent.vout.is_empty()
+            && transparent.vout.iter().all(|output| {
+                matches!(
+                    output.recipient_address(),
+                    Some(TransparentAddress::PublicKeyHash(_))
+                )
+            });
+        if transparent.is_coinbase() || !(shielding || payout) {
             return Err(WalletRpcError::TransactionPolicy(
-                "coinbase shielding must have transparent inputs and no transparent outputs",
+                "transparent components must be input-only shielding or output-only P2PKH payouts",
             ));
         }
     }

@@ -144,6 +144,8 @@ enum Command {
     },
     /// Canonically classify one Wcash address read from standard input.
     ValidateAddress,
+    /// Report supported payout receiver kinds without opening a wallet.
+    PayoutCapabilities,
     /// Create or verify the single wallet account using a hex seed on stdin.
     Init {
         /// First Wcash block to scan; defaults to a bounded recent birthday.
@@ -369,6 +371,10 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 ivk_file_written: true,
             })
         }
+        Command::PayoutCapabilities => print_json(&serde_json::json!({
+            "protocol_version": wcash_wallet::PAYOUT_BATCH_FORMAT_VERSION,
+            "receiver_kinds": ["ironwood", "transparent_p2pkh"],
+        })),
         Command::ValidateAddress => {
             let address = read_address()?;
             print_json(&validate_wcash_address(&address, network)?)

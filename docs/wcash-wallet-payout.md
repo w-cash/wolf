@@ -1,9 +1,8 @@
-# Wcash Testnet payout signer boundary
+# Wcash payout signer boundary
 
 `wcash-wallet` protocol version 2 is the isolated WEC signing boundary for the
-pool settlement service. It is deliberately enabled only with
-`--network testnet`; Wcash Regtest and the disabled mainnet cannot use these
-commands.
+pool settlement service. It supports explicitly selected Mainnet and Testnet networks. Regtest payout
+commands require the `regtest-payout` build feature. No consensus rules change.
 
 The pool first obtains the exact public identity:
 
@@ -67,9 +66,9 @@ wcash-wallet \
 The JSON input is bounded to 512 KiB and rejects unknown fields. It contains
 `batch_id`, `request_commitment`, the exact `identity`, ordered `outputs`,
 `confirmations`, and `max_fee_zat`. Each output contains a canonical allocation
-UUID, canonical Wcash Unified Address, `receiver_kind: "ironwood"`, positive
-`amount_zat`, and at most 512 memo bytes encoded as canonical lowercase
-`memo_hex`. UUIDs and 32-byte commitments must use canonical lowercase forms.
+UUID, canonical Wcash address, exact `receiver_kind`, positive `amount_zat`,
+and canonical lowercase `memo_hex`. Ironwood supports at most 512 memo bytes.
+Transparent P2PKH requires an empty memo. UUIDs and 32-byte commitments must use canonical lowercase forms.
 
 The seed credential path may appear in process metadata, but its contents may
 not. On Unix the file must be an absolute, lexically canonical, owner-owned
@@ -120,3 +119,59 @@ This component does not calculate balances from shares, choose eligible miners,
 freeze allocations across reorgs, hold portal credentials, or expose an
 Internet-facing endpoint. Those remain responsibilities of the independently
 reviewed pool ledger and its local authenticated adapter.
+
+## Optional public P2PKH destinations
+
+Shielded Ironwood (`wu1…` on Mainnet) remains recommended. A Mainnet W1 payment
+exposes the destination and transferred amount. P2SH/W3, TEX, Zcash t-addresses,
+wrong-network addresses and noncanonical encodings are rejected. Classification
+uses the authoritative Wcash parser, never string prefixes.
+
+Before enabling public payouts, the pool must pin the compatible wallet binary
+and check its seedless capability response:
+
+```console
+wcash-wallet --network mainnet payout-capabilities
+```
+
+```json
+{"protocol_version":2,"receiver_kinds":["ironwood","transparent_p2pkh"]}
+```
+
+The following output examples abbreviate addresses and are not executable
+requests. Use actual canonical addresses from the chosen network:
+
+```json
+{"allocation_id":"00000000-0000-0000-0000-000000000001","canonical_address":"wu1…","receiver_kind":"ironwood","amount_zat":1000000,"memo_hex":""}
+```
+
+```json
+{"allocation_id":"00000000-0000-0000-0000-000000000002","canonical_address":"W1…","receiver_kind":"transparent_p2pkh","amount_zat":1000000,"memo_hex":""}
+```
+
+Pass one address on standard input to `wcash-wallet --network mainnet
+validate-address`. A successful W1 response has this shape (address abbreviated):
+
+```json
+{"network":"mainnet","receiver_kind":"transparent_p2pkh","canonical":"W1…"}
+```
+
+The declared kind must match both the parsed kind and canonical address. W1
+outputs cannot carry shielded memos, including payout allocation memos. Inputs
+and internal change remain Ironwood; V6, network/branch, expiry, exact fees,
+nullifiers, output scripts/values/multiplicity and private change are checked.
+
+Protocol version 2 and the journal schema remain unchanged: the existing
+`transparent_p2pkh` JSON enum value is used. The canonical stored address uniquely
+binds the kind and is reparsed during recovery. Existing Ironwood rows remain
+recoverable; repeated requests recover the stored bytes. The compatibility test
+`old_ironwood_v2_journal_recovers_after_upgrade_and_restart` creates an Ironwood
+journal using the frozen writer from commit
+`1ecc5a4d611ad0cc4aa97e8cf1417345a4368e15`, then reopens SQLite and recovers it
+with the current code. The W1 proof/restart test exercises the current writer.
+Both retry through a disconnected client and require identical signed bytes,
+so recovery cannot silently create a replacement transaction.
+
+Store payout addresses in the miner's pool account rather than ASIC password
+fields. Never log seed phrases, seed material, full payout addresses or wallet
+request bodies. Logs should use batch/allocation identifiers and masked addresses.
