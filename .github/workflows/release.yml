@@ -1,4 +1,8 @@
-# Release workflow: Release PR planning and resumable publication.
+# Inherited Zebra release workflow.
+#
+# This workflow is deliberately disabled outside ZcashFoundation/zebra.
+# Wolf's Wcash artifacts require a separate reviewed release pipeline that
+# builds and verifies the `wcash-consensus` profile before any publication.
 #
 # Pipeline:
 #   non-release push to main      -> creates or updates the Release PR
@@ -41,6 +45,7 @@ jobs:
   release-pr:
     name: Create or update Release PR
     if: >-
+      github.repository == 'ZcashFoundation/zebra' &&
       github.event_name == 'push' &&
       !startsWith(github.event.head_commit.message, 'chore: release')
     runs-on: ubuntu-latest
@@ -186,11 +191,12 @@ jobs:
   release-target:
     name: Verify Release PR
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.merged == true &&
-       startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
-       contains(github.event.pull_request.labels.*.name, 'A-release'))
+      github.repository == 'ZcashFoundation/zebra' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+        contains(github.event.pull_request.labels.*.name, 'A-release')))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

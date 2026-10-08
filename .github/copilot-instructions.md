@@ -1,6 +1,12 @@
-# Zebra — Copilot Review Instructions
+# Wcash Wolf — Copilot Review Instructions
 
-You are reviewing PRs for Zebra, a Zcash full node in Rust. Prioritize correctness, consensus safety, DoS resistance, and maintainability. Stay consistent with existing Zebra conventions. Avoid style-only feedback unless it clearly prevents bugs.
+You are reviewing PRs for Wolf, the Rust node and protocol workspace for Wcash.
+It is derived from Zebra and retains many upstream crate names, but a Wcash
+artifact, network and contribution are not interchangeable with their Zcash
+counterparts. Read [`AGENTS.md`](../AGENTS.md), the
+[protocol direction](../docs/wcash-direction.md), and the relevant source before
+reviewing. Prioritize correctness, consensus safety, DoS resistance and
+maintainability. Avoid style-only feedback unless it clearly prevents bugs.
 
 If the diff or PR description is incomplete, ask questions before making strong claims.
 
@@ -8,7 +14,7 @@ If the diff or PR description is incomplete, ask questions before making strong 
 
 Before reviewing code quality, verify:
 
-- [ ] PR links to a pre-discussed issue
+- [ ] Scope was acknowledged by a Wcash maintainer, or the PR records a direct maintainer request
 - [ ] PR description includes Motivation, Solution, and Tests sections
 - [ ] PR title follows conventional commits
 - [ ] If AI tools were used, disclosure is present in the PR description
@@ -19,16 +25,37 @@ If these are missing, note it in the review.
 
 ```text
 zebrad (CLI orchestration)
-  → zebra-consensus (verification)
-  → zebra-state (storage/service boundaries)
-  → zebra-chain (data types; sync-only)
-  → zebra-network (P2P)
-  → zebra-rpc (JSON-RPC)
+  ├── zebra-consensus (verification)
+  ├── zebra-state (storage/service boundaries)
+  ├── zebra-network (P2P)
+  └── zebra-rpc (JSON-RPC and gRPC)
+        └── zebra-node-services (service traits)
+              └── zebra-chain (data types; sync-only)
 ```
 
 - Dependencies flow **downward only** (lower crates must not depend on higher crates)
 - `zebra-chain` is **sync-only** (no async / tokio / Tower services)
 - State uses `ReadRequest` for queries, `Request` for mutations
+
+## Wcash Direction Checks
+
+- A Wcash node is `zebrad` built with `wcash-consensus`; do not accept a default
+  Zcash artifact merely relabelled as Wcash.
+- Preserve AuxPoW merge mining and validate Wcash and parent targets
+  independently. Parent-chain acceptance is not required for a Wcash winner.
+- Mainnet uses a 40,000-block slow start, Monero-style integer smooth decay and
+  permanent 0.375-WEC tail emission. It has no halvings or fixed supply cap.
+- Reject any founders reward, development tax, funding stream, lockbox or other
+  protocol allocation in Wcash profiles.
+- Transparent and Ironwood are the only active Wcash value pools. Inherited
+  zero-valued RPC compatibility fields do not activate Sprout, Sapling, legacy
+  Orchard or lockbox value.
+- Keep Mainnet, Testnet and Regtest identities, transaction domains, addresses,
+  storage and subsidy schedules separate.
+- Preserve monetary values as exact integer atomic units. Do not infer an
+  economic supply cap from a technical amount bound.
+- Treat mining, signing, broadcasting, payout and candidate-retirement commands
+  as state-changing even when a wrapper calls them a preflight.
 
 ## High-Signal Checks
 
@@ -44,10 +71,12 @@ If the PR touches a Tower `Service` implementation:
 
 - Prefer `thiserror` with `#[from]` / `#[source]`
 - `expect()` messages must explain **why** the invariant holds:
+
   ```rust
   .expect("block hash exists because we just inserted it")  // good
   .expect("failed to get block")                            // bad
   ```
+
 - Don't turn invariant violations into misleading `None`/defaults
 
 ### Numeric Safety
@@ -85,6 +114,9 @@ When the PR adds abstraction, flags, generics, or refactors:
 - New behavior needs tests
 - Async tests: `#[tokio::test]` with timeouts for long-running tests
 - Test configs must use realistic network parameters
+- Wcash behavior needs the applicable checks from
+  `.github/workflows/wcash-release-gate.yml`; default-profile tests alone are
+  insufficient evidence
 
 ### Observability
 
@@ -103,7 +135,7 @@ When the PR adds abstraction, flags, generics, or refactors:
 - **`zebra-consensus` / `zebra-chain`**: Consensus-critical; check serialization, edge cases, overflow, test coverage
 - **`zebra-state`**: Read/write separation, long-lived locks, timeouts, database migrations
 - **`zebra-network`**: All inputs are attacker-controlled; check bounds, rate limits, protocol compatibility
-- **`zebra-rpc`**: zcashd compatibility (response shapes, errors, timeouts), user-facing behavior
+- **`zebra-rpc`**: zcashd compatibility where intended, Wcash identity and pool semantics, response shapes, errors, timeouts, user-facing behavior
 - **`zebra-script`**: FFI memory safety, lifetime/ownership across boundaries
 
 ## Output Format

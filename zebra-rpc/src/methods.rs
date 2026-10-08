@@ -564,7 +564,7 @@ pub trait Rpc {
     #[method(name = "getblockhash")]
     async fn get_block_hash(&self, index: i32) -> Result<GetBlockHashResponse>;
 
-    /// Returns a block template for mining new Zcash blocks.
+    /// Returns a block template for mining on the node's selected network.
     ///
     /// # Parameters
     ///
@@ -580,7 +580,7 @@ pub trait Rpc {
     /// Long polling, block proposals, server lists, and work IDs are not supported.
     ///
     /// Miners can make arbitrary changes to blocks, as long as:
-    /// - the data sent to `submitblock` is a valid Zcash block, and
+    /// - the data sent to `submitblock` is valid for the selected network, and
     /// - the parent block is a valid block that Zebra already has, or will receive soon.
     ///
     /// Zebra verifies blocks in parallel, and keeps recent chains in parallel,
@@ -728,8 +728,8 @@ pub trait Rpc {
     #[method(name = "ping")]
     async fn ping(&self) -> Result<()>;
 
-    /// Checks if a zcash transparent address of type P2PKH, P2SH or TEX is valid.
-    /// Returns information about the given address if valid.
+    /// Checks whether a transparent P2PKH, P2SH or TEX address is valid for the
+    /// node's selected network, and returns its decoded information when valid.
     ///
     /// zcashd reference: [`validateaddress`](https://zcash.github.io/rpc/validateaddress.html)
     /// method: post
@@ -737,12 +737,13 @@ pub trait Rpc {
     ///
     /// # Parameters
     ///
-    /// - `address`: (string, required) The zcash address to validate.
+    /// - `address`: (string, required) The network-specific address to validate.
     #[method(name = "validateaddress")]
     async fn validate_address(&self, address: String) -> Result<ValidateAddressResponse>;
 
-    /// Checks if a zcash address of type P2PKH, P2SH, TEX, SAPLING or UNIFIED is valid.
-    /// Returns information about the given address if valid.
+    /// Checks whether an address is valid for the node's selected network, and
+    /// returns its decoded receiver information when valid. Supported receiver
+    /// kinds depend on the selected consensus profile.
     ///
     /// zcashd reference: [`z_validateaddress`](https://zcash.github.io/rpc/z_validateaddress.html)
     /// method: post
@@ -750,7 +751,7 @@ pub trait Rpc {
     ///
     /// # Parameters
     ///
-    /// - `address`: (string, required) The zcash address to validate.
+    /// - `address`: (string, required) The network-specific address to validate.
     ///
     /// # Notes
     ///
@@ -768,8 +769,9 @@ pub trait Rpc {
     #[method(name = "getstandardfee")]
     async fn get_standard_fee(&self) -> Result<GetStandardFeeResponse>;
 
-    /// Returns the block subsidy reward of the block at `height`, taking into account the mining slow start.
-    /// Returns an error if `height` is less than the height of the first halving for the current network.
+    /// Returns the block subsidy at `height` under the selected network's exact
+    /// integer schedule, including any applicable slow start, smooth emission,
+    /// tail emission, halving, funding stream or lockbox rules.
     ///
     /// zcashd reference: [`getblocksubsidy`](https://zcash.github.io/rpc/getblocksubsidy.html)
     /// method: post
@@ -793,7 +795,8 @@ pub trait Rpc {
     #[method(name = "getdifficulty")]
     async fn get_difficulty(&self) -> Result<f64>;
 
-    /// Returns the list of individual payment addresses given a unified address.
+    /// Returns the individual receivers encoded by a Unified Address for the
+    /// node's selected network.
     ///
     /// zcashd reference: [`z_listunifiedreceivers`](https://zcash.github.io/rpc/z_listunifiedreceivers.html)
     /// method: post
@@ -801,7 +804,7 @@ pub trait Rpc {
     ///
     /// # Parameters
     ///
-    /// - `address`: (string, required) The zcash unified address to get the list from.
+    /// - `address`: (string, required) The network-specific Unified Address.
     ///
     /// # Notes
     ///

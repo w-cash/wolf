@@ -7,13 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-> **Historical Wcash development notes:** The Wcash bullets in this legacy
-> Unreleased snapshot describe earlier prelaunch profiles and are superseded by
-> the current source and [`docs/wcash-consensus.md`](docs/wcash-consensus.md).
-> Mainnet is now implemented with a 40,000-block ramp, smooth decay, and a
-> permanent 0.375-WEC tail rather than halvings or a fixed economic supply cap.
-> Current release changes are recorded in `.changes/unreleased/` fragments.
-
 ### Fixed
 
 - Refreshed the deterministic Wcash Testnet wallet vectors after the prelaunch
@@ -78,7 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Bound every durable share append to the originally locked journal inode and,
   on Unix, reject journal directories writable by group or other users.
 
-### Historical known limitations (superseded)
+### Known limitations
 
 - This release is local pre-testnet software. Public genesis/network/difficulty
   parameters, wallet maturity-and-spend interoperability, vendor ASIC testing,

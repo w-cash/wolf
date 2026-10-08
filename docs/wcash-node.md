@@ -12,7 +12,7 @@ Choose the instructions for your role:
 | Build a node and inspect Mainnet | Follow this guide |
 | Reproduce mining or wallet experiments with valueless coins | [Local regtest guide](wcash-local.md) |
 | Integrate a pool | [Pool compatibility](wcash-pool-compatibility.md) and [merged-mining design](wcash-merged-mining.md) |
-| Use an AI agent to work in this repository | [Agent workflow](wcash-agents.md) |
+| Use a coding agent to change this repository | [Agent contribution rules](../AGENTS.md) |
 
 This guide uses the current source's `WcashMainnet` profile. Mainnet is enabled
 in source; old prelaunch statements in engineering documents must not be used
@@ -48,7 +48,7 @@ rustc --version
 cargo --version
 
 cargo build --locked --release -p zebrad --bin zebrad \
-  --no-default-features --features wcash-consensus \
+  --features wcash-consensus \
   --target-dir target/wcash-node
 
 ./target/wcash-node/release/zebrad --help
@@ -56,10 +56,12 @@ cargo build --locked --release -p zebrad --bin zebrad \
 WOLF_REPO="$(pwd)"
 ```
 
-`wcash-consensus` selects Wcash validation rules. An ordinary upstream Zcash
-`zebrad` binary is not interchangeable with this build. The separate target
-directory makes the chosen artifact explicit when both profiles are built in
-one checkout. This command does not enable the internal miner.
+`wcash-consensus` selects Wcash validation rules. The default release features
+add the repository's normal observability and release-binary support; they do
+not select Zcash consensus. An ordinary upstream Zcash `zebrad` binary is not
+interchangeable with this build. The separate target directory makes the chosen
+artifact explicit when both profiles are built in one checkout. This command
+does not enable the internal miner.
 
 The commands describe how to build; they are not a claim that a binary was
 built or tested on your machine. A successful compilation also does not prove
@@ -143,10 +145,11 @@ cd "$WOLF_NODE_DIR"
   -c "$WOLF_NODE_DIR/wcash.toml" start
 ```
 
-The node now contacts the public Wcash network and writes local chain state.
-Keep this terminal open and watch for configuration, peer-discovery, and
-validation errors. Synchronization time and storage needs depend on the chain
-and your hardware; there is no fixed completion time in this guide.
+The node now attempts to contact the configured Wcash Mainnet bootstrap peers
+and writes locally validated chain state when peers respond. Keep this terminal
+open and watch for configuration, peer-discovery, and validation errors.
+Synchronization time and storage needs depend on the chain and your hardware;
+there is no fixed completion time in this guide.
 
 To stop, press **Ctrl-C** in that terminal and wait for shutdown to finish.
 Start with the same configuration and working directory to resume. Do not
@@ -222,6 +225,12 @@ Then inspect these `getblockchaininfo` fields:
 | `estimatedheight` and `verificationprogress` | Synchronization estimates, not proof of peer agreement or safety |
 | `chainSupply` and `valuePools` | Aggregate chain values, not a wallet balance or a list of shielded recipients |
 
+The inherited `valuePools` response shape can include zero-valued `sprout`,
+`sapling`, `orchard`, and `lockbox` rows. They are compatibility fields, not
+active Wcash pools. Only `transparent` and `ironwood` are active under Wcash
+consensus. A non-zero legacy or lockbox row is unexpected and should be
+investigated rather than presented as supported Wcash value.
+
 Use `getnetworkinfo.connections`, `getpeerinfo`, and the logs to check whether
 peers are available. Sample the tip again later; a single unchanged reading is
 not proof that the node is broken. Compare the same block height with another
@@ -240,7 +249,7 @@ the sync-ready flag, or mixing cache directories.
 
 | Profile | Purpose | P2P / suggested local RPC ports |
 | --- | --- | --- |
-| `WcashMainnet` | Observe the live WEC chain | `48233` / `48232` |
+| `WcashMainnet` | Validate and observe WEC Mainnet | `48233` / `48232` |
 | `WcashTestnet` | Engineering tests using valueless TWC | `38233` / `38232` |
 | `WcashRegtest` | Isolated, local development using valueless TWC | `28233` / `28232` |
 
@@ -274,8 +283,8 @@ addresses, and unnecessary host details from logs. A node observation report
 never needs a wallet seed or private key.
 
 Continue with the [documentation index](README.md),
-[Wcash project overview](https://w.cash/), or the
-[Equihash merged-mining explanation](https://equihash.com/merged-mining).
+[Wcash project overview](https://w.cash/), or the repository's
+[merged-mining contract](wcash-merged-mining.md).
 The repository's node software, consumer wallets, pool operations, and external
 websites have different roles; check the applicable release and service status
 before relying on each one.

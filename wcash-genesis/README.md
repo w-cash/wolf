@@ -71,8 +71,9 @@ timestamp of 19 September 2026 at 12:00:00 UTC. Its coinbase statement is
 `Wcash Mainnet ZEC #3488810` followed by that hash. The Wcash genesis block ID
 is frozen in `zebra-chain`. Command-line input cannot replace this anchor.
 
-The source anchor alone does not declare a public mainnet launch. The release
-procedure requires all of the following before operating a public network:
+The source anchor alone does not prove how it was selected or whether a binary
+is release-ready. The Mainnet anchor-freeze record and every release review
+must retain evidence that the following checks were completed:
 
 1. Waits for at least 100 Zcash confirmations after the selected block.
 2. Obtains the height, hash, and exact header from a locally validated Zcash
@@ -86,8 +87,9 @@ procedure requires all of the following before operating a public network:
 6. Releases the same source and reproducible binary to every participant.
 
 Checking an isolated source header is not proof of its claimed height,
-confirmations, or best-chain membership. These checks must be completed against
-the live Zcash chain before launch.
+confirmations, or best-chain membership. Historical anchor-selection evidence
+must bind those checks to the frozen bytes; release review must separately
+verify that the built artifact contains the same frozen anchor.
 
 ## Local testing
 

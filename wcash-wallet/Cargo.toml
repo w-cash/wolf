@@ -4,6 +4,7 @@ version = "0.1.0"
 publish = false
 authors.workspace = true
 description = "An experimental local wallet for Wcash"
+readme = "README.md"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -12,7 +13,7 @@ rust-version.workspace = true
 
 [features]
 default = []
-# Local integration only; public wallet builds retain Testnet-only pool payouts.
+# Local integration only; normal builds support Mainnet and Testnet pool payouts.
 regtest-payout = []
 
 [dependencies]

@@ -6,7 +6,7 @@ packageOverrides:
 
 githubRelease:
   package: zebrad
-  nameTemplate: "Zebra {version}"
+  nameTemplate: "Wcash {version}"
   notesFile: CHANGELOG.md
-  notesHeadingTemplate: "## [Zebra {version}]"
+  notesHeadingTemplate: "## [Wcash {version}]"
   makeLatest: auto

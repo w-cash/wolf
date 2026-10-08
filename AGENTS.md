@@ -40,6 +40,10 @@ and the repository's [PR template](.github/pull_request_template.md).
 - Mainnet, Testnet and Regtest have distinct genesis, branch IDs and storage
   namespaces. They also have different subsidy schedules. Use the
   [consensus reference](docs/wcash-consensus.md) and linked source.
+- Preserve the maintainer-approved [protocol direction](docs/wcash-direction.md):
+  merge mining, the 40,000-block Mainnet slow start, Monero-style integer smooth
+  decay, permanent tail emission, no protocol tax, and exactly the transparent
+  and Ironwood active value pools. Changing any of these is not a cleanup.
 - Never change frozen genesis, branch IDs, wire versions or monetary constants
   as a documentation cleanup. Mainnet has no fixed economic supply cap; its
   curve scale and per-transaction amount bounds are not maximum supply.

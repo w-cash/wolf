@@ -20,7 +20,7 @@ identify the running binary. Start a node with the [node guide](wcash-node.md).
 | Which JSON-RPC methods and fields exist? | [Method declarations and implementation](../zebra-rpc/src/methods.rs), [response types](../zebra-rpc/src/methods/types/) |
 | How are RPC transport and credentials configured? | [RPC configuration](../zebra-rpc/src/config/rpc.rs), [cookie implementation](../zebra-rpc/src/server/cookie.rs) |
 | What establishes AuxPoW validity? | [Proof format and vectors](../wcash-zcash-aux/README.md), [mining workflow](wcash-merged-mining.md) |
-| What can the local wallet do? | [CLI](../wcash-wallet/src/main.rs), [network identity](../wcash-wallet/src/network.rs), [payout boundary](wcash-wallet-payout.md) |
+| What can the local wallet do? | [Wallet guide](../wcash-wallet/README.md), [network identity](../wcash-wallet/src/network.rs), [payout boundary](wcash-wallet-payout.md) |
 | Which checks cover these boundaries? | [Wcash release workflow](../.github/workflows/wcash-release-gate.yml), [RPC tests](../zebra-rpc/src/methods/tests/) |
 
 Use the implementation and frozen tests for exact values; check prose against
@@ -73,7 +73,7 @@ reviewed profile from the source table above; do not change only the port or
 accept a server-provided identity as your expected value. Revisit the expected
 branch when adopting a reviewed network upgrade.
 
-The following Python 3 example makes three **read-only JSON-RPC methods via
+The following Python 3 example makes four **read-only JSON-RPC methods via
 HTTP POST** against the node guide's local Mainnet instance. It uses only the
 standard library, keeps the credential out of command-line arguments, refuses
 redirects/proxies, checks errors, and preserves integer JSON numbers exactly.
@@ -101,7 +101,7 @@ endpoint = "http://127.0.0.1:48232/"
 credential = Path(sys.argv[1]).read_bytes().strip()
 authorization = "Basic " + base64.b64encode(credential).decode("ascii")
 opener = build_opener(ProxyHandler({}), NoRedirect())
-allowed = {"getblockhash", "getblockchaininfo", "getblockheader"}
+allowed = {"getblockhash", "getblockchaininfo", "getblockheader", "rpc.discover"}
 
 def rpc(method, params, request_id):
     if method not in allowed:
@@ -136,12 +136,16 @@ if info["blocks"] >= 1 and info["consensus"]["chaintip"] != "d9c6a7ee":
 header = rpc("getblockheader", [info["bestblockhash"], True], 3)
 if header["hash"] != info["bestblockhash"] or header["height"] != info["blocks"]:
     raise RuntimeError("inconsistent block identity")
+schema = rpc("rpc.discover", [], 4)
+if schema.get("openrpc") != "1.3.2" or not isinstance(schema.get("methods"), list):
+    raise RuntimeError("invalid OpenRPC discovery response")
 print(json.dumps({
     "network": "Wcash Mainnet", "genesis": genesis,
     "observed_at": datetime.now(timezone.utc).isoformat(),
     "height": info["blocks"], "hash": info["bestblockhash"],
     "block_time": header["time"],
     "chain_supply_atoms": str(info["chainSupply"]["chainValueZat"]),
+    "openrpc": schema["openrpc"], "advertised_methods": len(schema["methods"]),
 }))
 PY
 ```
@@ -151,6 +155,14 @@ It deliberately fails on unavailable blocks or transport errors; it does not
 start a node, change configuration or retry automatically. Separate RPC calls
 are not an atomic snapshot: the tip can advance or reorganize between them.
 The printed `observed_at` is the client's observation time, not a server claim.
+
+`rpc.discover` is the authenticated machine-readable entry point for the
+compiled JSON-RPC interface. Its OpenRPC document is useful for generating a
+pinned client or comparing an endpoint with a reviewed artifact. Discovery is
+not authorization: an advertised method may be state-changing, restricted to a
+network/profile, unavailable at the current node state, or inappropriate for an
+agent. Apply a reviewed read-only allowlist independently of the schema, and
+retain the schema with the node version and artifact identity used to obtain it.
 
 ## Preserve money and evidence precisely
 
@@ -170,6 +182,16 @@ decimal strings for atomic amounts, define sign/range/unit, and reject
 fractional atomic units. Keep fees, subsidy, pool balances and chain supply
 distinct. Mainnet's finite implementation amount bound is not an economic
 supply cap; see [amount limits](../zebra-chain/src/amount.rs).
+
+Some inherited RPC schemas retain zero-valued `sprout`, `sapling`, `orchard`
+and `lockbox` entries in `valuePools`, and tree/subtree methods retain legacy
+pool-shaped fields or parameters for compatibility. Field or method presence
+does not activate those pools. For Wcash, only `transparent` and `ironwood` are
+active; consensus rejects post-genesis Sprout, Sapling and legacy Orchard
+components and Wcash has no lockbox allocation. An integration may parse the
+compatibility fields, but must not advertise them as supported Wcash pools or
+route value to them. Treat an unexpected non-zero legacy/lockbox balance as an
+identity or data-integrity failure requiring investigation.
 
 For each result retain the selected network/genesis, artifact or source
 revision when known, service identity, observation time, and relevant block

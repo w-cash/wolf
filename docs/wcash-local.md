@@ -321,9 +321,8 @@ Because these scripts perform real proof-of-work solving, they are mandatory
 local release checks and are intentionally excluded from GitHub Actions. The
 checked-in hosted workflows are configured to compile the same components and
 validate fixed Equihash/AuxPoW vectors, consensus rules, RPC behavior, and
-profile isolation without solving work. Repository Actions are currently
-disabled, so this branch relies on the recorded local gates instead of a hosted
-result.
+profile isolation without solving work. No hosted result is claimed here; link
+a dated workflow run for the exact revision in release evidence when one exists.
 
 The E2E proves only those deterministic local, single-writer wallet lifecycles.
 It does not prove general or production wallet interoperability,

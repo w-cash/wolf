@@ -18,19 +18,27 @@ Zcash build and a Wcash build are not interchangeable.
 > that a deployed service or wallet release is audited or ready for unrestricted
 > use. Verify the source, build profile and network of every artifact.
 > Testnet and Regtest coins are valueless `TWC`.
+>
+> The legacy unversioned `CHANGELOG.md` section is a historical pre-Mainnet
+> snapshot, not the current protocol definition. Use the
+> [protocol direction](docs/wcash-direction.md), [consensus reference](docs/wcash-consensus.md),
+> source and release fragments for current behavior. This revision also keeps
+> inherited Zebra publication and deployment workflows disabled in `w-cash/wolf`
+> until a Wcash-specific artifact pipeline is implemented and reviewed.
 
 ## Start here
 
 | I want to… | Read |
 | --- | --- |
 | Understand Wcash and find ecosystem services | [w.cash](https://w.cash/) and the [documentation index](docs/README.md) |
+| Understand the protocol's intended direction | [Protocol direction](docs/wcash-direction.md) |
 | Build and run a node | [Node operator guide](docs/wcash-node.md) |
 | Check network identity, supply and privacy rules | [Consensus reference](docs/wcash-consensus.md) |
 | Query a node from software or an AI agent | [Agent and integration guide](docs/wcash-agents.md) |
 | Contribute changes with a coding agent | [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Integrate merged mining | [Mining contract](docs/wcash-merged-mining.md) and [pool compatibility](docs/wcash-pool-compatibility.md) |
 | Exercise a disposable local network | [Local Regtest guide](docs/wcash-local.md) |
-| Use the included experimental wallet | [Wallet and payout boundary](docs/wcash-wallet-payout.md) |
+| Use the included experimental wallet | [Wallet guide](wcash-wallet/README.md) and [payout boundary](docs/wcash-wallet-payout.md) |
 | Report a suspected vulnerability privately | [Security policy](SECURITY.md) |
 
 For a consumer wallet, start at [wcashwallet.com](https://wcashwallet.com/) and
@@ -51,7 +59,7 @@ different identities and subsidy schedules; see the
 | Proof of work | Zcash Equihash `(200, 9)` with AuxPoW v2 |
 | Genesis | `5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48` |
 | Transaction domain | Wcash V6, Mainnet branch ID `0xd9c6a7ee` |
-| Emission | 40,000-block linear slow start, then integer smooth decay with a permanent 0.375-WEC tail |
+| Emission | 40,000-block linear slow start, then Monero-style integer smooth decay with a permanent 0.375-WEC tail |
 | Halvings and maximum supply | No Mainnet halvings and no fixed economic supply cap |
 | Protocol allocation | No founders reward, funding stream, lockbox or developer tax |
 | Active value pools | Transparent and Ironwood; Sprout, Sapling and legacy Orchard components are rejected |
@@ -115,7 +123,8 @@ JSON-RPC contract. A working service URL does not identify its deployed commit.
 The [website specification](https://w.cash/whitepaper) is an additional reading
 aid. For reproducible integrations, record the Wolf commit, build features,
 genesis and transaction branch, and check implementation and tests. The
-[documentation index](docs/README.md) maps those sources and website responsibilities.
+[protocol direction](docs/wcash-direction.md) records the intended design; the
+[documentation index](docs/README.md) maps each topic to its repository source.
 
 ## Review and security
 

@@ -103,6 +103,24 @@ fn wcash_mainnet_profile_is_fully_wired_with_frozen_anchor() -> Result<(), Repor
         block_subsidy(Height(40_001), &mainnet)?.zatoshis(),
         2_199_023_255
     );
+    let first_smooth_subsidy = block_subsidy(Height(40_001), &mainnet)?;
+    assert!(mainnet.all_funding_streams().is_empty());
+    assert!(mainnet.lockbox_disbursements(Height(40_001)).is_empty());
+    assert_eq!(
+        mainnet.lockbox_disbursement_total_amount(Height(40_001)),
+        Amount::<NonNegative>::zero()
+    );
+    assert_eq!(
+        miner_subsidy(Height(40_001), &mainnet, first_smooth_subsidy)?,
+        first_smooth_subsidy,
+        "Wcash Mainnet allocates the full subsidy to the miner"
+    );
+    assert_eq!(
+        founders_reward(&mainnet, Height(40_001)),
+        Amount::<NonNegative>::zero()
+    );
+    assert_eq!(founders_reward_address(&mainnet, Height(40_001)), None);
+    assert!(funding_stream_values(Height(40_001), &mainnet, first_smooth_subsidy)?.is_empty());
     assert_eq!(ConsensusBranchId::current(&mainnet, Height::MIN), None);
     assert_eq!(
         ConsensusBranchId::current(&mainnet, Height(1)),

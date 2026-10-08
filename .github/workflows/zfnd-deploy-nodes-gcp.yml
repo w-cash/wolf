@@ -126,6 +126,7 @@ jobs:
   # the reusable deployment workflow.
   set-matrix:
     name: Resolve event deployment inputs
+    if: github.repository == 'ZcashFoundation/zebra'
     runs-on: ubuntu-latest
     outputs:
       networks: ${{ steps.set-matrix.outputs.networks }}
@@ -246,7 +247,7 @@ jobs:
     needs: [set-matrix, build]
     if: >-
       ${{
-        github.repository_owner == 'ZcashFoundation' &&
+        github.repository == 'ZcashFoundation/zebra' &&
         (
           (github.event_name == 'push' && github.ref_name == 'main') ||
           (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')) ||
@@ -274,7 +275,10 @@ jobs:
   build-failure-issue:
     name: Open or update issues for image build failures
     needs: [build]
-    if: (failure() && github.event.pull_request == null) || (cancelled() && github.event.pull_request == null)
+    if: >-
+      github.repository == 'ZcashFoundation/zebra' &&
+      ((failure() && github.event.pull_request == null) ||
+       (cancelled() && github.event.pull_request == null))
     runs-on: ubuntu-latest
     permissions:
       contents: read

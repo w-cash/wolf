@@ -1,24 +1,30 @@
 ---
 name: "🚀 Wolf Release"
 about: "Wcash maintainer use only"
-title: "Publish next Wolf release: (version)"
+title: "Review Wolf release readiness: (version)"
 labels: "A-release"
 type: Task
 assignees: ""
 ---
 
-# Prepare for the Release
+# Prepare Wcash Release Evidence
 
 Record evidence for the exact Wolf commit and build features. An upstream Zebra
 workflow, inherited version number, local Regtest result, or reachable endpoint
 does not certify a Wcash release.
+
+> [!IMPORTANT]
+> Wolf does not currently have an enabled public-release pipeline. The inherited
+> Zebra publication workflow is owner-gated and the inherited binary workflow
+> does not build a Wcash release artifact. This issue can collect readiness
+> evidence, but must not be used to publish crates, tags, images or binaries.
 
 - [ ] Freeze the release scope and identify the Mainnet, Testnet, and Regtest
       behavior changed by the release.
 - [ ] Confirm every consensus, network, genesis, monetary-policy, privacy,
       mining, wallet, and state-format change has explicit Wcash review and
       applicable vectors.
-- [ ] Run `.github/workflows/wcash-release-gate.yml` successfully on the release
+- [ ] Run `.github/workflows/wcash-release-gate.yml` successfully on the candidate
       commit and retain the run URL and artifact hashes.
 - [ ] Run applicable local real-solver, wallet recovery, full-sync, migration,
       multi-node, and reorg checks. Record which checks were not applicable or
@@ -28,15 +34,19 @@ does not certify a Wcash release.
       software bill of materials.
 - [ ] Review `SECURITY.md`, open advisories, dependency/audit results, and every
       documented operational limitation before promotion.
-- [ ] Update the canonical repository docs and affected website/service docs,
-      preserving historical notes with an explicit supersession notice.
+- [ ] Update the canonical repository documentation and preserve historical
+      notes with an explicit supersession notice where needed.
 
-# Prepare and Publish the Release
+# Dedicated Release-Pipeline Gate
 
-- [ ] Obtain the required human approvals for the exact release commit.
-- [ ] Confirm all required checks pass on the latest commit and review the
-      generated release notes against `.changes/` fragments.
-- [ ] Publish only through the reviewed Wolf release workflow; verify the tag,
-      release assets, signatures, hashes, and public download links afterward.
-- [ ] Record rollback, incident, and operator communication owners before
-      advertising the release for value-bearing use.
+- [ ] Implement and independently review a Wcash-specific release pipeline in a
+      separate change. It must build with `wcash-consensus`, fail on a default
+      Zcash profile, bind artifacts to the source commit, and verify network
+      identity before publication.
+- [ ] Review every destination and credential scope for crates, tags, GitHub
+      releases, images and binary assets. Do not inherit Zcash Foundation
+      publication targets or credentials.
+- [ ] Add artifact signature, checksum, provenance, rollback, incident and
+      operator-communication procedures.
+- [ ] Obtain explicit maintainer approval before enabling any publication event
+      or write permission in the Wcash repository.

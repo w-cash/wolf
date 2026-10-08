@@ -1,4 +1,4 @@
 project: zebrad
 kind: Added
-body: "Document Wcash node setup, authenticated read-only agent integration, network-specific consensus rules and ecosystem documentation responsibilities."
+body: "Document Wcash protocol direction, node setup, authenticated read-only agent integration and network-specific consensus rules."
 time: 2026-10-08T21:00:00.000000000Z
