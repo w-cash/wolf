@@ -37,7 +37,10 @@ use crate::coordinator::{validate_persisted_winner_block, PersistedWinnerBlockKi
 pub const JOURNAL_FORMAT_VERSION: u16 = 2;
 
 /// Maximum number of events retained and replayed by this foundation.
-pub const MAX_JOURNAL_EVENTS: usize = 1_000_000;
+// The live mainnet journal crossed one million events during sustained mining.
+// Keep the event runway aligned with the bounded 4 GiB journal runway until
+// planned journal rollover is available.
+pub const MAX_JOURNAL_EVENTS: usize = 4_000_000;
 
 /// Maximum total size of a journal, including its header and newlines.
 // Winner records retain exact block bytes until their lifecycle is durable.
@@ -4268,6 +4271,7 @@ mod tests {
 
     #[test]
     fn page_and_storage_caps_return_errors_without_poisoning() {
+        assert_eq!(MAX_JOURNAL_EVENTS, 4_000_000);
         let directory = private_temp_dir();
         let config = config();
         let path = directory.path().join("backend.jsonl");
