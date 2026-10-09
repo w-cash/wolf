@@ -12,6 +12,7 @@ consensus profile or release.
 | Understand the maintainer-approved protocol direction | [Protocol direction](wcash-direction.md) |
 | Check release artifacts and deployed-source evidence | [Release and deployment status](wcash-release-status.md) |
 | Build, configure and verify a node | [Node operator guide](wcash-node.md) |
+| Deploy and verify the public wallet transport | [Wallet-service TLS guide](../deploy/wcash-wallet-service/README.md) |
 | Integrate an agent or read-only client | [Agent and integration guide](wcash-agents.md) |
 | Change this repository with a coding agent | [Agent contribution instructions](../AGENTS.md) |
 | Verify network identities and emission | [Consensus reference](wcash-consensus.md) |

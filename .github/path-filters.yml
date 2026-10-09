@@ -85,10 +85,17 @@ coverage:
 
 docs_check:
   - "**/*.md"
+  - "deploy/wcash-wallet-service/nginx.conf.example"
+  - "scripts/verify-wcash-wallet-service.py"
+  - ".github/scripts/test-verify-wcash-wallet-service.py"
   - "wcash-release-manifest.json"
   - "docs/wcash-release-manifest.schema.json"
   - ".github/scripts/validate-wcash-release-manifest.py"
   - ".github/scripts/test-validate-wcash-release-manifest.py"
+  - "wcash-wallet-service-manifest.json"
+  - "docs/wcash-wallet-service-manifest.schema.json"
+  - ".github/scripts/validate-wcash-wallet-service-manifest.py"
+  - ".github/scripts/test-validate-wcash-wallet-service-manifest.py"
   - "book/**"
   - ".lychee.toml"
   - ".codespellrc"

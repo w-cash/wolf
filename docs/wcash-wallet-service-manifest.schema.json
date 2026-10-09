@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/w-cash/wolf/blob/main/docs/wcash-wallet-service-manifest.schema.json",
+  "title": "Wcash Wolf wallet-service manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "project",
+    "repository",
+    "network",
+    "canonicalService",
+    "legacyObservations",
+    "knownLimitations",
+    "updatedAt"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "./docs/wcash-wallet-service-manifest.schema.json"
+    },
+    "schemaVersion": {"const": 1},
+    "project": {"const": "Wcash Wolf wallet service"},
+    "repository": {"const": "https://github.com/w-cash/wolf"},
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "genesis", "branchId"],
+      "properties": {
+        "name": {"const": "Wcash Mainnet"},
+        "genesis": {
+          "const": "5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48"
+        },
+        "branchId": {"const": "0xd9c6a7ee"}
+      }
+    },
+    "canonicalService": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "endpoint",
+        "transport",
+        "implementation",
+        "deployment",
+        "validation"
+      ],
+      "properties": {
+        "status": {
+          "enum": ["not deployed", "candidate", "ready", "withdrawn"]
+        },
+        "endpoint": {"type": "string", "minLength": 1},
+        "transport": {"enum": ["not deployed", "tls"]},
+        "implementation": {
+          "enum": ["unknown", "wolf-compact-tx-streamer"]
+        },
+        "deployment": {"$ref": "#/$defs/deployment"},
+        "validation": {"$ref": "#/$defs/validation"}
+      }
+    },
+    "legacyObservations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/legacyObservation"}
+    },
+    "knownLimitations": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "updatedAt": {"type": "string", "format": "date"}
+  },
+  "$defs": {
+    "commitOrUnknown": {
+      "oneOf": [
+        {"const": "unknown"},
+        {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      ]
+    },
+    "sha256OrUnknown": {
+      "oneOf": [
+        {"const": "unknown"},
+        {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      ]
+    },
+    "dateTimeOrUnknown": {
+      "oneOf": [
+        {"const": "unknown"},
+        {"type": "string", "format": "date-time"}
+      ]
+    },
+    "httpsUriOrUnknown": {
+      "oneOf": [
+        {"const": "unknown"},
+        {"type": "string", "format": "uri", "pattern": "^https://"}
+      ]
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceCommit",
+        "artifactSha256",
+        "buildFeatures",
+        "configurationRevision",
+        "deployedAt",
+        "evidenceUrl"
+      ],
+      "properties": {
+        "sourceCommit": {"$ref": "#/$defs/commitOrUnknown"},
+        "artifactSha256": {"$ref": "#/$defs/sha256OrUnknown"},
+        "buildFeatures": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "configurationRevision": {"type": "string", "minLength": 1},
+        "deployedAt": {"$ref": "#/$defs/dateTimeOrUnknown"},
+        "evidenceUrl": {"$ref": "#/$defs/httpsUriOrUnknown"}
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "endpoint", "checkedAt", "verifier", "resultUrl"],
+      "properties": {
+        "status": {"enum": ["not run", "passed", "failed"]},
+        "endpoint": {"type": "string", "minLength": 1},
+        "checkedAt": {"$ref": "#/$defs/dateTimeOrUnknown"},
+        "verifier": {"const": "scripts/verify-wcash-wallet-service.py"},
+        "resultUrl": {"$ref": "#/$defs/httpsUriOrUnknown"}
+      }
+    },
+    "legacyObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "endpoint",
+        "transport",
+        "observedAt",
+        "implementation",
+        "reportedVersion",
+        "reportedSubversion",
+        "reportedBranchId",
+        "observedHeight",
+        "sourceCommit",
+        "limitations"
+      ],
+      "properties": {
+        "status": {"const": "observed legacy"},
+        "endpoint": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^http://"
+        },
+        "transport": {"const": "plaintext"},
+        "observedAt": {"type": "string", "format": "date-time"},
+        "implementation": {
+          "enum": ["unknown", "consistent with wolf-compact-tx-streamer"]
+        },
+        "reportedVersion": {"type": "string", "minLength": 1},
+        "reportedSubversion": {"type": "string", "minLength": 1},
+        "reportedBranchId": {"const": "0xd9c6a7ee"},
+        "observedHeight": {"type": "integer", "minimum": 0},
+        "sourceCommit": {"$ref": "#/$defs/commitOrUnknown"},
+        "limitations": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

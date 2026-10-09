@@ -111,6 +111,29 @@ jobs:
       - name: Test Wcash release evidence validation
         run: python3 .github/scripts/test-validate-wcash-release-manifest.py
 
+  wallet-service-contract:
+    name: wallet-service-contract
+    needs: changes
+    if: needs.changes.outputs.docs_check == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Validate the Wcash wallet-service contract
+        run: |
+          pip install check-jsonschema==0.38.2
+          check-jsonschema \
+            --schemafile docs/wcash-wallet-service-manifest.schema.json \
+            wcash-wallet-service-manifest.json
+          python3 .github/scripts/validate-wcash-wallet-service-manifest.py
+          python3 .github/scripts/test-validate-wcash-wallet-service-manifest.py
+          python3 .github/scripts/test-verify-wcash-wallet-service.py
+
   docs-check:
     runs-on: ubuntu-latest
     if: always()
@@ -119,10 +142,11 @@ jobs:
       - spell-check
       - markdown-lint
       - release-manifest
+      - wallet-service-contract
     timeout-minutes: 5
     steps:
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          allowed-skips: spell-check, markdown-lint, release-manifest
+          allowed-skips: spell-check, markdown-lint, release-manifest, wallet-service-contract
