@@ -128,6 +128,13 @@ class ReleaseManifestValidatorTests(unittest.TestCase):
                 ),
                 "release.version must be recorded",
             ),
+            "not-deployed release identity": (
+                released_manifest(),
+                lambda manifest: manifest["release"].update(
+                    version="not deployed", tag="not deployed"
+                ),
+                "release.version must be recorded",
+            ),
             "different source and CI commits": (
                 released_manifest(),
                 lambda manifest: manifest["ci"].update(commit="c" * 40),
@@ -147,6 +154,36 @@ class ReleaseManifestValidatorTests(unittest.TestCase):
                     }
                 ),
                 "deployment.sourceCommit must equal source.commit",
+            ),
+            "deployment without a recorded environment": (
+                released_manifest(),
+                lambda manifest: manifest.update(
+                    deployment={
+                        "status": "deployed",
+                        "environment": "not provided",
+                        "sourceCommit": SOURCE_COMMIT,
+                        "artifactSha256": ARTIFACT_SHA256,
+                        "configurationRevision": "config-v2",
+                        "deployedAt": "2026-10-09T01:00:00Z",
+                        "evidenceUrl": "https://example.com/deployment",
+                    }
+                ),
+                "deployment.environment must be recorded",
+            ),
+            "deployment without a recorded configuration": (
+                released_manifest(),
+                lambda manifest: manifest.update(
+                    deployment={
+                        "status": "deployed",
+                        "environment": "production",
+                        "sourceCommit": SOURCE_COMMIT,
+                        "artifactSha256": ARTIFACT_SHA256,
+                        "configurationRevision": "not provided",
+                        "deployedAt": "2026-10-09T01:00:00Z",
+                        "evidenceUrl": "https://example.com/deployment",
+                    }
+                ),
+                "deployment.configurationRevision must be recorded",
             ),
         }
 

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-PLACEHOLDERS = {"unknown", "not released", "not provided"}
+PLACEHOLDERS = {"unknown", "not released", "not deployed", "not provided"}
 
 
 def is_recorded(value: Any) -> bool:
@@ -76,6 +76,16 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
     if deployment["status"] == "deployed":
         if release_status != "released":
             errors.append("deployment.status 'deployed' requires release.status 'released'")
+        if not is_recorded(deployment["environment"]):
+            errors.append(
+                "deployment.environment must be recorded when "
+                "deployment.status is 'deployed'"
+            )
+        if not is_recorded(deployment["configurationRevision"]):
+            errors.append(
+                "deployment.configurationRevision must be recorded when "
+                "deployment.status is 'deployed'"
+            )
         if deployment["sourceCommit"] != source["commit"]:
             errors.append("deployment.sourceCommit must equal source.commit")
         if deployment["artifactSha256"] not in artifact_hashes:
