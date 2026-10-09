@@ -73,11 +73,16 @@ python3 -m pip install check-jsonschema==0.38.2
 check-jsonschema \
   --schemafile docs/wcash-release-manifest.schema.json \
   wcash-release-manifest.json
+python3 .github/scripts/validate-wcash-release-manifest.py
+python3 .github/scripts/test-validate-wcash-release-manifest.py
 ```
 
-Schema validation checks the evidence shape and release-state requirements. It
-does not reproduce a build, inspect a remote deployment, audit consensus or
-make a wallet safe.
+Schema validation checks the evidence shape and release-state requirements. The
+semantic validator also checks that release and artifact states agree, CI refers
+to the recorded source commit, signatures refer to recorded artifacts, and a
+deployment refers to the recorded source and artifact. These checks do not
+reproduce a build, inspect a remote deployment, audit consensus or make a wallet
+safe.
 
 ## Deployment fields
 

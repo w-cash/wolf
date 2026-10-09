@@ -105,6 +105,12 @@ jobs:
             --schemafile docs/wcash-release-manifest.schema.json \
             wcash-release-manifest.json
 
+      - name: Validate Wcash release evidence relationships
+        run: python3 .github/scripts/validate-wcash-release-manifest.py
+
+      - name: Test Wcash release evidence validation
+        run: python3 .github/scripts/test-validate-wcash-release-manifest.py
+
   docs-check:
     runs-on: ubuntu-latest
     if: always()

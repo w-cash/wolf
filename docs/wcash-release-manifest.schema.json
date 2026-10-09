@@ -271,6 +271,31 @@
       "if": {
         "properties": {
           "release": {
+            "properties": {"status": {"const": "not released"}},
+            "required": ["status"]
+          }
+        },
+        "required": ["release"]
+      },
+      "then": {
+        "properties": {
+          "release": {
+            "properties": {
+              "version": {"const": "not released"},
+              "tag": {"const": "not released"},
+              "publishedAt": {"const": "not released"}
+            }
+          },
+          "artifacts": {
+            "properties": {"status": {"const": "not released"}}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "release": {
             "properties": {"status": {"enum": ["candidate", "released"]}},
             "required": ["status"]
           }
@@ -281,8 +306,8 @@
         "properties": {
           "release": {
             "properties": {
-              "version": {"not": {"const": "not released"}},
-              "tag": {"not": {"const": "not released"}}
+              "version": {"not": {"enum": ["unknown", "not released"]}},
+              "tag": {"not": {"enum": ["unknown", "not released"]}}
             }
           },
           "source": {
@@ -300,6 +325,45 @@
             "properties": {
               "items": {"minItems": 1}
             }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ci": {
+            "properties": {"status": {"enum": ["passed", "failed"]}},
+            "required": ["status"]
+          }
+        },
+        "required": ["ci"]
+      },
+      "then": {
+        "properties": {
+          "ci": {
+            "properties": {
+              "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+              "runUrl": {"type": "string", "format": "uri", "pattern": "^https://"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "signatures": {
+            "properties": {"status": {"const": "provided"}},
+            "required": ["status"]
+          }
+        },
+        "required": ["signatures"]
+      },
+      "then": {
+        "properties": {
+          "signatures": {
+            "properties": {"items": {"minItems": 1}}
           }
         }
       }

@@ -87,6 +87,8 @@ docs_check:
   - "**/*.md"
   - "wcash-release-manifest.json"
   - "docs/wcash-release-manifest.schema.json"
+  - ".github/scripts/validate-wcash-release-manifest.py"
+  - ".github/scripts/test-validate-wcash-release-manifest.py"
   - "book/**"
   - ".lychee.toml"
   - ".codespellrc"
