@@ -10,6 +10,7 @@ consensus profile or release.
 | --- | --- |
 | Understand the project and find services | [Project README](../README.md) |
 | Understand the maintainer-approved protocol direction | [Protocol direction](wcash-direction.md) |
+| Check release artifacts and deployed-source evidence | [Release and deployment status](wcash-release-status.md) |
 | Build, configure and verify a node | [Node operator guide](wcash-node.md) |
 | Integrate an agent or read-only client | [Agent and integration guide](wcash-agents.md) |
 | Change this repository with a coding agent | [Agent contribution instructions](../AGENTS.md) |
@@ -40,6 +41,7 @@ upstream governance do not define Wcash's corresponding behavior.
 | Which local RPC methods and types are implemented? | [RPC implementation](../zebra-rpc/src) |
 | What does the wallet actually support? | [Wallet implementation](../wcash-wallet/src), [wallet guide](../wcash-wallet/README.md), and [payout boundary](wcash-wallet-payout.md) |
 | Which verification jobs are defined? | [Wcash release workflow](../.github/workflows/wcash-release-gate.yml) |
+| Which source, artifacts and deployment are officially recorded? | [Release manifest](../wcash-release-manifest.json) and [status guide](wcash-release-status.md) |
 
 A source file proves what that revision implements, not which binary a service
 runs. For deployment claims, also record artifact digest, build features,
