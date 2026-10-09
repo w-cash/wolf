@@ -32,6 +32,7 @@ Zcash build and a Wcash build are not interchangeable.
 | --- | --- |
 | Understand Wcash and find ecosystem services | [w.cash](https://w.cash/) and the [documentation index](docs/README.md) |
 | Understand the protocol's intended direction | [Protocol direction](docs/wcash-direction.md) |
+| Check official release and deployment evidence | [Release and deployment status](docs/wcash-release-status.md) |
 | Build and run a node | [Node operator guide](docs/wcash-node.md) |
 | Check network identity, supply and privacy rules | [Consensus reference](docs/wcash-consensus.md) |
 | Query a node from software or an AI agent | [Agent and integration guide](docs/wcash-agents.md) |

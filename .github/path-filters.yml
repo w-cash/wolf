@@ -85,6 +85,8 @@ coverage:
 
 docs_check:
   - "**/*.md"
+  - "wcash-release-manifest.json"
+  - "docs/wcash-release-manifest.schema.json"
   - "book/**"
   - ".lychee.toml"
   - ".codespellrc"

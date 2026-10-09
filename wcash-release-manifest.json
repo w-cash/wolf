@@ -1,0 +1,61 @@
+{
+  "$schema": "./docs/wcash-release-manifest.schema.json",
+  "schemaVersion": 1,
+  "project": "Wcash Wolf",
+  "repository": "https://github.com/w-cash/wolf",
+  "release": {
+    "status": "not released",
+    "version": "not released",
+    "tag": "not released",
+    "publishedAt": "not released"
+  },
+  "source": {
+    "commit": "unknown",
+    "treeState": "unknown"
+  },
+  "build": {
+    "executable": "zebrad",
+    "profile": "release",
+    "features": [
+      "wcash-consensus"
+    ],
+    "defaultFeatures": false,
+    "rustToolchain": "1.91.0",
+    "target": "unknown"
+  },
+  "network": {
+    "name": "Wcash Mainnet",
+    "genesis": "5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48",
+    "branchId": "0xd9c6a7ee"
+  },
+  "artifacts": {
+    "status": "not released",
+    "items": []
+  },
+  "signatures": {
+    "requirement": "optional",
+    "status": "not provided",
+    "items": []
+  },
+  "ci": {
+    "status": "unknown",
+    "workflow": ".github/workflows/wcash-release-gate.yml",
+    "commit": "unknown",
+    "runUrl": "unknown"
+  },
+  "deployment": {
+    "status": "unknown",
+    "environment": "unknown",
+    "sourceCommit": "unknown",
+    "artifactSha256": "unknown",
+    "configurationRevision": "unknown",
+    "deployedAt": "unknown",
+    "evidenceUrl": "unknown"
+  },
+  "knownLimitations": [
+    "No official Wolf binary release is recorded by this manifest.",
+    "No artifact or deployment has been independently verified by this manifest.",
+    "Artifact signatures are optional and are not currently provided."
+  ],
+  "updatedAt": "2026-10-09"
+}

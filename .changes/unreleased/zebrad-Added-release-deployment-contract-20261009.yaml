@@ -1,0 +1,4 @@
+project: zebrad
+kind: Added
+body: "Publish a schema-validated Wcash release and deployment manifest that distinguishes implemented source from released artifacts and identified deployments."
+time: 2026-10-09T09:00:00.000000000Z

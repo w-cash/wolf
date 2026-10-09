@@ -83,6 +83,28 @@ jobs:
             --ignore .git \
             --config .trunk/configs/.markdownlint.yaml
 
+  release-manifest:
+    name: release-manifest
+    needs: changes
+    if: needs.changes.outputs.docs_check == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the JSON Schema validator
+        run: pip install check-jsonschema==0.38.2
+
+      - name: Validate the Wcash release manifest
+        run: |
+          check-jsonschema \
+            --schemafile docs/wcash-release-manifest.schema.json \
+            wcash-release-manifest.json
+
   docs-check:
     runs-on: ubuntu-latest
     if: always()
@@ -90,10 +112,11 @@ jobs:
       - changes
       - spell-check
       - markdown-lint
+      - release-manifest
     timeout-minutes: 5
     steps:
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          allowed-skips: spell-check, markdown-lint
+          allowed-skips: spell-check, markdown-lint, release-manifest

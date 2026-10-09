@@ -1,0 +1,379 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/w-cash/wolf/blob/main/docs/wcash-release-manifest.schema.json",
+  "title": "Wcash Wolf release and deployment manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "schemaVersion", "project", "repository", "release", "source", "build", "network", "artifacts", "signatures", "ci", "deployment", "knownLimitations", "updatedAt"],
+  "properties": {
+    "$schema": {
+      "const": "./docs/wcash-release-manifest.schema.json"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "project": {
+      "const": "Wcash Wolf"
+    },
+    "repository": {
+      "const": "https://github.com/w-cash/wolf"
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "version", "tag", "publishedAt"],
+      "properties": {
+        "status": {
+          "enum": ["not released", "candidate", "released", "withdrawn"]
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "publishedAt": {
+          "oneOf": [
+            {"const": "not released"},
+            {"type": "string", "format": "date-time"}
+          ]
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "treeState"],
+      "properties": {
+        "commit": {
+          "$ref": "#/$defs/commitOrUnknown"
+        },
+        "treeState": {
+          "enum": ["unknown", "clean"]
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executable", "profile", "features", "defaultFeatures", "rustToolchain", "target"],
+      "properties": {
+        "executable": {
+          "const": "zebrad"
+        },
+        "profile": {
+          "const": "release"
+        },
+        "features": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "contains": {"const": "wcash-consensus"},
+          "items": {"type": "string", "minLength": 1}
+        },
+        "defaultFeatures": {
+          "type": "boolean"
+        },
+        "rustToolchain": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "genesis", "branchId"],
+      "properties": {
+        "name": {
+          "const": "Wcash Mainnet"
+        },
+        "genesis": {
+          "const": "5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48"
+        },
+        "branchId": {
+          "const": "0xd9c6a7ee"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "items"],
+      "properties": {
+        "status": {
+          "enum": ["not released", "candidate", "released", "withdrawn"]
+        },
+        "items": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/artifact"}
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"status": {"const": "not released"}},
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {"items": {"maxItems": 0}}
+          }
+        }
+      ]
+    },
+    "signatures": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requirement", "status", "items"],
+      "properties": {
+        "requirement": {
+          "const": "optional"
+        },
+        "status": {
+          "enum": ["not provided", "provided", "withdrawn"]
+        },
+        "items": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/signature"}
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"status": {"const": "not provided"}},
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {"items": {"maxItems": 0}}
+          }
+        }
+      ]
+    },
+    "ci": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "workflow", "commit", "runUrl"],
+      "properties": {
+        "status": {
+          "enum": ["unknown", "not run", "passed", "failed"]
+        },
+        "workflow": {
+          "const": ".github/workflows/wcash-release-gate.yml"
+        },
+        "commit": {
+          "$ref": "#/$defs/commitOrUnknown"
+        },
+        "runUrl": {
+          "$ref": "#/$defs/httpsUriOrUnknown"
+        }
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "environment", "sourceCommit", "artifactSha256", "configurationRevision", "deployedAt", "evidenceUrl"],
+      "properties": {
+        "status": {
+          "enum": ["unknown", "not deployed", "deployed"]
+        },
+        "environment": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sourceCommit": {
+          "$ref": "#/$defs/commitOrUnknown"
+        },
+        "artifactSha256": {
+          "$ref": "#/$defs/sha256OrUnknown"
+        },
+        "configurationRevision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "deployedAt": {
+          "$ref": "#/$defs/dateTimeOrUnknown"
+        },
+        "evidenceUrl": {
+          "$ref": "#/$defs/httpsUriOrUnknown"
+        }
+      }
+    },
+    "knownLimitations": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date"
+    }
+  },
+  "$defs": {
+    "commitOrUnknown": {
+      "oneOf": [
+        {"const": "unknown"},
+        {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      ]
+    },
+    "sha256OrUnknown": {
+      "oneOf": [
+        {"const": "unknown"},
+        {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      ]
+    },
+    "httpsUriOrUnknown": {
+      "oneOf": [
+        {"const": "unknown"},
+        {"type": "string", "format": "uri", "pattern": "^https://"}
+      ]
+    },
+    "dateTimeOrUnknown": {
+      "oneOf": [
+        {"const": "unknown"},
+        {"type": "string", "format": "date-time"}
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "target", "bytes", "sha256", "downloadUrl"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "target": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "downloadUrl": {"type": "string", "format": "uri", "pattern": "^https://"}
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact", "scheme", "identity", "signatureUrl"],
+      "properties": {
+        "artifact": {"type": "string", "minLength": 1},
+        "scheme": {"type": "string", "minLength": 1},
+        "identity": {"type": "string", "minLength": 1},
+        "signatureUrl": {"type": "string", "format": "uri", "pattern": "^https://"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "release": {
+            "properties": {"status": {"enum": ["candidate", "released"]}},
+            "required": ["status"]
+          }
+        },
+        "required": ["release"]
+      },
+      "then": {
+        "properties": {
+          "release": {
+            "properties": {
+              "version": {"not": {"const": "not released"}},
+              "tag": {"not": {"const": "not released"}}
+            }
+          },
+          "source": {
+            "properties": {
+              "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+              "treeState": {"const": "clean"}
+            }
+          },
+          "build": {
+            "properties": {
+              "target": {"not": {"const": "unknown"}}
+            }
+          },
+          "artifacts": {
+            "properties": {
+              "items": {"minItems": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "release": {
+            "properties": {"status": {"const": "candidate"}},
+            "required": ["status"]
+          }
+        },
+        "required": ["release"]
+      },
+      "then": {
+        "properties": {
+          "artifacts": {
+            "properties": {"status": {"const": "candidate"}}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "release": {
+            "properties": {"status": {"const": "released"}},
+            "required": ["status"]
+          }
+        },
+        "required": ["release"]
+      },
+      "then": {
+        "properties": {
+          "release": {
+            "properties": {"publishedAt": {"type": "string", "format": "date-time"}}
+          },
+          "artifacts": {
+            "properties": {"status": {"const": "released"}}
+          },
+          "ci": {
+            "properties": {
+              "status": {"const": "passed"},
+              "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+              "runUrl": {"type": "string", "format": "uri", "pattern": "^https://"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "deployment": {
+            "properties": {"status": {"const": "deployed"}},
+            "required": ["status"]
+          }
+        },
+        "required": ["deployment"]
+      },
+      "then": {
+        "properties": {
+          "deployment": {
+            "properties": {
+              "environment": {"not": {"const": "unknown"}},
+              "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+              "artifactSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "configurationRevision": {"not": {"const": "unknown"}},
+              "deployedAt": {"type": "string", "format": "date-time"},
+              "evidenceUrl": {"type": "string", "format": "uri", "pattern": "^https://"}
+            }
+          }
+        }
+      }
+    }
+  ]
+}
