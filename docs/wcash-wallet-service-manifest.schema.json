@@ -47,7 +47,7 @@
       ],
       "properties": {
         "status": {
-          "enum": ["not deployed", "candidate", "ready", "withdrawn"]
+          "enum": ["not deployed", "candidate", "ready"]
         },
         "endpoint": {"type": "string", "minLength": 1},
         "transport": {"enum": ["not deployed", "tls"]},

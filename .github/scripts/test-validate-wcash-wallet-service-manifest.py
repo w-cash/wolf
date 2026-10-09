@@ -82,6 +82,23 @@ def main() -> None:
     expect_valid("fully evidenced ready service", ready)
 
     contradictions = {
+        "unsupported withdrawn service": changed(
+            changed(
+                changed(
+                    changed(
+                        BASE,
+                        ("canonicalService", "status"),
+                        "withdrawn",
+                    ),
+                    ("canonicalService", "endpoint"),
+                    "http://evil.example:9999",
+                ),
+                ("canonicalService", "transport"),
+                "tls",
+            ),
+            ("canonicalService", "implementation"),
+            "wolf-compact-tx-streamer",
+        ),
         "plaintext ready service": changed(
             ready, ("canonicalService", "transport"), "not deployed"
         ),

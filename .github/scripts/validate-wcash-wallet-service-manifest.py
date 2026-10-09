@@ -25,6 +25,7 @@ NOT_DEPLOYED_LIMITATIONS = {
     "No canonical TLS Wcash Mainnet wallet service is recorded as deployed.",
     "No exact production source commit, artifact digest or configuration revision is recorded.",
 }
+SERVICE_STATUSES = {"not deployed", "candidate", "ready"}
 
 
 def is_recorded(value: Any) -> bool:
@@ -74,6 +75,9 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
     deployment = service["deployment"]
     validation = service["validation"]
     status = service["status"]
+
+    if status not in SERVICE_STATUSES:
+        errors.append(f"unsupported canonical service status: {status!r}")
 
     if status == "not deployed":
         if service["endpoint"] != "not deployed":
