@@ -1,6 +1,6 @@
 ---
 name: "Upgrade zcashd dependencies"
-description: "Specific steps for upgrading dependencies shared with zcashd. Zebra developers only."
+description: "Specific steps for upgrading dependencies shared with zcashd. Wolf maintainers only."
 title: 'Upgrade dependencies for zcashd (version)'
 type: Task
 body:
@@ -10,11 +10,11 @@ body:
         ## Motivation
         
         `zcashd` crate dependency upgrades need to be done together, along with an upgrade to `zcash_script`.
-        We don't have upgrade instructions yet, but there's a draft in #6532.
+        The inherited draft procedure is in [ZcashFoundation/zebra#6532](https://github.com/ZcashFoundation/zebra/issues/6532); verify every step against this fork before use.
         
         The upgrade steps are:
         - [ ] upgrade and release `zcash_script`
-        - [ ] upgrade Zebra's ECC and `zcash_script` dependencies in the same PR
+        - [ ] upgrade Wolf's ECC and `zcash_script` dependencies in the same PR
   - type: textarea
     id: versions
     attributes:
@@ -48,4 +48,3 @@ body:
         Is this change related to other features or tickets?
     validations:
       required: false
-

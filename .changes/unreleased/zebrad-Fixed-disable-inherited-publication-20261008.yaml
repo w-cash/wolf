@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Fail closed on inherited Zebra publication, deployment, checkpoint-update, integration-dispatch and Pages workflows in the Wcash repository."
+time: 2026-10-08T23:45:00.000000000Z

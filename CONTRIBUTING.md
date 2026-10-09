@@ -10,23 +10,27 @@
 
 ## Running and Debugging
 
-Start with the [local Wcash guide](docs/wcash-local.md). The upstream
+Start with the [documentation index](docs/README.md), the
+[node operator guide](docs/wcash-node.md), or the
+[isolated local guide](docs/wcash-local.md) for Regtest. The upstream
 [Zebra documentation](https://zebra.zfnd.org/user.html) remains useful for
 inherited build and instrumentation details, but its public-network parameters
 do not apply to Wcash.
 
 ## Bug Reports
 
-Please create a non-sensitive bug report in the
-[Wcash issue tracker](https://github.com/w-cash/wolf/issues). Report
-security-sensitive issues through the private process in [SECURITY.md](SECURITY.md).
+Use the [Wcash issue tracker](https://github.com/w-cash/wolf/issues) when Issues
+are enabled. If they are disabled, coordinate non-sensitive work with a Wcash
+maintainer through an existing relevant PR or a direct maintainer request; do
+not open a Wcash issue in Zebra's tracker. Report security-sensitive issues
+through the private process in [SECURITY.md](SECURITY.md).
 
 ## Pull Requests
 
 PRs are welcome, but every PR requires human review time. To make that time count:
 
-1. **Start with an issue.** Check the [Wcash issue tracker](https://github.com/w-cash/wolf/issues) for existing work or create an issue describing what you want to change and why.
-2. **Coordinate consensus changes.** Discuss consensus, networking, genesis, monetary-policy, privacy, and merged-mining changes in a Wcash issue before opening a PR. These changes require explicit test vectors and independent review.
+1. **Agree on scope.** Check existing work and obtain Wcash maintainer acknowledgment before unsolicited changes. A direct request from a Wcash maintainer is sufficient approval; describe that request in the PR without inventing an issue link.
+2. **Preserve the protocol direction.** Read the [maintainer-approved direction](docs/wcash-direction.md). Discuss consensus, networking, genesis, monetary-policy, privacy, and merged-mining changes with Wcash maintainers before implementation. These changes require explicit test vectors and independent review.
 3. **Keep PRs focused.** One logical change per PR. If you're planning multiple related PRs, discuss the overall plan with the team first.
 4. **Follow conventional commits.** PRs are merged to main with a merge commit, so the PR title becomes the merge commit message and your branch commits are preserved in history. Follow the [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) standard for both.
 5. **Declare breaking changes.** If your change breaks a published crate's public Rust API, add `!` after the type and scope in the PR title (`feat(zebra-chain)!: ...`) **and** in the branch commit that introduces the break. The PR gate reads the title: that is what skips `semver-checks` and requires a `breaking` change fragment. release-plz reads the commits that land on `main`, which now include your branch commits, so the marker belongs on both for the release to bump the major version.
@@ -43,7 +47,7 @@ We welcome contributions that use AI tools. What matters is the quality of the r
 
 - **Disclose AI usage** in your PR description: Specify the tool and what it was used for (e.g., "Used Claude for test boilerplate"). This helps reviewers calibrate their review.
 - **Understand your code:** You are the sole responsible author. If asked during review, you must be able to explain the logic and design trade-offs of every change.
-- **Don't submit without reviewing:** Run the full test suite locally and review every line before opening a PR.
+- **Don't submit without reviewing:** Review every line and run the checks appropriate to the change in [AGENTS.md](AGENTS.md). State failures and unexecuted checks explicitly; documentation-only checks do not certify node or wallet behavior.
 
 Tab-completion, spell checking, and syntax highlighting don't need disclosure.
 
@@ -51,7 +55,7 @@ Tab-completion, spell checking, and syntax highlighting don't need disclosure.
 
 Any team member may close a PR. We'll leave a comment explaining why and invite you to create an issue if you believe the change has value. Common reasons for closure:
 
-- No linked issue, or issue exists but no team member has responded to it
+- No acknowledged scope or direct maintainer request
 - Feature or refactor nobody requested
 - Low-effort changes (typo fixes, minor formatting) not requested by the team
 - Missing test evidence or inability to explain the changes
@@ -61,11 +65,12 @@ This is not personal; it's about managing review capacity. We encourage you to r
 
 ## Code Standards
 
-Zebra enforces code quality through review. For the full list of architecture rules, code patterns, testing requirements, and security considerations, see [`AGENTS.md`](AGENTS.md). The key points:
+Wcash retains Zebra's core engineering conventions. For architecture rules, code patterns, testing requirements, and security considerations, see [`AGENTS.md`](AGENTS.md). The key points:
 
-- **Build requirements**: `cargo fmt`, `cargo clippy`, and `cargo test` must all pass
+- **Rust changes**: `cargo fmt`, `cargo clippy`, `cargo test` and applicable Wcash feature checks must pass before promotion; document blocked checks
+- **Documentation changes**: Check Markdown, spelling, links, examples and source consistency
 - **Architecture**: Dependencies flow downward only; `zebra-chain` is sync-only
 - **Error handling**: Use `thiserror`; `expect()` messages explain why the invariant holds
 - **Async**: CPU-heavy work in `spawn_blocking`; all waits need timeouts
 - **Security**: Bound allocations from untrusted data; validate at system boundaries
-- **Changelog**: Update `CHANGELOG.md` for user-visible changes (see [Changelog Guidelines](https://zebra.zfnd.org/dev/changelog-guidelines.html))
+- **Changelog**: Add an appropriate `.changes/unreleased/` fragment for user-visible changes; never edit generated changelogs by hand (see [Changelog Guidelines](book/src/dev/changelog-guidelines.md))

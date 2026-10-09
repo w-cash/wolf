@@ -23,6 +23,7 @@ permissions: {}
 jobs:
   update-checkpoints:
     name: Update checkpoint files
+    if: github.repository == 'ZcashFoundation/zebra'
     runs-on: ubuntu-latest
     permissions:
       actions: read

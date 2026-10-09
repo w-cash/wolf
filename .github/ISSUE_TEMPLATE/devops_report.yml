@@ -1,6 +1,6 @@
 ---
 name: '🚦 DevOps Report'
-description: Issues related to the Zebra build, test, or release process.
+description: Issues related to the Wolf build, test, or release process.
 title: 'devops: '
 labels: [devops]
 type: Bug
@@ -8,10 +8,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thank you for taking the time to report a bug in Zebra!
+        Thank you for taking the time to report a build, test, or release issue in Wcash Wolf!
 
         Please fill out the sections below to help us reproduce and fix the bug.
-        If you have a question, please ask on [Discord](https://discord.gg/fP2JGmhm) or [GitHub Discussions](https://github.com/ZcashFoundation/zebra/discussions)
+        Include the exact Wolf commit, selected features, network, and relevant redacted CI or command output.
   - type: textarea
     id: description
     attributes:

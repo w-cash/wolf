@@ -1,55 +1,52 @@
 ---
-name: "🚀 Zebra Release"
-about: "Zebra team use only"
-title: "Publish next Zebra release: (version)"
+name: "🚀 Wolf Release"
+about: "Wcash maintainer use only"
+title: "Review Wolf release readiness: (version)"
 labels: "A-release"
 type: Task
 assignees: ""
 ---
 
-# Prepare for the Release
+# Prepare Wcash Release Evidence
 
-These release steps can be done a week before the release, in separate PRs.
-They can be skipped for urgent releases.
+Record evidence for the exact Wolf commit and build features. An upstream Zebra
+workflow, inherited version number, local Regtest result, or reachable endpoint
+does not certify a Wcash release.
 
-## State Full Sync Test
+> [!IMPORTANT]
+> Wolf does not currently have an enabled public-release pipeline. The inherited
+> Zebra publication workflow is owner-gated and the inherited binary workflow
+> does not build a Wcash release artifact. This issue can collect readiness
+> evidence, but must not be used to publish crates, tags, images or binaries.
 
-To check consensus correctness, we want to test that the state format is valid after a full sync. (Format upgrades are tested in CI on each PR.)
+- [ ] Freeze the release scope and identify the Mainnet, Testnet, and Regtest
+      behavior changed by the release.
+- [ ] Confirm every consensus, network, genesis, monetary-policy, privacy,
+      mining, wallet, and state-format change has explicit Wcash review and
+      applicable vectors.
+- [ ] Run `.github/workflows/wcash-release-gate.yml` successfully on the candidate
+      commit and retain the run URL and artifact hashes.
+- [ ] Run applicable local real-solver, wallet recovery, full-sync, migration,
+      multi-node, and reorg checks. Record which checks were not applicable or
+      not run; do not substitute an upstream result.
+- [ ] Verify release artifacts were built with the intended Wcash features and
+      reproduce their genesis, transaction branch, signatures, checksums, and
+      software bill of materials.
+- [ ] Review `SECURITY.md`, open advisories, dependency/audit results, and every
+      documented operational limitation before promotion.
+- [ ] Update the canonical repository documentation and preserve historical
+      notes with an explicit supersession notice where needed.
 
-- [ ] Make sure there has been [at least one successful full sync test](https://github.com/ZcashFoundation/zebra/actions/workflows/zfnd-ci-integration-tests-gcp.yml?query=event%3Aschedule) since the last state change, or
-- [ ] Start a manual workflow run of [`zfnd-ci-integration-tests-gcp.yml`](https://github.com/ZcashFoundation/zebra/actions/workflows/zfnd-ci-integration-tests-gcp.yml) with both `run-full-sync: true` and `run-lwd-sync: true`.
+# Dedicated Release-Pipeline Gate
 
-State format changes can be made in `zebra-state` or `zebra-chain`. The state format can be changed by data that is sent to the state, data created within the state using `zebra-chain`, or serialization formats in `zebra-state` or `zebra-chain`.
-
-After the test has been started, or if it has finished already:
-
-- [ ] Ask for a state code freeze in Slack. The freeze lasts until the release has been published.
-
-## Checkpoints
-
-For performance and security, we want to update the Zebra checkpoints in every release.
-
-- [ ] You can copy the latest checkpoints from CI by following [the zebra-checkpoints README](https://github.com/ZcashFoundation/zebra/blob/main/zebra-utils/README.md#zebra-checkpoints).
-
-## Missed Dependency Updates
-
-Sometimes `dependabot` misses some dependency updates, or we accidentally turned them off.
-
-This step can be skipped if there is a large pending dependency upgrade. (For example, shared ECC crates.)
-
-Here's how we make sure we got everything:
-
-- [ ] Run `cargo update` on the latest `main` branch, and keep the output
-- [ ] If needed, [add duplicate dependency exceptions to deny.toml](https://github.com/ZcashFoundation/zebra/blob/main/book/src/dev/continuous-integration.md#fixing-duplicate-dependencies-in-check-denytoml-bans)
-- [ ] If needed, remove resolved duplicate dependencies from `deny.toml`
-- [ ] Open a separate PR with the changes
-- [ ] Add the output of `cargo update` to that PR as a comment
-
-# Prepare and Publish the Release
-
-Follow the [release process](https://github.com/ZcashFoundation/zebra/blob/main/book/src/dev/release-process.md#release-candidate--release-process) for detailed instructions and recovery guidance.
-
-- [ ] Wait for `PR Gate / Release readiness` and every other required check to pass on the latest Release PR commit.
-- [ ] Complete every checkbox in the generated Release PR and review its release plan.
-- [ ] Approve and merge the latest commit.
-- [ ] Confirm that the Release workflow completed after merge.
+- [ ] Implement and independently review a Wcash-specific release pipeline in a
+      separate change. It must build with `wcash-consensus`, fail on a default
+      Zcash profile, bind artifacts to the source commit, and verify network
+      identity before publication.
+- [ ] Review every destination and credential scope for crates, tags, GitHub
+      releases, images and binary assets. Do not inherit Zcash Foundation
+      publication targets or credentials.
+- [ ] Add artifact signature, checksum, provenance, rollback, incident and
+      operator-communication procedures.
+- [ ] Obtain explicit maintainer approval before enabling any publication event
+      or write permission in the Wcash repository.

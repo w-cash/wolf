@@ -146,7 +146,7 @@ jobs:
   build:
     name: Build CI Docker
     # Skip PRs from external repositories, let them pass, and then GitHub's Merge Queue will check them
-    if: ${{ (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-stateful-tests')) && (github.event_name != 'schedule' || github.repository == 'ZcashFoundation/zebra') }}
+    if: ${{ github.repository == 'ZcashFoundation/zebra' && (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-stateful-tests')) }}
     permissions:
       contents: read
       id-token: write
@@ -177,7 +177,7 @@ jobs:
   get-available-disks:
     name: Check if cached state disks exist for ${{ inputs.network || vars.ZCASH_NETWORK }}
     # Skip PRs from external repositories, let them pass, and then GitHub's Merge Queue will check them
-    if: ${{ (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-stateful-tests')) && (github.event_name != 'schedule' || github.repository == 'ZcashFoundation/zebra') }}
+    if: ${{ github.repository == 'ZcashFoundation/zebra' && (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-stateful-tests')) }}
     permissions:
       contents: read
       id-token: write
@@ -191,7 +191,7 @@ jobs:
   # Some outputs are ignored, because we don't run those jobs on testnet.
   get-available-disks-testnet:
     name: Check if cached state disks exist for testnet
-    if: ${{ (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-stateful-tests')) && (github.event_name != 'schedule' || github.repository == 'ZcashFoundation/zebra') }}
+    if: ${{ github.repository == 'ZcashFoundation/zebra' && (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-stateful-tests')) }}
     permissions:
       contents: read
       id-token: write
@@ -613,7 +613,10 @@ jobs:
       ]
     # Only open tickets for failed scheduled jobs, manual workflow runs, or `main` branch merges.
     # (PR statuses are already reported in the PR jobs list, and checked by GitHub's Merge Queue.)
-    if: (failure() && github.event.pull_request == null) || (cancelled() && github.event.pull_request == null)
+    if: >-
+      github.repository == 'ZcashFoundation/zebra' &&
+      ((failure() && github.event.pull_request == null) ||
+       (cancelled() && github.event.pull_request == null))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -634,9 +637,9 @@ jobs:
     if: >-
       ${{
         always() &&
+        github.repository == 'ZcashFoundation/zebra' &&
         (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) &&
-        (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-stateful-tests')) &&
-        (github.event_name != 'schedule' || github.repository == 'ZcashFoundation/zebra')
+        (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-stateful-tests'))
       }}
     needs:
       - build

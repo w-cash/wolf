@@ -57,6 +57,81 @@ use config::mining;
 use types::long_poll::LONG_POLL_ID_LENGTH;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn openrpc_describes_network_neutral_and_wcash_mining_contracts() {
+    let _init_guard = zebra_test::init();
+    let network = consensus_profile_network();
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = RpcImpl::new(
+        network,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let schema = serde_json::to_value(rpc.openrpc().expect("OpenRPC generation must succeed"))
+        .expect("the generated OpenRPC document must serialize");
+    assert_eq!(schema["openrpc"], "1.3.2");
+    let methods = schema["methods"]
+        .as_array()
+        .expect("OpenRPC methods must be an array");
+    let method = |name: &str| {
+        methods
+            .iter()
+            .find(|method| method["name"] == name)
+            .unwrap_or_else(|| panic!("OpenRPC must advertise {name}"))
+    };
+
+    for name in [
+        "rpc.discover",
+        "getblocktemplate",
+        "createauxblock",
+        "retireauxblock",
+        "submitauxblock",
+        "getauxblockstatus",
+        "getblocksubsidy",
+        "validateaddress",
+        "z_validateaddress",
+        "z_listunifiedreceivers",
+    ] {
+        method(name);
+    }
+
+    let description = |name: &str| {
+        method(name)["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("OpenRPC method {name} must have a description"))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert!(description("getblocktemplate").contains("selected network"));
+    assert!(!description("getblocktemplate").contains("new Zcash blocks"));
+    assert!(description("getblocksubsidy").contains("exact integer schedule"));
+    assert!(!description("getblocksubsidy").contains("first halving"));
+    for name in [
+        "validateaddress",
+        "z_validateaddress",
+        "z_listunifiedreceivers",
+    ] {
+        assert!(description(name).contains("selected network"));
+        assert!(!description(name).contains("zcash address"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblockstatus_distinguishes_committed_side_chain_from_unknown() {
     let _init_guard = zebra_test::init();
     let block: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES

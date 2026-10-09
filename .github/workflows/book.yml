@@ -35,7 +35,9 @@ jobs:
   build:
     name: Build Docs
     needs: changes
-    if: needs.changes.outputs.book == 'true'
+    if: >-
+      github.repository == 'ZcashFoundation/zebra' &&
+      needs.changes.outputs.book == 'true'
     permissions:
       contents: read
       id-token: write
@@ -114,7 +116,9 @@ jobs:
     # TODO: Uncomment this before merging
     # if: github.ref_name == 'main' && github.event_name == 'push'
     needs: [changes, build]
-    if: needs.changes.outputs.book == 'true'
+    if: >-
+      github.repository == 'ZcashFoundation/zebra' &&
+      needs.changes.outputs.book == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 

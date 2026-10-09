@@ -6,10 +6,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thank you for taking the time to report a bug in Zebra!
+        Thank you for taking the time to report a bug in Wcash Wolf!
 
         Please fill out the sections below to help us reproduce and fix the bug.
-        If you have a question, please ask on [Discord](https://discord.gg/fP2JGmhm) or [GitHub Discussions](https://github.com/ZcashFoundation/zebra/discussions)
+        Do not disclose security-sensitive details here; use the private process in [SECURITY.md](https://github.com/w-cash/wolf/blob/main/SECURITY.md).
   - type: textarea
     id: what-happened
     attributes:
@@ -34,16 +34,16 @@ body:
   - type: textarea
     id: logs
     attributes:
-      label: Zebra logs
-      description: Copy and paste the last 100 Zebra log lines or upload the full logs to https://gist.github.com/ and add a link to them here.
+      label: Wolf node logs
+      description: Paste only the relevant redacted log lines. Never include RPC cookies, wallet seeds, keys, tokens, or private payout data.
       placeholder: 'Copy and paste the logs here'
     validations:
       required: false
   - type: input
     id: zebrad-version
     attributes:
-      label: Zebra Version
-      description: 'For bugs in `zebrad`, run `zebrad --version`.'
+      label: Wolf revision and node version
+      description: 'Include the Wolf commit, build features, selected network, and output of `zebrad --version`.'
       placeholder: 'zebrad 1.0.0-placeholder'
     validations:
       required: false

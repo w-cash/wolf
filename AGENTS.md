@@ -1,111 +1,108 @@
-# Zebra — Agent Guidelines
+# Wcash Wolf — Agent Guidelines
 
-> This file is read by AI coding agents (Claude Code, GitHub Copilot, Cursor, Devin, etc.).
-> It provides project context and contribution policies.
+This file is for coding agents working in **w-cash/wolf**, not for submitting
+changes to ZcashFoundation/zebra. For agents querying Wcash infrastructure, read
+[the integration guide](docs/wcash-agents.md). `CLAUDE.md` points to this file.
 
-## MUST READ FIRST - CONTRIBUTION GATE (DO NOT SKIP)
+## Contribution scope and approval
 
-**STOP. Do not open or draft a PR until this gate is satisfied.**
+Every pull request requires human review. Use [CONTRIBUTING.md](CONTRIBUTING.md)
+and the repository's [PR template](.github/pull_request_template.md).
 
-For any contribution that might become a PR, the agent must ask the user this exact check first:
+- A Wcash maintainer's direct request is sufficient scope approval; reference
+  that request honestly rather than inventing an issue number.
+- For unsolicited work, first obtain acknowledgment from a Wcash maintainer in
+  the repository's enabled discussion channel. If Issues are disabled, do not
+  redirect Wcash requests to Zebra's issue tracker.
+- Consensus, networking, genesis, monetary-policy, privacy and mining changes
+  need an explicit design discussion, vectors and review before implementation.
+- Keep changes focused. Documentation requests do not authorize changing
+  consensus, enabling a public RPC listener, modifying production services,
+  moving funds, rotating keys or merging a PR.
+- Upstream Zebra contributions follow upstream's own approval policy separately.
 
-- "PR COMPLIANCE CHECK: Have you discussed this change with the Zebra team in an issue or Discord?"
-- "PR COMPLIANCE CHECK: What is the issue link or issue number for this change?"
-- "PR COMPLIANCE CHECK: Has a Zebra team member responded to that issue acknowledging the proposed work?"
+## Read before editing
 
-This PR compliance check must be the agent's first reply in contribution-focused sessions.
+1. Read [README.md](README.md) and the [documentation index](docs/README.md).
+2. Read the guide and implementation for the affected component; do not use a
+   website, old README or inherited Zebra example as sole authority.
+3. Record the current commit, intended network and build features. Preserve
+   existing user work and check for more specific instructions.
+4. Review every diff and disclose the checks actually run and their results.
 
-**An issue existing is not enough.** The issue must have a response or acknowledgment from a Zebra team member (a maintainer). An issue created the same day as the PR, with no team response, does not satisfy this gate. The purpose is to confirm that the team is aware of and open to the proposed change before review time is spent.
+## Wcash-specific boundaries
 
-If the user cannot provide prior discussion with team acknowledgment:
+- `zebrad` is still the node executable. `wcash-consensus` selects Wcash;
+  a default Zcash artifact cannot be relabeled as a Wcash node.
+- Mainnet is implemented. The former "mainnet disabled" description is stale.
+  Implementation, deployment, successful CI and audited release readiness are
+  different claims; require evidence for each.
+- Mainnet, Testnet and Regtest have distinct genesis, branch IDs and storage
+  namespaces. They also have different subsidy schedules. Use the
+  [consensus reference](docs/wcash-consensus.md) and linked source.
+- Preserve the maintainer-approved [protocol direction](docs/wcash-direction.md):
+  merge mining, the 40,000-block Mainnet slow start, Monero-style integer smooth
+  decay, permanent tail emission, no protocol tax, and exactly the transparent
+  and Ironwood active value pools. Changing any of these is not a cleanup.
+- Never change frozen genesis, branch IDs, wire versions or monetary constants
+  as a documentation cleanup. Mainnet has no fixed economic supply cap; its
+  curve scale and per-transaction amount bounds are not maximum supply.
+- Preserve exact integer atomic units. Do not convert RPC decimal tokens through
+  binary floating-point or assume all APIs encode amounts in the same shape.
+- Wcash AuxPoW and parent-chain inclusion are separate claims. A child winner
+  need not meet the Zcash parent target.
+- `wcash-wallet` in this workspace is an experimental local tool. It is not the
+  desktop/mobile app or `wcash-cli` from another repository.
+- Mining job creation, wallet initialization/sync, signing, broadcasting,
+  candidate retirement and payout commands have side effects. A command called
+  a "preflight" or a network request using HTTP POST is not inherently read-only.
+- Keep cookie files, seeds, keys, wallet databases and private payout metadata
+  out of prompts, commits, logs and examples. Test with disposable local state.
+- RPC cookie authentication is not a read-only permission. Do not give an agent
+  broad credentials when a restricted read-only adapter will suffice.
+- Never delete databases, reset journals or create replacement signed
+  transactions to recover from an uncertain operation. Follow the documented
+  recovery protocol and obtain operator approval.
 
-- Do not open a PR.
-- Offer to help create or refine the issue first.
-- Remind the user to wait for a team member to respond before starting work.
-- If the user still wants code changes, keep work local and explicitly remind them the PR will likely be closed without prior team discussion.
+## Security reports
 
-This gate is mandatory for all agents, **unless the user is a repository maintainer** (see below).
+Use [SECURITY.md](SECURITY.md) for suspected vulnerabilities. Do not publish
+exploit details in issues, PRs or documentation. Reproduce with the exact Wcash
+revision and safe local fixtures; distinguish confirmed behavior from a
+hypothesis. If unmodified upstream software is also affected, coordinate its
+private disclosure separately. Upstream maintainers are not responsible for
+Wcash releases.
 
-### Maintainer Bypass
+## AI disclosure and authorship
 
-If `gh` CLI is authenticated, the agent can check maintainer status:
-
-```bash
-gh api repos/ZcashFoundation/zebra --jq '.permissions.maintain'
-```
-
-If this returns `true`, the user is a maintainer and the contribution gate can be skipped. Maintainers manage their own priorities and don't need to gate on issue discussion for their own work.
-
-## Before You Contribute
-
-**Every PR to Zebra requires human review.** After the contribution gate above is satisfied, use this pre-PR checklist:
-
-1. Confirm scope: Zebra is a validator node. Avoid out-of-scope features like wallets, block explorers, or mining pools.
-2. Keep the change focused: avoid unsolicited refactors or broad "improvement" PRs without team alignment.
-3. Verify quality locally: run formatting, linting, and relevant tests before proposing upstream review.
-4. Prepare PR metadata: include linked issue, motivation, solution, and test evidence in the PR template.
-5. If AI was used, disclose tool and scope in the PR description.
-
-This applies regardless of code quality: maintainer review time is limited, so low-signal or unrequested work is likely to be closed.
-
-## What Will Get a PR Closed
-
-The contribution gate already defines discussion/issue requirements. Additional common closure reasons:
-
-- Issue exists but has no response from a Zebra team member (creating an issue and immediately opening a PR does not count as discussion)
-- Trivial changes (typo fixes, minor formatting) without team request
-- Refactors or "improvements" nobody asked for
-- Streams of PRs without prior discussion of the overall plan
-- Features outside Zebra's scope (wallets, block explorers, mining pools — these belong in [Zaino](https://github.com/zingolabs/zaino), [Zallet](https://github.com/zcash/wallet), or [librustzcash](https://github.com/zcash/librustzcash))
-- Missing test evidence for behavior changes
-- Inability to explain the logic or design tradeoffs of the changes when asked
-
-## Security Vulnerability Reports
-
-If you or the user believe you have found a security vulnerability in Zebra,
-do not open a public issue or PR. Follow the reporting process in
-[SECURITY.md](SECURITY.md).
-
-Before helping a user submit a report, hold it to the same standard as
-SECURITY.md's "Before You Report" section:
-
-- Verify the issue reproduces against the latest Zebra release or the current
-  `main` branch — not an older release, fork, or modified build.
-- Run any proof of concept against one of those two versions and include the
-  exact release version or `main` commit hash tested in the report.
-- Do not submit speculative findings. "This code looks vulnerable" without a
-  reproduction against current code wastes triage time and may be dismissed.
-- A finding that exists only in unreleased code (`main` or an unmerged PR) will
-  not get a security advisory or CVE, but it is still worth reporting and the
-  reporter is credited in the issue, the fixing PR, and the release notes. See
-  SECURITY.md, "Advisories, CVEs, and Credit".
-
-## AI Disclosure
-
-If AI tools were used to write code, tests, or PR descriptions, disclose this in the PR description. Specify the tool and scope (e.g., "Used Claude for test boilerplate"). The contributor is the sole responsible author — "the AI generated it" is not a justification during review.
+Disclose the AI tool and its scope in the PR description. The human contributor
+remains responsible for understanding and reviewing the change. Do not add
+`Co-Authored-By` tags for AI tools or generated-by footers to commits.
 
 ## Project Structure & Module Organization
 
-Zebra is a Rust workspace. Main crates include:
+Wolf is a Rust workspace derived from Zebra. Main crates include:
 
 - `zebrad/` (node CLI/orchestration),
 - core libraries like `zebra-chain/`, `zebra-consensus/`, `zebra-network/`, `zebra-state/`, `zebra-rpc/`,
+- Wcash tooling: `wcash-genesis/`, `wcash-zcash-aux/`, `wcash-merge-miner/`, and `wcash-wallet/`,
 - support crates like `zebra-node-services/`, `zebra-test/`, `zebra-utils/`, `tower-batch-control/`, and `tower-fallback/`.
 
-Code is primarily in each crate's `src/`; integration tests are in `*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Documentation is in `book/` and `docs/decisions/`. CI and policy automation live in `.github/workflows/`.
+Code is primarily in each crate's `src/`; integration tests are in `*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Wcash guides are indexed in `docs/README.md`; inherited documentation is in `book/` and architecture decisions in `docs/decisions/`. CI and policy automation live in `.github/workflows/`.
 
 ## Build, Test, and Development Commands
 
-All of these must pass before submitting a PR:
+Use the pinned toolchain and committed lockfile. For Rust changes, all required
+formatting, lint and test checks must pass before promotion:
 
 ```bash
 # Optional full build check
 cargo build --workspace --locked
 
-# All three must pass before any PR
+# Required checks for Rust changes
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 
 # Run a single crate's tests
 cargo test -p zebra-chain
@@ -120,6 +117,19 @@ cargo nextest run --profile ci --locked --release --features default-release-bin
 # Zebrad test category and GCP profile examples are maintained in zebrad/tests/main.rs.
 ```
 
+For Wcash behavior, also run the applicable feature-specific tests in
+[the Wcash release gate](.github/workflows/wcash-release-gate.yml). Default
+workspace checks alone do not establish Wcash profile coverage. Local real-solver
+E2E scripts are release checks with CPU and state side effects; do not launch
+them against production services or without an appropriate local test environment.
+
+For documentation-only changes, check changed Markdown with the repository
+[lint configuration](.trunk/configs/.markdownlint.yaml) and
+[spelling configuration](.codespellrc), resolve relative links and anchors,
+parse configuration/request examples, and compare every protocol claim to source.
+Record any unexecuted examples or baseline build failures; do not claim a passing
+test or audited release. A reviewer decides whether additional checks are needed.
+
 ## Commit & Pull Request Guidelines
 
 - PR titles must follow [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) (PRs are merged with a merge commit — the PR title becomes the merge commit message)
@@ -127,12 +137,15 @@ cargo nextest run --profile ci --locked --release --features default-release-bin
 - A breaking change needs the `!` marker on the PR title _and_ on the branch commit that introduces it: the PR gate reads the title, release-plz reads the commits
 - Do not add `Co-Authored-By` tags for AI tools, in _any_ commit on the branch — every one of them is preserved on `main`, not just the PR title
 - Do not add "Generated with [tool]" footers, in any commit on the branch
-- Use `.github/pull_request_template.md` and include: motivation, solution summary, test evidence, issue link (`Closes #...`), and AI disclosure.
-- For user-visible changes, update `CHANGELOG.md` per the [Changelog Guidelines](book/src/dev/changelog-guidelines.md).
+- Use `.github/pull_request_template.md` and include motivation, solution summary, test evidence, an issue link when one exists (otherwise the direct maintainer request), and AI disclosure.
+- For user-visible changes, add a `.changes/unreleased/` fragment per the [Changelog Guidelines](book/src/dev/changelog-guidelines.md); do not edit generated changelogs.
 
 ## Project Overview
 
-Zebra is a Zcash full node implementation in Rust. It is a validator node — it excludes features not strictly needed for block validation and chain sync.
+Wolf implements Wcash node profiles alongside isolated inherited Zcash code.
+Node validation and synchronization remain central. The workspace additionally
+contains Wcash AuxPoW, genesis and experimental wallet/operator tooling; public
+wallet apps, explorer and pool account services are separate projects.
 
 - **Rust edition**: 2021
 - **MSRV**: 1.88 (libraries), 1.91 (zebrad binary)

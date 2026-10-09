@@ -321,18 +321,18 @@ Because these scripts perform real proof-of-work solving, they are mandatory
 local release checks and are intentionally excluded from GitHub Actions. The
 checked-in hosted workflows are configured to compile the same components and
 validate fixed Equihash/AuxPoW vectors, consensus rules, RPC behavior, and
-profile isolation without solving work. Repository Actions are currently
-disabled, so this branch relies on the recorded local gates instead of a hosted
-result.
+profile isolation without solving work. No hosted result is claimed here; link
+a dated workflow run for the exact revision in release evidence when one exists.
 
 The E2E proves only those deterministic local, single-writer wallet lifecycles.
 It does not prove general or production wallet interoperability,
 vendor-by-vendor ASIC interoperability, public variable-difficulty behavior,
 payout correctness, Internet-facing security, public-network or long-running
-reorg behavior, or independent consensus-review results. No public Wcash
-Testnet, public pool, payout, or settlement service is deployed. No physical
-ASIC model or firmware is certified, and Wcash mainnet remains disabled. Those
-remain community-pool and network release gates.
+reorg behavior, or independent consensus-review results. Mainnet is implemented;
+see the [network reference](wcash-consensus.md) and
+[node guide](wcash-node.md). These local tests do not establish the deployment,
+availability or readiness of any public node, pool, payout service or physical
+ASIC. Operators need separate evidence for those claims.
 
 Wcash payment namespaces are disjoint from Zcash: Unified `wu...`, transparent
 `W...`, and transparent-source-only TEX `wtex...`, with separate testnet and

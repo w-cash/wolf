@@ -63,6 +63,7 @@ permissions:
 jobs:
   validate:
     name: Validate deployment inputs
+    if: github.repository == 'ZcashFoundation/zebra'
     runs-on: ubuntu-latest
     steps:
       - name: Validate deployment contract

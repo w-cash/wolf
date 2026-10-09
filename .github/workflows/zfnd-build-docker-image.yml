@@ -84,6 +84,7 @@ jobs:
   # consumers route to the same dev/stage/prod GitHub environment.
   determine-environment:
     name: Determine environment
+    if: github.repository == 'ZcashFoundation/zebra'
     runs-on: ubuntu-latest
     timeout-minutes: 1
     outputs:
@@ -107,6 +108,7 @@ jobs:
 
   prepare-matrix:
     name: Prepare build matrix
+    if: github.repository == 'ZcashFoundation/zebra'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}

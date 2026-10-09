@@ -141,6 +141,7 @@ jobs:
   # instance labels, where there is no 63-character budget to compete for.
   determine-environment:
     name: Determine environment
+    if: github.repository == 'ZcashFoundation/zebra'
     runs-on: ubuntu-latest
     timeout-minutes: 1
     outputs:
@@ -1021,7 +1022,7 @@ jobs:
     # Even if the instance continues running, no image will be created, so it's better to delete it.
     # upload-checkpoint-artifact is included to prevent the instance from being deleted
     # before checkpoint data is extracted from the container logs.
-    if: always()
+    if: ${{ always() && github.repository == 'ZcashFoundation/zebra' }}
     continue-on-error: true
     permissions:
       contents: read
@@ -1101,7 +1102,7 @@ jobs:
     name: Integration test deployment success
     runs-on: ubuntu-latest
     # Always run this job to check the status of dependent jobs
-    if: always()
+    if: ${{ always() && github.repository == 'ZcashFoundation/zebra' }}
     needs:
       # determine-environment resolves the resource names and can fail on its own
       # guards, so it is reported directly rather than through the jobs it skips.

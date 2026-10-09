@@ -616,15 +616,16 @@ pub const MAX_MONEY: i64 = 21_000_000 * COIN;
 /// supply cap. It leaves checked signed-integer headroom while allowing more
 /// than 46 billion WEC, over two thousand times the inherited 21-million limit.
 /// The 0.375 WEC tail would take roughly 292,000 target years to reach it.
-/// Individual transactions retain the inherited, separately enforced limit.
+/// Some inherited transaction-library value types retain a separate 21-million
+/// limit. Wcash also applies that smaller limit to total coinbase input, but it
+/// is not a general aggregate cap on every balanced non-coinbase transaction.
 #[cfg(feature = "wcash-consensus")]
 pub const MAX_MONEY: i64 = i64::MAX / 2;
 
-/// Maximum value supported by the inherited Zcash transaction libraries for a
-/// single transaction.
+/// Maximum value supported by inherited Zcash transaction-library value types.
 ///
-/// `zcash_protocol::value::Zatoshis` and `ZatBalance` limit a single transaction's
-/// value to the 21-million-coin monetary base.
+/// `zcash_protocol::value::Zatoshis` and `ZatBalance` limit the scalar or net
+/// values they represent to the inherited 21-million-coin range.
 pub const MAX_SINGLE_TRANSACTION_VALUE: i64 = 21_000_000 * COIN;
 
 /// Maximum Wcash coinbase value supported by the inherited Zcash transaction libraries.
