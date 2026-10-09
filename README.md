@@ -34,6 +34,7 @@ Zcash build and a Wcash build are not interchangeable.
 | Understand the protocol's intended direction | [Protocol direction](docs/wcash-direction.md) |
 | Check official release and deployment evidence | [Release and deployment status](docs/wcash-release-status.md) |
 | Build and run a node | [Node operator guide](docs/wcash-node.md) |
+| Deploy the public wallet transport | [Wallet-service TLS guide](deploy/wcash-wallet-service/README.md) |
 | Check network identity, supply and privacy rules | [Consensus reference](docs/wcash-consensus.md) |
 | Query a node from software or an AI agent | [Agent and integration guide](docs/wcash-agents.md) |
 | Contribute changes with a coding agent | [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md) |

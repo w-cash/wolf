@@ -1,0 +1,57 @@
+{
+  "$schema": "./docs/wcash-wallet-service-manifest.schema.json",
+  "schemaVersion": 1,
+  "project": "Wcash Wolf wallet service",
+  "repository": "https://github.com/w-cash/wolf",
+  "network": {
+    "name": "Wcash Mainnet",
+    "genesis": "5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48",
+    "branchId": "0xd9c6a7ee"
+  },
+  "canonicalService": {
+    "status": "not deployed",
+    "endpoint": "not deployed",
+    "transport": "not deployed",
+    "implementation": "unknown",
+    "deployment": {
+      "sourceCommit": "unknown",
+      "artifactSha256": "unknown",
+      "buildFeatures": [],
+      "configurationRevision": "unknown",
+      "deployedAt": "unknown",
+      "evidenceUrl": "unknown"
+    },
+    "validation": {
+      "status": "not run",
+      "endpoint": "unknown",
+      "checkedAt": "unknown",
+      "verifier": "scripts/verify-wcash-wallet-service.py",
+      "resultUrl": "unknown"
+    }
+  },
+  "legacyObservations": [
+    {
+      "status": "observed legacy",
+      "endpoint": "http://mainnet.zecwec.com:48234",
+      "transport": "plaintext",
+      "observedAt": "2026-10-09T15:09:00Z",
+      "implementation": "consistent with wolf-compact-tx-streamer",
+      "reportedVersion": "v6.3.0",
+      "reportedSubversion": "/Wcash:6.3.0/",
+      "reportedBranchId": "0xd9c6a7ee",
+      "observedHeight": 23164,
+      "sourceCommit": "unknown",
+      "limitations": [
+        "The endpoint is plaintext and does not authenticate the server to a wallet.",
+        "The responses do not prove an exact Wolf source commit, binary digest, build feature set or configuration revision.",
+        "This dated observation is not an uptime promise or a supported wallet endpoint declaration."
+      ]
+    }
+  ],
+  "knownLimitations": [
+    "No canonical TLS Wcash Mainnet wallet service is recorded as deployed.",
+    "No exact production source commit, artifact digest or configuration revision is recorded.",
+    "The integrated CompactTxStreamer service remains experimental until separately qualified with the wallet applications."
+  ],
+  "updatedAt": "2026-10-09"
+}

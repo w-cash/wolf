@@ -1,0 +1,4 @@
+project: zebrad
+kind: Added
+body: "Wallet-service operators can now validate Wcash Mainnet identity and tip freshness through a TLS endpoint, and record deployment evidence in a machine-checked manifest."
+time: 2026-10-09T16:15:00.000000000Z
