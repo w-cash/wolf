@@ -22,6 +22,7 @@ consensus profile or release.
 | Check pool/backend compatibility | [Pool compatibility](wcash-pool-compatibility.md) |
 | Run isolated mining and wallet exercises | [Local Regtest guide](wcash-local.md) |
 | Use the experimental local wallet | [Wallet guide](../wcash-wallet/README.md) |
+| Validate and hand off the Molepool operator wallet | [Molepool wallet handoff](wcash-wallet-molepool-handoff.md) |
 | Understand pool signing and payout boundaries | [Wallet payout guide](wcash-wallet-payout.md) |
 | Decode AuxPoW and use fixed vectors | [AuxPoW crate guide](../wcash-zcash-aux/README.md) |
 | Contribute or privately report a vulnerability | [Contributing](../CONTRIBUTING.md) and [security](../SECURITY.md) |
