@@ -1,0 +1,4 @@
+project: zebrad
+kind: Added
+body: "Document the validated multiple-coinbase-address wallet revision, its remaining release boundary, and the backup, verification, second-route, and rollback procedure for the Molepool operator handoff."
+time: 2026-10-10T17:55:49.000000000Z
