@@ -13,12 +13,13 @@ use thiserror::Error;
 use wcash_wallet::{
     broadcast_signed_payout_batch, create_idempotent_payout_batch,
     create_signed_coinbase_shielding, create_signed_transfer, derive_wallet_spending_key,
-    encode_orchard_receiver, encode_transparent_coinbase_receiver, initialize_wallet,
-    inspect_signed_payout_batch, payout_wallet_identity, payout_wallet_observation,
-    pending_signed_transactions, recover_signed_payout_batch, stored_signed_transaction,
-    synchronize_wallet, validate_wcash_address, wallet_balance, AttestedWcashClient,
-    PayoutBatchInspectionRequest, PayoutBatchLookup, PayoutBatchRequest, TransferRecipient,
-    WalletAddressError, WalletKeyError, WalletNetwork, WalletRpcError, WalletServiceError,
+    encode_orchard_receiver, encode_transparent_coinbase_receiver, ensure_coinbase_address,
+    initialize_wallet, inspect_signed_payout_batch, list_coinbase_addresses,
+    payout_wallet_identity, payout_wallet_observation, pending_signed_transactions,
+    recover_signed_payout_batch, stored_signed_transaction, synchronize_wallet,
+    validate_wcash_address, wallet_balance, AttestedWcashClient, PayoutBatchInspectionRequest,
+    PayoutBatchLookup, PayoutBatchRequest, TransferRecipient, WalletAddressError, WalletKeyError,
+    WalletNetwork, WalletRpcError, WalletServiceError, MAX_COINBASE_ADDRESS_INDEX,
 };
 use zcash_protocol::TxId;
 use zeroize::Zeroizing;
@@ -152,6 +153,11 @@ enum Command {
         #[arg(long)]
         birthday: Option<u32>,
     },
+    /// Manage deterministic transparent coinbase payout receivers.
+    CoinbaseAddress {
+        #[command(subcommand)]
+        command: CoinbaseAddressCommand,
+    },
     /// Download, validate, and scan compact blocks into SQLite.
     Sync {
         /// Maximum compact blocks per synchronizer batch.
@@ -247,6 +253,18 @@ enum Command {
     PayoutInspect,
     /// Broadcast exact caller-held bytes only after matching the durable batch.
     PayoutBroadcast,
+}
+
+#[derive(Debug, Subcommand)]
+enum CoinbaseAddressCommand {
+    /// Persistently expose one receiver at an exact external child index.
+    Ensure {
+        /// Managed child index; zero is the historical default.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(0..=MAX_COINBASE_ADDRESS_INDEX as i64))]
+        index: u32,
+    },
+    /// List the default and explicitly exposed coinbase receivers.
+    List,
 }
 
 #[derive(Serialize)]
@@ -392,6 +410,17 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             .await?;
             print_json(&result)
         }
+        Command::CoinbaseAddress { command } => match command {
+            CoinbaseAddressCommand::Ensure { index } => print_json(&ensure_coinbase_address(
+                required_database(&cli.db)?,
+                network,
+                index,
+            )?),
+            CoinbaseAddressCommand::List => print_json(&list_coinbase_addresses(
+                required_database(&cli.db)?,
+                network,
+            )?),
+        },
         Command::Sync { batch_size } => {
             let mut client = connect_required(&cli.lightwalletd, network).await?;
             let result = synchronize_wallet(

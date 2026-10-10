@@ -50,6 +50,7 @@ use zcash_client_backend::{
 use zcash_client_sqlite::{
     util::SystemClock, wallet::init::init_wallet_db, AccountUuid, ExtensionTransaction, WalletDb,
 };
+use zcash_keys::keys::{ReceiverRequirement, UnifiedAddressRequest};
 use zcash_primitives::transaction::{Transaction, TxVersion};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
@@ -58,22 +59,28 @@ use zcash_protocol::{
     value::Zatoshis,
     PoolType, ShieldedPool,
 };
-use zcash_transparent::bundle::OutPoint;
+use zcash_transparent::{
+    address::TransparentAddress,
+    bundle::OutPoint,
+    keys::{NonHardenedChildIndex, TransparentKeyScope},
+};
 use zebra_chain::{block::Height, parameters::Network};
+use zip32::DiversifierIndex;
 
 use crate::{
-    address::default_transparent_receiver,
+    address::{encode_wcash_transparent_receiver, transparent_receiver_at_index},
     decode_recipient, derive_wallet_seed, derive_wallet_spending_key, encode_orchard_receiver,
-    encode_transparent_coinbase_receiver,
+    encode_transparent_coinbase_receiver, encode_transparent_coinbase_receiver_at_index,
     identity::{
         open_wallet_connection, open_wallet_connection_read_only, verify_existing_identity,
-        verify_or_initialize_identity, ExistingWalletIdentityError, PAYOUT_BATCH_TABLE,
-        PAYOUT_OUTPUT_TABLE, TRANSPARENT_SYNC_STATE_TABLE,
+        verify_or_initialize_identity, ExistingWalletIdentityError, COINBASE_ADDRESS_TABLE,
+        PAYOUT_BATCH_TABLE, PAYOUT_OUTPUT_TABLE, TRANSPARENT_SYNC_STATE_TABLE,
     },
     inspect_signed_transaction,
     rpc::{MAX_TRANSPARENT_HISTORY_BLOCKS_PER_REQUEST, TRANSPARENT_UTXO_PAGE_OUTPUTS},
     sync, AttestedWcashClient, BlockRef, MemoryBlockCache, WalletAddressError,
     WalletDatabaseIdentityError, WalletKeyError, WalletNetwork, WalletRpcError,
+    MAX_COINBASE_ADDRESS_INDEX,
 };
 
 /// Maximum compact blocks requested in one synchronization batch.
@@ -384,6 +391,19 @@ pub struct WalletInfo {
     pub address: String,
     /// Default Wcash P2PKH receiver for transparent coinbase payouts.
     pub transparent_coinbase_address: String,
+}
+
+/// Public metadata for one managed transparent coinbase receiver.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CoinbaseAddress {
+    /// Opaque database account identifier.
+    pub account_id: String,
+    /// External non-hardened child index in the wallet's ZIP 32 account.
+    pub child_index: u32,
+    /// Canonical network-specific Wcash P2PKH address.
+    pub address: String,
+    /// True only for the historical index-zero receiver.
+    pub is_default: bool,
 }
 
 /// Wallet synchronization and balance summary.
@@ -774,7 +794,7 @@ enum StagedTransactionPurpose {
         expected_payments: Vec<BoundIronwoodOutput>,
     },
     CoinbaseShielding {
-        source: zcash_transparent::address::TransparentAddress,
+        sources: Vec<BoundTransparentSource>,
         destination_receiver: orchard::Address,
         expected_outpoints: Vec<OutPoint>,
         input_total_zat: u64,
@@ -852,11 +872,23 @@ struct ConfirmedTransactionRow {
 
 struct TransparentRecoveryContext<'a> {
     parameters: &'a zebra_chain::parameters::Network,
-    coinbase_address: &'a str,
-    coinbase_receiver: zcash_transparent::address::TransparentAddress,
+    receivers: &'a [ManagedTransparentReceiver],
     expected_tip: BlockRef,
     deadline: tokio::time::Instant,
     cancellation: &'a WalletSyncCancellation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedTransparentReceiver {
+    child_index: NonHardenedChildIndex,
+    address: String,
+    receiver: TransparentAddress,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundTransparentSource {
+    child_index: u32,
+    receiver: TransparentAddress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1009,6 +1041,193 @@ pub fn inspect_wallet(
         address,
         transparent_coinbase_address,
     })
+}
+
+/// Persistently exposes one deterministic transparent coinbase receiver.
+///
+/// Repeating this operation for the same index is idempotent. The wallet's
+/// standard address metadata is used so seed-only recovery retains the usual
+/// librustzcash gap-discovery guarantees.
+pub fn ensure_coinbase_address(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+    child_index: u32,
+) -> Result<CoinbaseAddress, WalletServiceError> {
+    // Validate before opening the database so an invalid request has no side
+    // effects, including creation of a new SQLite file.
+    let _ = NonHardenedChildIndex::from_index(child_index)
+        .filter(|index| index.index() <= MAX_COINBASE_ADDRESS_INDEX)
+        .ok_or(WalletAddressError::TransparentChildIndexOutOfRange(
+            child_index,
+        ))?;
+    let path = path.as_ref();
+    require_existing_wallet_file(path)?;
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Exclusive)?;
+    let mut wallet = open_wallet_database(path, network)?;
+    let account_ids = wallet.get_account_ids().map_err(database_error)?;
+    let account_id = only_account(&account_ids)?;
+    let stored_ufvk = wallet
+        .get_account(account_id)
+        .map_err(database_error)?
+        .and_then(|account| account.ufvk().cloned())
+        .ok_or(WalletServiceError::AuthorityMismatch)?;
+    let address = wallet
+        .get_address_for_index(
+            account_id,
+            DiversifierIndex::from(child_index),
+            coinbase_address_request(),
+        )
+        .map_err(database_error)?
+        .ok_or_else(|| {
+            WalletServiceError::Database(
+                "managed coinbase address index could not be generated".to_owned(),
+            )
+        })?;
+    let registered = address.transparent().copied().ok_or_else(|| {
+        WalletServiceError::Database(
+            "managed coinbase address has no transparent receiver".to_owned(),
+        )
+    })?;
+    let expected = transparent_receiver_at_index(&stored_ufvk, child_index)?;
+    if registered != expected {
+        return Err(WalletServiceError::AuthorityMismatch);
+    }
+    wallet.transactionally_with_extension(|_wallet, extension| {
+        extension.execute(
+            "INSERT INTO ext_wcash_coinbase_addresses (child_index, assignment_source)
+             VALUES (?1, 'operator')
+             ON CONFLICT(child_index) DO NOTHING",
+            [child_index],
+        )?;
+        Ok::<_, WalletServiceError>(())
+    })?;
+    Ok(CoinbaseAddress {
+        account_id: account_id.expose_uuid().to_string(),
+        child_index,
+        address: encode_transparent_coinbase_receiver_at_index(&stored_ufvk, network, child_index)?,
+        is_default: child_index == 0,
+    })
+}
+
+fn coinbase_address_request() -> UnifiedAddressRequest {
+    UnifiedAddressRequest::custom(
+        ReceiverRequirement::Allow,
+        ReceiverRequirement::Allow,
+        ReceiverRequirement::Require,
+    )
+    .expect("a transparent-required request permits shielded UA receivers")
+}
+
+/// Lists only coinbase receivers explicitly exposed by this wallet.
+///
+/// Index zero is always included for compatibility. Pre-generated gap
+/// addresses remain private until `ensure_coinbase_address` exposes them.
+pub fn list_coinbase_addresses(
+    path: impl AsRef<Path>,
+    network: WalletNetwork,
+) -> Result<Vec<CoinbaseAddress>, WalletServiceError> {
+    let path = path.as_ref();
+    require_existing_wallet_file(path)?;
+    let _operation_lock = acquire_wallet_operation_lock(path, WalletOperationLockMode::Shared)?;
+    let mut wallet = open_existing_wallet_read_only(path, network)?;
+    let account_ids = wallet.get_account_ids().map_err(database_error)?;
+    let account_id = only_account(&account_ids)?;
+    let stored_ufvk = wallet
+        .get_account(account_id)
+        .map_err(database_error)?
+        .and_then(|account| account.ufvk().cloned())
+        .ok_or(WalletServiceError::AuthorityMismatch)?;
+    let assigned_indices = wallet.transactionally_with_extension(|_wallet, extension| {
+        let table_exists = extension.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = ?1)",
+            [COINBASE_ADDRESS_TABLE],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let mut assigned = BTreeSet::from([0]);
+        if table_exists {
+            let encoded = extension.query_row(
+                "SELECT COALESCE(group_concat(child_index, ','), '')
+                 FROM (SELECT child_index FROM ext_wcash_coinbase_addresses ORDER BY child_index)",
+                [],
+                |row| row.get::<_, String>(0),
+            )?;
+            for value in encoded.split(',').filter(|value| !value.is_empty()) {
+                let index = value.parse::<u32>().map_err(|_| {
+                    WalletServiceError::Database(
+                        "coinbase address assignment index is malformed".to_owned(),
+                    )
+                })?;
+                assigned.insert(index);
+            }
+        }
+        Ok::<_, WalletServiceError>(assigned)
+    })?;
+    let mut addresses = wallet
+        .get_transparent_receivers(account_id, false, false)
+        .map_err(database_error)?
+        .into_iter()
+        .filter_map(|(receiver, metadata)| {
+            let index = metadata.address_index()?;
+            (metadata.scope() == Some(TransparentKeyScope::EXTERNAL)
+                && index.index() <= MAX_COINBASE_ADDRESS_INDEX
+                && assigned_indices.contains(&index.index()))
+            .then_some((index, receiver))
+        })
+        .map(|(index, receiver)| {
+            let expected = transparent_receiver_at_index(&stored_ufvk, index.index())?;
+            if receiver != expected {
+                return Err(WalletServiceError::AuthorityMismatch);
+            }
+            Ok(CoinbaseAddress {
+                account_id: account_id.expose_uuid().to_string(),
+                child_index: index.index(),
+                address: encode_transparent_coinbase_receiver_at_index(
+                    &stored_ufvk,
+                    network,
+                    index.index(),
+                )?,
+                is_default: index == NonHardenedChildIndex::ZERO,
+            })
+        })
+        .collect::<Result<Vec<_>, WalletServiceError>>()?;
+    addresses.sort_by_key(|address| address.child_index);
+    if addresses.first().map(|address| address.child_index) != Some(0) {
+        return Err(WalletServiceError::CorruptWalletDatabase);
+    }
+    Ok(addresses)
+}
+
+fn managed_coinbase_receivers(
+    wallet: &WalletDatabase,
+    account_id: AccountUuid,
+    ufvk: &zcash_keys::keys::UnifiedFullViewingKey,
+    network: WalletNetwork,
+) -> Result<Vec<ManagedTransparentReceiver>, WalletServiceError> {
+    let registered = wallet
+        .get_transparent_receivers(account_id, false, false)
+        .map_err(database_error)?;
+    (0..=MAX_COINBASE_ADDRESS_INDEX)
+        .map(|child_index| {
+            let index = NonHardenedChildIndex::from_index(child_index)
+                .expect("managed coinbase indices are non-hardened");
+            let expected = transparent_receiver_at_index(ufvk, child_index)?;
+            let metadata = registered.get(&expected).ok_or_else(|| {
+                WalletServiceError::Database(format!(
+                    "managed coinbase receiver {child_index} is absent from wallet metadata"
+                ))
+            })?;
+            if metadata.scope() != Some(TransparentKeyScope::EXTERNAL)
+                || metadata.address_index() != Some(index)
+            {
+                return Err(WalletServiceError::AuthorityMismatch);
+            }
+            Ok(ManagedTransparentReceiver {
+                child_index: index,
+                address: encode_wcash_transparent_receiver(expected, network),
+                receiver: expected,
+            })
+        })
+        .collect()
 }
 
 fn open_wallet_database_with_seed(
@@ -1714,8 +1933,8 @@ pub async fn synchronize_wallet_cancellable(
     let account_ufvk = account
         .ufvk()
         .ok_or(WalletServiceError::AuthorityMismatch)?;
-    let coinbase_receiver = default_transparent_receiver(account_ufvk)?;
-    let coinbase_address = encode_transparent_coinbase_receiver(account_ufvk, network)?;
+    let coinbase_receivers =
+        managed_coinbase_receivers(&wallet, account_id, account_ufvk, network)?;
     let recovery_session = begin_transparent_recovery(&mut wallet)?;
     let cache = MemoryBlockCache::default();
     let parameters = network.parameters();
@@ -1760,8 +1979,7 @@ pub async fn synchronize_wallet_cancellable(
     if transparent_coinbase_recovery_start(tip_height).is_some() {
         let recovery = TransparentRecoveryContext {
             parameters: &parameters,
-            coinbase_address: &coinbase_address,
-            coinbase_receiver,
+            receivers: &coinbase_receivers,
             expected_tip,
             deadline: tokio::time::Instant::now() + MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION,
             cancellation,
@@ -1801,38 +2019,79 @@ async fn recover_transparent_coinbase(
     wallet: &mut WalletDatabase,
     recovery: &TransparentRecoveryContext<'_>,
 ) -> Result<(), WalletServiceError> {
-    let mut page_start = TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT;
-    loop {
+    for managed in recovery.receivers {
+        let mut page_start = TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT;
+        loop {
+            require_exact_recovery_tip(client, recovery).await?;
+            let page = await_transparent_recovery_rpc(
+                recovery.deadline,
+                recovery.cancellation,
+                client.transparent_unspent_page(
+                    &managed.address,
+                    page_start,
+                    recovery.expected_tip.height,
+                    TRANSPARENT_UTXO_PAGE_OUTPUTS,
+                ),
+            )
+            .await?;
+            require_exact_recovery_tip(client, recovery).await?;
+            let next_start = page.next_start_height(page_start, TRANSPARENT_UTXO_PAGE_OUTPUTS)?;
+            let creators = page.into_complete_creators(next_start);
+            let stored_creators =
+                fully_classified_stored_creators(client, wallet, &creators, recovery)?;
+            for creator in creators {
+                ensure_sync_not_cancelled(recovery.cancellation)?;
+                if stored_creators.contains(&creator.txid()) {
+                    continue;
+                }
+                require_exact_recovery_tip(client, recovery).await?;
+                let transaction = await_transparent_recovery_rpc(
+                    recovery.deadline,
+                    recovery.cancellation,
+                    client.transparent_creator_transaction(creator),
+                )
+                .await?;
+                require_exact_recovery_tip(client, recovery).await?;
+                decrypt_and_store_transaction(
+                    recovery.parameters,
+                    wallet,
+                    &transaction.transaction,
+                    Some(BlockHeight::from_u32(transaction.height)),
+                )
+                .map_err(database_error)?;
+                ensure_transparent_recovery_deadline(recovery.deadline)?;
+            }
+            match next_start {
+                Some(next_start) => page_start = next_start,
+                None => break,
+            }
+        }
+    }
+
+    recover_managed_transparent_history(client, wallet, recovery).await?;
+    recover_transparent_spends(client, wallet, recovery).await?;
+    require_exact_recovery_tip(client, recovery).await
+}
+
+async fn recover_managed_transparent_history(
+    client: &mut AttestedWcashClient,
+    wallet: &mut WalletDatabase,
+    recovery: &TransparentRecoveryContext<'_>,
+) -> Result<(), WalletServiceError> {
+    for managed in recovery.receivers {
         require_exact_recovery_tip(client, recovery).await?;
-        let page = await_transparent_recovery_rpc(
+        let first_use = await_transparent_recovery_rpc(
             recovery.deadline,
             recovery.cancellation,
-            client.transparent_unspent_page(
-                recovery.coinbase_address,
-                page_start,
+            client.first_transparent_receiver_transaction(
+                &managed.address,
+                TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT,
                 recovery.expected_tip.height,
-                TRANSPARENT_UTXO_PAGE_OUTPUTS,
             ),
         )
         .await?;
         require_exact_recovery_tip(client, recovery).await?;
-        let next_start = page.next_start_height(page_start, TRANSPARENT_UTXO_PAGE_OUTPUTS)?;
-        let creators = page.into_complete_creators(next_start);
-        let stored_creators =
-            fully_classified_stored_creators(client, wallet, &creators, recovery)?;
-        for creator in creators {
-            ensure_sync_not_cancelled(recovery.cancellation)?;
-            if stored_creators.contains(&creator.txid()) {
-                continue;
-            }
-            require_exact_recovery_tip(client, recovery).await?;
-            let transaction = await_transparent_recovery_rpc(
-                recovery.deadline,
-                recovery.cancellation,
-                client.transparent_creator_transaction(creator),
-            )
-            .await?;
-            require_exact_recovery_tip(client, recovery).await?;
+        if let Some(transaction) = first_use {
             decrypt_and_store_transaction(
                 recovery.parameters,
                 wallet,
@@ -1841,15 +2100,25 @@ async fn recover_transparent_coinbase(
             )
             .map_err(database_error)?;
             ensure_transparent_recovery_deadline(recovery.deadline)?;
-        }
-        match next_start {
-            Some(next_start) => page_start = next_start,
-            None => break,
+            record_chain_used_coinbase_receiver(wallet, managed.child_index)?;
         }
     }
+    Ok(())
+}
 
-    recover_transparent_spends(client, wallet, recovery).await?;
-    require_exact_recovery_tip(client, recovery).await
+fn record_chain_used_coinbase_receiver(
+    wallet: &mut WalletDatabase,
+    child_index: NonHardenedChildIndex,
+) -> Result<(), WalletServiceError> {
+    wallet.transactionally_with_extension(|_wallet, extension| {
+        extension.execute(
+            "INSERT INTO ext_wcash_coinbase_addresses (child_index, assignment_source)
+             VALUES (?1, 'chain')
+             ON CONFLICT(child_index) DO NOTHING",
+            [child_index.index()],
+        )?;
+        Ok::<_, WalletServiceError>(())
+    })
 }
 
 fn fully_classified_stored_creators(
@@ -1926,12 +2195,19 @@ async fn recover_transparent_spends(
         ensure_transparent_recovery_deadline(recovery.deadline)?;
         let groups = group_transparent_history_requests(
             wallet.transaction_data_requests().map_err(database_error)?,
-            recovery.coinbase_receiver,
+            recovery.receivers,
             maximum_end,
         )?;
-        let Some(((start, end), requests)) = groups.into_iter().next() else {
+        let Some(((child_index, start, end), requests)) = groups.into_iter().next() else {
             return Ok(());
         };
+        let managed = recovery
+            .receivers
+            .iter()
+            .find(|managed| managed.child_index.index() == child_index)
+            .ok_or(WalletServiceError::UnexpectedTransparentHistoryRequest(
+                "managed receiver disappeared during recovery",
+            ))?;
 
         let final_height = end - 1;
         let expected_end = await_transparent_recovery_rpc(
@@ -1949,11 +2225,7 @@ async fn recover_transparent_spends(
             let transactions = await_transparent_recovery_rpc(
                 recovery.deadline,
                 recovery.cancellation,
-                client.transparent_transactions_range(
-                    recovery.coinbase_address,
-                    cursor,
-                    chunk_end - 1,
-                ),
+                client.transparent_transactions_range(&managed.address, cursor, chunk_end - 1),
             )
             .await?;
             for transaction in transactions {
@@ -1992,10 +2264,10 @@ async fn recover_transparent_spends(
 
 fn group_transparent_history_requests(
     requests: Vec<TransactionDataRequest>,
-    expected_receiver: zcash_transparent::address::TransparentAddress,
+    managed_receivers: &[ManagedTransparentReceiver],
     maximum_end: u32,
-) -> Result<BTreeMap<(u32, u32), Vec<TransactionsInvolvingAddress>>, WalletServiceError> {
-    let mut groups = BTreeMap::<(u32, u32), Vec<TransactionsInvolvingAddress>>::new();
+) -> Result<BTreeMap<(u32, u32, u32), Vec<TransactionsInvolvingAddress>>, WalletServiceError> {
+    let mut groups = BTreeMap::<(u32, u32, u32), Vec<TransactionsInvolvingAddress>>::new();
     for request in requests {
         let TransactionDataRequest::TransactionsInvolvingAddress(request) = request else {
             continue;
@@ -2008,18 +2280,23 @@ fn group_transparent_history_requests(
             // them. They are outside this fixed coinbase-recovery boundary. A
             // mined/all-output request for another funded receiver is rejected
             // below rather than silently ignored.
-            if request.address() == expected_receiver {
+            if managed_receivers
+                .iter()
+                .any(|managed| request.address() == managed.receiver)
+            {
                 return Err(WalletServiceError::UnexpectedTransparentHistoryRequest(
                     "coinbase receiver request is not mined all-output spend discovery",
                 ));
             }
             continue;
         }
-        if request.address() != expected_receiver {
-            return Err(WalletServiceError::UnexpectedTransparentHistoryRequest(
-                "receiver is not the fixed coinbase address",
-            ));
-        }
+        let child_index = managed_receivers
+            .iter()
+            .find(|managed| request.address() == managed.receiver)
+            .map(|managed| managed.child_index.index())
+            .ok_or(WalletServiceError::UnexpectedTransparentHistoryRequest(
+                "receiver is not a managed coinbase address",
+            ))?;
         let original_start: u32 = request.block_range_start().into();
         let start = original_start.max(TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT);
         let end: u32 = request
@@ -2033,7 +2310,10 @@ fn group_transparent_history_requests(
                 "request range is outside the synchronized tip",
             ));
         }
-        groups.entry((start, end)).or_default().push(request);
+        groups
+            .entry((child_index, start, end))
+            .or_default()
+            .push(request);
     }
     Ok(groups)
 }
@@ -4449,7 +4729,17 @@ pub fn propose_coinbase_shielding_offline(
         .ufvk()
         .ok_or(WalletServiceError::AuthorityMismatch)?
         .clone();
-    let source = default_transparent_receiver(&stored_ufvk)?;
+    let sources = managed_coinbase_receivers(&wallet, account_id, &stored_ufvk, network)?
+        .into_iter()
+        .map(|managed| BoundTransparentSource {
+            child_index: managed.child_index.index(),
+            receiver: managed.receiver,
+        })
+        .collect::<Vec<_>>();
+    let source_receivers = sources
+        .iter()
+        .map(|source| source.receiver)
+        .collect::<Vec<_>>();
     let private_destination =
         decode_recipient(&encode_orchard_receiver(&stored_ufvk, network)?, network)?;
     let destination_receiver = *private_destination
@@ -4472,7 +4762,7 @@ pub fn propose_coinbase_shielding_offline(
         &selector,
         &fee_rule,
         Zatoshis::ZERO,
-        &[source],
+        &source_receivers,
         destination.clone(),
         None,
         Some(maximum_inputs),
@@ -4512,7 +4802,7 @@ pub fn propose_coinbase_shielding_offline(
         && step
             .transparent_inputs()
             .iter()
-            .all(|input| input.recipient_address() == &source)
+            .all(|input| source_receivers.contains(input.recipient_address()))
         && inputs_are_mature
         && proposal.input_count_in_pool(PoolType::Transparent) == step.transparent_inputs().len()
         && proposal.input_count_in_pool(PoolType::SAPLING) == 0
@@ -4545,7 +4835,7 @@ pub fn propose_coinbase_shielding_offline(
         lock_owner,
         expiry_delta,
         StagedTransactionPurpose::CoinbaseShielding {
-            source,
+            sources,
             destination_receiver,
             expected_outpoints,
             input_total_zat,
@@ -4801,13 +5091,14 @@ pub fn calculate_staged_transaction(
             }
         }
         StagedTransactionPurpose::CoinbaseShielding {
-            source,
+            sources,
             destination_receiver,
             expected_outpoints,
             input_total_zat,
             payment_total_zat,
         } => {
-            if default_transparent_receiver(&usk.to_unified_full_viewing_key())? != *source {
+            let spending_ufvk = usk.to_unified_full_viewing_key();
+            if !transparent_sources_match_authority(&spending_ufvk, sources) {
                 return Err(WalletServiceError::AuthorityMismatch);
             }
             let step = proposal.steps().first();
@@ -4831,10 +5122,11 @@ pub fn calculate_staged_transaction(
                 && proposal.proposed_version() == Some(TxVersion::V6)
                 && !step.is_shielding()
                 && !step.transparent_inputs().is_empty()
-                && step
-                    .transparent_inputs()
-                    .iter()
-                    .all(|input| input.recipient_address() == source)
+                && step.transparent_inputs().iter().all(|input| {
+                    sources
+                        .iter()
+                        .any(|source| input.recipient_address() == &source.receiver)
+                })
                 && inputs_are_mature
                 && unique_outpoint_sets_match(expected_outpoints, &actual_outpoints)
                 && proposal.input_count_in_pool(PoolType::Transparent)
@@ -5449,6 +5741,22 @@ fn unique_outpoint_sets_match(expected: &[OutPoint], actual: &[OutPoint]) -> boo
     let has_duplicate =
         |outpoints: &[OutPoint]| outpoints.windows(2).any(|pair| pair[0] == pair[1]);
     !has_duplicate(&expected) && !has_duplicate(&actual) && expected == actual
+}
+
+fn transparent_sources_match_authority(
+    ufvk: &zcash_keys::keys::UnifiedFullViewingKey,
+    sources: &[BoundTransparentSource],
+) -> bool {
+    let mut previous_index = None;
+    !sources.is_empty()
+        && sources.iter().all(|source| {
+            let ordered = previous_index.is_none_or(|index| source.child_index > index);
+            previous_index = Some(source.child_index);
+            ordered
+                && source.child_index <= MAX_COINBASE_ADDRESS_INDEX
+                && transparent_receiver_at_index(ufvk, source.child_index)
+                    .is_ok_and(|receiver| receiver == source.receiver)
+        })
 }
 
 fn validate_confirmation_policy(
@@ -6644,6 +6952,56 @@ mod tests {
     }
 
     #[test]
+    fn coinbase_address_ensure_is_idempotent_and_list_hides_gap_addresses() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite");
+        let account = create_wallet_accounts(&wallet_path, WalletNetwork::Testnet, 1)
+            .pop()
+            .unwrap();
+
+        let initial = list_coinbase_addresses(&wallet_path, WalletNetwork::Testnet).unwrap();
+        assert_eq!(initial.len(), 1, "{initial:?}");
+        assert_eq!(initial[0].child_index, 0);
+        assert!(initial[0].is_default);
+        assert_eq!(initial[0].address, account.transparent_coinbase_address);
+
+        let ensured = ensure_coinbase_address(&wallet_path, WalletNetwork::Testnet, 1).unwrap();
+        let repeated = ensure_coinbase_address(&wallet_path, WalletNetwork::Testnet, 1).unwrap();
+        assert_eq!(ensured, repeated);
+        assert_eq!(ensured.account_id, account.account_id);
+        assert_eq!(ensured.child_index, 1);
+        assert!(!ensured.is_default);
+        assert_ne!(ensured.address, account.transparent_coinbase_address);
+
+        let listed = list_coinbase_addresses(&wallet_path, WalletNetwork::Testnet).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|address| address.child_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(listed[1], ensured);
+    }
+
+    #[test]
+    fn coinbase_address_index_is_validated_before_wallet_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing_wallet = directory.path().join("missing.sqlite");
+        assert!(matches!(
+            ensure_coinbase_address(
+                &missing_wallet,
+                WalletNetwork::Testnet,
+                MAX_COINBASE_ADDRESS_INDEX + 1,
+            ),
+            Err(WalletServiceError::Address(
+                WalletAddressError::TransparentChildIndexOutOfRange(10)
+            ))
+        ));
+        assert!(!missing_wallet.exists());
+    }
+
+    #[test]
     fn seedless_inspection_does_not_create_a_missing_database() {
         let directory = tempfile::tempdir().unwrap();
         let wallet_path = directory.path().join("missing.sqlite");
@@ -6909,11 +7267,25 @@ mod tests {
     #[test]
     fn transparent_history_groups_preserve_durable_request_boundaries() {
         let receiver = zcash_transparent::address::TransparentAddress::PublicKeyHash([1; 20]);
-        let unused_ephemeral =
+        let second_receiver =
             zcash_transparent::address::TransparentAddress::PublicKeyHash([2; 20]);
-        let spend_request = || {
-            TransactionDataRequest::transactions_involving_address(
+        let unused_ephemeral =
+            zcash_transparent::address::TransparentAddress::PublicKeyHash([3; 20]);
+        let managed = [
+            ManagedTransparentReceiver {
+                child_index: NonHardenedChildIndex::ZERO,
+                address: "first".to_owned(),
                 receiver,
+            },
+            ManagedTransparentReceiver {
+                child_index: NonHardenedChildIndex::from_index(1).unwrap(),
+                address: "second".to_owned(),
+                receiver: second_receiver,
+            },
+        ];
+        let spend_request = |address| {
+            TransactionDataRequest::transactions_involving_address(
+                address,
                 BlockHeight::from_u32(7),
                 Some(BlockHeight::from_u32(18)),
                 None,
@@ -6931,13 +7303,19 @@ mod tests {
         );
 
         let groups = group_transparent_history_requests(
-            vec![spend_request(), ephemeral_probe, spend_request()],
-            receiver,
+            vec![
+                spend_request(receiver),
+                ephemeral_probe,
+                spend_request(receiver),
+                spend_request(second_receiver),
+            ],
+            &managed,
             20,
         )
         .unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups.get(&(7, 18)).map(Vec::len), Some(2));
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.get(&(0, 7, 18)).map(Vec::len), Some(2));
+        assert_eq!(groups.get(&(1, 7, 18)).map(Vec::len), Some(1));
 
         let foreign_spend_request = TransactionDataRequest::transactions_involving_address(
             unused_ephemeral,
@@ -6948,7 +7326,7 @@ mod tests {
             OutputStatusFilter::All,
         );
         assert!(matches!(
-            group_transparent_history_requests(vec![foreign_spend_request], receiver, 20),
+            group_transparent_history_requests(vec![foreign_spend_request], &managed, 20),
             Err(WalletServiceError::UnexpectedTransparentHistoryRequest(_))
         ));
 
@@ -6961,7 +7339,7 @@ mod tests {
             OutputStatusFilter::Unspent,
         );
         assert!(matches!(
-            group_transparent_history_requests(vec![malformed_coinbase_request], receiver, 20),
+            group_transparent_history_requests(vec![malformed_coinbase_request], &managed, 20),
             Err(WalletServiceError::UnexpectedTransparentHistoryRequest(_))
         ));
     }
@@ -7164,6 +7542,32 @@ mod tests {
             &[first.clone(), first.clone()],
             &[first.clone(), first],
         ));
+    }
+
+    #[test]
+    fn shielding_sources_bind_every_child_index_to_the_signing_authority() {
+        let seed = SecretVec::new(vec![0x41; 32]);
+        let ufvk = derive_wallet_spending_key(&seed, WalletNetwork::Testnet, 0)
+            .unwrap()
+            .to_unified_full_viewing_key();
+        let source = |child_index| BoundTransparentSource {
+            child_index,
+            receiver: transparent_receiver_at_index(&ufvk, child_index).unwrap(),
+        };
+        let sources = vec![source(0), source(1)];
+        assert!(transparent_sources_match_authority(&ufvk, &sources));
+
+        let mut reordered = sources.clone();
+        reordered.swap(0, 1);
+        assert!(!transparent_sources_match_authority(&ufvk, &reordered));
+
+        let mut substituted = sources.clone();
+        substituted[1].receiver = TransparentAddress::PublicKeyHash([0xff; 20]);
+        assert!(!transparent_sources_match_authority(&ufvk, &substituted));
+
+        let duplicate = vec![source(0), source(0)];
+        assert!(!transparent_sources_match_authority(&ufvk, &duplicate));
+        assert!(!transparent_sources_match_authority(&ufvk, &[]));
     }
 
     #[test]

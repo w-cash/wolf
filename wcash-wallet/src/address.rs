@@ -6,10 +6,19 @@ use zcash_keys::{
     address::UnifiedAddress,
     keys::{UnifiedAddressRequest, UnifiedFullViewingKey},
 };
-use zcash_transparent::{address::TransparentAddress, keys::IncomingViewingKey};
+use zcash_transparent::{
+    address::TransparentAddress,
+    keys::{IncomingViewingKey, NonHardenedChildIndex},
+};
 use zebra_chain::primitives::{WcashAddress, WcashAddressKind, WcashAddressParseError};
 
 use crate::WalletNetwork;
+
+/// Highest external transparent child index managed for coinbase payouts.
+///
+/// Keeping this set small and contiguous ensures that a seed-only restore can
+/// rediscover every published receiver within librustzcash's standard gap.
+pub const MAX_COINBASE_ADDRESS_INDEX: u32 = 9;
 
 /// Canonical receiver class returned by authoritative Wcash address validation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -45,6 +54,11 @@ pub enum WalletAddressError {
     /// The wallet full viewing key has no usable transparent component.
     #[error("could not derive the default transparent coinbase address: {0}")]
     TransparentDerivation(String),
+    /// The requested coinbase receiver is outside the managed recovery range.
+    #[error(
+        "transparent coinbase address index {0} is outside the supported range 0..={MAX_COINBASE_ADDRESS_INDEX}"
+    )]
+    TransparentChildIndexOutOfRange(u32),
     /// The encoded value is not a canonical Wcash address.
     #[error("invalid Wcash address: {0}")]
     Parse(#[from] WcashAddressParseError),
@@ -89,6 +103,20 @@ pub fn encode_transparent_coinbase_receiver(
         .map(|receiver| encode_wcash_transparent_receiver(receiver, network))
 }
 
+/// Encodes one managed external P2PKH coinbase receiver.
+///
+/// Index zero is byte-for-byte identical to the historical default receiver.
+/// Indices one through nine provide deterministic destinations for additional
+/// mining routes while remaining recoverable from the same seed and account.
+pub fn encode_transparent_coinbase_receiver_at_index(
+    ufvk: &UnifiedFullViewingKey,
+    network: WalletNetwork,
+    child_index: u32,
+) -> Result<String, WalletAddressError> {
+    transparent_receiver_at_index(ufvk, child_index)
+        .map(|receiver| encode_wcash_transparent_receiver(receiver, network))
+}
+
 pub(crate) fn default_transparent_receiver(
     ufvk: &UnifiedFullViewingKey,
 ) -> Result<TransparentAddress, WalletAddressError> {
@@ -101,6 +129,30 @@ pub(crate) fn default_transparent_receiver(
         .derive_external_ivk()
         .map_err(|error| WalletAddressError::TransparentDerivation(error.to_string()))?;
     Ok(incoming.default_address().0)
+}
+
+pub(crate) fn transparent_receiver_at_index(
+    ufvk: &UnifiedFullViewingKey,
+    child_index: u32,
+) -> Result<TransparentAddress, WalletAddressError> {
+    if child_index > MAX_COINBASE_ADDRESS_INDEX {
+        return Err(WalletAddressError::TransparentChildIndexOutOfRange(
+            child_index,
+        ));
+    }
+    let child_index = NonHardenedChildIndex::from_index(child_index).ok_or(
+        WalletAddressError::TransparentChildIndexOutOfRange(child_index),
+    )?;
+    let account_key = ufvk.transparent().ok_or_else(|| {
+        WalletAddressError::TransparentDerivation(
+            "unified full viewing key has no transparent component".to_owned(),
+        )
+    })?;
+    account_key
+        .derive_external_ivk()
+        .map_err(|error| WalletAddressError::TransparentDerivation(error.to_string()))?
+        .derive_address(child_index)
+        .map_err(|error| WalletAddressError::TransparentDerivation(error.to_string()))
 }
 
 pub(crate) fn encode_wcash_transparent_receiver(
@@ -248,6 +300,70 @@ mod tests {
         );
         assert!(zcash.starts_with("tm"));
         assert_ne!(encoded, zcash);
+    }
+
+    #[test]
+    fn indexed_coinbase_receivers_preserve_the_legacy_default() {
+        let ufvk = test_ufvk(WalletNetwork::Mainnet);
+        let legacy = encode_transparent_coinbase_receiver(&ufvk, WalletNetwork::Mainnet).unwrap();
+        let indexed =
+            encode_transparent_coinbase_receiver_at_index(&ufvk, WalletNetwork::Mainnet, 0)
+                .unwrap();
+        assert_eq!(legacy, indexed);
+        assert!(indexed.starts_with("W1"));
+        assert_eq!(
+            WcashAddress::try_from_encoded(&indexed).unwrap().network(),
+            WalletNetwork::Mainnet.address_network()
+        );
+
+        let second =
+            encode_transparent_coinbase_receiver_at_index(&ufvk, WalletNetwork::Mainnet, 1)
+                .unwrap();
+        assert_eq!(
+            WcashAddress::try_from_encoded(&second).unwrap().network(),
+            WalletNetwork::Mainnet.address_network()
+        );
+        assert_ne!(second, indexed);
+        assert_eq!(
+            second,
+            encode_transparent_coinbase_receiver_at_index(&ufvk, WalletNetwork::Mainnet, 1)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn indexed_coinbase_receivers_use_each_network_namespace() {
+        let ufvk = test_ufvk(WalletNetwork::Regtest);
+        let testnet =
+            encode_transparent_coinbase_receiver_at_index(&ufvk, WalletNetwork::Testnet, 1)
+                .unwrap();
+        let regtest =
+            encode_transparent_coinbase_receiver_at_index(&ufvk, WalletNetwork::Regtest, 1)
+                .unwrap();
+        assert!(testnet.starts_with("WT"));
+        assert!(regtest.starts_with("WR"));
+        assert_eq!(
+            WcashAddress::try_from_encoded(&testnet).unwrap().network(),
+            WalletNetwork::Testnet.address_network()
+        );
+        assert_eq!(
+            WcashAddress::try_from_encoded(&regtest).unwrap().network(),
+            WalletNetwork::Regtest.address_network()
+        );
+        assert_ne!(testnet, regtest);
+    }
+
+    #[test]
+    fn indexed_coinbase_receivers_reject_unmanaged_indices() {
+        let ufvk = test_ufvk(WalletNetwork::Testnet);
+        assert!(matches!(
+            encode_transparent_coinbase_receiver_at_index(
+                &ufvk,
+                WalletNetwork::Testnet,
+                MAX_COINBASE_ADDRESS_INDEX + 1,
+            ),
+            Err(WalletAddressError::TransparentChildIndexOutOfRange(10))
+        ));
     }
 
     #[test]
