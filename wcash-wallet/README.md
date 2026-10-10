@@ -34,7 +34,8 @@ production policy.
 | `validate-address`, `payout-capabilities` | Parses standard input or reports compiled capabilities; no wallet database or network connection |
 | `derive-address` | Reads a seed from redirected standard input and prints derived public addresses; does not create a database |
 | `derive-collector` | Reads a seed and creates a new owner-private incoming-viewing-key file at the requested absolute path |
-| `balance`, `export`, `list-pending`, `payout-identity`, `payout-recover`, `payout-inspect` | Opens private wallet state for inspection or durable-operation recovery; keep a single writer and review each command's input contract |
+| `balance`, `coinbase-address list`, `export`, `list-pending`, `payout-identity`, `payout-recover`, `payout-inspect` | Opens private wallet state for inspection or durable-operation recovery; keep a single writer and review each command's input contract |
+| `coinbase-address ensure` | Persistently exposes one deterministic public coinbase receiver in the existing wallet account; it does not read a seed or contact a node |
 | `init`, `sync`, `status` | Connects to the selected compact-block endpoint; `init` and `sync` write wallet state |
 | `payout-observe` | Opens private wallet state and contacts the selected endpoint to create a short-lived, tip-bound observation |
 | `shield-coinbase`, `transfer`, `payout-sign` | Uses spending authority, constructs signed transactions and persists operation state; it can also reserve inputs or notes |
@@ -100,6 +101,44 @@ writes the database; replace every path and endpoint deliberately:
 The reserved `.invalid` endpoint is intentionally non-routable and the example
 must not be run unchanged. Never weaken TLS or network-identity checks to make an
 unknown service connect.
+
+## Multiple coinbase payout receivers
+
+One wallet account can expose up to ten deterministic external Wcash P2PKH
+receivers, indexed from zero through nine. Index zero is the historical
+`transparent_coinbase_address` returned by `init`; existing miners do not need
+to change it. Additional mining routes can use another index without creating
+another seed, account, balance, or Ironwood destination.
+
+Expose index one once, then list the public receivers:
+
+```sh
+./target/release/wcash-wallet \
+  --network mainnet \
+  --db /absolute/private/wcash-wallet.sqlite \
+  coinbase-address ensure --index 1
+
+./target/release/wcash-wallet \
+  --network mainnet \
+  --db /absolute/private/wcash-wallet.sqlite \
+  coinbase-address list
+```
+
+`ensure` is idempotent. `list` includes index zero and explicitly exposed
+indices only; it never prints the seed, spending key, viewing key, or unused gap
+addresses. Synchronization recovers coinbase history for the complete managed
+range, including an index-one address published before a database was restored
+from the same seed. Mature outputs from multiple managed receivers may be
+combined by one `shield-coinbase` transaction into the account's existing
+Ironwood receiver.
+
+Before assigning an added receiver to a pool, back up the wallet recovery data,
+record the child index in the operator inventory, and verify the address on the
+intended network. Rollback is operational: stop assigning new work to the added
+address and return the route to index zero. Do not delete the wallet database or
+forget a published index; keep synchronization active until every output sent to
+that receiver is mature and shielded. Deploying this source does not alter any
+node, pool, listener, miner configuration, or Mainnet address automatically.
 
 ## Related documentation
 

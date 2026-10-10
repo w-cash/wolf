@@ -693,6 +693,97 @@ impl AttestedWcashClient {
         }
         Ok(transactions)
     }
+
+    /// Finds the earliest transaction that pays a managed transparent receiver.
+    ///
+    /// This wide-range probe reads at most one transaction. It lets seed-only
+    /// recovery distinguish a previously used receiver from an unused gap
+    /// address without downloading empty 16-block history ranges across the
+    /// entire chain. Once the creator is stored, librustzcash schedules the
+    /// bounded mined/all-output history needed to discover its spends.
+    pub(crate) async fn first_transparent_receiver_transaction(
+        &mut self,
+        address: &str,
+        start_height: u32,
+        end_height: u32,
+    ) -> Result<Option<MinedTransparentTransaction>, WalletRpcError> {
+        let receiver = decode_wcash_transparent_address(address, self.network)?;
+        if start_height == 0 || start_height > end_height {
+            return Err(WalletRpcError::InvalidTransparentHistoryRequest);
+        }
+        let expected_predecessor = self.compact_block_ref(start_height - 1).await?;
+        let expected_end = self.compact_block_ref(end_height).await?;
+        let mut stream = self
+            .inner
+            .get_taddress_transactions(TransparentAddressBlockFilter {
+                address: address.to_owned(),
+                range: Some(BlockRange {
+                    start: Some(BlockId {
+                        height: u64::from(start_height),
+                        hash: Vec::new(),
+                    }),
+                    end: Some(BlockId {
+                        height: u64::from(end_height),
+                        hash: Vec::new(),
+                    }),
+                    pool_types: Vec::new(),
+                }),
+            })
+            .await?
+            .into_inner();
+        let raw = tokio::time::timeout(REQUEST_TIMEOUT, stream.message())
+            .await
+            .map_err(|_| WalletRpcError::ResponseTimeout("transparent first use"))??;
+        let transaction = raw
+            .map(|raw| {
+                let height = u32::try_from(raw.height).map_err(|_| {
+                    WalletRpcError::UnexpectedTransparentTransactionHeight {
+                        start: start_height,
+                        end: end_height,
+                        actual: raw.height,
+                    }
+                })?;
+                if !(start_height..=end_height).contains(&height) {
+                    return Err(WalletRpcError::UnexpectedTransparentTransactionHeight {
+                        start: start_height,
+                        end: end_height,
+                        actual: raw.height,
+                    });
+                }
+                if raw.data.len() > MAX_BLOCK_BYTES {
+                    return Err(WalletRpcError::TransparentHistoryByteLimit {
+                        maximum: MAX_BLOCK_BYTES,
+                    });
+                }
+                let transaction = parse_wcash_v6_transaction(&raw.data, self.network)?;
+                let pays_receiver = transaction.transparent_bundle().is_some_and(|bundle| {
+                    bundle
+                        .vout
+                        .iter()
+                        .any(|output| output.recipient_address().as_ref() == Some(&receiver))
+                });
+                if !pays_receiver {
+                    return Err(WalletRpcError::TransparentUtxoMismatch(
+                        "earliest indexed transaction does not pay the requested receiver"
+                            .to_owned(),
+                    ));
+                }
+                Ok(MinedTransparentTransaction {
+                    transaction,
+                    height,
+                })
+            })
+            .transpose()?;
+        if self.compact_block_ref(start_height - 1).await? != expected_predecessor
+            || self.compact_block_ref(end_height).await? != expected_end
+        {
+            return Err(WalletRpcError::TransparentHistoryChainChanged {
+                start: start_height,
+                end: end_height,
+            });
+        }
+        Ok(transaction)
+    }
 }
 
 fn validate_transparent_creator_transaction(

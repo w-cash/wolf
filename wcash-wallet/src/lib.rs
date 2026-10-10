@@ -16,8 +16,9 @@ mod wallet;
 
 pub use address::{
     decode_payout_recipient, decode_recipient, encode_orchard_receiver,
-    encode_transparent_coinbase_receiver, validate_wcash_address, PayoutRecipient,
-    ValidatedWcashAddress, WalletAddressError, WcashReceiverKind,
+    encode_transparent_coinbase_receiver, encode_transparent_coinbase_receiver_at_index,
+    validate_wcash_address, PayoutRecipient, ValidatedWcashAddress, WalletAddressError,
+    WcashReceiverKind, MAX_COINBASE_ADDRESS_INDEX,
 };
 pub use cache::{MemoryBlockCache, MemoryBlockCacheError};
 pub use identity::WalletDatabaseIdentityError;
@@ -43,7 +44,7 @@ pub use wallet::{
     pending_signed_transactions, propose_coinbase_shielding_offline, propose_transfer_offline,
     stored_signed_transaction, synchronize_wallet, synchronize_wallet_cancellable,
     verify_wallet_seed, wallet_balance, wallet_balance_with_confirmations, AccountBalanceSummary,
-    CalculatedTransaction, ConfirmedTransaction, ConfirmedTransactionDirection,
+    CalculatedTransaction, CoinbaseAddress, ConfirmedTransaction, ConfirmedTransactionDirection,
     ConfirmedTransactionHistory, ConfirmedTransactionKind, ConfirmedTransactionSummary,
     ConfirmedTransactionSummaryHistory, InitializedWallet, PendingSignedTransactionPage,
     SignedTransaction, StagedTransactionProposal, StoredSignedTransaction, TransferRecipient,
@@ -61,3 +62,4 @@ pub use wallet::{
     PayoutWalletObservation, SignedPayoutBatch, PAYOUT_BATCH_FORMAT_VERSION,
     PAYOUT_OBSERVATION_FORMAT_VERSION, PAYOUT_OBSERVATION_VALIDITY_SECS,
 };
+pub use wallet::{ensure_coinbase_address, list_coinbase_addresses};

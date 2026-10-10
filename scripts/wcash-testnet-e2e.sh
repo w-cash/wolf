@@ -145,6 +145,39 @@ wait_for_height() {
   return 1
 }
 
+wait_for_template_transaction() {
+  local url=$1
+  local txid=$2
+  local output_path=$3
+
+  # The node precomputes expensive Ironwood coinbase proofs. A template that
+  # was prepared immediately before a mempool update can therefore remain
+  # visible briefly after sendrawtransaction accepts the transaction.
+  for _attempt in {1..60}; do
+    if rpc_call_with_timeout 30 "$url" getblocktemplate \
+      '[{"mode":"template","capabilities":["coinbasetxn"]}]' \
+      >"$output_path" &&
+      python3 - "$output_path" "$txid" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response_file:
+    response = json.load(response_file)
+if response.get("error") not in (None, False):
+    raise SystemExit(1)
+transactions = response.get("result", {}).get("transactions", [])
+raise SystemExit(0 if any(tx.get("hash") == sys.argv[2] for tx in transactions) else 1)
+PY
+    then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "block template did not include accepted transaction $txid" >&2
+  return 1
+}
+
 "$repo_root/target/release/wcash-zebrad" \
   -c "$repo_root/scripts/wcash-testnet-ci.toml" start \
   >"$runtime_dir/wcash-testnet.log" 2>&1 &
@@ -234,7 +267,7 @@ assert response.get("error") in (None, False), response
 result = response["result"]
 assert result["height"] == 1, result
 assert result["previousblockhash"] == sys.argv[2], result
-assert result["coinbasevalue"] == 625_000_000, result
+assert result["coinbasevalue"] == 15_625, result
 assert len(result["hash"]) == 64, result
 assert len(result["retiretoken"]) == 64, result
 assert result["target"] == sys.argv[3], result
@@ -699,9 +732,8 @@ rpc_call "$wcash_wallet_rpc" getrawmempool \
 # Ironwood coinbase proving is intentionally more expensive than ordinary RPC
 # service, especially on the two-core deployment target. Keep it bounded
 # without weakening the five-second timeout used by all other test calls.
-rpc_call_with_timeout 30 "$wcash_wallet_rpc" getblocktemplate \
-  '[{"mode":"template","capabilities":["coinbasetxn"]}]' \
-  >"$runtime_dir/wcash-template-before.json"
+wait_for_template_transaction "$wcash_wallet_rpc" "$transfer_txid" \
+  "$runtime_dir/wcash-template-before.json"
 python3 - "$runtime_dir/wcash-mempool-before.json" \
   "$runtime_dir/wcash-template-before.json" "$transfer_txid" \
   "$raw_transaction" "$transfer_fee" <<'PY'
@@ -898,6 +930,72 @@ assert result["address"] == expected_private, result
 assert result["transparent_coinbase_address"] == expected_transparent, result
 PY
 
+"$repo_root/target/release/wcash-wallet" \
+  --network regtest --db "$transparent_sender_db" \
+  coinbase-address ensure --index 1 >"$runtime_dir/transparent-sender-coinbase-index-1.json"
+"$repo_root/target/release/wcash-wallet" \
+  --network regtest --db "$transparent_sender_db" \
+  coinbase-address list >"$runtime_dir/transparent-sender-coinbase-addresses.json"
+sender_transparent_address_1="$(
+  python3 - "$runtime_dir/transparent-sender-coinbase-addresses.json" \
+    "$sender_transparent_address" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as result_file:
+    addresses = json.load(result_file)
+assert [entry["child_index"] for entry in addresses] == [0, 1], addresses
+assert addresses[0]["is_default"] is True, addresses
+assert addresses[0]["address"] == sys.argv[2], addresses
+assert addresses[1]["is_default"] is False, addresses
+assert addresses[0]["account_id"] == addresses[1]["account_id"], addresses
+assert addresses[0]["address"] != addresses[1]["address"], addresses
+assert addresses[1]["address"].startswith("WR"), addresses
+print(addresses[1]["address"])
+PY
+)"
+
+# Both payout addresses must create independent candidates against one exact
+# tip before any pool route is allowed to publish the second receiver.
+rpc_call "$wcash_wallet_rpc" createauxblock \
+  "[\"$sender_transparent_address\"]" >"$runtime_dir/transparent-candidate-index-0.json"
+rpc_call "$wcash_wallet_rpc" createauxblock \
+  "[\"$sender_transparent_address_1\"]" >"$runtime_dir/transparent-candidate-index-1.json"
+read -r candidate_0 token_0 candidate_1 token_1 < <(
+  python3 - "$runtime_dir/transparent-candidate-index-0.json" \
+    "$runtime_dir/transparent-candidate-index-1.json" "$wcash_regtest_genesis" <<'PY'
+import json
+import sys
+
+def result(path):
+    with open(path, encoding="utf-8") as response_file:
+        response = json.load(response_file)
+    assert response.get("error") in (None, False), response
+    return response["result"]
+
+first = result(sys.argv[1])
+second = result(sys.argv[2])
+assert first["previousblockhash"] == sys.argv[3], first
+assert second["previousblockhash"] == sys.argv[3], second
+assert first["hash"] != second["hash"], (first, second)
+print(first["hash"], first["retiretoken"], second["hash"], second["retiretoken"])
+PY
+)
+rpc_call "$wcash_wallet_rpc" retireauxblock \
+  "[\"$candidate_0\",\"$token_0\"]" >"$runtime_dir/transparent-retire-index-0.json"
+rpc_call "$wcash_wallet_rpc" retireauxblock \
+  "[\"$candidate_1\",\"$token_1\"]" >"$runtime_dir/transparent-retire-index-1.json"
+python3 - "$runtime_dir/transparent-retire-index-0.json" \
+  "$runtime_dir/transparent-retire-index-1.json" <<'PY'
+import json
+import sys
+for path in sys.argv[1:]:
+    with open(path, encoding="utf-8") as response_file:
+        response = json.load(response_file)
+    assert response.get("error") in (None, False), response
+    assert response["result"] == {"state": "retired"}, response
+PY
+
 export WCASH_EXPECTED_GENESIS_HASH="$wcash_regtest_genesis"
 export ZCASH_EXPECTED_GENESIS_HASH=029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327
 export ZCASH_NETWORK=regtest
@@ -921,6 +1019,12 @@ mine_transparent_generation() {
   local generation=$1
   local expected_parent_height=$((transparent_parent_start_height + generation))
   local start_nonce=$(((1000 + generation) * 512))
+
+  if [[ "$generation" == 2 ]]; then
+    export WCASH_PAYOUT_ADDRESS="$sender_transparent_address_1"
+  else
+    export WCASH_PAYOUT_ADDRESS="$sender_transparent_address"
+  fi
 
   "$repo_root/target/release/wcash-merge-miner" native-mine \
     "${transparent_native_args[@]}" 512 "$start_nonce" \
@@ -1016,9 +1120,9 @@ assert account["transparent_regular_total_zat"] == 0, account
 PY
 
 # Recreate the same wallet with a deliberately late shielded birthday. The
-# fixed transparent receiver was already paid from height 1, so this proves
+# managed transparent receivers were already paid from heights 1 and 2, so this proves
 # the separate current-UTXO recovery pass does not silently lose pre-birthday
-# coinbase rewards.
+# coinbase rewards, including index one without wallet-database backup metadata.
 transparent_late_restore_db="$runtime_dir/transparent-late-restore.sqlite"
 wallet_with_seed "$sender_seed" \
   --network regtest --db "$transparent_late_restore_db" --lightwalletd "$wcash_wallet_grpc" \
@@ -1058,9 +1162,43 @@ assert account["transparent_regular_total_zat"] == 0, account
 assert account["ironwood_total_zat"] == 0, account
 PY
 
+"$repo_root/target/release/wcash-wallet" \
+  --network regtest --db "$transparent_late_restore_db" \
+  coinbase-address list >"$runtime_dir/transparent-late-restore-addresses.json"
+python3 - "$runtime_dir/transparent-late-restore-addresses.json" \
+  "$sender_transparent_address" "$sender_transparent_address_1" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as result_file:
+    addresses = json.load(result_file)
+assert [entry["child_index"] for entry in addresses] == [0, 1], addresses
+assert [entry["address"] for entry in addresses] == sys.argv[2:], addresses
+PY
+
+# At tip 101, the target height is 102 and both height-1 and height-2
+# coinbase outputs have reached the exact 100-block maturity boundary.
+mine_transparent_generation 101
+"$repo_root/target/release/wcash-wallet" \
+  --network regtest --db "$transparent_sender_db" --lightwalletd "$wcash_wallet_grpc" \
+  sync --batch-size "$wallet_sync_batch_size" >"$runtime_dir/transparent-sync-two-mature.json"
+python3 - "$runtime_dir/transparent-sync-two-mature.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as summary_file:
+    summary = json.load(summary_file)
+assert summary["synchronized"] is True, summary
+assert summary["chain_tip_height"] == 101, summary
+account = summary["accounts"][0]
+assert account["transparent_coinbase_total_zat"] == 101 * 625_000_000, account
+assert account["transparent_coinbase_spendable_zat"] == 2 * 625_000_000, account
+assert account["transparent_coinbase_pending_zat"] == 99 * 625_000_000, account
+PY
+
 wallet_with_seed "$sender_seed" \
   --network regtest --db "$transparent_sender_db" --lightwalletd "$wcash_wallet_grpc" \
-  shield-coinbase --max-inputs 1 --expiry-delta 40 --lock-for-blocks 100 \
+  shield-coinbase --max-inputs 2 --expiry-delta 40 --lock-for-blocks 100 \
   >"$runtime_dir/signed-coinbase-shielding.json"
 
 read -r shielding_txid shielding_raw shielding_fee < <(
@@ -1071,12 +1209,12 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as result_file:
     result = json.load(result_file)
 assert result["branch_id"] == "c3a6678a", result
-assert result["target_height"] == 101, result
-assert result["expiry_height"] == 141, result
+assert result["target_height"] == 102, result
+assert result["expiry_height"] == 142, result
 assert result["internal_change_receiver_verified"] is True, result
 assert len(result["txid"]) == 64, result
 assert result["raw_transaction_hex"], result
-assert 0 < result["fee_zat"] < 625_000_000, result
+assert 0 < result["fee_zat"] < 2 * 625_000_000, result
 print(result["txid"], result["raw_transaction_hex"], result["fee_zat"])
 PY
 )
@@ -1097,7 +1235,7 @@ assert result["status"]["state"] == "mempool", result
 PY
 
 # Decode through the node as an independent wire-format check: Wcash V6,
-# exactly one transparent input, no transparent output or legacy shielded
+# exactly two transparent inputs, no transparent output or legacy shielded
 # component, and the canonical two-action Ironwood bundle (one private output
 # plus one protocol padding action).
 rpc_call "$wcash_wallet_rpc" getrawtransaction \
@@ -1115,19 +1253,19 @@ transaction = response["result"]
 assert transaction["txid"] == expected_txid, transaction
 assert transaction["hex"] == expected_raw, transaction
 assert transaction["version"] == 6 and transaction["overwintered"] is True, transaction
-assert len(transaction["vin"]) == 1 and "coinbase" not in transaction["vin"][0], transaction
+assert len(transaction["vin"]) == 2, transaction
+assert all("coinbase" not in txin for txin in transaction["vin"]), transaction
 assert transaction["vout"] == [], transaction
 assert transaction["vShieldedSpend"] == [], transaction
 assert transaction["vShieldedOutput"] == [], transaction
 assert transaction["vjoinsplit"] == [], transaction
 assert transaction["orchard"]["actions"] == [], transaction
 assert len(transaction["ironwood"]["actions"]) == 2, transaction
-assert transaction["ironwood"]["valueBalanceZat"] == -(625_000_000 - int(fee)), transaction
+assert transaction["ironwood"]["valueBalanceZat"] == -(2 * 625_000_000 - int(fee)), transaction
 PY
 
-rpc_call_with_timeout 30 "$wcash_wallet_rpc" getblocktemplate \
-  '[{"mode":"template","capabilities":["coinbasetxn"]}]' \
-  >"$runtime_dir/transparent-template-with-shielding.json"
+wait_for_template_transaction "$wcash_wallet_rpc" "$shielding_txid" \
+  "$runtime_dir/transparent-template-with-shielding.json"
 python3 - "$runtime_dir/transparent-template-with-shielding.json" \
   "$shielding_txid" "$shielding_raw" "$shielding_fee" <<'PY'
 import json
@@ -1138,7 +1276,7 @@ with open(path, encoding="utf-8") as response_file:
     response = json.load(response_file)
 assert response.get("error") in (None, False), response
 template = response["result"]
-assert template["height"] == 101, template
+assert template["height"] == 102, template
 matches = [transaction for transaction in template["transactions"] if transaction["hash"] == expected_txid]
 assert len(matches) == 1, template
 assert matches[0]["data"] == expected_raw, matches[0]
@@ -1152,7 +1290,7 @@ assert coinbase["data"] and coinbase["hash"], coinbase
 assert coinbase["fee"] == -template_fees, coinbase
 PY
 
-mine_transparent_generation 101
+mine_transparent_generation 102
 
 "$repo_root/target/release/wcash-wallet" \
   --network regtest --lightwalletd "$wcash_wallet_grpc" \
@@ -1169,7 +1307,7 @@ with open(sys.argv[1], encoding="utf-8") as status_file:
 with open(sys.argv[2], encoding="utf-8") as mempool_file:
     mempool = json.load(mempool_file)
 assert status["txid"] == sys.argv[3], status
-assert status["status"] == {"state": "mined", "height": 101}, status
+assert status["status"] == {"state": "mined", "height": 102}, status
 assert mempool.get("error") in (None, False), mempool
 assert sys.argv[3] not in mempool["result"], mempool
 PY
@@ -1185,12 +1323,12 @@ with open(sys.argv[1], encoding="utf-8") as summary_file:
     summary = json.load(summary_file)
 fee = int(sys.argv[2])
 assert summary["synchronized"] is True, summary
-assert summary["chain_tip_height"] == 101, summary
-assert summary["fully_scanned_height"] == 101, summary
+assert summary["chain_tip_height"] == 102, summary
+assert summary["fully_scanned_height"] == 102, summary
 assert len(summary["accounts"]) == 1, summary
 account = summary["accounts"][0]
 expected_transparent = 100 * 625_000_000 + fee
-expected_ironwood = 625_000_000 - fee
+expected_ironwood = 2 * 625_000_000 - fee
 assert account["transparent_total_zat"] == expected_transparent, account
 assert account["transparent_coinbase_total_zat"] == expected_transparent, account
 assert account["transparent_coinbase_spendable_zat"] == 625_000_000, account
@@ -1199,7 +1337,7 @@ assert account["transparent_regular_total_zat"] == 0, account
 assert account["ironwood_total_zat"] == expected_ironwood, account
 assert account["sapling_total_zat"] == 0, account
 assert account["orchard_total_zat"] == 0, account
-assert account["transparent_total_zat"] + account["ironwood_total_zat"] == 101 * 625_000_000
+assert account["transparent_total_zat"] + account["ironwood_total_zat"] == 102 * 625_000_000
 PY
 
 rpc_call "$wcash_wallet_rpc" getblockchaininfo \
@@ -1213,13 +1351,55 @@ with open(sys.argv[1], encoding="utf-8") as response_file:
 fee = int(sys.argv[2])
 assert response.get("error") in (None, False), response
 result = response["result"]
-assert result["blocks"] == 101, result
-assert result["chainSupply"]["chainValueZat"] == 101 * 625_000_000, result
+assert result["blocks"] == 102, result
+assert result["chainSupply"]["chainValueZat"] == 102 * 625_000_000, result
 pools = {pool["id"]: pool for pool in result["valuePools"]}
 assert pools["transparent"]["chainValueZat"] == 100 * 625_000_000 + fee, pools
-assert pools["ironwood"]["chainValueZat"] == 625_000_000 - fee, pools
+assert pools["ironwood"]["chainValueZat"] == 2 * 625_000_000 - fee, pools
 assert pools["sapling"]["chainValueZat"] == 0, pools
 assert pools["orchard"]["chainValueZat"] == 0, pools
+PY
+
+# A fresh database restored from the same seed must rediscover index one, both
+# spent transparent creators, and the combined Ironwood shielding output.
+transparent_final_restore_db="$runtime_dir/transparent-final-restore.sqlite"
+wallet_with_seed "$sender_seed" \
+  --network regtest --db "$transparent_final_restore_db" --lightwalletd "$wcash_wallet_grpc" \
+  init --birthday 1 >"$runtime_dir/transparent-final-restore-init.json"
+"$repo_root/target/release/wcash-wallet" \
+  --network regtest --db "$transparent_final_restore_db" --lightwalletd "$wcash_wallet_grpc" \
+  sync --batch-size "$wallet_sync_batch_size" >"$runtime_dir/transparent-final-restore-sync.json"
+python3 - "$runtime_dir/transparent-final-restore-sync.json" "$shielding_fee" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as summary_file:
+    summary = json.load(summary_file)
+fee = int(sys.argv[2])
+assert summary["synchronized"] is True, summary
+assert summary["chain_tip_height"] == 102, summary
+assert summary["fully_scanned_height"] == 102, summary
+account = summary["accounts"][0]
+assert account["transparent_total_zat"] == 100 * 625_000_000 + fee, account
+assert account["transparent_coinbase_total_zat"] == 100 * 625_000_000 + fee, account
+assert account["ironwood_total_zat"] == 2 * 625_000_000 - fee, account
+assert account["transparent_regular_total_zat"] == 0, account
+assert account["sapling_total_zat"] == 0, account
+assert account["orchard_total_zat"] == 0, account
+assert account["transparent_total_zat"] + account["ironwood_total_zat"] == 102 * 625_000_000
+PY
+"$repo_root/target/release/wcash-wallet" \
+  --network regtest --db "$transparent_final_restore_db" \
+  coinbase-address list >"$runtime_dir/transparent-final-restore-addresses.json"
+python3 - "$runtime_dir/transparent-final-restore-addresses.json" \
+  "$sender_transparent_address" "$sender_transparent_address_1" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as result_file:
+    addresses = json.load(result_file)
+assert [entry["child_index"] for entry in addresses] == [0, 1], addresses
+assert [entry["address"] for entry in addresses] == sys.argv[2:], addresses
 PY
 
 echo "Wcash transparent coinbase maturity and shielding E2E passed at $wcash_regtest_genesis"

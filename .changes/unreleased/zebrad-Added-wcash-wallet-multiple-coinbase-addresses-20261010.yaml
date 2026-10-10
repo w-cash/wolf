@@ -1,0 +1,4 @@
+project: zebrad
+kind: Added
+body: "Allow one Wcash wallet account to expose and recover deterministic transparent coinbase receivers at child indices 0 through 9, aggregate their mature outputs into the existing Ironwood destination, and manage the public addresses through idempotent CLI commands."
+time: 2026-10-10T12:00:00.000000000Z

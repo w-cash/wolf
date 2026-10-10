@@ -9,6 +9,7 @@ use crate::{keys::WALLET_SEED_KDF_VERSION, WalletNetwork};
 
 const IDENTITY_TABLE: &str = "ext_wcash_wallet_identity";
 pub(crate) const TRANSPARENT_SYNC_STATE_TABLE: &str = "ext_wcash_transparent_sync_state";
+pub(crate) const COINBASE_ADDRESS_TABLE: &str = "ext_wcash_coinbase_addresses";
 pub(crate) const IRONWOOD_SYNC_STATE_TABLE: &str = "ext_wcash_ironwood_sync";
 pub(crate) const PAYOUT_BATCH_TABLE: &str = "ext_wcash_payout_batches";
 pub(crate) const PAYOUT_OUTPUT_TABLE: &str = "ext_wcash_payout_outputs";
@@ -195,6 +196,18 @@ fn ensure_transparent_sync_state(connection: &Connection) -> Result<(), rusqlite
                 CHECK (attested_tip_height BETWEEN 0 AND 4294967295),
             attested_tip_hash BLOB NOT NULL CHECK (length(attested_tip_hash) = 32)
         ) WITHOUT ROWID;
+        -- librustzcash can expose a transparent receiver incidentally while
+        -- deriving its default multi-receiver UA. Keep the operator-assigned
+        -- coinbase subset explicit so `list` never publishes such gap rows.
+        CREATE TABLE IF NOT EXISTS ext_wcash_coinbase_addresses (
+            child_index INTEGER PRIMARY KEY CHECK (child_index BETWEEN 0 AND 9),
+            assignment_source TEXT NOT NULL
+                CHECK (assignment_source IN ('legacy_default', 'operator', 'chain'))
+        ) WITHOUT ROWID;
+        INSERT OR IGNORE INTO ext_wcash_coinbase_addresses (
+            child_index,
+            assignment_source
+        ) VALUES (0, 'legacy_default');
         CREATE TABLE IF NOT EXISTS ext_wcash_payout_batches (
             batch_id BLOB PRIMARY KEY CHECK (length(batch_id) = 16),
             format_version INTEGER NOT NULL CHECK (format_version = 1),
