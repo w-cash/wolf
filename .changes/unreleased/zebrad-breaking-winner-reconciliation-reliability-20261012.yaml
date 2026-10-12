@@ -1,4 +1,4 @@
 project: zebrad
 kind: breaking
-body: "Keep transient parent confirmation failures retryable and retain exact noncanonical or overtaken Wcash winners without repeated submission or reward credit. Stable tip and witness checks preserve conservative observation, reorganization, and journal replay behavior; the coordinated pool protocol requires the Wcash side-chain capability."
+body: "Keep transient parent confirmation failures and ambiguous generic block rejections retryable; retain exact known noncanonical Wcash winners without repeated submission or reward credit. Pending proofs preserve delivery on competing tips; retained unknown proofs can requeue on their own stable predecessor. Stable tip and witness checks preserve conservative observation, reorganization, and journal replay behavior; the coordinated pool protocol requires Wcash side-chain and requeue capabilities."
 time: 2026-10-12T00:00:00.000000000Z

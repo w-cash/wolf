@@ -239,13 +239,19 @@ impl MinerError {
     /// Missing state during a reorganization is safe to retry here, but is not
     /// sufficient evidence to release new work during job preparation.
     pub fn is_retryable_winner_rpc_failure(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            // Blocking response reads wrap interrupted bodies and read timeouts
+            // as `io::ErrorKind::Other`. An interrupted observation cannot make
+            // exact durable winner bytes invalid. Keep preparation's stricter
+            // classifier independent, and retain construction/protocol errors.
+            Self::RpcTransport(error) => !error.is_builder(),
+            Self::Io(_) => true,
             Self::RpcError {
                 code: Some(-1 | -5),
                 ..
-            }
-        ) || self.is_retryable_native_rpc_failure()
+            } => true,
+            _ => self.is_retryable_native_rpc_failure(),
+        }
     }
 }
 
@@ -283,4 +289,30 @@ const fn is_retryable_io_kind(kind: io::ErrorKind) -> bool {
             | io::ErrorKind::TimedOut
             | io::ErrorKind::Interrupted
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn winner_retry_preserves_io_uncertainty_without_relaxing_preparation() {
+        let error = MinerError::Io(io::Error::other("interrupted HTTP response body"));
+        assert!(error.is_retryable_winner_rpc_failure());
+        assert!(!error.is_retryable_native_rpc_failure());
+    }
+
+    #[test]
+    fn winner_retry_keeps_construction_and_decoded_protocol_errors_fatal() {
+        let error = reqwest::blocking::Client::new()
+            .get("invalid URL")
+            .build()
+            .unwrap_err();
+        assert!(error.is_builder());
+        assert!(!MinerError::RpcTransport(error).is_retryable_winner_rpc_failure());
+        assert!(!MinerError::RpcProtocol("invalid response ID".to_string())
+            .is_retryable_winner_rpc_failure());
+        let error = serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err();
+        assert!(!MinerError::Json(error).is_retryable_winner_rpc_failure());
+    }
 }

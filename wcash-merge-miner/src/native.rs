@@ -2326,9 +2326,12 @@ fn validate_parent_block_status(
 }
 
 pub(crate) fn submitblock_reason_is_inconclusive(reason: &str) -> bool {
+    // Zebra also uses generic `rejected` for queued/replaced duplicates. It
+    // cannot prove invalidity, even while the sampled predecessor is current;
+    // exact membership observation must decide durable winner progression.
     matches!(
         reason,
-        "duplicate" | "duplicate-inconclusive" | "inconclusive"
+        "duplicate" | "duplicate-inconclusive" | "inconclusive" | "rejected"
     )
 }
 

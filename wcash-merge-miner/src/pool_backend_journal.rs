@@ -574,9 +574,9 @@ pub struct JournalShareCommit {
 pub enum JournalWinnerLifecycle {
     /// Exact bytes are retained for initial submission or reconciliation.
     Pending,
-    /// This exact valid proof lost its height race or the pinned nodes
-    /// proved it committed off the best chain. Status-only monitoring survives
-    /// side-chain pruning and restart.
+    /// This exact valid proof is retained for status-only monitoring. Such
+    /// monitoring survives side-chain pruning and restart; absent Wcash bytes
+    /// can be requeued if their exact predecessor becomes current again.
     SideChain {
         /// Stable best-chain tip sampled with the committed side-chain proof.
         tip: ChainTip,
@@ -632,8 +632,7 @@ impl JournalWinnerLifecycle {
 /// snapshots can authorize a compare-and-swap transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum JournalWinnerTransition {
-    /// This exact valid proof lost its height race or the pinned nodes
-    /// retained it off the best chain.
+    /// This retained proof requires status-only monitoring without credit.
     SideChain {
         /// Stable best-chain tip sampled with the noncanonical proof.
         tip: ChainTip,
@@ -655,9 +654,10 @@ pub(crate) enum JournalWinnerTransition {
         /// Exact best-chain tip sampled with the conflict.
         tip: ChainTip,
     },
-    /// A quarantined Wcash winner is absent and eligible for resubmission.
+    /// A quarantined or side-chain Wcash winner is absent and eligible for
+    /// resubmission on its exact predecessor.
     Requeued {
-        /// Exact best-chain tip sampled before releasing quarantine.
+        /// Exact best-chain tip sampled before releasing the retained proof.
         tip: ChainTip,
     },
     /// An observed reward reached its immutable maturity threshold.
@@ -2129,10 +2129,14 @@ impl JournalSemanticState {
             } => {
                 require_no_private_blocks(&record.winner_blocks, event_seq)?;
                 let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
-                if !matches!(state.lifecycle, JournalWinnerLifecycle::Quarantined { .. }) {
+                if !matches!(
+                    state.lifecycle,
+                    JournalWinnerLifecycle::Quarantined { .. }
+                        | JournalWinnerLifecycle::SideChain { .. }
+                ) {
                     return Err(semantic(
                         event_seq,
-                        "only a quarantined winner can be requeued",
+                        "only a quarantined or side-chain Wcash proof can be requeued",
                     ));
                 }
                 state.lifecycle = JournalWinnerLifecycle::Requeued { tip: tip.clone() };
@@ -3692,6 +3696,45 @@ mod tests {
             assert!(!retained.lifecycle.requires_submission());
             assert!(journal.next_unsettled_winner_state(None).unwrap().is_some());
             assert!(journal.next_matured_winner_state(None).unwrap().is_none());
+            let (journal, retained) = if !requeued {
+                let predecessor = ChainTip {
+                    block_hash_le: Hex32::new(block.header.previous_block_hash.0),
+                    height: winner.height - 1,
+                };
+                let requeue = journal
+                    .compare_and_transition_winner(
+                        &retained.share_id,
+                        MergedChain::Wcash,
+                        retained.revision_event_seq,
+                        JournalWinnerTransition::Requeued { tip: predecessor },
+                    )
+                    .unwrap();
+                assert!(matches!(requeue, BackendEvent::WinnerRequeued { .. }));
+                assert!(matches!(
+                    journal.compare_and_transition_winner(
+                        &retained.share_id,
+                        MergedChain::Wcash,
+                        retained.revision_event_seq,
+                        JournalWinnerTransition::SideChain { tip: tip.clone() },
+                    ),
+                    Err(PoolBackendJournalError::WinnerRevisionConflict { .. })
+                ));
+                drop(journal);
+                let journal = open(&path, &config);
+                let (_, retained) = journal.next_winner_state(None).unwrap().unwrap();
+                assert_eq!(retained.block_bytes, block_bytes);
+                assert_eq!(retained.parent_hash_le, Hex32::new(parent_hash));
+                assert_eq!(retained.winner, winner);
+                assert!(matches!(
+                    retained.lifecycle,
+                    JournalWinnerLifecycle::Requeued { .. }
+                ));
+                assert!(retained.lifecycle.requires_submission());
+                assert!(journal.next_matured_winner_state(None).unwrap().is_none());
+                (journal, retained)
+            } else {
+                (journal, retained)
+            };
             let canonical_tip = ChainTip {
                 block_hash_le: winner.block_hash_le.clone(),
                 height: winner.height,

@@ -109,32 +109,39 @@ are needed. Each parent must also prove its already identity-checked genesis
 through this status API at startup and subsequent identity checks, with exact
 height zero and positive best-chain confirmations. This rejects missing or
 incompatible APIs before admitting new mining work.
-A pending or explicitly requeued winner is submitted only when its exact
-predecessor height and hash are current. A stable tip that has passed the
-candidate height or replaced its exact predecessor stops further replay of the
-locally revalidated proof without asserting node acceptance. A tip with the
-candidate's own Wcash ID and uncertain witness status defers the verdict. Exact
-Wcash `side_chain` status, or all parents positively identifying
+A pending or explicitly requeued Wcash winner retains submission opportunities
+on a competing tip: height and hash alone cannot prove that its retained fork
+cannot become the best chain. A dependency behind its predecessor defers
+delivery. Zebra's generic `rejected` response includes queued or replaced
+duplicates and remains inconclusive even on a current predecessor. Unknown
+status after an uncertain or inconclusive attempt keeps exact bytes pending
+with paced retries. A tip with the candidate's own
+Wcash ID and uncertain witness status defers the verdict. Exact Wcash
+`side_chain` status, or all parents positively identifying
 the same exact committed noncanonical Zcash proof, also authorizes status-only
 monitoring. This evidence is durably recorded as `winner_side_chain`. The event
 creates no reward; ordinary exact best-chain observation and maturity checks
 must still pass before credit.
 
-The required `winner_side_chain_v1` and `wcash_winner_side_chain_v1` capabilities
-gate this behavior before mining. Subsequent monitoring is status-only: pruning
-or finalization of the losing fork cannot trigger obsolete submissions, and
-`unknown` leaves the retained noncanonical state intact. Unknown status alone
-on a current candidate never establishes this state. A transient winner
-confirmation RPC or HTTP failure is retried, while malformed responses and
-invalid material remain errors. Exact witness conflicts stay quarantined;
-quarantine is eligible for requeue only on its own current predecessor. The
-native version-2 journal header stays unchanged and old records reopen without
+The required `winner_side_chain_v1`, `wcash_winner_side_chain_v1`, and
+`wcash_winner_side_chain_requeue_v1` capabilities gate this behavior before
+mining. Subsequent monitoring is status-only: pruning or finalization of the
+losing fork leaves the retained noncanonical state intact. An unknown Wcash
+proof can be requeued when stable observations show its own exact predecessor
+is current again. Unknown status alone never establishes noncanonical
+membership. A transient winner confirmation RPC or HTTP failure is retried,
+while malformed successful responses and invalid material remain errors.
+Exact witness conflicts stay quarantined;
+quarantined or retained side-chain Wcash bytes are eligible for requeue only
+when unknown on their own current predecessor. The native version-2 journal
+header stays unchanged and old records reopen without
 rewrite.
 Deploy with the compatible pool protocol and projector, including migrations
 `0022` and `0023` and updated runtime grants. The dependency is pinned to pool
-revision `cad133afbb3f55c384f9bbdc4e4a45d16173f570`; older pool binaries reject
+revision `224e537b4ef5ffea7bf1ae5a299bc8072e4f4b5d`; older pool binaries reject
 the new capability before work is admitted.
-Once this new event is written, rollback requires a binary that understands it.
+Once a Wcash side-chain or side-chain-origin requeue event is written, rollback
+requires a binary and projector that understand those lifecycle transitions.
 An older reader cannot reopen the extended journal; never truncate or reset
 accounting history to force compatibility. The capability protects the live
 pool/backend protocol, not backward readability of new journal records.
