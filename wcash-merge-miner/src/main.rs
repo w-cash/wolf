@@ -1084,20 +1084,7 @@ fn wait_for_pool_backend_retry(
 
 fn is_retryable_winner_reconciliation_error(error: &MinerError) -> bool {
     matches!(error, MinerError::WinnerSubmissionDeferred { .. })
-        // Winner reconciliation is observational and the exact winner bytes
-        // are already durable. Zebra can briefly publish a new
-        // `getblockchaininfo` tip before its height/hash index serves the
-        // matching `getblockhash` or `getblock` lookup. Defer that pass rather
-        // than terminating the whole Stratum backend. Keep these broad RPC
-        // codes fatal during job preparation, where they are not sufficient
-        // evidence that retrying is safe.
-        || matches!(
-            error,
-            MinerError::RpcError {
-                code: Some(-1 | -5),
-                ..
-            }
-        )
+        || error.is_retryable_winner_rpc_failure()
         || is_retryable_native_preparation_error(error)
 }
 
@@ -1676,19 +1663,13 @@ fn retire_native_generation(
 /// configuration, and malformed RPC responses must stop the supervisor instead
 /// of being hidden behind an unbounded retry loop.
 fn is_retryable_native_preparation_error(error: &MinerError) -> bool {
-    match error {
-        MinerError::RpcTransport(error) => is_retryable_rpc_transport(error),
-        MinerError::RpcHttpStatus(status) => is_retryable_http_status(*status),
-        MinerError::RpcError {
-            code: Some(-9 | -10 | -28 | WCASH_AUX_TIP_CHANGED_ERROR_CODE),
-            ..
-        } => true,
-        MinerError::Io(error) => is_retryable_io_kind(error.kind()),
-        MinerError::ParentTipMismatch { .. }
-        | MinerError::ChildTipMismatch { .. }
-        | MinerError::StaleNativeJob(_) => true,
-        _ => false,
-    }
+    error.is_retryable_native_rpc_failure()
+        || matches!(
+            error,
+            MinerError::ParentTipMismatch { .. }
+                | MinerError::ChildTipMismatch { .. }
+                | MinerError::StaleNativeJob(_)
+        )
 }
 
 fn native_preparation_retry_delay(error: &MinerError, backoff: Duration) -> Duration {
@@ -1715,49 +1696,6 @@ fn next_native_preparation_backoff(error: &MinerError, backoff: Duration) -> Dur
         } => INITIAL_NATIVE_PREPARATION_BACKOFF,
         _ => (backoff * 2).min(MAX_NATIVE_PREPARATION_BACKOFF),
     }
-}
-
-fn is_retryable_rpc_transport(error: &reqwest::Error) -> bool {
-    if error.is_timeout() {
-        return true;
-    }
-
-    // A generic request/build/TLS error can be permanent or security-sensitive.
-    // Retry a non-timeout transport failure only when its source chain exposes
-    // an I/O kind which is explicitly classified as transient below.
-    let mut source = error.source();
-    while let Some(cause) = source {
-        if cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|error| is_retryable_io_kind(error.kind()))
-        {
-            return true;
-        }
-        source = cause.source();
-    }
-
-    false
-}
-
-const fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
-}
-
-const fn is_retryable_io_kind(kind: io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::HostUnreachable
-            | io::ErrorKind::NetworkUnreachable
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::NetworkDown
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::WouldBlock
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::Interrupted
-    )
 }
 
 #[derive(Debug, Eq, PartialEq)]

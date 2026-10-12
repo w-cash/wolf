@@ -2184,7 +2184,7 @@ fn submit_parent_to_node(
             }
         }
         Ok(None) => {}
-        Err(error) if is_transient_parent_rpc_failure(&error) => {
+        Err(error) if error.is_retryable_winner_rpc_failure() => {
             return ParentNodeOutcome::Unavailable {
                 endpoint: node.label().to_string(),
                 reason: error.to_string(),
@@ -2242,7 +2242,7 @@ fn submit_parent_to_broadcast_node(
             endpoint,
             reason: "submitted block is not yet confirmed on the relay best chain".to_string(),
         },
-        Err(error) if is_transient_parent_rpc_failure(&error) => ParentRelayOutcome::Unavailable {
+        Err(error) if error.is_retryable_winner_rpc_failure() => ParentRelayOutcome::Unavailable {
             endpoint,
             reason: error.to_string(),
         },
@@ -2286,7 +2286,7 @@ fn exact_noncanonical_parent_outcome(
         Ok(ParentCommittedMembership::BestChain) => ParentNodeOutcome::Accepted { endpoint },
         Ok(ParentCommittedMembership::SideChain) => ParentNodeOutcome::KnownSideChain { endpoint },
         Ok(ParentCommittedMembership::Unknown) => ParentNodeOutcome::Unconfirmed { endpoint },
-        Err(error) if is_transient_parent_rpc_failure(&error) => ParentNodeOutcome::Unavailable {
+        Err(error) if error.is_retryable_winner_rpc_failure() => ParentNodeOutcome::Unavailable {
             endpoint,
             reason: error.to_string(),
         },
@@ -3885,5 +3885,23 @@ pub(crate) mod tests {
             .is_err(),
             "a reachable HTTP failure must prevent maturity"
         );
+    }
+
+    #[test]
+    fn transient_reachable_parent_rpc_failure_still_vetoes_reward_credit() {
+        for code in [-1, -9, -10, -28, -32_001] {
+            assert!(
+                conservative_parent_confirmation_depth([
+                    Ok(Some(100)),
+                    Err(MinerError::RpcError {
+                        endpoint: "test-parent".to_string(),
+                        code: Some(code),
+                        message: "temporary observation state".to_string()
+                    }),
+                ])
+                .is_err(),
+                "a retryable reachable response must not be ignored for credit"
+            );
+        }
     }
 }

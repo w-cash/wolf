@@ -352,26 +352,35 @@ the bound. The reconciler polls every non-matured winner fairly in journal
 order with fixed RPC pacing. Matured history is not replayed on every pass:
 one matured winner is re-audited per pass with an advancing round-robin cursor,
 so deep reorganizations remain detectable without node load growing with the
-full history. A Wcash `submitblock` rejection stops the backend unless exact
-status already proves the block is known. Rejection by every pinned Zcash node
-also stops the backend when the stable best-chain tip is still the exact
-predecessor on which the candidate was built. A tip change during submission
-defers that verdict. If a stable tip has filled the candidate height or replaced
-its predecessor, the locally revalidated proof has lost its race: the backend
-appends `winner_side_chain` once and monitors it without replay or reward.
-Every pinned parent returning `side_chain` with the exact hash and coinbase
-height through `getblockstatus` produces the same noncanonical state. Ambiguous
-or unavailable submission remains durable, immediately makes backend health
-false, and is retried; it is never reported as a healthy successful submission.
-The noncanonical event is not an observation, maturity, or orphan event and
-creates no reward. Its exact bytes and state survive journal replay. Later node
-fork eviction or finalization can remove the block from node storage;
-authoritative absence then leaves this state intact. Later best-chain inclusion
-still requires ordinary observation and maturity. Unknown status without stable
-overtaking evidence, malformed responses, rejection on the exact stable
-predecessor, and unavailable dependencies retain the failure behavior. The required
-`winner_side_chain_v1` capability rejects older pool/backend pairs before mining;
-existing version-2 journal headers and records remain readable unchanged.
+full history. Pending and explicitly requeued winners are submitted only while
+their exact predecessor is current. A rejection on that stable predecessor
+stops the backend unless exact status proves the winner is known. A stable tip
+that has advanced past the candidate height or replaced its exact predecessor
+makes initial submission obsolete: the backend appends `winner_side_chain` once
+and monitors the locally revalidated proof without replay or reward. This event
+does not assert that a node accepted the obsolete candidate. If the sampled tip
+has the candidate's own Wcash ID, `unknown` or `side_chain` status defers the
+verdict until exact witness status is available.
+
+Exact Wcash `getauxblockstatus` results retain the AuxPoW witness identity.
+`side_chain` produces the same status-only state for pending or requeued Wcash
+proofs; `best_chain` requires the exact witness, matching confirmation depth,
+and a stable tip before observation or maturity. A conflicting witness remains
+quarantined. Every pinned parent returning `side_chain` with the exact hash and
+coinbase height through `getblockstatus` likewise retains a noncanonical Zcash
+proof. Unknown status without stable overtaking evidence defers initial delivery.
+A transient confirmation RPC or HTTP error keeps the durable bytes retryable;
+malformed responses and invalid winner bytes remain fatal. Retry scheduling is
+independent of active-job share-admission health, and uncertainty never creates
+reward credit.
+
+The noncanonical event creates no reward. Its exact bytes and state survive
+journal replay. Node fork eviction or finalization can remove the block from
+node storage; subsequent `unknown` status leaves this state intact. Later
+best-chain inclusion still requires ordinary observation and maturity. Required
+`winner_side_chain_v1` and `wcash_winner_side_chain_v1` capabilities reject
+incompatible pool/backend pairs before mining; existing version-2 journal
+headers and records remain readable unchanged.
 After the first `winner_side_chain` record, older binaries that do not recognize
 the event cannot reopen that journal. Rollback must retain a compatible reader;
 never truncate, reset, or discard the journal to make an old binary start. The

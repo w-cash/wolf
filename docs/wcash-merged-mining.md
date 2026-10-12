@@ -109,15 +109,31 @@ are needed. Each parent must also prove its already identity-checked genesis
 through this status API at startup and subsequent identity checks, with exact
 height zero and positive best-chain confirmations. This rejects missing or
 incompatible APIs before admitting new mining work.
-All parents must positively identify the same exact committed
-noncanonical proof before it can remain healthy pending work. It earns no
-reward until ordinary best-chain observation and maturity checks pass. That
-positive noncanonical evidence is durably recorded as `winner_side_chain`,
-guarded by the required `winner_side_chain_v1` backend capability. Subsequent
-monitoring is status-only: pruning or finalization of the losing fork cannot
-trigger obsolete submissions or poison mining health. Absence alone never
-establishes this state, and transport/protocol errors remain errors. The native
-version-2 journal header stays unchanged and old records reopen without rewrite.
+A pending or explicitly requeued winner is submitted only when its exact
+predecessor height and hash are current. A stable tip that has passed the
+candidate height or replaced its exact predecessor stops further replay of the
+locally revalidated proof without asserting node acceptance. A tip with the
+candidate's own Wcash ID and uncertain witness status defers the verdict. Exact
+Wcash `side_chain` status, or all parents positively identifying
+the same exact committed noncanonical Zcash proof, also authorizes status-only
+monitoring. This evidence is durably recorded as `winner_side_chain`. The event
+creates no reward; ordinary exact best-chain observation and maturity checks
+must still pass before credit.
+
+The required `winner_side_chain_v1` and `wcash_winner_side_chain_v1` capabilities
+gate this behavior before mining. Subsequent monitoring is status-only: pruning
+or finalization of the losing fork cannot trigger obsolete submissions, and
+`unknown` leaves the retained noncanonical state intact. Unknown status alone
+on a current candidate never establishes this state. A transient winner
+confirmation RPC or HTTP failure is retried, while malformed responses and
+invalid material remain errors. Exact witness conflicts stay quarantined;
+quarantine is eligible for requeue only on its own current predecessor. The
+native version-2 journal header stays unchanged and old records reopen without
+rewrite.
+Deploy with the compatible pool protocol and projector, including migrations
+`0022` and `0023` and updated runtime grants. The dependency is pinned to pool
+revision `cad133afbb3f55c384f9bbdc4e4a45d16173f570`; older pool binaries reject
+the new capability before work is admitted.
 Once this new event is written, rollback requires a binary that understands it.
 An older reader cannot reopen the extended journal; never truncate or reset
 accounting history to force compatibility. The capability protects the live
