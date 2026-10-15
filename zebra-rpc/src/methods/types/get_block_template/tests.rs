@@ -1239,90 +1239,297 @@ fn wcash_coinbase_supports_transparent_and_private_payouts() {
     ));
 }
 
-/// Mainnet templates and consensus validation must agree on the exact Option B
-/// reward for both supported payout modes, including fees and one-atom claim
-/// mismatches.
+/// Builders and semantic value checks agree at both Mainnet funding boundaries.
 #[test]
 fn wcash_mainnet_templates_match_exact_coinbase_validation() {
     use zebra_chain::parameters::subsidy::SubsidyError;
+    use zebra_chain::parameters::subsidy::{
+        wcash_foundation_fund, wcash_foundation_fund_output_index,
+    };
     use zebra_consensus::error::{BlockError, TransactionError};
 
     let net = Network::new_wcash_mainnet_for_tests();
-    assert!(net.uses_wcash_consensus() && net.is_wcash_mainnet());
-    let height = Height(40_001);
-    let subsidy = block_subsidy(height, &net).expect("Mainnet subsidy is defined");
-    assert_eq!(subsidy.zatoshis(), 2_199_023_255);
+    for height in [
+        Height(32_999),
+        Height(33_000),
+        Height(33_001),
+        Height(40_000),
+        Height(40_001),
+        Height(621_454),
+        Height(621_455),
+    ] {
+        let subsidy = block_subsidy(height, &net).expect("Mainnet subsidy is defined");
+        let allocation = wcash_foundation_fund(height, &net, subsidy);
+        let fund_atoms = allocation.as_ref().map_or(0, |fund| fund.amount.zatoshis());
+        for address_type in [MinerAddressType::Transparent, MinerAddressType::Unified] {
+            let address = default_miner_address_for_network(&net, &address_type)
+                .expect("Wcash Mainnet supports this payout mode");
+            let miner_params = MinerParams::new(
+                &net,
+                Config {
+                    miner_address: Some(address.parse().expect("generated address parses")),
+                    ..Default::default()
+                },
+            )
+            .expect("the Mainnet miner address belongs to Wcash");
+            for fee_atoms in [0_i64, 1] {
+                let fees = Amount::try_from(fee_atoms).expect("fee is representable");
+                let template = TransactionTemplate::new_coinbase(&net, height, &miner_params, fees)
+                    .expect("Mainnet coinbase template is buildable");
+                let coinbase: Transaction = template
+                    .data
+                    .as_ref()
+                    .zcash_deserialize_into()
+                    .expect("Mainnet coinbase deserializes");
+                let expected_miner = subsidy.zatoshis() - fund_atoms + fee_atoms;
+                let fund_index =
+                    wcash_foundation_fund_output_index(height, &net, subsidy, &coinbase.outputs())
+                        .expect("mandatory output is present exactly when scheduled");
+                if let Some(fund) = &allocation {
+                    assert_eq!(
+                        coinbase.outputs()[fund_index.expect("active fund has an output")],
+                        fund.output()
+                    );
+                }
+                match address_type {
+                    MinerAddressType::Transparent => {
+                        assert_eq!(
+                            coinbase.outputs().len(),
+                            1 + usize::from(allocation.is_some())
+                        );
+                        let miner_total: i64 = coinbase
+                            .outputs()
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| Some(*index) != fund_index)
+                            .map(|(_, output)| output.value().zatoshis())
+                            .sum();
+                        assert_eq!(miner_total, expected_miner);
+                        assert!(coinbase.ironwood_actions().next().is_none());
+                    }
+                    MinerAddressType::Unified => {
+                        assert_eq!(coinbase.outputs().len(), usize::from(allocation.is_some()));
+                        assert!(coinbase.ironwood_actions().next().is_some());
+                        assert_eq!(
+                            coinbase
+                                .ironwood_value_balance()
+                                .ironwood_amount()
+                                .zatoshis(),
+                            -expected_miner
+                        );
+                        zebra_consensus::transaction::check::wcash_coinbase_outputs_are_private(
+                            &coinbase, &net, height,
+                        )
+                        .expect("the mandatory transparent fund does not weaken miner privacy");
+                    }
+                    MinerAddressType::Sapling => unreachable!("Sapling is not a Wcash payout mode"),
+                }
+                zebra_consensus::miner_fees_are_valid(
+                    &coinbase,
+                    height,
+                    fees,
+                    subsidy,
+                    DeferredPoolBalanceChange::zero(),
+                    &net,
+                )
+                .expect("the generated full claim is accepted by Mainnet consensus");
+                if fee_atoms == 1 {
+                    for wrong_fee in [0_i64, 2] {
+                        assert_eq!(
+                            zebra_consensus::miner_fees_are_valid(
+                                &coinbase,
+                                height,
+                                Amount::try_from(wrong_fee).expect("fee is representable"),
+                                subsidy,
+                                DeferredPoolBalanceChange::zero(),
+                                &net
+                            ),
+                            Err(BlockError::Transaction(TransactionError::Subsidy(
+                                SubsidyError::InvalidMinerFees
+                            )))
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
 
+#[test]
+fn wcash_foundation_builder_keeps_matching_miner_separate_and_checks_gross_limit() {
+    use zebra_chain::parameters::subsidy::{wcash_foundation_fund, SubsidyError};
+    use zebra_consensus::error::TransactionError;
+
+    let net = Network::new_wcash_mainnet_for_tests();
+    let height = Height(40_001);
+    let subsidy = block_subsidy(height, &net).expect("Mainnet subsidy exists");
+    let fund = wcash_foundation_fund(height, &net, subsidy).expect("funding is active");
+    assert_eq!(fund.amount.zatoshis(), 659_706_976);
+    let params = MinerParams::new(
+        &net,
+        Config {
+            miner_address: Some(
+                fund.address
+                    .encode_wcash(&net)
+                    .expect("Mainnet recipient")
+                    .parse()
+                    .expect("recipient parses"),
+            ),
+            ..Default::default()
+        },
+    )
+    .expect("the miner may choose the foundation address");
+    let template = TransactionTemplate::new_coinbase(&net, height, &params, Amount::zero())
+        .expect("two separate outputs are buildable");
+    let coinbase: Transaction = template
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("coinbase parses");
+    assert_eq!(coinbase.outputs().len(), 2);
+    assert!(coinbase.outputs().contains(&fund.output()));
+    let mut amounts = coinbase
+        .outputs()
+        .iter()
+        .map(|output| output.value().zatoshis())
+        .collect::<Vec<_>>();
+    amounts.sort_unstable();
+    assert_eq!(amounts, vec![659_706_976, 1_539_316_279]);
+    assert!(coinbase
+        .outputs()
+        .iter()
+        .all(|output| output.lock_script == fund.address.script()));
+    zebra_consensus::miner_fees_are_valid(
+        &coinbase,
+        height,
+        Amount::zero(),
+        subsidy,
+        DeferredPoolBalanceChange::zero(),
+        &net,
+    )
+    .expect("matching addresses preserve value conservation");
+
+    // This fee would fit if only the reduced miner payout were checked.
+    let excessive_fee = Amount::try_from(MAX_WCASH_COINBASE_VALUE - subsidy.zatoshis() + 1)
+        .expect("the fee itself is representable");
+    assert!(matches!(
+        TransactionTemplate::new_coinbase(&net, height, &params, excessive_fee),
+        Err(TransactionError::Subsidy(
+            SubsidyError::WcashCoinbaseValueTooLarge
+        ))
+    ));
+}
+
+#[test]
+fn wcash_foundation_coinbase_cache_recomputes_both_boundary_directions() {
+    use zebra_chain::parameters::subsidy::wcash_foundation_fund;
+
+    let net = Network::new_wcash_mainnet_for_tests();
+    let address = default_miner_address_for_network(&net, &MinerAddressType::Transparent)
+        .expect("transparent payout supported");
+    let params = MinerParams::new(
+        &net,
+        Config {
+            miner_address: Some(address.parse().expect("miner address parses")),
+            ..Default::default()
+        },
+    )
+    .expect("miner parameters are valid");
+    let cache = CoinbaseCache::default();
+    for height in [
+        32_999, 33_000, 32_999, 33_000, 40_000, 40_001, 621_454, 621_455, 621_454, 621_455,
+    ] {
+        let height = Height(height);
+        let subsidy = block_subsidy(height, &net).expect("subsidy exists");
+        let template = cache.get_or_build(height, Amount::zero(), || {
+            TransactionTemplate::new_coinbase(&net, height, &params, Amount::zero())
+                .expect("boundary coinbase is buildable")
+        });
+        let coinbase: Transaction = template
+            .data
+            .as_ref()
+            .zcash_deserialize_into()
+            .expect("coinbase parses");
+        assert!(matches!(coinbase.inputs().first(),
+            Some(transparent::Input::Coinbase { height: actual, .. }) if *actual == height));
+        assert_eq!(
+            coinbase.outputs().len(),
+            1 + usize::from(wcash_foundation_fund(height, &net, subsidy).is_some())
+        );
+    }
+}
+
+#[cfg(feature = "wcash-funding-test-fixture")]
+#[test]
+fn wcash_foundation_fixture_templates_pay_thirty_percent_and_all_miner_fees() {
+    use zebra_chain::parameters::subsidy::wcash_foundation_fund_output_index;
+
+    let network = Network::new_wcash_regtest();
+    let height = Height(10);
+    let subsidy = block_subsidy(height, &network).expect("Regtest subsidy exists");
+    assert_eq!(subsidy.zatoshis(), 625_000_000);
     for address_type in [MinerAddressType::Transparent, MinerAddressType::Unified] {
-        let address = default_miner_address_for_network(&net, &address_type)
-            .expect("Wcash Mainnet supports this payout mode");
-        let miner_params = MinerParams::new(
-            &net,
+        let address = default_miner_address_for_network(&network, &address_type)
+            .expect("Regtest payout mode is supported");
+        let params = MinerParams::new(
+            &network,
             Config {
                 miner_address: Some(address.parse().expect("generated address parses")),
                 ..Default::default()
             },
         )
-        .expect("the Mainnet miner address belongs to Wcash");
-
-        for fee_atoms in [0_i64, 1] {
+        .expect("miner parameters match Regtest");
+        for fee_atoms in [0_i64, 12_345] {
             let fees = Amount::try_from(fee_atoms).expect("fee is representable");
-            let template = TransactionTemplate::new_coinbase(&net, height, &miner_params, fees)
-                .expect("Mainnet coinbase template is buildable");
+            let template = TransactionTemplate::new_coinbase(&network, height, &params, fees)
+                .expect("funded fixture coinbase is buildable");
             let coinbase: Transaction = template
                 .data
                 .as_ref()
                 .zcash_deserialize_into()
-                .expect("Mainnet coinbase deserializes");
-            let expected_claim = subsidy.zatoshis() + fee_atoms;
-
+                .expect("fixture coinbase parses");
+            let fund_index =
+                wcash_foundation_fund_output_index(height, &network, subsidy, &coinbase.outputs())
+                    .expect("fund output matches")
+                    .expect("fixture term is active");
+            assert_eq!(
+                coinbase.outputs()[fund_index].value().zatoshis(),
+                187_500_000
+            );
+            let expected_miner = 437_500_000 + fee_atoms;
             match address_type {
                 MinerAddressType::Transparent => {
-                    assert_eq!(coinbase.outputs().len(), 1);
-                    assert_eq!(coinbase.outputs()[0].value().zatoshis(), expected_claim);
-                    assert!(coinbase.ironwood_actions().next().is_none());
+                    assert_eq!(coinbase.outputs().len(), 2);
+                    let miner: i64 = coinbase
+                        .outputs()
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| *index != fund_index)
+                        .map(|(_, output)| output.value().zatoshis())
+                        .sum();
+                    assert_eq!(miner, expected_miner);
                 }
                 MinerAddressType::Unified => {
-                    assert!(coinbase.outputs().is_empty());
-                    assert!(coinbase.ironwood_actions().next().is_some());
+                    assert_eq!(coinbase.outputs().len(), 1);
                     assert_eq!(
                         coinbase
                             .ironwood_value_balance()
                             .ironwood_amount()
                             .zatoshis(),
-                        -expected_claim
+                        -expected_miner
                     );
                 }
                 MinerAddressType::Sapling => unreachable!("Sapling is not a Wcash payout mode"),
             }
-
             zebra_consensus::miner_fees_are_valid(
                 &coinbase,
                 height,
                 fees,
                 subsidy,
                 DeferredPoolBalanceChange::zero(),
-                &net,
+                &network,
             )
-            .expect("the generated claim is accepted by Mainnet consensus");
-
-            if fee_atoms == 1 {
-                for wrong_fee in [0_i64, 2] {
-                    assert_eq!(
-                        zebra_consensus::miner_fees_are_valid(
-                            &coinbase,
-                            height,
-                            Amount::try_from(wrong_fee).expect("fee is representable"),
-                            subsidy,
-                            DeferredPoolBalanceChange::zero(),
-                            &net,
-                        ),
-                        Err(BlockError::Transaction(TransactionError::Subsidy(
-                            SubsidyError::InvalidMinerFees,
-                        )))
-                    );
-                }
-            }
+            .expect("fixture foundation and miner values conserve the gross reward");
         }
     }
 }

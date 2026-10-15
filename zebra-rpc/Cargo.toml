@@ -37,6 +37,13 @@ wcash-consensus = [
     "zebra-network/wcash-consensus",
 ]
 
+# Isolated Regtest-only funding-policy fixture; never publish these binaries.
+wcash-funding-test-fixture = [
+    "wcash-consensus",
+    "zebra-chain/wcash-funding-test-fixture",
+    "zebra-consensus/wcash-funding-test-fixture",
+]
+
 # Test-only features
 proptest-impl = [
     "proptest",

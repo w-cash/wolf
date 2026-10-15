@@ -70,6 +70,13 @@ jobs:
             exit 1
           fi
 
+          case "${FEATURES}" in
+            *wcash-funding-test-fixture*)
+              echo "::error::local funding fixtures cannot be packaged as release binaries"
+              exit 1
+              ;;
+          esac
+
           SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)"
           export SOURCE_DATE_EPOCH
           # Keep build-host paths out of the binary.
@@ -78,6 +85,10 @@ jobs:
           # ROCKSDB_LIB_DIR is left unset so librocksdb-sys builds and links RocksDB
           # statically; the binary then depends only on glibc and libstdc++.
           cargo build --locked --release --features "${FEATURES}" --package zebrad --bin zebrad
+
+          # Inspect the actual executable too: feature aliases or cached outputs
+          # must never substitute a local fixture for the intended release node.
+          python3 scripts/verify-wcash-funding-artifacts.py --allow-zcash target/release/zebrad
 
           # Documented floor for Zebra's pre-built binaries (Ubuntu 22.04+,
           # Debian 12+, RHEL 9+, Amazon Linux 2023). Bump together with

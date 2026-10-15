@@ -16,4 +16,5 @@ expression: empty_column_families
   "tx_loc_by_transparent_addr_loc: no entries",
   "utxo_by_out_loc: no entries",
   "utxo_loc_by_transparent_addr_loc: no entries",
+  "wcash_foundation_validation: no entries",
 ]

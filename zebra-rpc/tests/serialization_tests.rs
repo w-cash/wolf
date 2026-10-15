@@ -1500,7 +1500,7 @@ fn test_get_block_subsidy() -> Result<(), Box<dyn std::error::Error>> {
             let value_zat = stream.value_zat();
             let address = stream.address();
 
-            FundingStream::new(recipient, specification, value, value_zat, *address)
+            FundingStream::new(recipient, specification, value, value_zat, address.clone())
         })
         .collect::<Vec<_>>();
     let lockbox_streams = obj.lockbox_streams().clone();

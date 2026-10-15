@@ -20,6 +20,8 @@ fn coin_precision_matches_zcash() {
 }
 
 #[test]
+// The selected consensus amount bound is itself a frozen regression vector.
+#[allow(clippy::assertions_on_constants)]
 fn max_money_matches_selected_consensus() {
     #[cfg(not(feature = "wcash-consensus"))]
     assert_eq!(MAX_MONEY, 21_000_000 * COIN);

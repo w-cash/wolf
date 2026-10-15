@@ -87,9 +87,9 @@ pool-shielding workflow.
 The coordinator verifies an exact transparent Wcash recipient and value from
 the serialized child candidate. Supplying a Wcash Unified Address with an
 Orchard receiver instead opts into private Ironwood payout, whose recipient is
-not publicly recoverable; that mode verifies the private-only shape and value
-but trusts the reviewed loopback `createauxblock` implementation for recipient
-correctness. The child binary, configuration, RPC socket, and host remain
+not publicly recoverable. That mode verifies the private miner shape and value,
+trial-decrypts every Ironwood action with the protected incoming viewing key,
+and matches the exact configured receiver. The child binary, configuration, RPC socket, and host remain
 payout-critical in both modes.
 
 `ZCASH_PAYOUT_ADDRESS` must exactly match the canonical address configured as

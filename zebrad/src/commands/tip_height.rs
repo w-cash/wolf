@@ -44,6 +44,19 @@ impl Runnable for TipHeightCmd {
 }
 
 impl TipHeightCmd {
+    /// Reject public-network state inspection with a disposable fixture binary.
+    pub(super) fn validate_fixture_network(&self) -> Result<(), std::io::Error> {
+        if !zebra_chain::parameters::subsidy::WCASH_FOUNDATION_TEST_FIXTURE_ENABLED
+            || self.network.is_wcash_regtest()
+        {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "LOCAL FUNDING TEST FIXTURE only supports WcashRegtest state",
+            ))
+        }
+    }
+
     /// Load the chain tip height from the state cache directory.
     fn load_tip_height(&self) -> Result<block::Height> {
         self.load_read_state()?
@@ -61,5 +74,28 @@ impl TipHeightCmd {
         }
 
         Ok(zebra_state::init_read_only(config, &self.network)?.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn funding_fixture_state_inspection_uses_shared_policy_flag() {
+        for network in [
+            Network::try_new_wcash_mainnet().unwrap(),
+            Network::new_wcash_testnet(),
+            Network::Mainnet,
+            Network::new_wcash_regtest(),
+        ] {
+            let allowed = !zebra_chain::parameters::subsidy::WCASH_FOUNDATION_TEST_FIXTURE_ENABLED
+                || network.is_wcash_regtest();
+            let command = TipHeightCmd {
+                cache_dir: None,
+                network,
+            };
+            assert_eq!(command.validate_fixture_network().is_ok(), allowed);
+        }
     }
 }

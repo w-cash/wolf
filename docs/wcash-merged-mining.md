@@ -74,6 +74,16 @@ difficulty, and empty witness. Candidates are bounded to 16 entries and expire
 after ten minutes. A candidate remains exact and retryable across a shallow
 child reorg while its parent is retained in either committed chain.
 
+`createauxblock.coinbasevalue` is the miner's **net** payout including all fees:
+`subsidy - foundation + fees`. It excludes the compulsory transparent foundation
+output. During Mainnet heights 33000–621454, pool accounting must credit miners
+from this net amount. The coordinator derives the fund amount and recipient
+from its own candidate-height policy and checks the serialized coinbase before
+attesting miner rewards. Candidate caches, replacement jobs and outbox replay
+continue to bind the exact block and height. Both node and coordinator must
+upgrade; the Zcash parent reward is unchanged. See the
+[upgrade guide](wcash-foundation-fund-upgrade.md).
+
 `retireauxblock` lets the pool release an unsolved or parent-only generation
 when every listener and in-flight share handler has stopped. Its per-candidate
 capability is generated from the operating system CSPRNG, is redacted from
@@ -177,9 +187,10 @@ The native adapter enforces these rules before a job reaches an ASIC:
   diversion while allowing the validator to remain unmodified.
 - For a transparent Wcash address, the coordinator checks the exact public
   recipient and value in the serialized child candidate. A private Ironwood
-  coinbase is intentionally not publicly recoverable; the coordinator verifies
-  its private-only shape and value, then trusts the loopback child node's
-  reviewed `createauxblock` implementation for recipient correctness. The child
+  coinbase is intentionally not publicly recoverable. The coordinator removes
+  one exact mandatory foundation output, then verifies the private miner value
+  and trial-decrypts every Ironwood action with the protected incoming viewing
+  key, matching the configured receiver. The child
   binary, configuration, RPC socket, and host are payout-critical in either
   mode.
 - Transaction bytes, transaction IDs, authorization digests, both Merkle

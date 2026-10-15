@@ -1,7 +1,7 @@
 //! Fixed test vectors for value balances.
 
 use crate::{
-    amount::{Amount, NegativeAllowed, NonNegative, COIN, MAX_MONEY},
+    amount::{Amount, NegativeAllowed, NonNegative, MAX_MONEY},
     value_balance::{ValueBalance, ValueBalanceError},
 };
 
@@ -66,7 +66,7 @@ fn total_over_max_money_is_rejected() {
 #[cfg(feature = "wcash-consensus")]
 #[test]
 fn wcash_chain_value_pool_can_cross_twenty_one_million() {
-    let legacy_boundary = 21_000_000_i64 * COIN;
+    let legacy_boundary = 21_000_000_i64 * crate::amount::COIN;
     let mut chain = ValueBalance::<NonNegative>::zero();
     chain.set_transparent_value_balance(ValueBalance::from_transparent_amount(
         Amount::try_from(legacy_boundary).expect("the legacy boundary is representable"),

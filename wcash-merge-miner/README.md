@@ -46,10 +46,24 @@ The coordinator verifies the configured Zcash coinbase recipient and an exact
 transparent Wcash child recipient directly from their serialized coinbases. A
 Wcash Unified Address with an Orchard receiver explicitly selects a private
 Ironwood child reward whose recipient cannot be publicly recovered. Private
-mode verifies the Ironwood-only shape and value, then trusts the loopback Wcash
-node and its reviewed `createauxblock` implementation for recipient correctness.
-Protect the child binary, configuration, RPC socket, and host as one
-payout-critical trust boundary.
+mode requires a protected-file incoming viewing capability and trial-decrypts
+all Ironwood actions to the configured receiver, checks their total value, and
+retains the prohibition on public zero-OVK recovery. Protect that read-only
+capability, the child binary, configuration, RPC socket, and host.
+
+At Mainnet heights 33000–621454, both miner modes include a separate transparent
+foundation output equal to 30% of the block subsidy, rounded down per block.
+The coordinator derives and verifies the fixed destination and amount from its
+own height/network policy before checking the miner remainder. The miner keeps
+all fees. `createauxblock.coinbasevalue` is the net miner payout and excludes the
+fund output. A private miner payout has exactly that one transparent output;
+extra transparent outputs are rejected. See the
+[committed policy](../docs/wcash-foundation-fund-specification.md).
+
+`wcash-merge-miner funding-policy` prints the compiled policy as JSON without
+RPC access. The non-default `wcash-funding-test-fixture` feature builds an
+explicitly marked coordinator that accepts only isolated WcashRegtest and uses
+heights 10–19. Fixture binaries must never be published as release artifacts.
 
 RPC credentials are read only from paired environment variables. Redirects
 are disabled, requests have deadlines, response sizes are bounded, credentials

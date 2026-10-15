@@ -176,7 +176,8 @@ pub struct CreateAuxBlockResponse {
     #[getter(copy)]
     previous_block_hash: block::Hash,
 
-    /// Total miner reward, including selected transaction fees, in zatoshis.
+    /// Net miner reward, including all selected transaction fees, in zatoshis.
+    /// Excludes any mandatory transparent foundation output.
     ///
     /// This amount is always public supply accounting. The recipient is public
     /// for transparent payouts and hidden for private Ironwood payouts.

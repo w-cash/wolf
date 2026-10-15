@@ -153,3 +153,15 @@ network targets locally; an edge must never be allowed to replace that trust
 boundary. The bundled `zip301-mine` client and automated two-generation test
 cover the real socket and Equihash submission path, but they do not certify any
 physical ASIC model or firmware.
+
+## Foundation allocation upgrade
+
+Upgrade the Wcash node and native coordinator together before Mainnet block
+33000. For heights 33000–621454, 30% of subsidy goes to the fixed
+transparent foundation address. All fees remain with the miner;
+`createauxblock.coinbasevalue` advertises `subsidy - foundation + fees`. Credit
+miners from that net amount. Both transparent and private Ironwood miner modes
+retain the transparent fund output, which the coordinator independently
+verifies. Parent Zcash payouts are unchanged. There is no automatic renewal at
+expiry height 621455. See the [operator guide](wcash-foundation-fund-upgrade.md)
+for old-validator asymmetry, database coverage, recovery and deployment evidence.

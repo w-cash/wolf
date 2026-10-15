@@ -11,6 +11,13 @@ const IDENTITY_TABLE: &str = "ext_wcash_wallet_identity";
 pub(crate) const TRANSPARENT_SYNC_STATE_TABLE: &str = "ext_wcash_transparent_sync_state";
 pub(crate) const COINBASE_ADDRESS_TABLE: &str = "ext_wcash_coinbase_addresses";
 pub(crate) const IRONWOOD_SYNC_STATE_TABLE: &str = "ext_wcash_ironwood_sync";
+pub(crate) const PARTIAL_TRANSPARENT_RECOVERY_TABLE: &str =
+    "ext_wcash_partial_transparent_recovery";
+pub(crate) const PARTIAL_TRANSPARENT_WITNESS_GENERATION_TABLE: &str =
+    "ext_wcash_partial_transparent_witness_generation";
+pub(crate) const PARTIAL_TRANSPARENT_WITNESS_TABLE: &str = "ext_wcash_partial_transparent_witness";
+pub(crate) const PARTIAL_TRANSPARENT_CHECKED_CANDIDATE_TABLE: &str =
+    "ext_wcash_partial_transparent_checked_candidate";
 pub(crate) const PAYOUT_BATCH_TABLE: &str = "ext_wcash_payout_batches";
 pub(crate) const PAYOUT_OUTPUT_TABLE: &str = "ext_wcash_payout_outputs";
 const IDENTITY_FORMAT_VERSION: i64 = 1;
@@ -195,6 +202,49 @@ fn ensure_transparent_sync_state(connection: &Connection) -> Result<(), rusqlite
             attested_tip_height INTEGER NOT NULL
                 CHECK (attested_tip_height BETWEEN 0 AND 4294967295),
             attested_tip_hash BLOB NOT NULL CHECK (length(attested_tip_hash) = 32)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS ext_wcash_partial_transparent_recovery (
+            child_index INTEGER PRIMARY KEY CHECK (child_index BETWEEN 0 AND 9),
+            reconciliation_digest BLOB NOT NULL
+                CHECK (typeof(reconciliation_digest) = 'blob' AND length(reconciliation_digest) = 32),
+            scanned_through INTEGER NOT NULL
+                CHECK (typeof(scanned_through) = 'integer' AND scanned_through BETWEEN 1 AND 4294967295),
+            canonical_block_hash BLOB NOT NULL
+                CHECK (typeof(canonical_block_hash) = 'blob' AND length(canonical_block_hash) = 32)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS ext_wcash_partial_transparent_witness_generation (
+            child_index INTEGER PRIMARY KEY CHECK (child_index BETWEEN 0 AND 9),
+            reconciliation_digest BLOB NOT NULL
+                CHECK (typeof(reconciliation_digest) = 'blob' AND length(reconciliation_digest) = 32),
+            anchor_height INTEGER NOT NULL
+                CHECK (typeof(anchor_height) = 'integer' AND anchor_height BETWEEN 1 AND 4294967295),
+            canonical_block_hash BLOB NOT NULL
+                CHECK (typeof(canonical_block_hash) = 'blob' AND length(canonical_block_hash) = 32),
+            witness_count INTEGER NOT NULL
+                CHECK (typeof(witness_count) = 'integer' AND witness_count BETWEEN 0 AND 2000000),
+            checked_count INTEGER NOT NULL
+                CHECK (typeof(checked_count) = 'integer' AND checked_count BETWEEN 0 AND 2000000)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS ext_wcash_partial_transparent_checked_candidate (
+            child_index INTEGER NOT NULL CHECK (child_index BETWEEN 0 AND 9),
+            mined_height INTEGER NOT NULL
+                CHECK (typeof(mined_height) = 'integer' AND mined_height BETWEEN 1 AND 4294967295),
+            PRIMARY KEY (child_index, mined_height),
+            FOREIGN KEY (child_index)
+                REFERENCES ext_wcash_partial_transparent_witness_generation(child_index)
+                ON DELETE CASCADE
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS ext_wcash_partial_transparent_witness (
+            child_index INTEGER NOT NULL CHECK (child_index BETWEEN 0 AND 9),
+            txid BLOB NOT NULL CHECK (typeof(txid) = 'blob' AND length(txid) = 32),
+            mined_height INTEGER NOT NULL
+                CHECK (typeof(mined_height) = 'integer' AND mined_height BETWEEN 1 AND 4294967295),
+            raw_digest BLOB NOT NULL
+                CHECK (typeof(raw_digest) = 'blob' AND length(raw_digest) = 32),
+            PRIMARY KEY (child_index, txid),
+            FOREIGN KEY (child_index)
+                REFERENCES ext_wcash_partial_transparent_witness_generation(child_index)
+                ON DELETE CASCADE
         ) WITHOUT ROWID;
         -- librustzcash can expose a transparent receiver incidentally while
         -- deriving its default multi-receiver UA. Keep the operator-assigned

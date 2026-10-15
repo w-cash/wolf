@@ -36,6 +36,9 @@ internal-miner = ["equihash/solver"]
 # Select Wcash network and consensus behavior.
 wcash-consensus = []
 
+# Isolated Regtest-only funding activation at 10 and expiry at 20. Never ship.
+wcash-funding-test-fixture = ["wcash-consensus"]
+
 # Experimental elasticsearch support
 elasticsearch = []
 

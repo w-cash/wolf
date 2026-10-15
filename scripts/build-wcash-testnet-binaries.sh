@@ -25,6 +25,10 @@ cp "$zcash_target/release/zebrad" "$release_dir/zcash-zebrad"
 cp "$wcash_target/release/zebrad" "$release_dir/wcash-zebrad"
 chmod 0755 "$release_dir/zcash-zebrad" "$release_dir/wcash-zebrad"
 
+# Inspect the executable policy, rather than trusting filenames or build intent.
+python3 "$repo_root/scripts/verify-wcash-funding-artifacts.py" \
+  "$release_dir/wcash-zebrad" "$release_dir/wcash-merge-miner"
+
 if cmp -s "$release_dir/zcash-zebrad" "$release_dir/wcash-zebrad"; then
   echo "refusing identical Zcash and Wcash consensus binaries" >&2
   exit 1

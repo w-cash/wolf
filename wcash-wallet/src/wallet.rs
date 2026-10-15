@@ -120,6 +120,9 @@ pub const COINBASE_SHIELDING_MATURITY: u32 = COINBASE_MATURITY_BLOCKS;
 pub const TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT: u32 = 1;
 /// Maximum wall-clock duration of one restartable transparent recovery pass.
 pub const MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION: Duration = Duration::from_secs(5 * 60);
+/// Per-receiver bound across all current-UTXO pages, including omitted and live
+/// siblings. This covers two outputs for every funded Mainnet block with headroom.
+const MAX_PARTIAL_TRANSPARENT_RECOVERY_OUTPUTS: usize = 2_000_000;
 
 /// Cooperative cancellation handle for one wallet synchronization.
 ///
@@ -1878,17 +1881,19 @@ pub async fn initialize_wallet(
 /// the default coinbase receiver, because the lightwalletd UTXO message does
 /// not carry the transaction index needed to classify an output as coinbase.
 /// Repeating this current-set pass after every sync repairs classification after
-/// any upstream rewind without a separate historical cursor.
+/// any upstream rewind without a separate historical cursor. Orphaned coinbase
+/// receipts are removed after the pass: unlike regular transactions, coinbases
+/// cannot remain valid in the mempool after their block is removed.
 ///
 /// The current-set query starts at height one rather than the shielded scanning
 /// birthday. The fixed transparent receiver can be derived and published before
 /// SQLite initialization, so this guarantees recovery of every still-unspent
 /// coinbase controlled by the seed without replaying spent history.
 ///
-/// A creator transaction with both spent and unspent outputs to this same
-/// receiver is rejected rather than risking resurrection of the spent sibling.
-/// The supported mining path therefore uses one payout-address output in each
-/// coinbase transaction; a nonstandard split creator requires manual recovery.
+/// If a creator has both spent and unspent outputs to a managed receiver, every
+/// missing output must have an exact mined spending input in tip-bound address
+/// history. Recovery stays incomplete until those spends are stored, so replaying
+/// a split miner/foundation coinbase cannot resurrect its spent sibling.
 pub async fn synchronize_wallet(
     client: &mut AttestedWcashClient,
     path: impl AsRef<Path>,
@@ -1976,14 +1981,14 @@ pub async fn synchronize_wallet_cancellable(
     if client.latest_block().await? != expected_tip {
         return Err(WalletServiceError::StaleChain);
     }
+    let recovery = TransparentRecoveryContext {
+        parameters: &parameters,
+        receivers: &coinbase_receivers,
+        expected_tip,
+        deadline: tokio::time::Instant::now() + MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION,
+        cancellation,
+    };
     if transparent_coinbase_recovery_start(tip_height).is_some() {
-        let recovery = TransparentRecoveryContext {
-            parameters: &parameters,
-            receivers: &coinbase_receivers,
-            expected_tip,
-            deadline: tokio::time::Instant::now() + MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION,
-            cancellation,
-        };
         if let Err(error) = recover_transparent_coinbase(client, &mut wallet, &recovery).await {
             // Transparent recovery can commit verified transactions and
             // request-frontier progress incrementally. If the complete pass
@@ -1995,6 +2000,8 @@ pub async fn synchronize_wallet_cancellable(
             return Err(error);
         }
     }
+    remove_orphaned_transparent_coinbase_receipts(path, network, recovery_session, &recovery)?;
+    require_exact_recovery_tip(client, &recovery).await?;
     let recovered = wallet_balance_summary(&wallet, public_confirmation_policy())?;
     if !recovered.synchronized || recovered.chain_tip_height != expected_tip.height {
         return Err(WalletServiceError::NotSynchronized);
@@ -2020,6 +2027,7 @@ async fn recover_transparent_coinbase(
     recovery: &TransparentRecoveryContext<'_>,
 ) -> Result<(), WalletServiceError> {
     for managed in recovery.receivers {
+        let mut partial_spends = PartialTransparentSpendReconciliation::default();
         let mut page_start = TRANSPARENT_COINBASE_RECOVERY_START_HEIGHT;
         loop {
             require_exact_recovery_tip(client, recovery).await?;
@@ -2037,8 +2045,14 @@ async fn recover_transparent_coinbase(
             require_exact_recovery_tip(client, recovery).await?;
             let next_start = page.next_start_height(page_start, TRANSPARENT_UTXO_PAGE_OUTPUTS)?;
             let creators = page.into_complete_creators(next_start);
-            let stored_creators =
-                fully_classified_stored_creators(client, wallet, &creators, recovery)?;
+            let stored_creators = reusable_stored_transparent_creators(
+                client,
+                wallet,
+                &creators,
+                recovery,
+                &mut partial_spends,
+                &managed.receiver,
+            )?;
             for creator in creators {
                 ensure_sync_not_cancelled(recovery.cancellation)?;
                 if stored_creators.contains(&creator.txid()) {
@@ -2052,6 +2066,7 @@ async fn recover_transparent_coinbase(
                 )
                 .await?;
                 require_exact_recovery_tip(client, recovery).await?;
+                partial_spends.track(&transaction, &managed.receiver)?;
                 decrypt_and_store_transaction(
                     recovery.parameters,
                     wallet,
@@ -2066,11 +2081,657 @@ async fn recover_transparent_coinbase(
                 None => break,
             }
         }
+        recover_partial_transparent_spends(client, wallet, managed, recovery, &mut partial_spends)
+            .await?;
     }
 
     recover_managed_transparent_history(client, wallet, recovery).await?;
     recover_transparent_spends(client, wallet, recovery).await?;
     require_exact_recovery_tip(client, recovery).await
+}
+
+/// Reconciles receipts that the upstream rewind un-mined but its UTXO upsert
+/// cannot remove. Keep transaction bytes, pending operations and spend intent;
+/// only a raw-proven coinbase receipt is invalid without a canonical block.
+fn remove_orphaned_transparent_coinbase_receipts(
+    path: &Path,
+    network: WalletNetwork,
+    session: TransparentRecoverySession,
+    recovery: &TransparentRecoveryContext<'_>,
+) -> Result<(), WalletServiceError> {
+    // The caller holds the exclusive wallet operation lock. The backend has no
+    // receipt-removal API, and its extension handle only permits ext_* writes.
+    let prepared = prepare_existing_wallet_path(path)?;
+    let mut connection = open_wallet_connection(&prepared.canonical_path)?;
+    prepared.verify_current_path()?;
+    verify_existing_identity(&connection, network)
+        .map_err(|_| WalletServiceError::CorruptWalletDatabase)?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let owns_exact_tip: bool = transaction.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM ext_wcash_transparent_sync_state
+            WHERE singleton = 1 AND recovery_in_progress = 1 AND recovery_session = ?1
+         ) AND (EXISTS (
+            SELECT 1 FROM blocks
+            WHERE height = ?2 AND hash = ?3 AND height = (SELECT MAX(height) FROM blocks)
+         ) OR (?4 AND NOT EXISTS (SELECT 1 FROM blocks)))",
+        params![
+            &session.0[..],
+            recovery.expected_tip.height,
+            &recovery.expected_tip.hash[..],
+            recovery.expected_tip.height == 0
+                && recovery.expected_tip.hash == network.genesis_hash(),
+        ],
+        |row| row.get(0),
+    )?;
+    if !owns_exact_tip {
+        return Err(WalletServiceError::StaleChain);
+    }
+
+    let mut cursor = 0_i64;
+    loop {
+        ensure_sync_not_cancelled(recovery.cancellation)?;
+        ensure_transparent_recovery_deadline(recovery.deadline)?;
+        // Bound memory even for a wallet with a large orphaned history.
+        let creators = transaction
+            .prepare(
+                "SELECT t.id_tx, t.txid, t.raw FROM transactions t
+                 WHERE t.id_tx > ?1 AND t.mined_height IS NULL AND t.raw IS NOT NULL
+                   AND EXISTS (
+                       SELECT 1 FROM transparent_received_outputs u
+                       WHERE u.transaction_id = t.id_tx
+                   )
+                 ORDER BY t.id_tx LIMIT 128",
+            )?
+            .query_map([cursor], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if creators.is_empty() {
+            break;
+        }
+        for (id, txid, raw) in creators {
+            ensure_sync_not_cancelled(recovery.cancellation)?;
+            ensure_transparent_recovery_deadline(recovery.deadline)?;
+            cursor = id;
+            let mut bytes = raw.as_slice();
+            let creator =
+                Transaction::read(&mut bytes, network.branch_id()).map_err(database_error)?;
+            if !bytes.is_empty()
+                || creator.version() != TxVersion::V6
+                || creator.consensus_branch_id() != network.branch_id()
+                || creator.txid().as_ref() != txid.as_slice()
+            {
+                return Err(WalletServiceError::Database(
+                    "stored transparent creator bytes do not match the Wcash transaction"
+                        .to_owned(),
+                ));
+            }
+            if !creator
+                .transparent_bundle()
+                .is_some_and(|bundle| bundle.is_coinbase())
+            {
+                continue;
+            }
+            // Receipt deletion cascades its spend links. Preserve those intents
+            // by outpoint so the backend restores them if the coinbase reappears.
+            transaction.execute(
+                "INSERT INTO transparent_spend_map
+                 (spending_transaction_id, prevout_txid, prevout_output_index)
+                 SELECT s.transaction_id, ?1, u.output_index
+                 FROM transparent_received_outputs u
+                 JOIN transparent_received_output_spends s
+                   ON s.transparent_received_output_id = u.id
+                 WHERE u.transaction_id = ?2
+                 ON CONFLICT DO NOTHING",
+                params![txid, id],
+            )?;
+            transaction.execute(
+                "DELETE FROM transparent_received_outputs WHERE transaction_id = ?1",
+                [id],
+            )?;
+        }
+    }
+    ensure_sync_not_cancelled(recovery.cancellation)?;
+    ensure_transparent_recovery_deadline(recovery.deadline)?;
+    prepared.verify_current_path()?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Reconciles only split creators. A current-UTXO omission is not spend proof:
+/// every omitted outpoint needs an exact mined input from the pinned chain.
+#[derive(Default)]
+struct PartialTransparentSpendReconciliation {
+    outputs: HashMap<OutPoint, PartialTransparentOutput>,
+    start_height: Option<u32>,
+}
+
+struct PartialTransparentOutput {
+    created_height: u32,
+    coinbase: bool,
+    missing: bool,
+    spent_by: Option<(zcash_protocol::TxId, u32)>,
+}
+
+impl PartialTransparentSpendReconciliation {
+    fn track(
+        &mut self,
+        creator: &crate::rpc::ValidatedTransparentCreator,
+        receiver: &TransparentAddress,
+    ) -> Result<(), WalletServiceError> {
+        self.track_with_limit(creator, receiver, MAX_PARTIAL_TRANSPARENT_RECOVERY_OUTPUTS)
+    }
+
+    fn track_with_limit(
+        &mut self,
+        creator: &crate::rpc::ValidatedTransparentCreator,
+        receiver: &TransparentAddress,
+        maximum_outputs: usize,
+    ) -> Result<(), WalletServiceError> {
+        if creator.missing_outputs.is_empty() {
+            return Ok(());
+        }
+        let bundle = creator.transaction.transparent_bundle().ok_or_else(|| {
+            partial_transparent_spend_error("partial creator has no transparent bundle")
+        })?;
+        let additional_outputs = bundle
+            .vout
+            .iter()
+            .filter(|output| output.recipient_address().as_ref() == Some(receiver))
+            .count();
+        checked_partial_transparent_output_count(
+            self.outputs.len(),
+            additional_outputs,
+            maximum_outputs,
+        )
+        .ok_or_else(|| {
+            partial_transparent_spend_error(
+                "partial transparent recovery exceeds its tracked-output limit",
+            )
+        })?;
+        let missing = creator.missing_outputs.iter().collect::<HashSet<_>>();
+        let mut missing_count = 0;
+        for (index, output) in bundle.vout.iter().enumerate() {
+            if output.recipient_address().as_ref() != Some(receiver) {
+                continue;
+            }
+            let index = u32::try_from(index).map_err(|_| {
+                partial_transparent_spend_error("partial creator output index exceeds u32")
+            })?;
+            let outpoint = OutPoint::new(*creator.transaction.txid().as_ref(), index);
+            let is_missing = missing.contains(&outpoint);
+            missing_count += usize::from(is_missing);
+            if self
+                .outputs
+                .insert(
+                    outpoint,
+                    PartialTransparentOutput {
+                        created_height: creator.height,
+                        coinbase: bundle.is_coinbase(),
+                        missing: is_missing,
+                        spent_by: None,
+                    },
+                )
+                .is_some()
+            {
+                return Err(partial_transparent_spend_error(
+                    "partial creator was reported more than once",
+                ));
+            }
+        }
+        if creator.height == 0 || missing_count != creator.missing_outputs.len() {
+            return Err(partial_transparent_spend_error(
+                "partial creator has invalid omitted outpoints or mined height",
+            ));
+        }
+        self.start_height = Some(
+            self.start_height
+                .map_or(creator.height, |height| height.min(creator.height)),
+        );
+        Ok(())
+    }
+
+    fn start_height(&self) -> Option<u32> {
+        self.start_height
+    }
+
+    fn checkpoint_digest(&self) -> [u8; 32] {
+        let mut outputs = self.outputs.iter().collect::<Vec<_>>();
+        outputs.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let mut digest = Sha256::new();
+        digest.update(b"wcash-partial-transparent-recovery-v1\0");
+        for (outpoint, output) in outputs {
+            digest.update(outpoint.hash());
+            digest.update(outpoint.n().to_le_bytes());
+            digest.update(output.created_height.to_le_bytes());
+            digest.update([u8::from(output.coinbase), u8::from(output.missing)]);
+        }
+        digest.finalize().into()
+    }
+
+    fn candidate_spend_heights(
+        &self,
+        wallet: &mut WalletDatabase,
+        tip_height: u32,
+        deadline: tokio::time::Instant,
+        cancellation: &WalletSyncCancellation,
+    ) -> Result<BTreeSet<u32>, WalletServiceError> {
+        wallet.transactionally_with_extension(|_wallet, extension| {
+            let mut heights = BTreeSet::new();
+            for (outpoint, output) in &self.outputs {
+                ensure_sync_not_cancelled(cancellation)?;
+                ensure_transparent_recovery_deadline(deadline)?;
+                if !output.missing || output.spent_by.is_some() {
+                    continue;
+                }
+                let height = extension.query_row(
+                    "SELECT MIN(spender.mined_height)
+                     FROM transactions creator
+                     JOIN transparent_received_outputs output ON output.transaction_id = creator.id_tx
+                     JOIN transparent_received_output_spends spend
+                       ON spend.transparent_received_output_id = output.id
+                     JOIN transactions spender ON spender.id_tx = spend.transaction_id
+                     WHERE creator.txid = ?1 AND output.output_index = ?2
+                       AND spender.mined_height BETWEEN ?3 AND ?4",
+                    params![
+                        &outpoint.hash()[..],
+                        outpoint.n(),
+                        output.created_height,
+                        tip_height,
+                    ],
+                    |row| row.get::<_, Option<u32>>(0),
+                )?;
+                if let Some(height) = height {
+                    heights.insert(height);
+                }
+            }
+            Ok(heights)
+        })
+    }
+
+    fn observe(
+        &mut self,
+        transaction: &crate::rpc::MinedTransparentTransaction,
+        tip_height: u32,
+    ) -> Result<bool, WalletServiceError> {
+        if transaction.height == 0 || transaction.height > tip_height {
+            return Err(partial_transparent_spend_error(
+                "partial spend witness is outside the mined recovery range",
+            ));
+        }
+        let Some(bundle) = transaction.transaction.transparent_bundle() else {
+            return Ok(false);
+        };
+        let mut seen = HashSet::new();
+        let mut witnessed = false;
+        for input in &bundle.vin {
+            let outpoint = input.prevout();
+            let Some(output) = self.outputs.get_mut(outpoint) else {
+                continue;
+            };
+            if !seen.insert(outpoint) {
+                return Err(partial_transparent_spend_error(
+                    "partial spend witness repeats an input",
+                ));
+            }
+            if !output.missing {
+                return Err(partial_transparent_spend_error(
+                    "mined history spends an output reported as currently unspent",
+                ));
+            }
+            if transaction.height < output.created_height
+                || (output.coinbase
+                    && !coinbase_is_mature(output.created_height, transaction.height))
+            {
+                return Err(partial_transparent_spend_error(
+                    "partial spend witness predates its output or coinbase maturity",
+                ));
+            }
+            let witness = (transaction.transaction.txid(), transaction.height);
+            if output.spent_by.is_some_and(|previous| previous != witness) {
+                return Err(partial_transparent_spend_error(
+                    "mined history contains conflicting partial spend witnesses",
+                ));
+            }
+            output.spent_by = Some(witness);
+            witnessed = true;
+        }
+        Ok(witnessed)
+    }
+
+    fn reset_witnesses(&mut self) {
+        for output in self.outputs.values_mut() {
+            output.spent_by = None;
+        }
+    }
+
+    fn finish(&self) -> Result<(), WalletServiceError> {
+        if self
+            .outputs
+            .values()
+            .any(|output| output.missing && output.spent_by.is_none())
+        {
+            return Err(partial_transparent_spend_error(
+                "creator output is absent from current UTXOs without a mined spending input",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn partial_transparent_spend_error(message: &str) -> WalletServiceError {
+    WalletRpcError::TransparentUtxoMismatch(message.to_owned()).into()
+}
+
+fn checked_partial_transparent_output_count(
+    current: usize,
+    additional: usize,
+    maximum: usize,
+) -> Option<usize> {
+    current
+        .checked_add(additional)
+        .filter(|total| *total <= maximum)
+}
+
+fn partial_checkpoint_resume_height(
+    start_height: u32,
+    tip_height: u32,
+    checkpoint: BlockRef,
+    current_canonical: BlockRef,
+) -> Option<u32> {
+    if start_height == 0
+        || !(start_height..tip_height).contains(&checkpoint.height)
+        || checkpoint != current_canonical
+    {
+        return None;
+    }
+    checkpoint.height.checked_add(1)
+}
+
+fn discard_partial_spend_cache(
+    wallet: &mut WalletDatabase,
+    child_index: u32,
+    reconciliation: &mut PartialTransparentSpendReconciliation,
+) -> Result<(), WalletServiceError> {
+    crate::partial_recovery::clear_witnesses(wallet, child_index)?;
+    crate::partial_recovery::clear(wallet, child_index)?;
+    reconciliation.reset_witnesses();
+    Ok(())
+}
+
+async fn restore_verified_partial_spends(
+    client: &mut AttestedWcashClient,
+    wallet: &mut WalletDatabase,
+    child_index: u32,
+    digest: [u8; 32],
+    recovery: &TransparentRecoveryContext<'_>,
+    reconciliation: &mut PartialTransparentSpendReconciliation,
+) -> Result<(), WalletServiceError> {
+    const PAGE_SIZE: usize = 128;
+    ensure_sync_not_cancelled(recovery.cancellation)?;
+    ensure_transparent_recovery_deadline(recovery.deadline)?;
+    let (anchor, mut receipts) = match crate::partial_recovery::load_witnesses_page(
+        wallet,
+        child_index,
+        digest,
+        None,
+        PAGE_SIZE,
+    ) {
+        Ok(Some(page)) => page,
+        Ok(None) => {
+            // A cursor from an older wallet version has no durable witness
+            // receipts. Rebuild that prefix once before relying on it.
+            return crate::partial_recovery::clear(wallet, child_index);
+        }
+        Err(_) => return discard_partial_spend_cache(wallet, child_index, reconciliation),
+    };
+    if anchor.height > recovery.expected_tip.height {
+        return discard_partial_spend_cache(wallet, child_index, reconciliation);
+    }
+    require_exact_recovery_tip(client, recovery).await?;
+    let canonical = await_transparent_recovery_rpc(
+        recovery.deadline,
+        recovery.cancellation,
+        client.compact_block_ref(anchor.height),
+    )
+    .await?;
+    require_exact_recovery_tip(client, recovery).await?;
+    if canonical != anchor {
+        return discard_partial_spend_cache(wallet, child_index, reconciliation);
+    }
+
+    // Every receipt was persisted only after its exact mined bytes were
+    // imported under this anchor. An unchanged canonical prefix preserves that
+    // attestation; ordinary SQLite spend links alone cannot establish it.
+    loop {
+        let complete = receipts.len() < PAGE_SIZE;
+        let after = receipts.last().map(|receipt| receipt.txid);
+        for receipt in receipts {
+            ensure_sync_not_cancelled(recovery.cancellation)?;
+            ensure_transparent_recovery_deadline(recovery.deadline)?;
+            let raw = match crate::partial_recovery::load_witness_transaction(wallet, &receipt) {
+                Ok(raw) => raw,
+                Err(_) => return discard_partial_spend_cache(wallet, child_index, reconciliation),
+            };
+            let transaction = match client.validate_cached_transparent_witness(
+                &raw,
+                receipt.txid,
+                receipt.height,
+            ) {
+                Ok(transaction) => transaction,
+                Err(_) => return discard_partial_spend_cache(wallet, child_index, reconciliation),
+            };
+            if !matches!(
+                reconciliation.observe(&transaction, anchor.height),
+                Ok(true)
+            ) {
+                return discard_partial_spend_cache(wallet, child_index, reconciliation);
+            }
+            decrypt_and_store_transaction(
+                recovery.parameters,
+                wallet,
+                &transaction.transaction,
+                Some(BlockHeight::from_u32(transaction.height)),
+            )
+            .map_err(database_error)?;
+        }
+        if complete {
+            return require_exact_recovery_tip(client, recovery).await;
+        }
+        ensure_sync_not_cancelled(recovery.cancellation)?;
+        ensure_transparent_recovery_deadline(recovery.deadline)?;
+        receipts = match crate::partial_recovery::load_witnesses_page(
+            wallet,
+            child_index,
+            digest,
+            after,
+            PAGE_SIZE,
+        ) {
+            Ok(Some((page_anchor, page))) if page_anchor == anchor => page,
+            _ => return discard_partial_spend_cache(wallet, child_index, reconciliation),
+        };
+    }
+}
+
+fn import_partial_spend_history(
+    wallet: &mut WalletDatabase,
+    recovery: &TransparentRecoveryContext<'_>,
+    reconciliation: &mut PartialTransparentSpendReconciliation,
+    transactions: Vec<crate::rpc::MinedTransparentTransaction>,
+) -> Result<Vec<crate::partial_recovery::CachedTransparentWitness>, WalletServiceError> {
+    let mut receipts = Vec::new();
+    for transaction in transactions {
+        ensure_sync_not_cancelled(recovery.cancellation)?;
+        ensure_transparent_recovery_deadline(recovery.deadline)?;
+        let witnessed = reconciliation.observe(&transaction, recovery.expected_tip.height)?;
+        // Import after the creators, including external spends without any
+        // wallet-owned change, so the backend can identify every input.
+        decrypt_and_store_transaction(
+            recovery.parameters,
+            wallet,
+            &transaction.transaction,
+            Some(BlockHeight::from_u32(transaction.height)),
+        )
+        .map_err(database_error)?;
+        if witnessed {
+            let mut raw = Vec::new();
+            transaction
+                .transaction
+                .write(&mut raw)
+                .map_err(database_error)?;
+            receipts.push(crate::partial_recovery::CachedTransparentWitness {
+                txid: transaction.transaction.txid(),
+                height: transaction.height,
+                raw_digest: Sha256::digest(&raw).into(),
+            });
+        }
+        ensure_transparent_recovery_deadline(recovery.deadline)?;
+    }
+    Ok(receipts)
+}
+
+async fn recover_partial_transparent_spends(
+    client: &mut AttestedWcashClient,
+    wallet: &mut WalletDatabase,
+    managed: &ManagedTransparentReceiver,
+    recovery: &TransparentRecoveryContext<'_>,
+    reconciliation: &mut PartialTransparentSpendReconciliation,
+) -> Result<(), WalletServiceError> {
+    let Some(mut cursor) = reconciliation.start_height() else {
+        return Ok(());
+    };
+    let child_index = managed.child_index.index();
+    let digest = reconciliation.checkpoint_digest();
+    restore_verified_partial_spends(
+        client,
+        wallet,
+        child_index,
+        digest,
+        recovery,
+        reconciliation,
+    )
+    .await?;
+    if reconciliation.finish().is_ok() {
+        require_exact_recovery_tip(client, recovery).await?;
+        return crate::partial_recovery::clear(wallet, child_index);
+    }
+    // Persisted spend links only hint at useful heights; they never prove a
+    // current spend. Re-fetch canonical history there so ordinary repeated sync
+    // does not replay the lifetime of an old, partially spent coinbase.
+    let candidate_heights = reconciliation.candidate_spend_heights(
+        wallet,
+        recovery.expected_tip.height,
+        recovery.deadline,
+        recovery.cancellation,
+    )?;
+    for height in candidate_heights {
+        ensure_sync_not_cancelled(recovery.cancellation)?;
+        ensure_transparent_recovery_deadline(recovery.deadline)?;
+        if crate::partial_recovery::candidate_was_checked(wallet, child_index, digest, height)? {
+            continue;
+        }
+        require_exact_recovery_tip(client, recovery).await?;
+        let transactions = await_transparent_recovery_rpc(
+            recovery.deadline,
+            recovery.cancellation,
+            client.transparent_transactions_range(&managed.address, height, height),
+        )
+        .await?;
+        require_exact_recovery_tip(client, recovery).await?;
+        let receipts =
+            import_partial_spend_history(wallet, recovery, reconciliation, transactions)?;
+        require_exact_recovery_tip(client, recovery).await?;
+        crate::partial_recovery::store_witnesses(
+            wallet,
+            child_index,
+            digest,
+            recovery.expected_tip,
+            &receipts,
+            &[height],
+        )?;
+    }
+    if reconciliation.finish().is_ok() {
+        require_exact_recovery_tip(client, recovery).await?;
+        return crate::partial_recovery::clear(wallet, child_index);
+    }
+    // The scan cursor skips only a verified prefix. Its exact spend receipts
+    // were restored above under a freshly checked canonical anchor.
+    if let Some(checkpoint) = crate::partial_recovery::load(wallet, child_index, digest)? {
+        if (cursor..recovery.expected_tip.height).contains(&checkpoint.height) {
+            require_exact_recovery_tip(client, recovery).await?;
+            let current = await_transparent_recovery_rpc(
+                recovery.deadline,
+                recovery.cancellation,
+                client.compact_block_ref(checkpoint.height),
+            )
+            .await?;
+            require_exact_recovery_tip(client, recovery).await?;
+            if let Some(next_height) = partial_checkpoint_resume_height(
+                cursor,
+                recovery.expected_tip.height,
+                checkpoint,
+                current,
+            ) {
+                cursor = next_height;
+            } else {
+                crate::partial_recovery::clear(wallet, child_index)?;
+            }
+        } else {
+            crate::partial_recovery::clear(wallet, child_index)?;
+        }
+    }
+    loop {
+        require_exact_recovery_tip(client, recovery).await?;
+        let end = cursor
+            .saturating_add(MAX_TRANSPARENT_HISTORY_BLOCKS_PER_REQUEST - 1)
+            .min(recovery.expected_tip.height);
+        let transactions = await_transparent_recovery_rpc(
+            recovery.deadline,
+            recovery.cancellation,
+            client.transparent_transactions_range(&managed.address, cursor, end),
+        )
+        .await?;
+        require_exact_recovery_tip(client, recovery).await?;
+        let receipts =
+            import_partial_spend_history(wallet, recovery, reconciliation, transactions)?;
+        require_exact_recovery_tip(client, recovery).await?;
+        // Receipts and their anchor commit before the scan cursor. An
+        // interrupted attempt can re-establish every earlier witness locally.
+        crate::partial_recovery::store_witnesses(
+            wallet,
+            child_index,
+            digest,
+            recovery.expected_tip,
+            &receipts,
+            &[],
+        )?;
+        if reconciliation.finish().is_ok() {
+            return crate::partial_recovery::clear(wallet, child_index);
+        }
+        if end == recovery.expected_tip.height {
+            // A persisted prefix is useful only while it can still lead to a
+            // complete proof. If database spend hints were lost, a later retry
+            // must be able to rediscover those witnesses in the old prefix.
+            crate::partial_recovery::clear(wallet, child_index)?;
+            return reconciliation.finish();
+        }
+        let checkpoint = await_transparent_recovery_rpc(
+            recovery.deadline,
+            recovery.cancellation,
+            client.compact_block_ref(end),
+        )
+        .await?;
+        require_exact_recovery_tip(client, recovery).await?;
+        crate::partial_recovery::store(wallet, child_index, digest, checkpoint)?;
+        cursor = end + 1;
+    }
 }
 
 async fn recover_managed_transparent_history(
@@ -2121,11 +2782,13 @@ fn record_chain_used_coinbase_receiver(
     })
 }
 
-fn fully_classified_stored_creators(
+fn reusable_stored_transparent_creators(
     client: &AttestedWcashClient,
     wallet: &mut WalletDatabase,
     creators: &[crate::rpc::TransparentUnspentCreator],
     recovery: &TransparentRecoveryContext<'_>,
+    partial_spends: &mut PartialTransparentSpendReconciliation,
+    receiver: &TransparentAddress,
 ) -> Result<HashSet<zcash_protocol::TxId>, WalletServiceError> {
     wallet.transactionally_with_extension(|_wallet, extension| {
         let mut fully_classified = HashSet::with_capacity(creators.len());
@@ -2152,30 +2815,41 @@ fn fully_classified_stored_creators(
                 )
                 .optional()?;
             let Some(stored) = stored else { continue };
-            let is_fully_classified = match client.validate_stored_transparent_creator(
+            let validated = match client.validate_stored_transparent_creator(
                 creator,
                 &stored.raw,
                 stored.mined_height,
             ) {
-                Ok(true) if stored.tx_index == Some(0) => true,
-                Ok(true) if stored.tx_index.is_none() => false,
-                Ok(true) => {
+                Ok(validated) => validated,
+                Err(_) => continue,
+            };
+            let is_coinbase = validated
+                .transaction
+                .transparent_bundle()
+                .is_some_and(|bundle| bundle.is_coinbase());
+            let is_fully_classified = match (is_coinbase, stored.tx_index) {
+                (true, Some(0)) => true,
+                (true, None) => false,
+                (true, _) => {
                     return Err(WalletServiceError::Database(
                         "stored coinbase creator has a nonzero transaction index".to_owned(),
                     ))
                 }
-                Ok(false) if stored.tx_index.is_none_or(|index| index > 0) => true,
-                Ok(false) => {
+                (false, index) if index.is_none_or(|index| index > 0) => true,
+                (false, _) => {
                     return Err(WalletServiceError::Database(
                         "stored non-coinbase creator has an invalid transaction index".to_owned(),
                     ))
                 }
-                Err(_) => false,
             };
-            ensure_transparent_recovery_deadline(recovery.deadline)?;
             if is_fully_classified {
+                // Current UTXOs revalidate cached bytes, including every live
+                // output and the exact omission set. Reusing them avoids a
+                // repeated network prefix; omissions still need mined witnesses.
+                partial_spends.track(&validated, receiver)?;
                 fully_classified.insert(creator.txid());
             }
+            ensure_transparent_recovery_deadline(recovery.deadline)?;
         }
         Ok(fully_classified)
     })
@@ -5982,6 +6656,10 @@ mod tests {
     use zcash_client_backend::data_api::chain::ChainState;
     use zcash_primitives::block::BlockHash;
 
+    mod recovery_progress_tests {
+        include!("wallet/recovery_progress_tests.rs");
+    }
+
     fn create_wallet_accounts(
         path: &Path,
         network: WalletNetwork,
@@ -7249,6 +7927,701 @@ mod tests {
             tip_height + 1,
         ));
         assert_eq!(transparent_coinbase_recovery_start(0), None);
+    }
+
+    fn same_address_creator_fixture(
+        receiver: zcash_transparent::address::TransparentAddress,
+    ) -> Transaction {
+        use zcash_transparent::{
+            address::Script,
+            bundle::{Authorized, Bundle, TxIn, TxOut},
+        };
+
+        zcash_primitives::transaction::TransactionData::from_parts_v6(
+            WalletNetwork::Regtest.branch_id(),
+            0,
+            BlockHeight::from_u32(10),
+            Some(Bundle {
+                vin: vec![TxIn::<Authorized>::from_parts(
+                    OutPoint::NULL,
+                    Script::default(),
+                    u32::MAX,
+                )],
+                vout: vec![
+                    TxOut::new(
+                        Zatoshis::const_from_u64(437_500_000),
+                        receiver.script().into(),
+                    ),
+                    TxOut::new(
+                        Zatoshis::const_from_u64(187_500_000),
+                        receiver.script().into(),
+                    ),
+                ],
+                authorization: Authorized,
+            }),
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .unwrap()
+    }
+
+    fn transparent_spend_bookkeeping_fixture(inputs: Vec<OutPoint>, expiry: u32) -> Transaction {
+        use zcash_transparent::{
+            address::Script,
+            bundle::{Authorized, Bundle, TxIn},
+        };
+
+        // Only the parsed transparent inputs are relevant to these database
+        // and recovery tests. This is not a signed Ironwood transaction or a
+        // claim that a node would accept the artificial transaction.
+        zcash_primitives::transaction::TransactionData::from_parts_v6(
+            WalletNetwork::Regtest.branch_id(),
+            0,
+            BlockHeight::from_u32(expiry),
+            Some(Bundle {
+                vin: inputs
+                    .into_iter()
+                    .map(|input| TxIn::<Authorized>::from_parts(input, Script::default(), u32::MAX))
+                    .collect(),
+                vout: vec![],
+                authorization: Authorized,
+            }),
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .unwrap()
+    }
+
+    fn partial_creator_fixture(
+        transaction: &Transaction,
+        live_index: usize,
+    ) -> crate::rpc::ValidatedTransparentCreator {
+        let creator =
+            crate::rpc::TransparentUnspentCreator::for_test(transaction, 10, &[live_index]);
+        let mut raw = Vec::new();
+        transaction.write(&mut raw).unwrap();
+        let client = AttestedWcashClient::disconnected_for_test(WalletNetwork::Regtest);
+        let validated = client
+            .validate_stored_transparent_creator(&creator, &raw, 10)
+            .unwrap();
+        assert!(validated
+            .transaction
+            .transparent_bundle()
+            .unwrap()
+            .is_coinbase());
+        assert_eq!(validated.missing_outputs.len(), 1);
+        validated
+    }
+
+    #[tokio::test]
+    async fn partial_same_address_creator_requires_mature_exact_spend_witnesses() {
+        let receiver = zcash_transparent::address::TransparentAddress::PublicKeyHash([0x55; 20]);
+        let transaction = same_address_creator_fixture(receiver);
+        let creator = partial_creator_fixture(&transaction, 1);
+        let missing = creator.missing_outputs[0].clone();
+        let live = OutPoint::new(transaction.txid().into(), 1);
+        let witness = |inputs, height, expiry| crate::rpc::MinedTransparentTransaction {
+            transaction: transparent_spend_bookkeeping_fixture(inputs, expiry),
+            height,
+        };
+        let tracked = || {
+            let mut reconciliation = PartialTransparentSpendReconciliation::default();
+            reconciliation.track(&creator, &receiver).unwrap();
+            assert_eq!(reconciliation.start_height(), Some(10));
+            reconciliation
+        };
+
+        let mut reconciliation = tracked();
+        assert!(reconciliation.finish().is_err());
+        reconciliation
+            .observe(&witness(vec![missing.clone()], 110, 200), 110)
+            .unwrap();
+        reconciliation.finish().unwrap();
+
+        for (inputs, height, tip) in [
+            (vec![missing.clone()], 0, 110),
+            (vec![missing.clone()], 109, 110),
+            (vec![missing.clone()], 111, 110),
+            (vec![missing.clone()], 9, 110),
+            (vec![live], 110, 110),
+            (vec![missing.clone(), missing.clone()], 110, 110),
+        ] {
+            assert!(tracked()
+                .observe(&witness(inputs, height, 200), tip)
+                .is_err());
+        }
+        for unrelated in [
+            OutPoint::new([0x66; 32], 0),
+            OutPoint::new(transaction.txid().into(), 2),
+        ] {
+            let mut reconciliation = tracked();
+            reconciliation
+                .observe(&witness(vec![unrelated], 110, 200), 110)
+                .unwrap();
+            assert!(reconciliation.finish().is_err());
+        }
+        let mut conflicting = tracked();
+        conflicting
+            .observe(&witness(vec![missing.clone()], 110, 200), 111)
+            .unwrap();
+        assert!(conflicting
+            .observe(&witness(vec![missing], 111, 201), 111)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn same_address_partial_coinbase_recovery_preserves_spends_on_repeat_restore_and_reorg() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wallet.sqlite");
+        let restored_path = directory.path().join("restored.sqlite");
+        let network = WalletNetwork::Regtest;
+        let original = create_wallet_accounts(&path, network, 1);
+        let restored = create_wallet_accounts(&restored_path, network, 1);
+        let path = fs::canonicalize(path).unwrap();
+        let restored_path = fs::canonicalize(restored_path).unwrap();
+        assert_eq!(
+            original[0].transparent_coinbase_address,
+            restored[0].transparent_coinbase_address
+        );
+        let parameters = network.parameters();
+        let receiver = {
+            let wallet = open_wallet_database(&path, network).unwrap();
+            let account_id = wallet.get_account_ids().unwrap()[0];
+            let account = wallet.get_account(account_id).unwrap().unwrap();
+            let receivers =
+                managed_coinbase_receivers(&wallet, account_id, account.ufvk().unwrap(), network)
+                    .unwrap();
+            receivers[0].receiver
+        };
+        let transaction = same_address_creator_fixture(receiver);
+        // This fixture exercises receipt/spend recovery, not proving or input
+        // selection. The real CLI lifecycle separately exercises max-inputs=1
+        // signing; here its consumed miner output is an explicit outpoint.
+        let consumed = OutPoint::new(transaction.txid().into(), 0);
+        let consumed_value = 437_500_000;
+        let live_index = 1;
+        let creator = partial_creator_fixture(&transaction, live_index);
+        assert_eq!(creator.missing_outputs, vec![consumed.clone()]);
+        let spending = crate::rpc::MinedTransparentTransaction {
+            transaction: transparent_spend_bookkeeping_fixture(vec![consumed], 200),
+            height: 110,
+        };
+
+        for wallet_path in [&path, &restored_path] {
+            let tip = set_synchronized_test_tip(wallet_path, network, 110, 0xbb);
+            let _operation_lock =
+                acquire_wallet_operation_lock(wallet_path, WalletOperationLockMode::Exclusive)
+                    .unwrap();
+            let mut wallet = open_wallet_database(wallet_path, network).unwrap();
+            let session = begin_transparent_recovery(&mut wallet).unwrap();
+            let mut reconciliation = PartialTransparentSpendReconciliation::default();
+            reconciliation.track(&creator, &receiver).unwrap();
+            let cancellation = WalletSyncCancellation::new();
+            let account_id = wallet.get_account_ids().unwrap()[0];
+            let account = wallet.get_account(account_id).unwrap().unwrap();
+            let receivers =
+                managed_coinbase_receivers(&wallet, account_id, account.ufvk().unwrap(), network)
+                    .unwrap();
+            let recovery = TransparentRecoveryContext {
+                parameters: &parameters,
+                receivers: &receivers,
+                expected_tip: tip,
+                deadline: tokio::time::Instant::now() + MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION,
+                cancellation: &cancellation,
+            };
+            let client = AttestedWcashClient::disconnected_for_test(network);
+            assert!(reconciliation.finish().is_err());
+            assert!(reconciliation
+                .candidate_spend_heights(
+                    &mut wallet,
+                    tip.height,
+                    recovery.deadline,
+                    recovery.cancellation
+                )
+                .unwrap()
+                .is_empty());
+            assert!(matches!(
+                require_transparent_recovery_complete(&mut wallet),
+                Err(WalletServiceError::TransparentRecoveryIncomplete)
+            ));
+            let cancelled = WalletSyncCancellation::new();
+            cancelled.cancel();
+            assert!(matches!(
+                ensure_sync_not_cancelled(&cancelled),
+                Err(WalletServiceError::SynchronizationCancelled)
+            ));
+            assert!(matches!(
+                reconciliation.candidate_spend_heights(
+                    &mut wallet,
+                    tip.height,
+                    recovery.deadline,
+                    &cancelled,
+                ),
+                Err(WalletServiceError::SynchronizationCancelled)
+            ));
+            assert!(matches!(
+                reconciliation.candidate_spend_heights(
+                    &mut wallet,
+                    tip.height,
+                    tokio::time::Instant::now(),
+                    recovery.cancellation,
+                ),
+                Err(WalletServiceError::TransparentRecoveryDeadline)
+            ));
+            assert!(matches!(
+                require_transparent_recovery_complete(&mut wallet),
+                Err(WalletServiceError::TransparentRecoveryIncomplete)
+            ));
+            for _ in 0..3 {
+                // Reimporting the full creator is the path that could revive
+                // its spent sibling. Store history after it, including during
+                // restoration into the independent same-seed database.
+                decrypt_and_store_transaction(
+                    &parameters,
+                    &mut wallet,
+                    &transaction,
+                    Some(BlockHeight::from_u32(10)),
+                )
+                .unwrap();
+                decrypt_and_store_transaction(
+                    &parameters,
+                    &mut wallet,
+                    &spending.transaction,
+                    Some(BlockHeight::from_u32(spending.height)),
+                )
+                .unwrap();
+                let current = crate::rpc::TransparentUnspentCreator::for_test(
+                    &transaction,
+                    10,
+                    &[live_index],
+                );
+                let mut cached_partial = PartialTransparentSpendReconciliation::default();
+                assert!(reusable_stored_transparent_creators(
+                    &client,
+                    &mut wallet,
+                    &[current],
+                    &recovery,
+                    &mut cached_partial,
+                    &receiver,
+                )
+                .unwrap()
+                .contains(&transaction.txid()));
+                assert!(cached_partial.finish().is_err());
+                assert_eq!(
+                    cached_partial
+                        .candidate_spend_heights(
+                            &mut wallet,
+                            tip.height,
+                            recovery.deadline,
+                            recovery.cancellation
+                        )
+                        .unwrap(),
+                    std::collections::BTreeSet::from([110])
+                );
+                reconciliation.observe(&spending, tip.height).unwrap();
+                reconciliation.finish().unwrap();
+                assert!(reconciliation
+                    .candidate_spend_heights(
+                        &mut wallet,
+                        tip.height,
+                        recovery.deadline,
+                        recovery.cancellation,
+                    )
+                    .unwrap()
+                    .is_empty());
+                let summary =
+                    wallet_balance_summary(&wallet, public_confirmation_policy()).unwrap();
+                assert_eq!(
+                    summary.accounts[0].transparent_coinbase_total_zat,
+                    625_000_000 - consumed_value
+                );
+                assert_eq!(summary.accounts[0].transparent_regular_total_zat, 0);
+            }
+            complete_transparent_recovery(&mut wallet, session, tip).unwrap();
+
+            // A reorg of the spend alone restores both canonical receipts,
+            // while the unexpired orphan transaction still reserves its input.
+            wallet
+                .truncate_to_height(BlockHeight::from_u32(109))
+                .unwrap();
+            let connection = open_wallet_connection(wallet_path).unwrap();
+            let canonical_receipts: u32 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM transparent_received_outputs u
+                     JOIN transactions t ON t.id_tx = u.transaction_id
+                     WHERE t.txid = ?1 AND t.mined_height = 10",
+                    [transaction.txid().as_ref()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(canonical_receipts, 2);
+            let orphan_height: Option<u32> = connection
+                .query_row(
+                    "SELECT mined_height FROM transactions WHERE txid = ?1",
+                    [spending.transaction.txid().as_ref()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(orphan_height, None);
+            drop(connection);
+            assert!(reconciliation
+                .candidate_spend_heights(&mut wallet, 109, recovery.deadline, recovery.cancellation)
+                .unwrap()
+                .is_empty());
+            let summary = wallet_balance_summary(&wallet, public_confirmation_policy()).unwrap();
+            assert_eq!(
+                summary.accounts[0].transparent_coinbase_total_zat,
+                625_000_000 - consumed_value
+            );
+            // Once the orphan spend expires, both outputs are genuinely
+            // unspent again; preserving intent must not permanently lose value.
+            wallet.update_chain_tip(BlockHeight::from_u32(201)).unwrap();
+            let summary = wallet_balance_summary(&wallet, public_confirmation_policy()).unwrap();
+            assert_eq!(
+                summary.accounts[0].transparent_coinbase_total_zat,
+                625_000_000
+            );
+            assert!(reconciliation
+                .candidate_spend_heights(&mut wallet, 201, recovery.deadline, recovery.cancellation)
+                .unwrap()
+                .is_empty());
+
+            wallet.truncate_to_height(BlockHeight::from_u32(9)).unwrap();
+            let session = begin_transparent_recovery(&mut wallet).unwrap();
+            let account_id = wallet.get_account_ids().unwrap()[0];
+            let account = wallet.get_account(account_id).unwrap().unwrap();
+            let receivers =
+                managed_coinbase_receivers(&wallet, account_id, account.ufvk().unwrap(), network)
+                    .unwrap();
+            let cancellation = WalletSyncCancellation::new();
+            let recovery = TransparentRecoveryContext {
+                parameters: &parameters,
+                receivers: &receivers,
+                expected_tip: block_ref(9, 9),
+                deadline: tokio::time::Instant::now() + MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION,
+                cancellation: &cancellation,
+            };
+            remove_orphaned_transparent_coinbase_receipts(wallet_path, network, session, &recovery)
+                .unwrap();
+            let connection = open_wallet_connection(wallet_path).unwrap();
+            let pending_intents: u32 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM transparent_spend_map WHERE prevout_txid = ?1",
+                    [transaction.txid().as_ref()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(pending_intents, 1);
+            let stored_raw: Vec<u8> = connection
+                .query_row(
+                    "SELECT raw FROM transactions WHERE txid = ?1",
+                    [spending.transaction.txid().as_ref()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut expected_raw = Vec::new();
+            spending.transaction.write(&mut expected_raw).unwrap();
+            assert_eq!(stored_raw, expected_raw);
+            drop(connection);
+            decrypt_and_store_transaction(
+                &parameters,
+                &mut wallet,
+                &transaction,
+                Some(BlockHeight::from_u32(10)),
+            )
+            .unwrap();
+            wallet.update_chain_tip(BlockHeight::from_u32(110)).unwrap();
+            let summary = wallet_balance_summary(&wallet, public_confirmation_policy()).unwrap();
+            assert_eq!(
+                summary.accounts[0].transparent_coinbase_total_zat,
+                625_000_000 - consumed_value
+            );
+            assert_eq!(summary.accounts[0].transparent_regular_total_zat, 0);
+        }
+    }
+
+    #[test]
+    fn transparent_reorg_removes_only_orphaned_coinbase_receipts_and_preserves_spend_intent() {
+        use zcash_transparent::{
+            address::Script,
+            bundle::{Authorized, Bundle, TxIn, TxOut},
+        };
+
+        const FUND_VALUE: u64 = 187_500_000;
+        const SPENT_FUND_VALUE: u64 = 75_000;
+        const REGULAR_VALUE: u64 = 50_000;
+        const PENDING_REGULAR_VALUE: u64 = 20_000;
+        const UNCLASSIFIED_VALUE: u64 = 30_000;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wallet.sqlite");
+        let network = WalletNetwork::Regtest;
+        create_wallet_accounts(&path, network, 1);
+        let path = fs::canonicalize(path).unwrap();
+        set_synchronized_test_tip(&path, network, 21, 0xaa);
+        let _operation_lock =
+            acquire_wallet_operation_lock(&path, WalletOperationLockMode::Exclusive).unwrap();
+        let mut wallet = open_wallet_database(&path, network).unwrap();
+        let account_id = wallet.get_account_ids().unwrap()[0];
+        let account = wallet.get_account(account_id).unwrap().unwrap();
+        let receivers =
+            managed_coinbase_receivers(&wallet, account_id, account.ufvk().unwrap(), network)
+                .unwrap();
+        let receiver = receivers[0].receiver;
+        let parameters = network.parameters();
+        let build = |prevout, expiry_height, value| {
+            zcash_primitives::transaction::TransactionData::from_parts_v6(
+                network.branch_id(),
+                0,
+                BlockHeight::from_u32(expiry_height),
+                Some(Bundle {
+                    vin: vec![TxIn::<Authorized>::from_parts(
+                        prevout,
+                        Script::default(),
+                        u32::MAX,
+                    )],
+                    vout: vec![TxOut::new(
+                        Zatoshis::from_u64(value).unwrap(),
+                        receiver.script().into(),
+                    )],
+                    authorization: Authorized,
+                }),
+                None,
+                None,
+                None,
+            )
+            .freeze()
+            .unwrap()
+        };
+        let fund = build(OutPoint::NULL, 10, FUND_VALUE);
+        let spent_fund = build(OutPoint::NULL, 11, SPENT_FUND_VALUE);
+        let regular = build(OutPoint::new([0x51; 32], 0), 200, REGULAR_VALUE);
+        let pending_regular = build(OutPoint::new([0x52; 32], 0), 200, PENDING_REGULAR_VALUE);
+        let unclassified = build(OutPoint::new([0x53; 32], 0), 200, UNCLASSIFIED_VALUE);
+        for (transaction, height) in [
+            (&fund, Some(10)),
+            (&spent_fund, Some(11)),
+            (&regular, Some(7)),
+            (&pending_regular, None),
+            (&unclassified, None),
+        ] {
+            decrypt_and_store_transaction(
+                &parameters,
+                &mut wallet,
+                transaction,
+                height.map(BlockHeight::from_u32),
+            )
+            .unwrap();
+        }
+
+        // Parser-valid signed bytes exercise the durable pending-operation
+        // guard; this test does not claim to validate their artificial proof.
+        let (pending_txid, pending_raw) = parser_valid_ironwood_raw(network, 200, 91);
+        let connection = open_wallet_connection(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE transactions SET raw = NULL WHERE txid = ?1",
+                [unclassified.txid().as_ref()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO transactions
+                 (txid, created, expiry_height, raw, target_height, min_observed_height)
+                 VALUES (?1, '2026-10-15T00:00:00Z', 200, ?2, 22, 1)",
+                params![pending_txid.as_ref(), pending_raw],
+            )
+            .unwrap();
+        let signed_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO transparent_received_output_spends
+                 (transparent_received_output_id, transaction_id)
+                 SELECT u.id, ?1 FROM transparent_received_outputs u
+                 JOIN transactions t ON t.id_tx = u.transaction_id WHERE t.txid = ?2",
+                params![signed_id, spent_fund.txid().as_ref()],
+            )
+            .unwrap();
+        drop(connection);
+
+        wallet.truncate_to_height(BlockHeight::from_u32(8)).unwrap();
+        let before = wallet_balance_summary(&wallet, public_confirmation_policy()).unwrap();
+        assert_eq!(before.accounts[0].transparent_coinbase_total_zat, 0);
+        assert_eq!(
+            before.accounts[0].transparent_regular_total_zat,
+            FUND_VALUE + REGULAR_VALUE + PENDING_REGULAR_VALUE + UNCLASSIFIED_VALUE
+        );
+        let session = begin_transparent_recovery(&mut wallet).unwrap();
+        let cancellation = WalletSyncCancellation::new();
+        let recovery = TransparentRecoveryContext {
+            parameters: &parameters,
+            receivers: &receivers,
+            expected_tip: block_ref(8, 8),
+            deadline: tokio::time::Instant::now() + MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION,
+            cancellation: &cancellation,
+        };
+        assert!(matches!(
+            remove_orphaned_transparent_coinbase_receipts(
+                &path,
+                network,
+                TransparentRecoverySession([0; TRANSPARENT_RECOVERY_SESSION_BYTES]),
+                &recovery,
+            ),
+            Err(WalletServiceError::StaleChain)
+        ));
+        remove_orphaned_transparent_coinbase_receipts(&path, network, session, &recovery).unwrap();
+        complete_transparent_recovery(&mut wallet, session, recovery.expected_tip).unwrap();
+        let after = wallet_balance_summary(&wallet, public_confirmation_policy()).unwrap();
+        assert_eq!(after.accounts[0].transparent_coinbase_total_zat, 0);
+        assert_eq!(
+            after.accounts[0].transparent_total_zat,
+            REGULAR_VALUE + PENDING_REGULAR_VALUE + UNCLASSIFIED_VALUE
+        );
+        assert!(matches!(
+            ensure_no_active_pending_transactions(&mut wallet, network),
+            Err(WalletServiceError::ActivePendingTransaction { txid, .. })
+                if txid == pending_txid.to_string()
+        ));
+
+        // Canonical reappearance rehydrates the receipts and their spend links.
+        // The signed operation and its exact bytes have never been replaced.
+        for (transaction, height) in [(&fund, 10), (&spent_fund, 11)] {
+            decrypt_and_store_transaction(
+                &parameters,
+                &mut wallet,
+                transaction,
+                Some(BlockHeight::from_u32(height)),
+            )
+            .unwrap();
+        }
+        wallet.update_chain_tip(BlockHeight::from_u32(21)).unwrap();
+        let restored = wallet_balance_summary(&wallet, public_confirmation_policy()).unwrap();
+        assert_eq!(
+            restored.accounts[0].transparent_coinbase_total_zat,
+            FUND_VALUE
+        );
+        assert_eq!(
+            restored.accounts[0].transparent_regular_total_zat,
+            REGULAR_VALUE + PENDING_REGULAR_VALUE + UNCLASSIFIED_VALUE
+        );
+        let connection = open_wallet_connection(&path).unwrap();
+        let preserved_raw: Vec<u8> = connection
+            .query_row(
+                "SELECT raw FROM transactions WHERE id_tx = ?1 AND txid = ?2",
+                params![signed_id, pending_txid.as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_raw, pending_raw);
+        let restored_spends: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM transparent_received_output_spends
+                 WHERE transaction_id = ?1",
+                [signed_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_spends, 1);
+        let fund_index: Option<u32> = connection
+            .query_row(
+                "SELECT tx_index FROM transactions WHERE txid = ?1",
+                [fund.txid().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fund_index, Some(0));
+        drop(connection);
+
+        // A complete rewind has no scanned block row, but still has an exact network genesis
+        // and recovery owner. Do not skip cleanup just because there are no UTXOs to recover.
+        wallet
+            .truncate_to_chain_state(ChainState::empty(
+                BlockHeight::from_u32(0),
+                BlockHash(network.genesis_hash()),
+            ))
+            .unwrap();
+        assert!(wallet.get_max_height_hash().unwrap().is_none());
+        let genesis_session = begin_transparent_recovery(&mut wallet).unwrap();
+        let mut genesis_recovery = TransparentRecoveryContext {
+            parameters: &parameters,
+            receivers: &receivers,
+            expected_tip: BlockRef {
+                height: 0,
+                hash: network.genesis_hash(),
+            },
+            deadline: tokio::time::Instant::now() + MAX_TRANSPARENT_COINBASE_RECOVERY_DURATION,
+            cancellation: &cancellation,
+        };
+        assert!(matches!(
+            remove_orphaned_transparent_coinbase_receipts(
+                &path,
+                network,
+                TransparentRecoverySession([0; TRANSPARENT_RECOVERY_SESSION_BYTES]),
+                &genesis_recovery,
+            ),
+            Err(WalletServiceError::StaleChain)
+        ));
+        genesis_recovery.expected_tip.hash = [0x55; 32];
+        assert!(matches!(
+            remove_orphaned_transparent_coinbase_receipts(
+                &path,
+                network,
+                genesis_session,
+                &genesis_recovery,
+            ),
+            Err(WalletServiceError::StaleChain)
+        ));
+        genesis_recovery.expected_tip.hash = network.genesis_hash();
+        remove_orphaned_transparent_coinbase_receipts(
+            &path,
+            network,
+            genesis_session,
+            &genesis_recovery,
+        )
+        .unwrap();
+        complete_transparent_recovery(&mut wallet, genesis_session, genesis_recovery.expected_tip)
+            .unwrap();
+        // No scanned block remains to authorize an offline signing snapshot. The pending
+        // transaction still exists, and absence of that snapshot must continue to block signing.
+        assert!(matches!(
+            ensure_no_active_pending_transactions(&mut wallet, network),
+            Err(WalletServiceError::NotSynchronized)
+        ));
+        let connection = open_wallet_connection(&path).unwrap();
+        let (retained_value, retained_receipts): (u64, u32) = connection
+            .query_row(
+                "SELECT SUM(value_zat), COUNT(*) FROM transparent_received_outputs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained_receipts, 3);
+        assert_eq!(
+            retained_value,
+            REGULAR_VALUE + PENDING_REGULAR_VALUE + UNCLASSIFIED_VALUE
+        );
+        let preserved_raw: Vec<u8> = connection
+            .query_row(
+                "SELECT raw FROM transactions WHERE id_tx = ?1 AND txid = ?2",
+                params![signed_id, pending_txid.as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_raw, pending_raw);
+        let retained_intent: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM transparent_spend_map
+                 WHERE spending_transaction_id = ?1 AND prevout_txid = ?2
+                   AND prevout_output_index = 0",
+                params![signed_id, spent_fund.txid().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_intent, 1);
     }
 
     #[test]
@@ -9081,5 +10454,133 @@ mod tests {
             verify_named_file_matches(&wallet_path, &opened),
             Err(WalletServiceError::WalletPathChanged)
         ));
+    }
+
+    #[test]
+    fn partial_recovery_checkpoint_resumes_only_a_verified_canonical_ancestor() {
+        let checkpoint = block_ref(25, 0x25);
+        for (start, tip, stored, canonical, expected) in [
+            (10, 26, checkpoint, checkpoint, Some(26)),
+            (10, 110, checkpoint, checkpoint, Some(26)),
+            (10, 110, checkpoint, block_ref(25, 0x26), None),
+            (10, 110, checkpoint, block_ref(24, 0x25), None),
+            (26, 110, checkpoint, checkpoint, None),
+            (0, 110, checkpoint, checkpoint, None),
+            (10, 25, checkpoint, checkpoint, None),
+            (10, 24, checkpoint, checkpoint, None),
+            (110, 10, checkpoint, checkpoint, None),
+            (
+                1,
+                u32::MAX,
+                block_ref(u32::MAX, 1),
+                block_ref(u32::MAX, 1),
+                None,
+            ),
+            (
+                1,
+                u32::MAX,
+                block_ref(u32::MAX - 1, 1),
+                block_ref(u32::MAX - 1, 1),
+                Some(u32::MAX),
+            ),
+        ] {
+            assert_eq!(
+                partial_checkpoint_resume_height(start, tip, stored, canonical),
+                expected,
+                "start {start}, tip {tip}, checkpoint {stored:?}, canonical {canonical:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn partial_recovery_checkpoint_digest_binds_all_outputs_and_is_order_independent() {
+        let receiver = TransparentAddress::PublicKeyHash([0x55; 20]);
+        let transaction = same_address_creator_fixture(receiver);
+        let missing = OutPoint::new(*transaction.txid().as_ref(), 0);
+        let live = OutPoint::new(*transaction.txid().as_ref(), 1);
+        let tracked = || {
+            let creator = crate::rpc::ValidatedTransparentCreator {
+                transaction: transaction.clone(),
+                height: 10,
+                missing_outputs: vec![missing.clone()],
+            };
+            let mut reconciliation = PartialTransparentSpendReconciliation::default();
+            reconciliation.track(&creator, &receiver).unwrap();
+            reconciliation
+        };
+        let mut reconciliation = tracked();
+        let expected = reconciliation.checkpoint_digest();
+        let mut outputs = reconciliation.outputs.drain().collect::<Vec<_>>();
+        outputs.sort_unstable_by(|(left, _), (right, _)| right.cmp(left));
+        for (outpoint, output) in outputs {
+            reconciliation.outputs.insert(outpoint, output);
+        }
+        assert_eq!(reconciliation.checkpoint_digest(), expected);
+        reconciliation.outputs.get_mut(&missing).unwrap().spent_by =
+            Some((zcash_protocol::TxId::from_bytes([0x77; 32]), 110));
+        assert_eq!(reconciliation.checkpoint_digest(), expected);
+
+        for outpoint in [&missing, &live] {
+            let mut changed = tracked();
+            changed.outputs.get_mut(outpoint).unwrap().created_height += 1;
+            assert_ne!(changed.checkpoint_digest(), expected);
+            let mut changed = tracked();
+            changed.outputs.get_mut(outpoint).unwrap().coinbase = false;
+            assert_ne!(changed.checkpoint_digest(), expected);
+            let mut changed = tracked();
+            let output = changed.outputs.get_mut(outpoint).unwrap();
+            output.missing = !output.missing;
+            assert_ne!(changed.checkpoint_digest(), expected);
+            let mut changed = tracked();
+            changed.outputs.remove(outpoint);
+            assert_ne!(changed.checkpoint_digest(), expected);
+            for replacement in [
+                OutPoint::new([0x66; 32], outpoint.n()),
+                OutPoint::new(*outpoint.hash(), outpoint.n() + 2),
+            ] {
+                let mut changed = tracked();
+                let output = changed.outputs.remove(outpoint).unwrap();
+                changed.outputs.insert(replacement, output);
+                assert_ne!(changed.checkpoint_digest(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn partial_recovery_output_budget_rejects_before_mutating_tracked_state() {
+        assert_eq!(checked_partial_transparent_output_count(2, 2, 4), Some(4));
+        assert_eq!(checked_partial_transparent_output_count(2, 2, 3), None);
+        assert_eq!(
+            checked_partial_transparent_output_count(usize::MAX, 1, usize::MAX),
+            None
+        );
+
+        let receiver = TransparentAddress::PublicKeyHash([0x55; 20]);
+        let transaction = same_address_creator_fixture(receiver);
+        let creator = crate::rpc::ValidatedTransparentCreator {
+            missing_outputs: vec![OutPoint::new(*transaction.txid().as_ref(), 0)],
+            transaction,
+            height: 10,
+        };
+        let mut reconciliation = PartialTransparentSpendReconciliation::default();
+        let empty_digest = reconciliation.checkpoint_digest();
+        assert!(reconciliation
+            .track_with_limit(&creator, &receiver, 1)
+            .is_err());
+        assert!(reconciliation.outputs.is_empty());
+        assert_eq!(reconciliation.start_height(), None);
+        assert_eq!(reconciliation.checkpoint_digest(), empty_digest);
+
+        reconciliation
+            .track_with_limit(&creator, &receiver, 2)
+            .unwrap();
+        let prior_digest = reconciliation.checkpoint_digest();
+        assert_eq!(reconciliation.outputs.len(), 2);
+        assert!(reconciliation
+            .track_with_limit(&creator, &receiver, 3)
+            .is_err());
+        assert_eq!(reconciliation.outputs.len(), 2);
+        assert_eq!(reconciliation.start_height(), Some(10));
+        assert_eq!(reconciliation.checkpoint_digest(), prior_digest);
     }
 }

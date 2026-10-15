@@ -68,6 +68,7 @@ pub mod watch_receiver;
 pub mod check;
 
 pub(crate) mod finalized_state;
+mod foundation_validation;
 pub(crate) mod non_finalized_state;
 mod pending_utxos;
 mod queued_blocks;
@@ -331,11 +332,13 @@ impl StateService {
                     #[cfg(feature = "elasticsearch")]
                     true,
                 )
-                .expect(
-                    "opening the read-write finalized state database failed; check that the \
-                     state cache directory is writable and not locked by another Zebra instance, \
-                     and that there is free disk space",
-                );
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "opening the read-write finalized state database failed: {error}; \
+                         check that the state cache directory is writable and not locked by \
+                         another Zebra instance, and that there is free disk space"
+                    )
+                });
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();
@@ -383,7 +386,8 @@ impl StateService {
                     is_finalized_tip_past_max_checkpoint,
                     config.debug_skip_non_finalized_state_backup_task,
                 )
-                .await;
+                .await
+                .unwrap_or_else(|error| panic!("opening non-finalized backup failed: {error}"));
 
         let non_finalized_block_write_sent_hashes = SentHashes::new(&non_finalized_state);
         let initial_tip = non_finalized_state

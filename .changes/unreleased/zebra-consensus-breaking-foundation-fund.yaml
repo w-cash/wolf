@@ -1,0 +1,4 @@
+project: zebra-consensus
+kind: breaking
+body: "Implement the fixed 30% Mainnet foundation allocation at heights 33000–621454, preserving gross issuance and all miner fees, with private miner support and safe legacy-state refusal. See docs/wcash-foundation-fund-upgrade.md."
+time: 2026-10-14T23:00:00.000000000Z

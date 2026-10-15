@@ -10,6 +10,7 @@ mod cache;
 mod identity;
 mod keys;
 mod network;
+mod partial_recovery;
 mod rpc;
 mod sync;
 mod wallet;

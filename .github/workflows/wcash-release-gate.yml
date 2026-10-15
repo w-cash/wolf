@@ -27,6 +27,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Test foundation Python harness regressions without solving work
+        run: python3 -m unittest discover -s scripts/tests -p 'test_wcash_foundation*.py'
+
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           toolchain: 1.91.0
@@ -78,6 +82,26 @@ jobs:
           cargo clippy --locked -p zebra-consensus --features wcash-consensus --all-targets -- -D warnings
           cargo clippy --locked -p zebra-rpc --features zebra-chain/wcash-consensus --all-targets -- -D warnings
           cargo clippy --locked -p zebra-state --lib --tests --features zebra-chain/wcash-consensus -- -D warnings
+
+      - name: Test fixed foundation policy and legacy-state coverage without solving
+        run: |
+          cargo test --locked -p zebra-chain --lib --features wcash-consensus wcash_foundation
+          cargo test --locked -p zebra-consensus --lib --features wcash-consensus wcash_foundation
+          cargo test --locked -p zebra-state --lib --features zebra-chain/wcash-consensus foundation_ -- --test-threads=1
+          cargo test --locked -p zebra-chain --lib --features wcash-funding-test-fixture wcash_foundation
+          cargo test --locked -p zebra-state --lib --features zebra-chain/wcash-funding-test-fixture foundation_ -- --test-threads=1
+          cargo test --locked -p zebra-rpc --lib --features wcash-funding-test-fixture wcash_foundation
+          cargo test --locked -p wcash-merge-miner --features wcash-funding-test-fixture foundation
+          cargo test --locked -p zebrad --lib --no-default-features --features wcash-funding-test-fixture funding_
+          cargo clippy --locked -p zebrad --no-default-features --features wcash-funding-test-fixture --all-targets -- -D warnings
+          # Dependency features can be enabled without the executable alias.
+          cargo test --locked -p zebrad --lib --no-default-features --features wcash-consensus,zebra-chain/wcash-funding-test-fixture funding_
+          cargo test --locked -p zebrad --lib --no-default-features --features zebra-chain/wcash-funding-test-fixture funding_
+          cargo test --locked -p zebrad --lib --no-default-features --features wcash-consensus,zebra-chain/wcash-funding-test-fixture user_agent_matches_the_selected_consensus_profile
+          cargo test --locked -p wcash-merge-miner --features zebra-chain/wcash-funding-test-fixture foundation
+          bash -n scripts/wcash-foundation-fund-e2e.sh scripts/build-wcash-foundation-fixtures.sh
+          python3 -m py_compile scripts/verify-wcash-funding-artifacts.py scripts/tests/wcash_foundation_fund_e2e.py
+          python3 scripts/test-wcash-funding-artifacts.py
 
       - name: Test parent RPC payout attestation and serialization
         run: |

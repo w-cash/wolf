@@ -33,6 +33,7 @@ use super::disk_format::upgrade::restorable_db_versions;
 
 pub mod block;
 pub mod chain;
+pub(super) mod foundation;
 pub mod metrics;
 pub mod shielded;
 pub mod transparent;
@@ -126,7 +127,7 @@ impl ZebraDb {
                 config,
                 &db_kind,
                 network,
-            )
+            )?
             .or_else(|| {
                 database_format_version_on_disk(
                     config,
@@ -194,6 +195,8 @@ impl ZebraDb {
             )
         }
 
+        // Check before any asynchronous format upgrades can modify legacy history.
+        db.check_foundation_validation_coverage()?;
         db.spawn_format_change(format_change);
 
         Ok(db)
