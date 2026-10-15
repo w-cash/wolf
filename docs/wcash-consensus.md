@@ -136,10 +136,17 @@ non-Wcash build retains Zcash's aggregate 21-million-unit limit. See
 [`amount.rs`](../zebra-chain/src/amount.rs); changing a transaction bound to match
 a website's supply label would change a different rule.
 
-Wcash profiles clear founders rewards, funding streams and lockbox
-disbursements. The complete subsidy plus fees belongs to the miner coinbase,
-subject to the payout-mode rules below. This allocation rule does not establish
-who mined the initial supply or the fairness of an operational launch.
+Wcash founders rewards and lockbox disbursements remain zero. Mainnet blocks
+33000–621454 allocate 30%, `floor(3 * subsidy / 10)`, to the fixed transparent P2PKH
+recipient `W1ZRudbQKz7jQdKmAarbaJsegscnZzXjpu2`; miners receive the remaining
+subsidy plus all fees. Block 621455 ends this allocation without changing gross
+emission. The required output has the exact script and exact per-block amount;
+one matching occurrence is accounted for, leaving any additional transparent
+payouts in the miner remainder. Ordinary Testnet and Regtest have no allocation.
+The non-default `wcash-funding-test-fixture` changes only isolated Regtest to
+heights 10–19 and cannot run on public networks. See the
+[policy](wcash-foundation-fund-specification.md) and
+[state migration guide](wcash-foundation-fund-upgrade.md).
 
 ## Block timing, difficulty and AuxPoW
 
@@ -169,7 +176,8 @@ transparent Wcash address or a Wcash Unified Address with an Orchard receiver
 for private Ironwood note encryption. The template builder never invents a
 runtime payout address. It rejects inherited Zcash and wrong-network addresses;
 standalone Sapling and TEX addresses are not coinbase destinations. Transparent
-and Ironwood miner payouts cannot be mixed in one coinbase.
+and Ironwood miner payouts cannot be mixed, except for the single compulsory
+transparent foundation output alongside private miner rewards during the term.
 
 Transparent and Ironwood are the active value pools. Consensus rejects Sprout,
 Sapling and legacy Orchard components in Wcash transactions. The Orchard

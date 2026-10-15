@@ -13,7 +13,10 @@
 //! `Network` and `block::Height`.
 
 pub(crate) mod constants;
+mod wcash_foundation;
 pub mod wcash_mainnet;
+
+pub use wcash_foundation::*;
 
 use std::collections::HashMap;
 
@@ -476,6 +479,9 @@ pub enum SubsidyError {
     #[error("Wcash coinbase subsidy plus fees exceeds the supported per-transaction value")]
     WcashCoinbaseValueTooLarge,
 
+    #[error("Wcash coinbase is missing the exact mandatory transparent foundation output")]
+    WcashFoundationOutputMissing,
+
     #[error("addition of amounts overflowed")]
     Overflow,
 
@@ -616,7 +622,9 @@ pub fn miner_subsidy(
     expected_block_subsidy: Amount<NonNegative>,
 ) -> Result<Amount<NonNegative>, amount::Error> {
     if network.uses_wcash_consensus() {
-        return Ok(expected_block_subsidy);
+        return expected_block_subsidy
+            - wcash_foundation_fund(height, network, expected_block_subsidy)
+                .map_or(Amount::zero(), |allocation| allocation.amount);
     }
 
     let founders_reward = founders_reward(network, height);

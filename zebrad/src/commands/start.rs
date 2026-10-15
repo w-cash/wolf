@@ -1005,6 +1005,9 @@ impl StartCmd {
 impl Runnable for StartCmd {
     /// Start the application.
     fn run(&self) {
+        if zebra_chain::parameters::subsidy::WCASH_FOUNDATION_TEST_FIXTURE_ENABLED {
+            warn!("LOCAL FUNDING TEST FIXTURE: WcashRegtest activation 10, expiry 20; never release this executable");
+        }
         if cfg!(feature = "wcash-consensus") {
             info!("Starting Wcash");
         } else {
@@ -1034,6 +1037,14 @@ impl config::Override<ZebradConfig> for StartCmd {
     // a configuration file using explicit flags taken from command-line
     // arguments.
     fn override_config(&self, mut config: ZebradConfig) -> Result<ZebradConfig, FrameworkError> {
+        if zebra_chain::parameters::subsidy::WCASH_FOUNDATION_TEST_FIXTURE_ENABLED
+            && !config.network.network.is_wcash_regtest()
+        {
+            return Err(std::io::Error::other(
+                "LOCAL FUNDING TEST FIXTURE only supports network = 'WcashRegtest'; this executable must never be used on Mainnet or public Testnet",
+            )
+            .into());
+        }
         #[cfg(feature = "wcash-consensus")]
         if !config.network.network.uses_wcash_consensus() {
             return Err(std::io::Error::other(
@@ -1189,6 +1200,12 @@ mod tests {
         ] {
             let mut config = ZebradConfig::default();
             config.network.network = network.clone();
+            if zebra_chain::parameters::subsidy::WCASH_FOUNDATION_TEST_FIXTURE_ENABLED
+                && !network.is_wcash_regtest()
+            {
+                assert!(cmd.override_config(config).is_err());
+                continue;
+            }
             let configured = cmd
                 .override_config(config)
                 .expect("the Wcash binary supports both built-in Wcash networks");
@@ -1204,6 +1221,10 @@ mod tests {
             unsafe_low_specs: false,
         };
 
+        if zebra_chain::parameters::subsidy::WCASH_FOUNDATION_TEST_FIXTURE_ENABLED {
+            assert!(cmd.override_config(ZebradConfig::default()).is_err());
+            return;
+        }
         let config = cmd
             .override_config(ZebradConfig::default())
             .expect("the default network must match the selected consensus build");
@@ -1212,17 +1233,34 @@ mod tests {
             config.network.network.uses_wcash_consensus(),
             cfg!(feature = "wcash-consensus")
         );
+    }
 
-        #[cfg(not(feature = "wcash-consensus"))]
+    #[test]
+    fn funding_fixture_refuses_public_networks_and_accepts_only_wcash_regtest() {
+        use zebra_chain::parameters::Network;
+        if !zebra_chain::parameters::subsidy::WCASH_FOUNDATION_TEST_FIXTURE_ENABLED {
+            return;
+        }
+        let cmd = StartCmd::default();
+        for network in [
+            Network::try_new_wcash_mainnet().unwrap(),
+            Network::new_wcash_testnet(),
+            Network::Mainnet,
+            Network::new_regtest(Default::default()),
+        ] {
+            let mut config = ZebradConfig::default();
+            config.network.network = network;
+            assert!(cmd
+                .override_config(config)
+                .unwrap_err()
+                .to_string()
+                .contains("LOCAL FUNDING TEST FIXTURE"));
+        }
+        let mut config = ZebradConfig::default();
+        config.network.network = Network::new_wcash_regtest();
         assert_eq!(
-            zebra_chain::amount::MAX_MONEY,
-            21_000_000 * zebra_chain::amount::COIN
-        );
-
-        #[cfg(feature = "wcash-consensus")]
-        assert_eq!(
-            zebra_chain::amount::MAX_MONEY,
-            21_000_000 * zebra_chain::amount::COIN
+            cmd.override_config(config).is_ok(),
+            cfg!(feature = "wcash-consensus")
         );
     }
 

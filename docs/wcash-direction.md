@@ -36,9 +36,15 @@ Mainnet monetary policy has four deliberate properties:
    adopt Monero's block-weight penalty.
 3. **A permanent 0.375 WEC tail emission.** The subsidy never decays below
    37,500,000 atomic units. Mainnet therefore has no fixed maximum supply.
-4. **No protocol tax.** There is no founders reward, development tax, funding
-   stream, lockbox disbursement or premine allocation in the Wcash subsidy.
-   Subsidy plus transaction fees belongs to the miner's coinbase.
+4. **A finite foundation allocation.** This changes the original zero-allocation
+   policy: Mainnet blocks 33000–621454 must pay 30% of the subsidy,
+   rounded down per block, to the fixed transparent recipient
+   `W1ZRudbQKz7jQdKmAarbaJsegscnZzXjpu2`. Miners receive the remainder plus all
+   fees. The allocation stops at 621455, the first reward below half the initial
+   post-ramp subsidy. Renewal requires a separate consensus upgrade. Gross
+   emission, founders rewards and lockbox rules are unchanged. See the
+   [policy specification](wcash-foundation-fund-specification.md) and
+   [upgrade guide](wcash-foundation-fund-upgrade.md).
 
 The consensus recurrence, boundary heights and fixed vectors are in
 [`wcash_mainnet.rs`](../zebra-chain/src/parameters/network/subsidy/wcash_mainnet.rs).
@@ -68,7 +74,9 @@ shielded pools. Reusing cryptographic machinery is not permission to expose an
 old pool as a Wcash feature.
 
 A miner chooses one coinbase payout mode for a block: transparent or private
-Ironwood. The two modes cannot be mixed in the same coinbase. A mature
+Ironwood. During the foundation term the mandatory transparent fund output
+accompanies either miner mode; a private miner cannot add any other transparent
+output. Outside the term the modes remain exclusive. A mature
 transparent coinbase must be shielded before its value can later return to a
 transparent recipient. These rules keep a transparent integration path while
 making Ironwood the single privacy pool.
@@ -98,7 +106,7 @@ policy.
 | --- | --- |
 | Frozen identities and external anchors | [`wcash-genesis`](../wcash-genesis/src/lib.rs) and [genesis blocks](../zebra-chain/src/block/genesis.rs) |
 | Mainnet slow start, smooth decay and tail | [`wcash_mainnet.rs`](../zebra-chain/src/parameters/network/subsidy/wcash_mainnet.rs) |
-| No protocol allocation | [network subsidy dispatch](../zebra-chain/src/parameters/network/subsidy.rs) |
+| Fixed, expiring foundation allocation | [network subsidy dispatch](../zebra-chain/src/parameters/network/subsidy.rs) |
 | Wcash V6 and Ironwood domain | [network upgrades](../zebra-chain/src/parameters/network_upgrade.rs) and [transaction validation](../zebra-consensus/src/transaction.rs) |
 | Active value-pool accounting | [value balances](../zebra-chain/src/value_balance.rs) and [state accounting](../zebra-state/src/service/non_finalized_state/chain.rs) |
 | AuxPoW proof format | [`wcash-zcash-aux`](../wcash-zcash-aux/README.md) |

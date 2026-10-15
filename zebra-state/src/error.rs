@@ -50,6 +50,22 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
+    /// Stored history was not covered by the current foundation consensus rule.
+    #[error(
+        "cannot trust stored Wcash foundation history at height {height:?}, hash {hash:?}, \
+         in {path:?}: current rule validation coverage is missing or does not match this history. \
+         Preserve this directory and its backups. Configure a NEW, empty state cache_dir and \
+         rebuild by syncing with upgraded peers; do not delete or reuse the original directory"
+    )]
+    UncoveredFoundationHistory {
+        /// Database or backup path that must be preserved.
+        path: PathBuf,
+        /// First uncovered height encountered.
+        height: block::Height,
+        /// Hash of the uncovered block.
+        hash: block::Hash,
+    },
+
     /// A read-only state was requested, but the configured cache directory is
     /// missing or unreadable.
     ///

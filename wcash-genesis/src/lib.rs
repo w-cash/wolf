@@ -1057,6 +1057,8 @@ mod tests {
     }
 
     #[test]
+    // This test intentionally checks ordering of frozen consensus constants.
+    #[allow(clippy::assertions_on_constants)]
     fn mainnet_launch_time_and_pow_limit_are_frozen() {
         assert_eq!(PUBLIC_MAINNET_GENESIS_TIME, 1_789_819_200);
         assert_eq!(PUBLIC_MAINNET_ZCASH_TIME, 1_789_819_009);

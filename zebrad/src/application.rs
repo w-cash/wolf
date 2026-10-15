@@ -159,7 +159,14 @@ pub fn release_version() -> Version {
 /// [BIP 14]: https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki
 pub fn user_agent() -> String {
     let release_version = release_version();
-    if cfg!(feature = "wcash-consensus") {
+    if zebra_chain::parameters::subsidy::WCASH_FOUNDATION_TEST_FIXTURE_ENABLED {
+        let product = if cfg!(feature = "wcash-consensus") {
+            "Wcash"
+        } else {
+            "Zebra"
+        };
+        format!("/{product}:{release_version}(funding-test-fixture)/")
+    } else if cfg!(feature = "wcash-consensus") {
         format!("/Wcash:{release_version}/")
     } else {
         format!("/Zebra:{release_version}/")
@@ -596,6 +603,10 @@ mod tests {
         let user_agent = super::user_agent();
 
         assert!(user_agent.ends_with('/'));
+        assert_eq!(
+            user_agent.contains("funding-test-fixture"),
+            zebra_chain::parameters::subsidy::WCASH_FOUNDATION_TEST_FIXTURE_ENABLED
+        );
         if cfg!(feature = "wcash-consensus") {
             assert!(user_agent.starts_with("/Wcash:"));
             assert!(!user_agent.contains("Zebra"));

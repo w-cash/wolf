@@ -109,6 +109,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "history_tree",
     "tip_chain_value_pool",
     BLOCK_INFO,
+    zebra_db::foundation::FOUNDATION_VALIDATION,
 ];
 
 /// The finalized part of the chain state, stored in the db.

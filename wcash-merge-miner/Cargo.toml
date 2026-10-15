@@ -10,6 +10,10 @@ homepage.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Isolated Regtest-only funding-policy fixture; never publish these binaries.
+wcash-funding-test-fixture = ["zebra-chain/wcash-funding-test-fixture"]
+
 [dependencies]
 argon2 = "0.5"
 blake2b_simd.workspace = true

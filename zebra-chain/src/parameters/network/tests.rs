@@ -112,8 +112,8 @@ fn wcash_mainnet_profile_is_fully_wired_with_frozen_anchor() -> Result<(), Repor
     );
     assert_eq!(
         miner_subsidy(Height(40_001), &mainnet, first_smooth_subsidy)?,
-        first_smooth_subsidy,
-        "Wcash Mainnet allocates the full subsidy to the miner"
+        Amount::<NonNegative>::try_from(1_539_316_279)?,
+        "Wcash Mainnet reserves thirty percent of subsidy for the fixed foundation output"
     );
     assert_eq!(
         founders_reward(&mainnet, Height(40_001)),

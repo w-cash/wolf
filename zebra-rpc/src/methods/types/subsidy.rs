@@ -4,7 +4,10 @@ use derive_getters::Getters;
 use derive_new::new;
 use zebra_chain::{
     amount::{Amount, NonNegative},
-    parameters::subsidy::FundingStreamReceiver,
+    parameters::{
+        subsidy::{FundingStreamReceiver, WcashFoundationAllocation},
+        Network,
+    },
     transparent,
 };
 
@@ -84,10 +87,26 @@ pub struct FundingStream {
     ///
     /// This is optional so we can support funding streams with no addresses (lockbox streams).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub address: Option<transparent::Address>,
+    pub address: Option<String>,
 }
 
 impl FundingStream {
+    /// Describe the fixed Wcash allocation without using the inherited Zcash
+    /// address display, which would change the public Wcash namespace.
+    pub(crate) fn wcash_foundation(
+        allocation: WcashFoundationAllocation,
+        network: &Network,
+    ) -> Self {
+        Self {
+            recipient: "Wcash Foundation (wcash.foundation)".to_string(),
+            specification: "https://github.com/w-cash/wolf/blob/main/docs/wcash-foundation-fund-specification.md".to_string(),
+            value: allocation.amount.into(),
+            value_zat: allocation.amount,
+            address: Some(allocation.address.encode_wcash(network)
+                .expect("the consensus recipient belongs to the selected Wcash network")),
+        }
+    }
+
     /// Convert a `receiver`, `value`, and `address` into a `FundingStream` response.
     pub(crate) fn new_internal(
         is_post_nu6: bool,
@@ -102,7 +121,7 @@ impl FundingStream {
             specification: specification.to_string(),
             value: value.into(),
             value_zat: value,
-            address: address.cloned(),
+            address: address.map(ToString::to_string),
         }
     }
 }

@@ -28,7 +28,10 @@ use zebra_chain::{
     },
     block::{self, merkle::AUTH_DIGEST_PLACEHOLDER, Height},
     parameters::{
-        subsidy::{block_subsidy, funding_stream_values, miner_subsidy, SubsidyError},
+        subsidy::{
+            block_subsidy, funding_stream_values, miner_subsidy, wcash_foundation_fund,
+            SubsidyError,
+        },
         Network, NetworkUpgrade,
     },
     primitives::ed25519,
@@ -143,11 +146,11 @@ impl TransactionTemplate<NegativeOrZero> {
             // Amount addition. In a standard Zcash build the Amount ceiling is
             // also 21 million coins, so adding a positive subsidy to a
             // limit-sized fee would otherwise surface as a generic overflow.
-            let raw_miner_reward = miner_subsidy
+            let raw_coinbase_value = block_subsidy
                 .zatoshis()
                 .checked_add(txs_fee.zatoshis())
                 .ok_or(SubsidyError::Overflow)?;
-            if raw_miner_reward > MAX_WCASH_COINBASE_VALUE {
+            if raw_coinbase_value > MAX_WCASH_COINBASE_VALUE {
                 return Err(SubsidyError::WcashCoinbaseValueTooLarge.into());
             }
         }
@@ -263,6 +266,18 @@ impl TransactionTemplate<NegativeOrZero> {
         .ok_or(TransactionError::CoinbaseConstruction(
             "Could not construct output with miner reward".to_string(),
         ))?;
+
+        // This fixed Wcash P2PKH allocation is independent of Zcash's rotating
+        // funding streams. Required construction must fail closed rather than
+        // silently omit an output through the inherited optional-address path.
+        if let Some(allocation) = wcash_foundation_fund(height, net, block_subsidy) {
+            let address = allocation.address.try_into().map_err(|error| {
+                TransactionError::CoinbaseConstruction(format!(
+                    "invalid mandatory Wcash foundation recipient: {error}"
+                ))
+            })?;
+            builder.add_transparent_output(&address, Zatoshis::try_from(allocation.amount)?)?;
+        }
 
         let mut funding_streams = funding_stream_values(height, net, block_subsidy)?
             .into_iter()

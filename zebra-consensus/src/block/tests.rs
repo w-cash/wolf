@@ -833,6 +833,461 @@ fn wcash_coinbase_payout_modes_are_exclusive() {
     );
 }
 
+/// Construct a coinbase for payout-accounting unit tests. The synthetic Ironwood
+/// authorization is deliberately not a substitute for proof-verifier coverage.
+fn wcash_foundation_accounting_coinbase(
+    height: Height,
+    outputs: Vec<transparent::Output>,
+    ironwood_reward: Option<i64>,
+) -> Transaction {
+    let ironwood = ironwood_reward.map(|reward| {
+        zebra_chain::transaction::arbitrary::fake_orchard_bundle(
+            ::orchard::bundle::Flags::ENABLED,
+            zcash_protocol::value::ZatBalance::from_i64(-reward).unwrap(),
+            1,
+            918,
+            ::orchard::bundle::BundleVersion::ironwood_v3(),
+        )
+    });
+    Transaction::test_v6_with_bundles(
+        NetworkUpgrade::Nu6_3,
+        vec![transparent::Input::Coinbase {
+            height,
+            data: vec![1, 1],
+            sequence: u32::MAX,
+        }],
+        outputs,
+        LockTime::unlocked(),
+        height,
+        None,
+        ironwood,
+    )
+}
+
+fn wcash_foundation_check_accounting(
+    transaction: &Transaction,
+    network: &Network,
+    height: Height,
+    fees: u64,
+) -> Result<(), BlockError> {
+    check::miner_fees_are_valid(
+        transaction,
+        height,
+        Amount::try_from(fees).unwrap(),
+        block_subsidy(height, network).unwrap(),
+        DeferredPoolBalanceChange::zero(),
+        network,
+    )
+}
+
+#[test]
+fn wcash_foundation_transparent_and_ironwood_accounting_at_every_boundary() {
+    use zebra_chain::parameters::subsidy::wcash_foundation_fund;
+
+    let network = Network::try_new_wcash_mainnet().unwrap();
+    let miner_script = transparent::Address::from_pub_key_hash(network.kind(), [23; 20]).script();
+    for height in [
+        32_999, 33_000, 33_001, 39_999, 40_000, 40_001, 40_002, 621_454, 621_455, 621_456,
+    ] {
+        let height = Height(height);
+        let subsidy = block_subsidy(height, &network).unwrap();
+        for fees in [0u64, 123_457] {
+            let allocation = wcash_foundation_fund(height, &network, subsidy);
+            let fund = allocation
+                .as_ref()
+                .map_or(Amount::zero(), |fund| fund.amount);
+            let miner = ((subsidy - fund).unwrap() + Amount::try_from(fees).unwrap()).unwrap();
+            let fund_outputs: Vec<_> = allocation.iter().map(|fund| fund.output()).collect();
+            let mut transparent = fund_outputs.clone();
+            transparent.push(transparent::Output::new(miner, miner_script.clone()));
+            let transaction = wcash_foundation_accounting_coinbase(height, transparent, None);
+            assert_eq!(
+                wcash_foundation_check_accounting(&transaction, &network, height, fees),
+                Ok(())
+            );
+            let transaction =
+                wcash_foundation_accounting_coinbase(height, fund_outputs, Some(miner.zatoshis()));
+            assert_eq!(
+                wcash_foundation_check_accounting(&transaction, &network, height, fees),
+                Ok(())
+            );
+        }
+    }
+}
+
+#[test]
+fn wcash_foundation_requires_exact_allocation_in_both_modes() {
+    use zebra_chain::parameters::subsidy::{
+        wcash_foundation_fund, WCASH_FOUNDATION_TEST_FIXTURE_ENABLED,
+    };
+
+    let mainnet = Network::try_new_wcash_mainnet().unwrap();
+    let mut cases = vec![
+        (
+            mainnet.clone(),
+            Height(33_000),
+            1_814_194_185,
+            544_258_255,
+            1_269_935_930,
+        ),
+        (
+            mainnet.clone(),
+            Height(33_001),
+            1_814_249_160,
+            544_274_748,
+            1_269_974_412,
+        ),
+        (
+            mainnet.clone(),
+            Height(39_999),
+            2_198_968_279,
+            659_690_483,
+            1_539_277_796,
+        ),
+        (
+            mainnet.clone(),
+            Height(40_000),
+            2_199_023_255,
+            659_706_976,
+            1_539_316_279,
+        ),
+        (
+            mainnet.clone(),
+            Height(40_001),
+            2_199_023_255,
+            659_706_976,
+            1_539_316_279,
+        ),
+        (
+            mainnet.clone(),
+            Height(40_002),
+            2_199_020_634,
+            659_706_190,
+            1_539_314_444,
+        ),
+        (
+            mainnet,
+            Height(621_454),
+            1_099_512_482,
+            329_853_744,
+            769_658_738,
+        ),
+    ];
+    if WCASH_FOUNDATION_TEST_FIXTURE_ENABLED {
+        for height in [Height(10), Height(19)] {
+            cases.push((
+                Network::new_wcash_regtest(),
+                height,
+                625_000_000,
+                187_500_000,
+                437_500_000,
+            ));
+        }
+    }
+    let header = Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_1046400_BYTES[..])
+        .unwrap()
+        .header;
+    let missing = || {
+        BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::WcashFoundationOutputMissing,
+        ))
+    };
+    for (network, height, expected_gross, expected_fund, expected_miner) in cases {
+        let gross = block_subsidy(height, &network).unwrap();
+        assert_eq!(gross.zatoshis(), expected_gross);
+        let allocation = wcash_foundation_fund(height, &network, gross).unwrap();
+        assert_eq!(allocation.amount.zatoshis(), expected_fund);
+        assert_eq!(
+            (gross - allocation.amount).unwrap().zatoshis(),
+            expected_miner
+        );
+        let miner_script =
+            transparent::Address::from_pub_key_hash(network.kind(), [23; 20]).script();
+        for fees in [0u64, 123_457] {
+            let total = (gross + Amount::try_from(fees).unwrap()).unwrap();
+            for private in [false, true] {
+                for amount in [allocation.amount, (gross / 5).unwrap()] {
+                    let miner = (total - amount).unwrap();
+                    let mut outputs = vec![transparent::Output::new(
+                        amount,
+                        allocation.address.script(),
+                    )];
+                    if !private {
+                        outputs.push(transparent::Output::new(miner, miner_script.clone()));
+                    }
+                    let transaction = wcash_foundation_accounting_coinbase(
+                        height,
+                        outputs,
+                        private.then_some(miner.zatoshis()),
+                    );
+                    let block = Block {
+                        header: header.clone(),
+                        transactions: vec![Arc::new(transaction.clone())],
+                    };
+                    if amount == allocation.amount {
+                        assert_eq!(
+                            wcash_foundation_check_accounting(&transaction, &network, height, fees),
+                            Ok(())
+                        );
+                        assert_eq!(
+                            check::subsidy_is_valid(&block, &network, gross),
+                            Ok(DeferredPoolBalanceChange::zero())
+                        );
+                    } else {
+                        assert_eq!(
+                            wcash_foundation_check_accounting(&transaction, &network, height, fees),
+                            Err(missing())
+                        );
+                        assert_eq!(
+                            check::subsidy_is_valid(&block, &network, gross),
+                            Err(missing())
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn wcash_foundation_transparent_reordering_splits_and_duplicate_allocations_are_valid() {
+    use zebra_chain::parameters::subsidy::wcash_foundation_fund;
+
+    let network = Network::try_new_wcash_mainnet().unwrap();
+    let height = Height(40_002);
+    let gross = block_subsidy(height, &network).unwrap();
+    let fund = wcash_foundation_fund(height, &network, gross).unwrap();
+    let required = fund.output();
+    let fees = Amount::try_from(103).unwrap();
+    let miner = ((gross - fund.amount).unwrap() + fees).unwrap();
+    // The miner can use the same address, split its reward, and voluntarily
+    // pay one extra exact tuple, provided exactly one is allocated to the fund.
+    let split =
+        transparent::Output::new(Amount::try_from(17).unwrap(), required.lock_script.clone());
+    let remainder = transparent::Output::new(
+        ((miner - fund.amount).unwrap() - split.value).unwrap(),
+        required.lock_script.clone(),
+    );
+    for outputs in [
+        vec![
+            required.clone(),
+            transparent::Output::new(miner, required.lock_script.clone()),
+        ],
+        vec![
+            transparent::Output::new(miner, required.lock_script.clone()),
+            required.clone(),
+        ],
+        vec![
+            required.clone(),
+            split.clone(),
+            remainder.clone(),
+            required.clone(),
+        ],
+        vec![split, required.clone(), required, remainder],
+    ] {
+        let transaction = wcash_foundation_accounting_coinbase(height, outputs, None);
+        assert_eq!(
+            wcash_foundation_check_accounting(&transaction, &network, height, 103),
+            Ok(())
+        );
+    }
+}
+
+#[test]
+fn wcash_foundation_rejects_missing_wrong_split_combined_or_fee_inclusive_outputs() {
+    use zebra_chain::parameters::subsidy::wcash_foundation_fund;
+
+    let network = Network::try_new_wcash_mainnet().unwrap();
+    let height = Height(40_001);
+    let gross = block_subsidy(height, &network).unwrap();
+    let fund = wcash_foundation_fund(height, &network, gross).unwrap();
+    let required = fund.output();
+    let fees = Amount::try_from(100).unwrap();
+    let total = (gross + fees).unwrap();
+    let other_script = transparent::Address::from_pub_key_hash(network.kind(), [23; 20]).script();
+    let missing = Err(BlockError::Transaction(TransactionError::Subsidy(
+        SubsidyError::WcashFoundationOutputMissing,
+    )));
+    let mut candidates = vec![
+        vec![transparent::Output::new(total, other_script.clone())],
+        vec![transparent::Output::new(
+            total,
+            required.lock_script.clone(),
+        )],
+        vec![
+            transparent::Output::new(fund.amount, other_script.clone()),
+            transparent::Output::new((total - fund.amount).unwrap(), other_script.clone()),
+        ],
+    ];
+    for change in [-1, 1, 20] {
+        let altered = Amount::try_from(fund.amount.zatoshis() + change).unwrap();
+        candidates.push(vec![
+            transparent::Output::new(altered, required.lock_script.clone()),
+            transparent::Output::new((total - altered).unwrap(), other_script.clone()),
+        ]);
+    }
+    let first = (fund.amount / 2).unwrap();
+    candidates.push(vec![
+        transparent::Output::new(first, required.lock_script.clone()),
+        transparent::Output::new((fund.amount - first).unwrap(), required.lock_script.clone()),
+        transparent::Output::new((total - fund.amount).unwrap(), other_script),
+    ]);
+    for outputs in candidates {
+        let transaction = wcash_foundation_accounting_coinbase(height, outputs, None);
+        assert_eq!(
+            wcash_foundation_check_accounting(&transaction, &network, height, 100),
+            missing
+        );
+    }
+    let shielded_substitute =
+        wcash_foundation_accounting_coinbase(height, vec![], Some(total.zatoshis()));
+    assert_eq!(
+        wcash_foundation_check_accounting(&shielded_substitute, &network, height, 100),
+        missing
+    );
+}
+
+#[test]
+fn wcash_foundation_enforces_gross_value_and_narrow_mixed_output_exception() {
+    use zebra_chain::parameters::subsidy::wcash_foundation_fund;
+
+    let network = Network::try_new_wcash_mainnet().unwrap();
+    let height = Height(40_001);
+    let gross = block_subsidy(height, &network).unwrap();
+    let fund = wcash_foundation_fund(height, &network, gross).unwrap();
+    let required = fund.output();
+    let miner = (gross - fund.amount).unwrap();
+    for delta in [-1, 1] {
+        for shielded in [false, true] {
+            let claim = Amount::try_from(miner.zatoshis() + delta).unwrap();
+            let outputs = if shielded {
+                vec![required.clone()]
+            } else {
+                vec![
+                    required.clone(),
+                    transparent::Output::new(claim, required.lock_script.clone()),
+                ]
+            };
+            let transaction = wcash_foundation_accounting_coinbase(
+                height,
+                outputs,
+                shielded.then_some(claim.zatoshis()),
+            );
+            assert_eq!(
+                wcash_foundation_check_accounting(&transaction, &network, height, 0),
+                Err(BlockError::Transaction(TransactionError::Subsidy(
+                    SubsidyError::InvalidMinerFees
+                )))
+            );
+        }
+    }
+    // Even an identical second mandatory tuple is an invalid transparent
+    // miner remainder when an Ironwood miner payout is present.
+    let mixed = wcash_foundation_accounting_coinbase(
+        height,
+        vec![required.clone(), required.clone()],
+        Some((miner - fund.amount).unwrap().zatoshis()),
+    );
+    assert_eq!(
+        wcash_foundation_check_accounting(&mixed, &network, height, 0),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::WcashMixedCoinbaseOutputs
+        )))
+    );
+    for height in [Height(32_999), Height(621_455)] {
+        let gross = block_subsidy(height, &network).unwrap();
+        let mixed = wcash_foundation_accounting_coinbase(
+            height,
+            vec![required.clone()],
+            Some((gross - fund.amount).unwrap().zatoshis()),
+        );
+        assert_eq!(
+            wcash_foundation_check_accounting(&mixed, &network, height, 0),
+            Err(BlockError::Transaction(TransactionError::Subsidy(
+                SubsidyError::WcashMixedCoinbaseOutputs
+            )))
+        );
+    }
+    let transaction =
+        wcash_foundation_accounting_coinbase(height, vec![required], Some(miner.zatoshis()));
+    assert_eq!(
+        wcash_foundation_check_accounting(
+            &transaction,
+            &network,
+            height,
+            u64::try_from(MAX_WCASH_COINBASE_VALUE).unwrap()
+        ),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::WcashCoinbaseValueTooLarge
+        )))
+    );
+}
+
+#[test]
+fn wcash_foundation_subsidy_check_requires_exact_output_from_candidate_height() {
+    use zebra_chain::parameters::subsidy::wcash_foundation_fund;
+
+    let network = Network::try_new_wcash_mainnet().unwrap();
+    let header = Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_1046400_BYTES[..])
+        .unwrap()
+        .header;
+    for height in [
+        Height(32_999),
+        Height(33_000),
+        Height(33_001),
+        Height(39_999),
+        Height(40_000),
+        Height(40_001),
+        Height(621_454),
+        Height(621_455),
+    ] {
+        let gross = block_subsidy(height, &network).unwrap();
+        let fund = wcash_foundation_fund(height, &network, gross);
+        let no_fund = Block {
+            header: header.clone(),
+            transactions: vec![Arc::new(wcash_foundation_accounting_coinbase(
+                height,
+                vec![transparent::Output::new(
+                    gross,
+                    transparent::Script::new(&[0x51]),
+                )],
+                None,
+            ))],
+        };
+        if let Some(fund) = fund {
+            assert_eq!(
+                check::subsidy_is_valid(&no_fund, &network, gross),
+                Err(BlockError::Transaction(TransactionError::Subsidy(
+                    SubsidyError::WcashFoundationOutputMissing
+                )))
+            );
+            let funded = Block {
+                header: header.clone(),
+                transactions: vec![Arc::new(wcash_foundation_accounting_coinbase(
+                    height,
+                    vec![
+                        fund.output(),
+                        transparent::Output::new(
+                            (gross - fund.amount).unwrap(),
+                            transparent::Script::new(&[0x51]),
+                        ),
+                    ],
+                    None,
+                ))],
+            };
+            assert_eq!(
+                check::subsidy_is_valid(&funded, &network, gross),
+                Ok(DeferredPoolBalanceChange::zero())
+            );
+        } else {
+            assert_eq!(
+                check::subsidy_is_valid(&no_fund, &network, gross),
+                Ok(DeferredPoolBalanceChange::zero())
+            );
+        }
+    }
+}
+
 #[test]
 fn time_is_valid_for_historical_blocks() -> Result<(), Report> {
     let _init_guard = zebra_test::init();

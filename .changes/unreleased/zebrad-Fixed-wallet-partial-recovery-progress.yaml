@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Retain verified partial-coinbase recovery progress across deadlines and restarts, reusing validated creator bytes and mined spend receipts after checking their canonical chain anchor."
+time: 2026-10-15T12:52:00Z

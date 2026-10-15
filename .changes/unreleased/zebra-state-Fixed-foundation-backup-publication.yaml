@@ -1,0 +1,4 @@
+project: zebra-state
+kind: Fixed
+body: "Publish foundation validation coverage durably before non-finalized backup blocks, preserve a restartable verified prefix after filesystem errors, and retry incomplete backup updates without waiting for a new tip."
+time: 2026-10-15T08:30:00.000000000Z

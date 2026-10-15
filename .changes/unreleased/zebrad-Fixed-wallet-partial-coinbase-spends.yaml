@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Recover partially spent same-address miner and foundation coinbase outputs using exact mined spend history, preserving synchronization and seed recovery without resurrecting spent siblings."
+time: 2026-10-15T11:21:01Z
