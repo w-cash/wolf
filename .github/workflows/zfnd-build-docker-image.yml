@@ -164,6 +164,15 @@ jobs:
           echo "SOURCE_SHA_SHORT=${SOURCE_SHA:0:7}" >> "$GITHUB_ENV"
           echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
 
+      - name: Refuse local funding fixtures in published images
+        run: |
+          case "${FEATURES}" in
+            *wcash-funding-test-fixture*)
+              echo "::error::local funding fixtures cannot be published as container images"
+              exit 1
+              ;;
+          esac
+
       # Automatic tag management and OCI Image Format Specification for labels
       - name: Docker meta
         id: meta

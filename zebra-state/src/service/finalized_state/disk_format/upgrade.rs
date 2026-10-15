@@ -110,7 +110,11 @@ fn format_upgrades(
         // and the genesis Ironwood anchor is missing for NU6.3 anchor validation). This is a
         // major-version upgrade that is restorable from the previous major database format version.
         Box::new(add_ironwood_tree::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 6])
+        Box::new(no_migration::NoMigration::new(
+            "add foundation validation coverage without blessing legacy history",
+            Version::new(28, 1, 0),
+        )),
+    ] as [Box<dyn DiskFormatUpgrade>; 7])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }

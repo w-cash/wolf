@@ -288,3 +288,13 @@ Continue with the [documentation index](README.md),
 The repository's node software, consumer wallets, pool operations, and external
 websites have different roles; check the applicable release and service status
 before relying on each one.
+
+## Foundation consensus upgrade
+
+Before running a new binary against an existing Mainnet database, read the
+[foundation upgrade guide](wcash-foundation-fund-upgrade.md). The fixed
+allocation starts at block 40001 and stops at 621455. Upgrade validators and
+coordinators before activation. Uncovered postactivation history is refused;
+preserve the original cache directory and rebuild into a new one from verified
+upgraded peers if required. A production rollout still requires custody
+evidence, independent review and recorded operator adoption.

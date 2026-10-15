@@ -90,6 +90,15 @@ wcash-consensus = [
     "zebra-rpc/wcash-consensus",
 ]
 
+# Disposable local funding upgrade exercise; never package this profile.
+wcash-funding-test-fixture = [
+    "wcash-consensus",
+    "zebra-chain/wcash-funding-test-fixture",
+    "zebra-consensus/wcash-funding-test-fixture",
+    "zebra-rpc/wcash-funding-test-fixture",
+    "wcash-merge-miner?/wcash-funding-test-fixture",
+]
+
 # Experimental elasticsearch indexing
 elasticsearch = [
     "zebra-state/elasticsearch",

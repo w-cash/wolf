@@ -87,6 +87,94 @@ fn reject_unshielded_coinbase_utxo_spend() {
     assert_eq!(result, Err(UnshieldedTransparentCoinbaseSpend { outpoint }));
 }
 
+/// The fixed P2PKH foundation output retains mandatory shielding after maturity and expiry.
+#[test]
+fn foundation_recipient_cannot_bypass_shielding_after_maturity_or_expiry() {
+    use zebra_chain::parameters::{
+        subsidy::{
+            block_subsidy, wcash_foundation_activation_height, wcash_foundation_expiry_height,
+            wcash_foundation_fund, WCASH_FOUNDATION_ADDRESS,
+        },
+        Network,
+    };
+
+    let _init_guard = zebra_test::init();
+    let network = Network::try_new_wcash_mainnet().expect("Wcash Mainnet parameters are enabled");
+    let created_height = wcash_foundation_activation_height(&network).unwrap();
+    let gross = block_subsidy(created_height, &network).unwrap();
+    let allocation = wcash_foundation_fund(created_height, &network, gross).unwrap();
+    assert_eq!(
+        allocation.address.encode_wcash(&network).unwrap(),
+        WCASH_FOUNDATION_ADDRESS
+    );
+    assert!(!allocation.address.is_script_hash());
+
+    let miner_script = transparent::Address::from_pub_key_hash(network.kind(), [2; 20]).script();
+    let coinbase = Transaction::test_v6_for_network(
+        &network,
+        created_height,
+        vec![transparent::Input::Coinbase {
+            height: created_height,
+            data: b"foundation shielding restriction".to_vec(),
+            sequence: u32::MAX,
+        }],
+        vec![
+            transparent::Output::new((gross - allocation.amount).unwrap(), miner_script.clone()),
+            allocation.output(),
+        ],
+        LockTime::unlocked(),
+        created_height,
+    );
+    let outpoint = transparent::OutPoint {
+        hash: coinbase.hash(),
+        index: 1,
+    };
+    let utxo = transparent::OrderedUtxo::new(coinbase.outputs()[1].clone(), created_height, 0);
+    assert!(utxo.utxo.from_coinbase);
+
+    let maturity = Height(created_height.0 + MIN_TRANSPARENT_COINBASE_MATURITY);
+    let expiry = wcash_foundation_expiry_height(&network).unwrap();
+    assert!(
+        wcash_foundation_fund(expiry, &network, block_subsidy(expiry, &network).unwrap()).is_none()
+    );
+    for spend_height in [maturity, expiry] {
+        // Isolate the contextual restriction: signatures and proofs are not checked by this test.
+        let spend = Transaction::test_v6_for_network(
+            &network,
+            spend_height,
+            vec![transparent::Input::PrevOut {
+                outpoint,
+                unlock_script: transparent::Script::new(&[]),
+                sequence: u32::MAX,
+            }],
+            vec![transparent::Output::new(
+                allocation.amount,
+                miner_script.clone(),
+            )],
+            LockTime::unlocked(),
+            spend_height,
+        );
+        assert_eq!(
+            check::utxo::transparent_coinbase_spend(
+                outpoint,
+                transparent::CoinbaseSpendRestriction::CheckCoinbaseMaturity { spend_height },
+                utxo.as_ref(),
+            ),
+            Ok(()),
+            "the fund output is already mature at this candidate height",
+        );
+        let restriction = spend.coinbase_spend_restriction(&network, spend_height);
+        assert_eq!(
+            restriction,
+            transparent::CoinbaseSpendRestriction::DisallowCoinbaseSpend
+        );
+        assert_eq!(
+            check::utxo::transparent_coinbase_spend(outpoint, restriction, utxo.as_ref()),
+            Err(UnshieldedTransparentCoinbaseSpend { outpoint }),
+        );
+    }
+}
+
 /// Check that early spends of coinbase transparent outputs fail.
 #[test]
 fn reject_immature_coinbase_utxo_spend() {

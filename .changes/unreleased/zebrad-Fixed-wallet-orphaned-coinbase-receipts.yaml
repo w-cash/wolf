@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Reconcile orphaned transparent coinbase receipts after wallet reorgs while preserving ordinary pending receipts, signed transaction bytes, and spend intent when a coinbase reappears."
+time: 2026-10-14T23:06:21Z

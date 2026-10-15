@@ -1088,7 +1088,8 @@ async fn non_finalized_state_writes_blocks_to_and_restores_blocks_from_backup_ca
                 false,
                 false,
             )
-            .await;
+            .await
+            .expect("empty backup should open");
 
     let blocks = network.block_map();
     let height = NetworkUpgrade::Heartwood
@@ -1116,7 +1117,8 @@ async fn non_finalized_state_writes_blocks_to_and_restores_blocks_from_backup_ca
 
     let (non_finalized_state, _sender, _receiver) = NonFinalizedState::new(&network)
         .with_backup(Some(backup_dir_path), &finalized_state.db, true, false)
-        .await;
+        .await
+        .expect("verified backup should restore");
 
     assert_eq!(
         non_finalized_state.best_chain_len(),

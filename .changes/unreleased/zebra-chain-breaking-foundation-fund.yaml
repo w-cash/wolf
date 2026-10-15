@@ -1,0 +1,4 @@
+project: zebra-chain
+kind: breaking
+body: "Implement the fixed Mainnet foundation allocation at heights 40001–621454, preserving gross issuance and all miner fees, with private miner support and safe legacy-state refusal. See docs/wcash-foundation-fund-upgrade.md; requested directly by the maintainer."
+time: 2026-10-14T23:00:00.000000000Z

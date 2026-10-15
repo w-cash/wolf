@@ -42,6 +42,7 @@ RUN apt-get -qq update && \
     apt-get -qq install -y --no-install-recommends \
     libclang-dev=1:19.0-* \
     protobuf-compiler=3.21.12-* \
+    python3 \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/log/* /var/cache/ldconfig/aux-cache
 
 # Build arguments and variables
@@ -174,10 +175,12 @@ RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
     --mount=type=bind,source=zebrad,target=zebrad \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
+    --mount=type=bind,source=scripts/verify-wcash-funding-artifacts.py,target=verify-wcash-funding-artifacts.py \
     --mount=type=cache,target=${CARGO_TARGET_DIR} \
     --mount=type=cache,target=${CARGO_HOME} \
     [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
     cargo build --locked --release --features "${FEATURES}" --package zebrad --bin zebrad && \
+    python3 verify-wcash-funding-artifacts.py --allow-zcash "${CARGO_TARGET_DIR}/release/zebrad" && \
     cp ${CARGO_TARGET_DIR}/release/zebrad /usr/local/bin
 
 # This stage starts from scratch using Debian and copies the built Wcash node binary

@@ -63,7 +63,7 @@ different identities and subsidy schedules; see the
 | Transaction domain | Wcash V6, Mainnet branch ID `0xd9c6a7ee` |
 | Emission | 40,000-block linear slow start, then Monero-style integer smooth decay with a permanent 0.375-WEC tail |
 | Halvings and maximum supply | No Mainnet halvings and no fixed economic supply cap |
-| Protocol allocation | No founders reward, funding stream, lockbox or developer tax |
+| Protocol allocation | 20% of subsidy at blocks 40001–621454 to the fixed transparent foundation recipient; all fees go to miners; expires at 621455 |
 | Active value pools | Transparent and Ironwood; Sprout, Sapling and legacy Orchard components are rejected |
 | Coinbase maturity | 100 blocks; transparent coinbase outputs must first be shielded |
 

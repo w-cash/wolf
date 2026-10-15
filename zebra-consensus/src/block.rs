@@ -288,9 +288,10 @@ where
             // Now do the slower checks
 
             // Zcash requires public recovery of shielded coinbase outputs using the all-zero
-            // outgoing viewing key. Wcash instead permits exactly one payout mode: conventional
-            // transparent outputs, or ordinary private Ironwood note encryption. Wcash subsidy
-            // validation rejects legacy shielded and mixed payout modes and retains all proof and
+            // outgoing viewing key. Wcash miners choose transparent outputs or ordinary private
+            // Ironwood note encryption. During the foundation term, both modes also include the
+            // exact mandatory transparent fund output. Subsidy validation rejects legacy pools
+            // and any additional transparent outputs alongside Ironwood, retaining proof and
             // value-balance checks.
             if !network.uses_wcash_consensus() {
                 tx::check::coinbase_outputs_are_decryptable(&coinbase_tx, &network, height)?;

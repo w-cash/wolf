@@ -579,6 +579,7 @@ impl ZebraDb {
             self.finalized_value_pool(),
             prev_note_commitment_trees,
         )?;
+        self.prepare_foundation_validation_coverage(&mut batch, finalized.height, finalized.hash);
 
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();

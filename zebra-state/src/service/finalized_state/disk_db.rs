@@ -31,13 +31,19 @@ use zebra_chain::{parameters::Network, primitives::byte_array::increment_big_end
 
 use crate::{
     database_format_version_on_disk,
-    service::finalized_state::disk_format::{FromDisk, IntoDisk},
+    service::{
+        finalized_state::disk_format::{FromDisk, IntoDisk},
+        non_finalized_state::check_foundation_backup_coverage,
+    },
     write_database_format_version_to_disk, Config, StateInitError,
 };
 
-use super::zebra_db::transparent::{
-    fetch_add_balance_and_received, BALANCE_BY_TRANSPARENT_ADDR,
-    BALANCE_BY_TRANSPARENT_ADDR_MERGE_OP,
+use super::zebra_db::{
+    foundation::check_disk_coverage,
+    transparent::{
+        fetch_add_balance_and_received, BALANCE_BY_TRANSPARENT_ADDR,
+        BALANCE_BY_TRANSPARENT_ADDR_MERGE_OP,
+    },
 };
 // Doc-only imports
 #[allow(unused_imports)]
@@ -1043,6 +1049,23 @@ impl DiskDb {
 
         let db_options = DiskDb::options();
 
+        // Refuse incompatible history before writable RocksDB opening creates columns, changes
+        // its manifest, or replays its log. Secondary opening leaves the original DB unchanged.
+        if !read_only
+            && !config.ephemeral
+            && zebra_chain::parameters::subsidy::wcash_foundation_activation_height(network)
+                .is_some()
+        {
+            if DB::list_cf(&db_options, &path).is_ok_and(|cf| !cf.is_empty()) {
+                let snapshot =
+                    Self::new(config, db_kind, format_version_in_code, network, [], true)?;
+                check_disk_coverage(&snapshot)?;
+                check_foundation_backup_coverage(config, network, Some(&snapshot))?;
+            } else {
+                check_foundation_backup_coverage(config, network, None)?;
+            }
+        }
+
         let column_families =
             DiskDb::construct_column_families(db_options.clone(), &path, column_families_in_code);
 
@@ -1169,7 +1192,7 @@ impl DiskDb {
         config: &Config,
         db_kind: impl AsRef<str>,
         network: &Network,
-    ) -> Option<Version> {
+    ) -> Result<Option<Version>, StateInitError> {
         if let Some(&major_db_ver) = restorable_db_versions
             .iter()
             .find(|v| **v == format_version_in_code.major)
@@ -1180,7 +1203,7 @@ impl DiskDb {
             let old_path = config.db_path(db_kind, old_major_db_ver, network);
             // Exit early if the path doesn't exist or there's an error checking it.
             if !fs::exists(&old_path).unwrap_or(false) {
-                return None;
+                return Ok(None);
             }
 
             let new_path = config.db_path(db_kind, major_db_ver, network);
@@ -1189,7 +1212,7 @@ impl DiskDb {
                 Ok(canonicalized_old_path) => canonicalized_old_path,
                 Err(e) => {
                     warn!("could not canonicalize {old_path:?}: {e}");
-                    return None;
+                    return Ok(None);
                 }
             };
 
@@ -1197,7 +1220,7 @@ impl DiskDb {
                 Ok(canonicalized_cache_path) => canonicalized_cache_path,
                 Err(e) => {
                     warn!("could not canonicalize {:?}: {e}", config.cache_dir);
-                    return None;
+                    return Ok(None);
                 }
             };
 
@@ -1212,7 +1235,7 @@ impl DiskDb {
             // (TOCTOU attacks). Zebra should not be run with elevated privileges.
             if !old_path.starts_with(&cache_path) {
                 info!("skipped reusing previous state cache: state is outside cache directory");
-                return None;
+                return Ok(None);
             }
 
             let opts = DiskDb::options();
@@ -1220,6 +1243,21 @@ impl DiskDb {
             let new_db_exists = DB::list_cf(&opts, &new_path).is_ok_and(|cf| !cf.is_empty());
 
             if old_db_exists && !new_db_exists {
+                // Check the original directory before moving it or rewriting its version file.
+                if zebra_chain::parameters::subsidy::wcash_foundation_activation_height(network)
+                    .is_some()
+                {
+                    let snapshot = Self::new(
+                        config,
+                        db_kind,
+                        &Version::new(old_major_db_ver, 0, 0),
+                        network,
+                        [],
+                        true,
+                    )?;
+                    check_disk_coverage(&snapshot)?;
+                    check_foundation_backup_coverage(config, network, Some(&snapshot))?;
+                }
                 // Create the parent directory for the new db. This is because we can't directly
                 // rename e.g. `state/v25/mainnet/` to `state/v26/mainnet/` with `fs::rename()` if
                 // `state/v26/` does not exist.
@@ -1233,7 +1271,7 @@ impl DiskDb {
                         warn!(
                             "could not create new directory for state cache at {new_path:?}: {e}"
                         );
-                        return None;
+                        return Ok(None);
                     }
                 };
 
@@ -1281,7 +1319,7 @@ impl DiskDb {
                             }
                         }
 
-                        return Some(disk_version);
+                        return Ok(Some(disk_version));
                     }
                     Err(e) => {
                         warn!("could not move state cache from {old_path:?} to {new_path:?}: {e}");
@@ -1290,7 +1328,7 @@ impl DiskDb {
             }
         };
 
-        None
+        Ok(None)
     }
 
     /// Returns the database options for the finalized state database.

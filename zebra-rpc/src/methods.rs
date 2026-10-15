@@ -68,7 +68,7 @@ use zebra_chain::{
     parameters::{
         subsidy::{
             block_subsidy, founders_reward, funding_stream_values, miner_subsidy,
-            FundingStreamReceiver,
+            wcash_foundation_fund, FundingStreamReceiver,
         },
         ConsensusBranchId, Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
     },
@@ -4163,6 +4163,27 @@ where
         };
 
         let subsidy = block_subsidy(height, &net).map_misc_error()?;
+
+        if net.uses_wcash_consensus() {
+            let allocation = wcash_foundation_fund(height, &net, subsidy);
+            let funding_streams_total = allocation
+                .as_ref()
+                .map_or(Amount::zero(), |fund| fund.amount);
+            return Ok(GetBlockSubsidyResponse {
+                miner: miner_subsidy(height, &net, subsidy)
+                    .map_misc_error()?
+                    .into(),
+                founders: Amount::zero().into(),
+                funding_streams: allocation
+                    .into_iter()
+                    .map(|fund| types::subsidy::FundingStream::wcash_foundation(fund, &net))
+                    .collect(),
+                lockbox_streams: Vec::new(),
+                funding_streams_total: funding_streams_total.into(),
+                lockbox_total: Amount::zero().into(),
+                total_block_subsidy: subsidy.into(),
+            });
+        }
 
         let (lockbox_streams, mut funding_streams): (Vec<_>, Vec<_>) =
             funding_stream_values(height, &net, subsidy)

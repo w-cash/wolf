@@ -91,6 +91,9 @@ const WCASH_POOL_BACKEND_LISTENERS: &str = "WCASH_POOL_BACKEND_LISTENERS";
 
 const USAGE: &str = r#"Wcash/Zcash merged-mining operator CLI
 
+Read-only artifact inspection:
+  wcash-merge-miner funding-policy
+
 Synthetic development harness:
   wcash-merge-miner job  <child-hash-le> [target-le]
   wcash-merge-miner mine <child-hash-le> [target-le] [max-runs] [start-nonce]
@@ -217,6 +220,9 @@ consensus order. Their default target is ff..ff.
 "#;
 
 fn main() {
+    if zebra_chain::parameters::subsidy::WCASH_FOUNDATION_TEST_FIXTURE_ENABLED {
+        eprintln!("TEST FIXTURE: wcash-funding-test-fixture (WcashRegtest only; never release)");
+    }
     if let Err(error) = run() {
         eprintln!("wcash-merge-miner: {error}");
         process::exit(2);
@@ -235,6 +241,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     match command.as_str() {
+        "funding-policy" => run_funding_policy(arguments),
         "job" | "mine" | "serve" => run_synthetic(&command, arguments),
         "native-job" => run_native_job(arguments),
         "native-mine" => run_native_mine(arguments),
@@ -247,6 +254,47 @@ fn run() -> Result<(), Box<dyn Error>> {
         "native-pool-backend" => run_native_pool_backend(arguments),
         _ => Err(MinerError::InvalidRequest(format!("unknown command {command:?}")).into()),
     }
+}
+
+fn run_funding_policy(mut arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    if arguments.next().is_some() {
+        return Err("funding-policy accepts no arguments".into());
+    }
+    println!("{}", serde_json::to_string(&funding_policy_report()?)?);
+    Ok(())
+}
+
+fn funding_policy_report() -> Result<serde_json::Value, Box<dyn Error>> {
+    use zebra_chain::parameters::{
+        subsidy::{
+            block_subsidy, wcash_foundation_activation_height, wcash_foundation_expiry_height,
+            wcash_foundation_fund,
+        },
+        Network,
+    };
+
+    let fixture = zebra_chain::parameters::subsidy::WCASH_FOUNDATION_TEST_FIXTURE_ENABLED;
+    let network = if fixture {
+        Network::new_wcash_regtest()
+    } else {
+        Network::try_new_wcash_mainnet()?
+    };
+    let start = wcash_foundation_activation_height(&network)
+        .ok_or("this artifact has no foundation policy for its intended network")?;
+    let end = wcash_foundation_expiry_height(&network)
+        .ok_or("this artifact has no foundation expiry for its intended network")?;
+    let allocation = wcash_foundation_fund(start, &network, block_subsidy(start, &network)?)
+        .ok_or("the foundation policy must be active at its start height")?;
+    Ok(json!({
+        "consensus_profile": "wcash",
+        "fixture": fixture,
+        "network": if fixture { "WcashRegtest" } else { "WcashMainnet" },
+        "start_height": start.0,
+        "end_height_exclusive": end.0,
+        "recipient": allocation.address.encode_wcash(&network)?,
+        "script_pub_key": hex::encode(allocation.output().lock_script.as_raw_bytes()),
+        "divisor": 5,
+    }))
 }
 
 fn run_worker_password_hash(arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
@@ -2511,6 +2559,27 @@ fn ensure_no_more(mut arguments: impl Iterator<Item = String>) -> Result<(), Min
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foundation_funding_policy_reports_actual_shared_fixture() {
+        let report = funding_policy_report().expect("the compiled policy is inspectable");
+        let fixture = zebra_chain::parameters::subsidy::WCASH_FOUNDATION_TEST_FIXTURE_ENABLED;
+        assert_eq!(report["fixture"], fixture);
+        assert_eq!(report["consensus_profile"], "wcash");
+        assert_eq!(
+            report["network"],
+            if fixture {
+                "WcashRegtest"
+            } else {
+                "WcashMainnet"
+            }
+        );
+        assert_eq!(report["start_height"], if fixture { 10 } else { 40_001 });
+        assert_eq!(
+            report["end_height_exclusive"],
+            if fixture { 20 } else { 621_455 }
+        );
+    }
 
     #[test]
     fn pool_backend_grace_requires_at_least_one_unchanged_tip() {

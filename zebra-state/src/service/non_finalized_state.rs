@@ -27,11 +27,13 @@ use crate::{
         finalized_state::{calculate_deferred_pool_balance_change, ZebraDb},
         InvalidateError,
     },
-    SemanticallyVerifiedBlock, ValidateContextError, WatchReceiver,
+    SemanticallyVerifiedBlock, StateInitError, ValidateContextError, WatchReceiver,
 };
 
 mod backup;
 mod chain;
+
+pub(crate) use backup::check_foundation_backup_coverage;
 
 #[cfg(test)]
 pub(crate) use backup::MIN_DURATION_BETWEEN_BACKUP_UPDATES;
@@ -162,18 +164,21 @@ impl NonFinalizedState {
         finalized_state: &ZebraDb,
         should_restore_backup: bool,
         skip_backup_task: bool,
-    ) -> (
-        Self,
-        watch::Sender<NonFinalizedState>,
-        WatchReceiver<NonFinalizedState>,
-    ) {
+    ) -> Result<
+        (
+            Self,
+            watch::Sender<NonFinalizedState>,
+            WatchReceiver<NonFinalizedState>,
+        ),
+        StateInitError,
+    > {
         let with_watch_channel = |non_finalized_state: NonFinalizedState| {
             let (sender, receiver) = watch::channel(non_finalized_state.clone());
             (non_finalized_state, sender, WatchReceiver::new(receiver))
         };
 
         let Some(backup_dir_path) = backup_dir_path else {
-            return with_watch_channel(self);
+            return Ok(with_watch_channel(self));
         };
 
         if !should_restore_backup {
@@ -206,11 +211,11 @@ impl NonFinalizedState {
                 if should_restore_backup {
                     backup::restore_backup(self, &backup_dir_path, &finalized_state)
                 } else {
-                    self
+                    Ok(self)
                 }
             })
             .await
-            .expect("failed to join blocking task")
+            .expect("failed to join blocking task")?
         };
 
         let (non_finalized_state, sender, receiver) = with_watch_channel(non_finalized_state);
@@ -233,7 +238,7 @@ impl NonFinalizedState {
             tracing::info!("no blocks were restored from the non-finalized backup cache");
         }
 
-        (non_finalized_state, sender, receiver)
+        Ok((non_finalized_state, sender, receiver))
     }
 
     /// Is the internal state of `self` the same as `other`?

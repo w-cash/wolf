@@ -14,8 +14,9 @@ use zebra_chain::{
     block::{Block, Hash, Header, Height},
     parameters::{
         subsidy::{
-            founders_reward, founders_reward_address, funding_stream_values, FundingStreamReceiver,
-            ParameterSubsidy, SubsidyError,
+            founders_reward, founders_reward_address, funding_stream_values, wcash_foundation_fund,
+            wcash_foundation_fund_output_index, FundingStreamReceiver, ParameterSubsidy,
+            SubsidyError,
         },
         Network, NetworkUpgrade,
     },
@@ -278,6 +279,20 @@ pub fn subsidy_is_valid(
 
     let height = block.coinbase_height().ok_or(SubsidyError::NoCoinbase)?;
 
+    if net.uses_wcash_consensus() {
+        wcash_foundation_fund_output_index(
+            height,
+            net,
+            expected_block_subsidy,
+            &block
+                .transactions
+                .first()
+                .ok_or(SubsidyError::NoCoinbase)?
+                .outputs(),
+        )?;
+        return Ok(DeferredPoolBalanceChange::zero());
+    }
+
     let mut coinbase_outputs: MultiSet<Output> = block
         .transactions
         .first()
@@ -433,8 +448,8 @@ pub fn miner_fees_are_valid(
     expected_deferred_pool_balance_change: DeferredPoolBalanceChange,
     network: &Network,
 ) -> Result<(), BlockError> {
-    let transparent_value_balance = coinbase_tx
-        .outputs()
+    let coinbase_outputs = coinbase_tx.outputs();
+    let transparent_value_balance = coinbase_outputs
         .iter()
         .map(|output| output.value())
         .sum::<Result<Amount<NonNegative>, AmountError>>()
@@ -483,16 +498,23 @@ pub fn miner_fees_are_valid(
         (expected_block_subsidy + block_miner_fees).map_err(|_| SubsidyError::Overflow)?;
 
     if network.uses_wcash_consensus() && height > Height::MIN {
-        // Wcash accepts exactly one coinbase payout mode: transparent outputs for conventional
-        // pool integration, or private Ironwood actions for miners that opt in to shielded
-        // rewards. Legacy Sapling and Orchard components are never valid Wcash coinbase outputs.
+        // Classify the miner payout after accounting for exactly one mandatory fund output.
+        // The fund stays transparent in both payout modes; any additional transparent output
+        // alongside Ironwood remains forbidden.
         if coinbase_tx.has_sapling_shielded_data() {
             return Err(SubsidyError::WcashSaplingCoinbaseOutput.into());
         }
         if coinbase_tx.has_orchard_shielded_data() {
             return Err(SubsidyError::WcashOrchardCoinbaseOutput.into());
         }
-        let has_transparent_outputs = !coinbase_tx.outputs().is_empty();
+        let foundation_output_index = wcash_foundation_fund_output_index(
+            height,
+            network,
+            expected_block_subsidy,
+            &coinbase_outputs,
+        )?;
+        let has_transparent_outputs =
+            coinbase_outputs.len() > usize::from(foundation_output_index.is_some());
         let has_ironwood_outputs = coinbase_tx.ironwood_actions().next().is_some();
         match wcash_coinbase_payout_mode(has_transparent_outputs, has_ironwood_outputs)? {
             WcashCoinbasePayoutMode::Ironwood => {
@@ -505,7 +527,11 @@ pub fn miner_fees_are_valid(
                 // A negative shielded value balance represents value entering Ironwood. At the
                 // eventual zero-subsidy tail, a zero-fee block has zero total input and therefore
                 // a zero value balance; otherwise all positive coinbase value must enter Ironwood.
-                if !total_input_value.is_zero() && ironwood_value_balance.zatoshis() >= 0 {
+                let miner_input_value = (total_input_value
+                    - wcash_foundation_fund(height, network, expected_block_subsidy)
+                        .map_or(Amount::zero(), |allocation| allocation.amount))
+                .map_err(|_| SubsidyError::Underflow)?;
+                if !miner_input_value.is_zero() && ironwood_value_balance.zatoshis() >= 0 {
                     return Err(SubsidyError::WcashIronwoodValueBalanceNotNegative.into());
                 }
             }

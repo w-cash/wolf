@@ -4621,3 +4621,83 @@ async fn rpc_getblocksubsidy_major_grants_metadata_across_nu6_boundary() {
         );
     }
 }
+
+/// Funding metadata uses the fixed Wcash address and excludes fees and lockboxes.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getblocksubsidy_wcash_foundation_boundaries_and_namespaces() {
+    use zebra_chain::parameters::{
+        subsidy::{block_subsidy, wcash_foundation_fund, WCASH_FOUNDATION_ADDRESS},
+        Network,
+    };
+
+    for network in [
+        Network::new_wcash_mainnet_for_tests(),
+        Network::new_wcash_testnet(),
+        Network::new_wcash_regtest(),
+    ] {
+        let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (rpc, _rpc_tx_queue) = RpcImpl::new(
+            network.clone(),
+            Default::default(),
+            Default::default(),
+            "0.0.1",
+            "RPC foundation test",
+            Buffer::new(mempool, 1),
+            Buffer::new(state, 1),
+            Buffer::new(read_state, 1),
+            MockService::build().for_unit_tests(),
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            None,
+        );
+        for height in [9, 10, 19, 20, 40_000, 40_001, 621_454, 621_455] {
+            let subsidy = block_subsidy(zebra_chain::block::Height(height), &network)
+                .expect("subsidy exists");
+            let fund = wcash_foundation_fund(zebra_chain::block::Height(height), &network, subsidy);
+            let response = rpc
+                .get_block_subsidy(Some(height))
+                .await
+                .expect("funding RPC succeeds");
+            let fund_atoms = fund
+                .as_ref()
+                .map_or(0, |allocation| allocation.amount.zatoshis());
+            assert_eq!(
+                response.total_block_subsidy().zatoshis(),
+                subsidy.zatoshis()
+            );
+            assert_eq!(response.miner().zatoshis(), subsidy.zatoshis() - fund_atoms);
+            assert_eq!(response.funding_streams_total().zatoshis(), fund_atoms);
+            assert_eq!(response.founders().zatoshis(), 0);
+            assert_eq!(response.lockbox_total().zatoshis(), 0);
+            assert!(response.lockbox_streams().is_empty());
+            assert_eq!(
+                response.funding_streams().len(),
+                usize::from(fund.is_some())
+            );
+            if let Some(fund) = fund {
+                let encoded = serde_json::to_value(&response).expect("response serializes");
+                assert_eq!(
+                    encoded["fundingstreams"][0]["valueZat"],
+                    fund.amount.zatoshis()
+                );
+                assert_eq!(
+                    encoded["fundingstreams"][0]["address"],
+                    fund.address
+                        .encode_wcash(&network)
+                        .expect("address matches network")
+                );
+                if network.is_wcash_mainnet() {
+                    assert_eq!(
+                        encoded["fundingstreams"][0]["address"],
+                        WCASH_FOUNDATION_ADDRESS
+                    );
+                }
+            }
+        }
+    }
+}
