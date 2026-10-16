@@ -574,9 +574,9 @@ pub struct JournalShareCommit {
 pub enum JournalWinnerLifecycle {
     /// Exact bytes are retained for initial submission or reconciliation.
     Pending,
-    /// This exact valid Zcash proof lost its height race or every pinned parent
-    /// proved it committed off the best chain. Status-only monitoring survives
-    /// side-chain pruning and restart.
+    /// This exact valid proof is retained for status-only monitoring. Such
+    /// monitoring survives side-chain pruning and restart; absent Wcash bytes
+    /// can be requeued if their exact predecessor becomes current again.
     SideChain {
         /// Stable best-chain tip sampled with the committed side-chain proof.
         tip: ChainTip,
@@ -618,9 +618,9 @@ pub enum JournalWinnerLifecycle {
 impl JournalWinnerLifecycle {
     /// Returns true while exact winner bytes still require node submission.
     ///
-    /// A dependency failure in these states blocks safe winner delivery and
-    /// therefore mining admission. Status-only audits retain exact bytes and
-    /// keep payout transitions closed without blocking current share work.
+    /// A dependency failure in these states defers safe winner delivery.
+    /// Status-only audits retain exact bytes and keep payout transitions closed;
+    /// active-job share admission is independent of historical retry state.
     pub fn requires_submission(&self) -> bool {
         matches!(self, Self::Pending | Self::Requeued { .. })
     }
@@ -632,8 +632,7 @@ impl JournalWinnerLifecycle {
 /// snapshots can authorize a compare-and-swap transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum JournalWinnerTransition {
-    /// This exact valid Zcash proof lost its height race or every pinned parent
-    /// retained it off the best chain.
+    /// This retained proof requires status-only monitoring without credit.
     SideChain {
         /// Stable best-chain tip sampled with the noncanonical proof.
         tip: ChainTip,
@@ -655,9 +654,10 @@ pub(crate) enum JournalWinnerTransition {
         /// Exact best-chain tip sampled with the conflict.
         tip: ChainTip,
     },
-    /// A quarantined Wcash winner is absent and eligible for resubmission.
+    /// A quarantined or side-chain Wcash winner is absent and eligible for
+    /// resubmission on its exact predecessor.
     Requeued {
-        /// Exact best-chain tip sampled before releasing quarantine.
+        /// Exact best-chain tip sampled before releasing the retained proof.
         tip: ChainTip,
     },
     /// An observed reward reached its immutable maturity threshold.
@@ -2044,12 +2044,13 @@ impl JournalSemanticState {
             } => {
                 require_no_private_blocks(&record.winner_blocks, event_seq)?;
                 let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
-                if winner.chain != MergedChain::Zcash
-                    || !matches!(state.lifecycle, JournalWinnerLifecycle::Pending)
-                {
+                if !matches!(
+                    state.lifecycle,
+                    JournalWinnerLifecycle::Pending | JournalWinnerLifecycle::Requeued { .. }
+                ) {
                     return Err(semantic(
                         event_seq,
-                        "only a pending Zcash proof can enter side-chain monitoring",
+                        "only a pending or requeued proof can enter side-chain monitoring",
                     ));
                 }
                 state.lifecycle = JournalWinnerLifecycle::SideChain { tip: tip.clone() };
@@ -2128,10 +2129,14 @@ impl JournalSemanticState {
             } => {
                 require_no_private_blocks(&record.winner_blocks, event_seq)?;
                 let state = self.exact_winner_mut(event_seq, share_id, job_id, winner)?;
-                if !matches!(state.lifecycle, JournalWinnerLifecycle::Quarantined { .. }) {
+                if !matches!(
+                    state.lifecycle,
+                    JournalWinnerLifecycle::Quarantined { .. }
+                        | JournalWinnerLifecycle::SideChain { .. }
+                ) {
                     return Err(semantic(
                         event_seq,
-                        "only a quarantined winner can be requeued",
+                        "only a quarantined or side-chain Wcash proof can be requeued",
                     ));
                 }
                 state.lifecycle = JournalWinnerLifecycle::Requeued { tip: tip.clone() };
@@ -3574,6 +3579,179 @@ mod tests {
             .expect("replay state is reconstructed");
         assert!(replay.replayed);
         assert_eq!(reopened.current_event_seq().unwrap(), 2);
+    }
+
+    #[test]
+    fn wcash_noncanonical_witness_and_requeued_state_survive_restart() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("backend.jsonl");
+        let config = config();
+        let block_bytes =
+            hex::decode(include_str!("vectors/wcash-valid-auxpow-block-nonzero-prev.txt").trim())
+                .unwrap();
+        let block: Block = block_bytes.as_slice().zcash_deserialize_into().unwrap();
+        let proof = wcash_zcash_aux::AuxPowProof::decode(
+            block.header.solution.as_wcash().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let parent_hash = proof.parent_header().block_hash().into_le_bytes();
+        let mut descriptor = job(9);
+        descriptor.wcash_candidate_hash_le = Hex32::new(block.hash().0);
+        descriptor.wcash_previous_hash_le = Hex32::new(block.header.previous_block_hash.0);
+        descriptor.wcash_coinbase_txid_le = Hex32::new(block.transactions[0].hash().0);
+        descriptor.wcash_height = u32::from(block.coinbase_height().unwrap());
+        let target: U256 = block
+            .header
+            .difficulty_threshold
+            .to_expanded()
+            .unwrap()
+            .into();
+        descriptor.wcash_target_le = TargetLe::new(target.to_little_endian());
+        let winner = WinnerDescriptor {
+            chain: MergedChain::Wcash,
+            block_hash_le: descriptor.wcash_candidate_hash_le.clone(),
+            height: descriptor.wcash_height,
+            coinbase_txid_le: descriptor.wcash_coinbase_txid_le.clone(),
+            reward_zat: descriptor.wcash_reward_zat,
+            maturity_confirmations: descriptor.wcash_maturity_confirmations,
+        };
+        let tip = ChainTip {
+            block_hash_le: Hex32::new([0x91; 32]),
+            height: winner.height,
+        };
+        for requeued in [false, true] {
+            let path = path.with_extension(if requeued { "requeued" } else { "pending" });
+            let journal = create(&path, &config);
+            journal
+                .append_event(BackendEvent::JobActivated {
+                    event_seq: 0,
+                    job: descriptor.clone(),
+                })
+                .unwrap();
+            let commit = journal
+                .append_share_committed(
+                    descriptor.job_id.clone(),
+                    Hex32::new([0x81; 32]),
+                    Hex32::new(parent_hash),
+                    vec![winner.clone()],
+                    identity(4),
+                    TargetLe::new([0xff; 32]),
+                    JournalWinnerBlocks {
+                        wcash: Some(block_bytes.clone()),
+                        zcash: None,
+                    },
+                )
+                .unwrap();
+            let mut revision = commit.receipt.event_seq;
+            if requeued {
+                let quarantined = journal
+                    .compare_and_transition_winner(
+                        &commit.receipt.share_id,
+                        MergedChain::Wcash,
+                        revision,
+                        JournalWinnerTransition::Quarantined { tip: tip.clone() },
+                    )
+                    .unwrap();
+                let requeue = journal
+                    .compare_and_transition_winner(
+                        &commit.receipt.share_id,
+                        MergedChain::Wcash,
+                        quarantined.event_seq(),
+                        JournalWinnerTransition::Requeued { tip: tip.clone() },
+                    )
+                    .unwrap();
+                revision = requeue.event_seq();
+            }
+            let side_chain = journal
+                .compare_and_transition_winner(
+                    &commit.receipt.share_id,
+                    MergedChain::Wcash,
+                    revision,
+                    JournalWinnerTransition::SideChain { tip: tip.clone() },
+                )
+                .unwrap();
+            assert!(matches!(side_chain, BackendEvent::WinnerSideChain { .. }));
+            assert!(matches!(
+                journal.compare_and_transition_winner(
+                    &commit.receipt.share_id,
+                    MergedChain::Wcash,
+                    revision,
+                    JournalWinnerTransition::Observed {
+                        tip: tip.clone(),
+                        confirmations: 1
+                    }
+                ),
+                Err(PoolBackendJournalError::WinnerRevisionConflict { .. })
+            ));
+            drop(journal);
+            let journal = open(&path, &config);
+            let (_, retained) = journal.next_winner_state(None).unwrap().unwrap();
+            assert_eq!(retained.block_bytes, block_bytes);
+            assert_eq!(retained.parent_hash_le, Hex32::new(parent_hash));
+            assert_eq!(retained.winner, winner);
+            assert!(matches!(
+                retained.lifecycle,
+                JournalWinnerLifecycle::SideChain { .. }
+            ));
+            assert!(!retained.lifecycle.requires_submission());
+            assert!(journal.next_unsettled_winner_state(None).unwrap().is_some());
+            assert!(journal.next_matured_winner_state(None).unwrap().is_none());
+            let (journal, retained) = if !requeued {
+                let predecessor = ChainTip {
+                    block_hash_le: Hex32::new(block.header.previous_block_hash.0),
+                    height: winner.height - 1,
+                };
+                let requeue = journal
+                    .compare_and_transition_winner(
+                        &retained.share_id,
+                        MergedChain::Wcash,
+                        retained.revision_event_seq,
+                        JournalWinnerTransition::Requeued { tip: predecessor },
+                    )
+                    .unwrap();
+                assert!(matches!(requeue, BackendEvent::WinnerRequeued { .. }));
+                assert!(matches!(
+                    journal.compare_and_transition_winner(
+                        &retained.share_id,
+                        MergedChain::Wcash,
+                        retained.revision_event_seq,
+                        JournalWinnerTransition::SideChain { tip: tip.clone() },
+                    ),
+                    Err(PoolBackendJournalError::WinnerRevisionConflict { .. })
+                ));
+                drop(journal);
+                let journal = open(&path, &config);
+                let (_, retained) = journal.next_winner_state(None).unwrap().unwrap();
+                assert_eq!(retained.block_bytes, block_bytes);
+                assert_eq!(retained.parent_hash_le, Hex32::new(parent_hash));
+                assert_eq!(retained.winner, winner);
+                assert!(matches!(
+                    retained.lifecycle,
+                    JournalWinnerLifecycle::Requeued { .. }
+                ));
+                assert!(retained.lifecycle.requires_submission());
+                assert!(journal.next_matured_winner_state(None).unwrap().is_none());
+                (journal, retained)
+            } else {
+                (journal, retained)
+            };
+            let canonical_tip = ChainTip {
+                block_hash_le: winner.block_hash_le.clone(),
+                height: winner.height,
+            };
+            let observed = journal
+                .compare_and_transition_winner(
+                    &retained.share_id,
+                    MergedChain::Wcash,
+                    retained.revision_event_seq,
+                    JournalWinnerTransition::Observed {
+                        tip: canonical_tip,
+                        confirmations: 1,
+                    },
+                )
+                .unwrap();
+            assert!(matches!(observed, BackendEvent::WinnerObserved { .. }));
+        }
     }
 
     #[test]

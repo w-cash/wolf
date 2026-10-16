@@ -1,6 +1,6 @@
 //! Error types for local job construction and share validation.
 
-use std::io;
+use std::{error::Error as _, io};
 
 use thiserror::Error;
 
@@ -215,4 +215,104 @@ pub enum MinerError {
     /// The live parent template failed a local invariant before reaching miners.
     #[error("invalid parent template: {0}")]
     InvalidParentTemplate(String),
+}
+
+impl MinerError {
+    /// Whether a well-formed dependency failure can be retried during native
+    /// preparation, before any winner bytes have been durably recorded.
+    pub fn is_retryable_native_rpc_failure(&self) -> bool {
+        match self {
+            Self::RpcTransport(error) => is_retryable_rpc_transport(error),
+            Self::RpcHttpStatus(status) => {
+                matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
+            }
+            Self::RpcError {
+                code: Some(-9 | -10 | -28 | -32_001),
+                ..
+            } => true,
+            Self::Io(error) => is_retryable_io_kind(error.kind()),
+            _ => false,
+        }
+    }
+
+    /// Whether an RPC observation of an already durable winner can be retried.
+    /// Missing state during a reorganization is safe to retry here, but is not
+    /// sufficient evidence to release new work during job preparation.
+    pub fn is_retryable_winner_rpc_failure(&self) -> bool {
+        match self {
+            // Blocking response reads wrap interrupted bodies and read timeouts
+            // as `io::ErrorKind::Other`. An interrupted observation cannot make
+            // exact durable winner bytes invalid. Keep preparation's stricter
+            // classifier independent, and retain construction/protocol errors.
+            Self::RpcTransport(error) => !error.is_builder(),
+            Self::Io(_) => true,
+            Self::RpcError {
+                code: Some(-1 | -5),
+                ..
+            } => true,
+            _ => self.is_retryable_native_rpc_failure(),
+        }
+    }
+}
+
+fn is_retryable_rpc_transport(error: &reqwest::Error) -> bool {
+    if error.is_timeout() {
+        return true;
+    }
+    // Generic build/TLS errors can be permanent. Require an explicitly
+    // transient I/O cause before retrying a non-timeout transport error.
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| is_retryable_io_kind(error.kind()))
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
+}
+
+const fn is_retryable_io_kind(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn winner_retry_preserves_io_uncertainty_without_relaxing_preparation() {
+        let error = MinerError::Io(io::Error::other("interrupted HTTP response body"));
+        assert!(error.is_retryable_winner_rpc_failure());
+        assert!(!error.is_retryable_native_rpc_failure());
+    }
+
+    #[test]
+    fn winner_retry_keeps_construction_and_decoded_protocol_errors_fatal() {
+        let error = reqwest::blocking::Client::new()
+            .get("invalid URL")
+            .build()
+            .unwrap_err();
+        assert!(error.is_builder());
+        assert!(!MinerError::RpcTransport(error).is_retryable_winner_rpc_failure());
+        assert!(!MinerError::RpcProtocol("invalid response ID".to_string())
+            .is_retryable_winner_rpc_failure());
+        let error = serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err();
+        assert!(!MinerError::Json(error).is_retryable_winner_rpc_failure());
+    }
 }
