@@ -53,7 +53,9 @@ pub(crate) fn uses_wcash_consensus() -> bool {
 
 /// Returns the genesis block belonging to `network`.
 pub(crate) fn test_genesis(network: &Network) -> Arc<Block> {
-    if network.is_wcash_testnet() {
+    if network.is_wcash_mainnet() {
+        block::genesis::wcash_mainnet_genesis_block().expect("Wcash Mainnet genesis is enabled")
+    } else if network.is_wcash_testnet() {
         block::genesis::wcash_testnet_genesis_block()
     } else if network.is_wcash_regtest() {
         block::genesis::wcash_regtest_genesis_block()

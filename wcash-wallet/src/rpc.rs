@@ -35,7 +35,10 @@ use zcash_primitives::{
     transaction::{Transaction, TxVersion},
 };
 use zcash_protocol::{constants::MAX_BLOCK_BYTES, TxId};
-use zcash_transparent::address::{Script, TransparentAddress};
+use zcash_transparent::{
+    address::{Script, TransparentAddress},
+    bundle::OutPoint,
+};
 use zebra_chain::{
     parameters::ConsensusBranchId,
     primitives::{WcashAddress, WcashAddressKind},
@@ -74,10 +77,18 @@ fn transparent_utxo_page_is_block_safe(maximum_outputs: usize) -> bool {
     maximum_outputs > MAX_BLOCK_BYTES / MIN_P2PKH_OUTPUT_ENCODED_BYTES
 }
 
-/// One mined full transaction returned by the current-UTXO query.
+/// One mined full transaction returned by an attested transparent-history query.
 pub(crate) struct MinedTransparentTransaction {
     pub(crate) transaction: Transaction,
     pub(crate) height: u32,
+}
+
+/// Exact creator bytes and validated current outputs. Omitted receiver outputs still require
+/// independent mined-spend reconciliation before transparent recovery may be completed.
+pub(crate) struct ValidatedTransparentCreator {
+    pub(crate) transaction: Transaction,
+    pub(crate) height: u32,
+    pub(crate) missing_outputs: Vec<OutPoint>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +108,31 @@ pub(crate) struct TransparentUnspentCreator {
 impl TransparentUnspentCreator {
     pub(crate) const fn txid(&self) -> TxId {
         self.txid
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(transaction: &Transaction, height: u32, indexes: &[usize]) -> Self {
+        let bundle = transaction
+            .transparent_bundle()
+            .expect("test creator has a transparent bundle");
+        Self {
+            txid: transaction.txid(),
+            outputs: indexes
+                .iter()
+                .map(|&output_index| {
+                    let output = bundle
+                        .vout
+                        .get(output_index)
+                        .expect("test creator output exists");
+                    TransparentUnspentOutput {
+                        output_index,
+                        script: output.script_pubkey().0 .0.clone(),
+                        value_zat: output.value().into_u64(),
+                        height,
+                    }
+                })
+                .collect(),
+        }
     }
 }
 
@@ -157,6 +193,12 @@ impl AttestedWcashClient {
     #[cfg(test)]
     pub(crate) fn disconnected_for_test(network: WalletNetwork) -> Self {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        Self::from_test_channel(network, channel)
+    }
+
+    /// Uses a local test transport with the same response decoding limit as a real connection.
+    #[cfg(test)]
+    pub(crate) fn from_test_channel(network: WalletNetwork, channel: Channel) -> Self {
         Self {
             inner: CompactTxStreamerClient::new(channel).max_decoding_message_size(MAX_BLOCK_BYTES),
             network,
@@ -547,11 +589,12 @@ impl AttestedWcashClient {
     }
 
     /// Fetches and verifies one full creator transaction from a previously
-    /// validated current-UTXO page.
+    /// validated current-UTXO page. Missing receiver outputs are returned explicitly and must
+    /// be reconciled with canonical mined spends before the caller completes recovery.
     pub(crate) async fn transparent_creator_transaction(
         &mut self,
         creator: TransparentUnspentCreator,
-    ) -> Result<MinedTransparentTransaction, WalletRpcError> {
+    ) -> Result<ValidatedTransparentCreator, WalletRpcError> {
         let txid = creator.txid;
         let raw = self
             .inner
@@ -562,36 +605,46 @@ impl AttestedWcashClient {
             })
             .await?
             .into_inner();
-        let (transaction, expected_height) = validate_transparent_creator_transaction(
-            self.network,
-            &creator,
-            &raw.data,
-            raw.height,
-        )?;
-        Ok(MinedTransparentTransaction {
-            transaction,
-            height: expected_height,
-        })
+        validate_transparent_creator_transaction(self.network, &creator, &raw.data, raw.height)
     }
 
     /// Revalidates a previously persisted creator against a fresh current-UTXO
-    /// page without performing another transaction RPC.
+    /// page without performing another transaction RPC. The returned full bytes
+    /// can be imported again, but omissions still require canonical spend proof.
     pub(crate) fn validate_stored_transparent_creator(
         &self,
         creator: &TransparentUnspentCreator,
         raw: &[u8],
         mined_height: u32,
-    ) -> Result<bool, WalletRpcError> {
+    ) -> Result<ValidatedTransparentCreator, WalletRpcError> {
         validate_transparent_creator_transaction(
             self.network,
             creator,
             raw,
             u64::from(mined_height),
         )
-        .map(|(transaction, _)| {
-            transaction
-                .transparent_bundle()
-                .is_some_and(|bundle| bundle.is_coinbase())
+    }
+
+    /// Revalidates exact cached witness bytes for this network and expected txid.
+    /// The caller must separately authenticate the claimed height and canonical
+    /// checkpoint before using these bytes as mined-spend evidence.
+    pub(crate) fn validate_cached_transparent_witness(
+        &self,
+        raw: &[u8],
+        expected_txid: TxId,
+        height: u32,
+    ) -> Result<MinedTransparentTransaction, WalletRpcError> {
+        if raw.len() > MAX_BLOCK_BYTES {
+            return Err(WalletRpcError::OversizedTransparentTransaction {
+                txid: expected_txid.to_string(),
+                encoded_bytes: raw.len(),
+            });
+        }
+        let transaction = parse_wcash_v6_transaction(raw, self.network)?;
+        ensure_expected_txid(transaction.txid(), expected_txid)?;
+        Ok(MinedTransparentTransaction {
+            transaction,
+            height,
         })
     }
 
@@ -791,7 +844,7 @@ fn validate_transparent_creator_transaction(
     creator: &TransparentUnspentCreator,
     raw: &[u8],
     actual_height: u64,
-) -> Result<(Transaction, u32), WalletRpcError> {
+) -> Result<ValidatedTransparentCreator, WalletRpcError> {
     let txid = creator.txid;
     let expected_height = creator
         .outputs
@@ -835,8 +888,13 @@ fn validate_transparent_creator_transaction(
                 "creator transaction {txid} has a non-P2PKH output script"
             ))
         })?;
-    validate_transparent_unspent_outputs(&transaction, &creator.outputs, &receiver, txid)?;
-    Ok((transaction, expected_height))
+    let missing_outputs =
+        validate_transparent_unspent_outputs(&transaction, &creator.outputs, &receiver, txid)?;
+    Ok(ValidatedTransparentCreator {
+        transaction,
+        height: expected_height,
+        missing_outputs,
+    })
 }
 
 fn transparent_history_limits(
@@ -994,30 +1052,25 @@ fn validate_transparent_unspent_outputs(
     outputs: &[TransparentUnspentOutput],
     receiver: &TransparentAddress,
     txid: TxId,
-) -> Result<(), WalletRpcError> {
+) -> Result<Vec<OutPoint>, WalletRpcError> {
     let bundle = transaction.transparent_bundle().ok_or_else(|| {
         WalletRpcError::TransparentUtxoMismatch(format!(
             "creator transaction {txid} has no transparent bundle"
         ))
     })?;
-    let matching_output_indexes = bundle
-        .vout
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| {
-            (candidate.recipient_address().as_ref() == Some(receiver)).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let reported_output_indexes = outputs
-        .iter()
-        .map(|output| output.output_index)
-        .collect::<Vec<_>>();
-    if !exact_unique_index_sets_match(&matching_output_indexes, &reported_output_indexes) {
+    if outputs.is_empty() {
         return Err(WalletRpcError::TransparentUtxoMismatch(format!(
-            "creator transaction {txid} has a payout-address output absent from the current UTXO set"
+            "creator transaction {txid} has no reported current outputs"
         )));
     }
+    let mut reported_output_indexes = HashSet::with_capacity(outputs.len());
     for output in outputs {
+        if !reported_output_indexes.insert(output.output_index) {
+            return Err(WalletRpcError::DuplicateTransparentOutpoint {
+                txid: txid.to_string(),
+                output_index: output.output_index,
+            });
+        }
         let candidate = bundle.vout.get(output.output_index).ok_or_else(|| {
             WalletRpcError::TransparentUtxoMismatch(format!(
                 "creator transaction {txid} has no output {}",
@@ -1034,19 +1087,23 @@ fn validate_transparent_unspent_outputs(
             )));
         }
     }
-    Ok(())
-}
-
-fn exact_unique_index_sets_match(expected: &[usize], actual: &[usize]) -> bool {
-    if expected.len() != actual.len() {
-        return false;
-    }
-    let mut expected = expected.to_vec();
-    let mut actual = actual.to_vec();
-    expected.sort_unstable();
-    actual.sort_unstable();
-    let has_duplicate = |indexes: &[usize]| indexes.windows(2).any(|pair| pair[0] == pair[1]);
-    !has_duplicate(&expected) && !has_duplicate(&actual) && expected == actual
+    bundle
+        .vout
+        .iter()
+        .enumerate()
+        .filter(|(index, output)| {
+            output.recipient_address().as_ref() == Some(receiver)
+                && !reported_output_indexes.contains(index)
+        })
+        .map(|(index, _)| {
+            let index = u32::try_from(index).map_err(|_| {
+                WalletRpcError::TransparentUtxoMismatch(format!(
+                    "creator transaction {txid} output index exceeds the outpoint encoding"
+                ))
+            })?;
+            Ok(OutPoint::new(*txid.as_ref(), index))
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -2324,16 +2381,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn current_utxos_must_cover_every_output_to_the_payout_receiver() {
-        assert!(exact_unique_index_sets_match(&[7, 2], &[2, 7]));
-        assert!(!exact_unique_index_sets_match(&[2, 7], &[2]));
-        assert!(!exact_unique_index_sets_match(&[2], &[2, 7]));
-        assert!(!exact_unique_index_sets_match(&[2, 7], &[2, 2]));
-    }
-
-    #[test]
-    fn full_creator_validation_rejects_an_unreported_spent_sibling() {
+    fn split_transparent_creator_transaction() -> (Transaction, TransparentAddress) {
         use zcash_protocol::{consensus::BranchId, value::Zatoshis};
         use zcash_transparent::bundle::{Authorized, Bundle, OutPoint, TxIn, TxOut};
 
@@ -2350,8 +2398,12 @@ mod tests {
                     u32::MAX,
                 )],
                 vout: vec![
-                    TxOut::new(Zatoshis::const_from_u64(11), script.clone()),
-                    TxOut::new(Zatoshis::const_from_u64(12), script.clone()),
+                    TxOut::new(Zatoshis::const_from_u64(437_500_000), script.clone()),
+                    TxOut::new(Zatoshis::const_from_u64(187_500_000), script),
+                    TxOut::new(
+                        Zatoshis::const_from_u64(7),
+                        Script::from(TransparentAddress::PublicKeyHash([0x66; 20]).script()),
+                    ),
                 ],
                 authorization: Authorized,
             }),
@@ -2361,47 +2413,290 @@ mod tests {
         )
         .freeze()
         .unwrap();
-        let output = |output_index, value_zat| TransparentUnspentOutput {
-            output_index,
-            script: script.0 .0.clone(),
-            value_zat,
-            height: 7,
-        };
+        (transaction, receiver)
+    }
 
+    #[test]
+    fn partial_creator_validation_reports_each_omitted_receiver_outpoint() {
+        let (transaction, receiver) = split_transparent_creator_transaction();
+        for (reported_index, missing_index) in [(0, 1), (1, 0)] {
+            let creator = TransparentUnspentCreator::for_test(&transaction, 10, &[reported_index]);
+            assert_eq!(
+                validate_transparent_unspent_outputs(
+                    &transaction,
+                    &creator.outputs,
+                    &receiver,
+                    transaction.txid(),
+                )
+                .unwrap(),
+                vec![OutPoint::new(*transaction.txid().as_ref(), missing_index)],
+            );
+        }
+
+        // Output 2 pays a different receiver and must never become an omission to reconcile.
+        let creator = TransparentUnspentCreator::for_test(&transaction, 10, &[1, 0]);
+        assert!(validate_transparent_unspent_outputs(
+            &transaction,
+            &creator.outputs,
+            &receiver,
+            transaction.txid(),
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn reported_creator_outputs_require_exact_unique_outpoints() {
+        let (transaction, receiver) = split_transparent_creator_transaction();
+        let creator = TransparentUnspentCreator::for_test(&transaction, 10, &[0, 0]);
         assert!(matches!(
             validate_transparent_unspent_outputs(
                 &transaction,
-                &[output(0, 11)],
+                &creator.outputs,
+                &receiver,
+                transaction.txid(),
+            ),
+            Err(WalletRpcError::DuplicateTransparentOutpoint {
+                output_index: 0,
+                ..
+            })
+        ));
+
+        let mut creator = TransparentUnspentCreator::for_test(&transaction, 10, &[0]);
+        creator.outputs[0].output_index = 3;
+        assert!(matches!(
+            validate_transparent_unspent_outputs(
+                &transaction,
+                &creator.outputs,
                 &receiver,
                 transaction.txid(),
             ),
             Err(WalletRpcError::TransparentUtxoMismatch(_))
         ));
-        assert!(validate_transparent_unspent_outputs(
-            &transaction,
-            &[output(1, 12), output(0, 11)],
-            &receiver,
-            transaction.txid(),
-        )
-        .is_ok());
+        assert!(matches!(
+            validate_transparent_unspent_outputs(&transaction, &[], &receiver, transaction.txid()),
+            Err(WalletRpcError::TransparentUtxoMismatch(_))
+        ));
+    }
 
-        let creator = TransparentUnspentCreator {
-            txid: transaction.txid(),
-            outputs: vec![output(1, 12), output(0, 11)],
+    #[test]
+    fn reported_creator_outputs_require_exact_values_scripts_and_receiver() {
+        let (transaction, receiver) = split_transparent_creator_transaction();
+        let validate = |creator: &TransparentUnspentCreator| {
+            validate_transparent_unspent_outputs(
+                &transaction,
+                &creator.outputs,
+                &receiver,
+                transaction.txid(),
+            )
         };
+        let mut creator = TransparentUnspentCreator::for_test(&transaction, 10, &[0, 1]);
+        // Preserving the sum cannot substitute for checking each individual output.
+        creator.outputs[0].value_zat -= 1;
+        creator.outputs[1].value_zat += 1;
+        assert!(matches!(
+            validate(&creator),
+            Err(WalletRpcError::TransparentUtxoMismatch(_))
+        ));
+
+        let mut creator = TransparentUnspentCreator::for_test(&transaction, 10, &[0]);
+        creator.outputs[0].script =
+            Script::from(TransparentAddress::PublicKeyHash([0x66; 20]).script())
+                .0
+                 .0;
+        assert!(matches!(
+            validate(&creator),
+            Err(WalletRpcError::TransparentUtxoMismatch(_))
+        ));
+        creator.outputs[0].script = vec![0x51];
+        assert!(matches!(
+            validate(&creator),
+            Err(WalletRpcError::TransparentUtxoMismatch(_))
+        ));
+
+        let foreign_receiver = TransparentUnspentCreator::for_test(&transaction, 10, &[2]);
+        assert!(matches!(
+            validate(&foreign_receiver),
+            Err(WalletRpcError::TransparentUtxoMismatch(_))
+        ));
+        let mixed_receivers = TransparentUnspentCreator::for_test(&transaction, 10, &[0, 2]);
+        assert!(matches!(
+            validate(&mixed_receivers),
+            Err(WalletRpcError::TransparentUtxoMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn full_creator_validation_returns_omissions_without_claiming_they_are_spent() {
+        let (transaction, _) = split_transparent_creator_transaction();
+        let creator = TransparentUnspentCreator::for_test(&transaction, 10, &[1]);
         let mut raw = Vec::new();
         transaction.write(&mut raw).unwrap();
-        let (stored, height) =
-            validate_transparent_creator_transaction(WalletNetwork::Testnet, &creator, &raw, 7)
+        let validated =
+            validate_transparent_creator_transaction(WalletNetwork::Testnet, &creator, &raw, 10)
                 .unwrap();
-        assert_eq!(stored.txid(), transaction.txid());
-        assert_eq!(height, 7);
-        assert!(stored
+        assert_eq!(validated.transaction.txid(), transaction.txid());
+        assert_eq!(validated.height, 10);
+        assert_eq!(
+            validated.missing_outputs,
+            vec![OutPoint::new(*transaction.txid().as_ref(), 0)]
+        );
+        assert!(validated
+            .transaction
             .transparent_bundle()
             .is_some_and(|bundle| bundle.is_coinbase()));
+
+        let creator = TransparentUnspentCreator::for_test(&transaction, 10, &[1, 0]);
+        let validated =
+            validate_transparent_creator_transaction(WalletNetwork::Testnet, &creator, &raw, 10)
+                .unwrap();
+        assert!(validated.missing_outputs.is_empty());
+    }
+
+    #[test]
+    fn full_creator_validation_rejects_inconsistent_or_unmined_heights() {
+        let (transaction, _) = split_transparent_creator_transaction();
+        let mut raw = Vec::new();
+        transaction.write(&mut raw).unwrap();
+        let mut creator = TransparentUnspentCreator::for_test(&transaction, 10, &[1, 0]);
+        for actual_height in [0, 9, 11, u64::MAX] {
+            assert!(matches!(
+                validate_transparent_creator_transaction(
+                    WalletNetwork::Testnet,
+                    &creator,
+                    &raw,
+                    actual_height,
+                ),
+                Err(WalletRpcError::UnexpectedTransparentTransactionHeight { .. })
+            ));
+        }
+        creator.outputs[1].height = 9;
         assert!(matches!(
-            validate_transparent_creator_transaction(WalletNetwork::Testnet, &creator, &raw, 8,),
+            validate_transparent_creator_transaction(WalletNetwork::Testnet, &creator, &raw, 10),
+            Err(WalletRpcError::TransparentUtxoMismatch(_))
+        ));
+        creator.outputs.clear();
+        assert!(matches!(
+            validate_transparent_creator_transaction(WalletNetwork::Testnet, &creator, &raw, 10),
+            Err(WalletRpcError::TransparentUtxoMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn full_creator_validation_binds_exact_transaction_bytes_and_network() {
+        let (transaction, _) = split_transparent_creator_transaction();
+        let mut raw = Vec::new();
+        transaction.write(&mut raw).unwrap();
+        let mut creator = TransparentUnspentCreator::for_test(&transaction, 10, &[0]);
+        creator.txid = TxId::from_bytes([0x77; 32]);
+        assert!(matches!(
+            validate_transparent_creator_transaction(WalletNetwork::Testnet, &creator, &raw, 10),
+            Err(WalletRpcError::InvalidTransaction(_))
+        ));
+        let creator = TransparentUnspentCreator::for_test(&transaction, 10, &[0]);
+        assert!(validate_transparent_creator_transaction(
+            WalletNetwork::Mainnet,
+            &creator,
+            &raw,
+            10,
+        )
+        .is_err());
+        raw.push(0);
+        assert!(matches!(
+            validate_transparent_creator_transaction(WalletNetwork::Testnet, &creator, &raw, 10),
+            Err(WalletRpcError::InvalidTransaction(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stored_creator_validation_reports_partial_and_complete_current_outputs() {
+        let (transaction, _) = split_transparent_creator_transaction();
+        let mut raw = Vec::new();
+        transaction.write(&mut raw).unwrap();
+        let client = AttestedWcashClient::disconnected_for_test(WalletNetwork::Testnet);
+        let creator = TransparentUnspentCreator::for_test(&transaction, 10, &[0]);
+        let validated = client
+            .validate_stored_transparent_creator(&creator, &raw, 10)
+            .unwrap();
+        assert_eq!(validated.transaction.txid(), transaction.txid());
+        assert_eq!(validated.height, 10);
+        assert_eq!(
+            validated.missing_outputs,
+            vec![OutPoint::new(*transaction.txid().as_ref(), 1)],
+        );
+        let mut cached_raw = Vec::new();
+        validated.transaction.write(&mut cached_raw).unwrap();
+        assert_eq!(cached_raw, raw);
+        let creator = TransparentUnspentCreator::for_test(&transaction, 10, &[1, 0]);
+        let validated = client
+            .validate_stored_transparent_creator(&creator, &raw, 10)
+            .unwrap();
+        assert!(validated.missing_outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_creator_reuse_revalidates_current_output_metadata_and_full_bytes() {
+        let (transaction, _) = split_transparent_creator_transaction();
+        let mut raw = Vec::new();
+        transaction.write(&mut raw).unwrap();
+        let client = AttestedWcashClient::disconnected_for_test(WalletNetwork::Testnet);
+        let mut creator = TransparentUnspentCreator::for_test(&transaction, 10, &[1]);
+        creator.outputs[0].value_zat += 1;
+        assert!(matches!(
+            client.validate_stored_transparent_creator(&creator, &raw, 10),
+            Err(WalletRpcError::TransparentUtxoMismatch(_))
+        ));
+        let creator = TransparentUnspentCreator::for_test(&transaction, 10, &[1]);
+        assert!(matches!(
+            client.validate_stored_transparent_creator(&creator, &raw, 9),
             Err(WalletRpcError::UnexpectedTransparentTransactionHeight { .. })
+        ));
+        assert!(matches!(
+            client.validate_stored_transparent_creator(&creator, &[0], 10),
+            Err(WalletRpcError::InvalidTransaction(_))
+        ));
+        raw.push(0);
+        assert!(matches!(
+            client.validate_stored_transparent_creator(&creator, &raw, 10),
+            Err(WalletRpcError::InvalidTransaction(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cached_witness_validation_binds_exact_bytes_txid_and_network() {
+        let (transaction, _) = split_transparent_creator_transaction();
+        let mut raw = Vec::new();
+        transaction.write(&mut raw).unwrap();
+        let txid = transaction.txid();
+        let client = AttestedWcashClient::disconnected_for_test(WalletNetwork::Testnet);
+        let validated = client
+            .validate_cached_transparent_witness(&raw, txid, 110)
+            .unwrap();
+        assert_eq!(validated.transaction.txid(), txid);
+        assert_eq!(validated.height, 110);
+        let mut retained_raw = Vec::new();
+        validated.transaction.write(&mut retained_raw).unwrap();
+        assert_eq!(retained_raw, raw);
+        assert!(matches!(
+            client.validate_cached_transparent_witness(&raw, TxId::from_bytes([0x77; 32]), 110),
+            Err(WalletRpcError::InvalidTransaction(_))
+        ));
+        let other_network = AttestedWcashClient::disconnected_for_test(WalletNetwork::Mainnet);
+        assert!(other_network
+            .validate_cached_transparent_witness(&raw, txid, 110)
+            .is_err());
+        assert!(matches!(
+            client.validate_cached_transparent_witness(&[0], txid, 110),
+            Err(WalletRpcError::InvalidTransaction(_))
+        ));
+        raw.push(0);
+        assert!(matches!(
+            client.validate_cached_transparent_witness(&raw, txid, 110),
+            Err(WalletRpcError::InvalidTransaction(_))
+        ));
+        assert!(matches!(
+            client.validate_cached_transparent_witness(&vec![0; MAX_BLOCK_BYTES + 1], txid, 110),
+            Err(WalletRpcError::OversizedTransparentTransaction { .. })
         ));
     }
 }

@@ -42,7 +42,8 @@ and the repository's [PR template](.github/pull_request_template.md).
   [consensus reference](docs/wcash-consensus.md) and linked source.
 - Preserve the maintainer-approved [protocol direction](docs/wcash-direction.md):
   merge mining, the 40,000-block Mainnet slow start, Monero-style integer smooth
-  decay, permanent tail emission, no protocol tax, and exactly the transparent
+  decay, permanent tail emission, the fixed 30% foundation allocation only at
+  Mainnet heights 33000–621454, and exactly the transparent
   and Ironwood active value pools. Changing any of these is not a cleanup.
 - Never change frozen genesis, branch IDs, wire versions or monetary constants
   as a documentation cleanup. Mainnet has no fixed economic supply cap; its

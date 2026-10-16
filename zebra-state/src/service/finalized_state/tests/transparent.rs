@@ -16,7 +16,9 @@ use std::{
 };
 
 use zebra_chain::{
-    amount::{Amount, DeferredPoolBalanceChange, NonNegative, MAX_MONEY},
+    amount::{
+        Amount, DeferredPoolBalanceChange, NonNegative, MAX_MONEY, MAX_SINGLE_TRANSACTION_VALUE,
+    },
     block::{self, Block, Height},
     parameters::{Network, NetworkKind},
     serialization::ZcashDeserializeInto,
@@ -58,16 +60,16 @@ fn new_ephemeral_zebra_db(network: &Network) -> ZebraDb {
 /// Cross-version regression test for the credit-before-debit overflow panic.
 ///
 /// Builds a synthetic block whose two transactions form a same-address self-spend
-/// chain that re-creates an existing `MAX_MONEY / 2` UTXO twice, and drives it
+/// chain that re-creates a transaction-representable UTXO of value `V` twice, and drives it
 /// through [`DiskWriteBatch::prepare_transparent_transaction_batch`].
 ///
 /// - On the **buggy** revision the writer credits both new outputs before debiting
-///   the matching spends, so the intermediate balance reaches `1.5 * MAX_MONEY`
+///   the matching spends, so the intermediate balance reaches `MAX_MONEY + V`
 ///   and panics with `"balance overflow already checked"`.
 /// - On the **fixed** revision the writer processes each transaction in block order
 ///   (debit-then-credit), so the per-address running balance stays in
 ///   `[0, MAX_MONEY]` and the final on-disk balance equals the original
-///   `MAX_MONEY / 2`.
+///   `MAX_MONEY - V`. Other unspent outputs account for the rest of that address balance.
 #[test]
 fn intra_block_self_spend_chain_in_finalized_state() {
     let _init_guard = zebra_test::init();
@@ -75,8 +77,20 @@ fn intra_block_self_spend_chain_in_finalized_state() {
     let network = Network::Mainnet;
     let height = Height(1);
     let address = Address::from_script_hash(NetworkKind::Mainnet, [0x42; 20]);
-    let value = Amount::<NonNegative>::try_from(MAX_MONEY / 2)
-        .expect("MAX_MONEY / 2 fits in Amount<NonNegative>");
+    // Wcash widens aggregate address balances, while individual serialized outputs still
+    // use the inherited transaction-library bound. Keep the overflow regression meaningful
+    // under either profile by placing the initial aggregate balance one output below its bound.
+    let value_atoms = MAX_MONEY.min(MAX_SINGLE_TRANSACTION_VALUE) / 2;
+    let value = Amount::<NonNegative>::try_from(value_atoms)
+        .expect("half the smaller value bound fits in a transaction output");
+    let initial_balance = Amount::<NonNegative>::try_from(MAX_MONEY - value_atoms)
+        .expect("the initial address balance is below the aggregate value bound");
+    let after_first_credit = (initial_balance + value).unwrap();
+    assert_eq!(after_first_credit.zatoshis(), MAX_MONEY);
+    assert!(
+        (after_first_credit + value).is_err(),
+        "credit-before-debit must still overflow"
+    );
 
     // T0 spends a pre-existing on-chain UTXO of value V to address A and re-creates V to A.
     let existing_outpoint = OutPoint {
@@ -162,8 +176,8 @@ fn intra_block_self_spend_chain_in_finalized_state() {
     // Pre-populate `address_balances` with A's pre-block on-chain balance, the way
     // `block.rs` does via `read_addr_locs`.
     let mut existing_abl = AddressBalanceLocation::new(existing_output_location);
-    *existing_abl.balance_mut() = value;
-    *existing_abl.received_mut() = u64::from(value);
+    *existing_abl.balance_mut() = initial_balance;
+    *existing_abl.received_mut() = u64::from(initial_balance);
     let address_balances =
         AddressBalanceLocationUpdates::Insert(HashMap::from([(address, existing_abl)]));
 
@@ -171,7 +185,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
     let mut batch = DiskWriteBatch::new();
 
     // On the buggy revision this call panics with "balance overflow already checked" during
-    // the credit-first batch (intermediate balance reaches 1.5 * MAX_MONEY). On the fixed
+    // the credit-first batch (intermediate balance reaches MAX_MONEY + V). On the fixed
     // revision it completes cleanly.
     batch.prepare_transparent_transaction_batch(
         &zebra_db,
@@ -186,7 +200,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
     );
 
     // Write the batch and confirm the final on-disk balance matches the consensus value
-    // (existing V − 2*V debits + 2*V credits = V).
+    // (existing balance − 2*V debits + 2*V credits = existing balance).
     zebra_db
         .write_batch(batch)
         .expect("ephemeral db accepts the batch");
@@ -194,10 +208,15 @@ fn intra_block_self_spend_chain_in_finalized_state() {
     let (balance, received) = zebra_db
         .address_balance(&address)
         .expect("address balance is present after writing the batch");
-    assert_eq!(balance, value, "final balance equals the existing balance");
+    assert_eq!(
+        balance, initial_balance,
+        "final balance equals the existing balance"
+    );
     assert_eq!(
         received,
-        u64::from(value).saturating_mul(3),
-        "received counts the existing V plus two intra-block credits of V",
+        u64::from(initial_balance)
+            .checked_add(u64::from(value).checked_mul(2).unwrap())
+            .unwrap(),
+        "received counts the initial balance plus two intra-block credits of V",
     );
 }

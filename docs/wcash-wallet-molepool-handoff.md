@@ -6,6 +6,68 @@ operator commands needed to expose a second deterministic coinbase receiver.
 It does not authorize a pool, Stratum, node, payout-worker, miner, or Mainnet
 transaction change.
 
+## Current source status: 16 October 2026
+
+The wallet implementation was merged in [Wolf PR 33](https://github.com/w-cash/wolf/pull/33)
+on 10 October 2026. It is already included in Mainnet-upgrade commit
+`c0be7a0f2b39d4afa5c63f7c61b4e1d6a389be15`, together with the later wallet
+recovery fixes and foundation rules. The validation table below records the
+original wallet revision; it is not a test certificate for every later commit.
+
+The 16 October review repeated `cargo test -p wcash-wallet --locked` against
+the current wallet source included in `c0be7a0f2b`: 151 library tests, 11 CLI
+tests, and two transaction-domain tests passed, with no failures. Workspace
+formatting and `cargo clippy -p wcash-wallet --all-targets --all-features --locked -- -D warnings`
+also passed. The review changed documentation only. The real-node
+Regtest results below are the original validation record, not a claim that the
+full Regtest acceptance flow was rerun on 16 October.
+
+This feature creates **two addresses in one wallet account**, not two independent
+wallets. Use the existing database and account. Keep the current index-0 address
+for the first mining instance and expose index 1 for the second. Both receivers
+contribute to the same account balance and shield into the same Ironwood
+receiver. Creating account 1 would separate the logical account and does not
+implement this procedure.
+
+The CLI manages indices `0..=9`. Repeating `ensure --index 1` returns the same
+address. The account and receivers derive from the same seed; a fresh recovery
+must use the same network, account derivation, and a birthday covering the
+original history, then complete synchronization. Receiver assignment files are
+useful operator records, not a replacement for seed recovery material.
+
+### Build from reviewed source
+
+An operator can build the pinned source on the intended Linux host or an
+isolated Linux build machine with the documented
+[native prerequisites](wcash-node.md). This is a source build, not an officially
+signed release download:
+
+```sh
+git clone --filter=blob:none https://github.com/w-cash/wolf.git wolf-molepool
+cd wolf-molepool
+git checkout --detach c0be7a0f2b39d4afa5c63f7c61b4e1d6a389be15
+cargo +1.91.0 build --locked --release -p wcash-wallet --bin wcash-wallet
+sha256sum target/release/wcash-wallet
+```
+
+Record the source revision and resulting checksum. Review the resulting Linux
+artifact before installing it. The macOS validation binary described below is
+not a Linux artifact. Replacing an executable is separate from changing an
+existing wallet database or mining route.
+
+### Foundation upgrade and Stratum
+
+The [foundation upgrade](wcash-foundation-fund-upgrade.md) is a separate node
+upgrade required before Mainnet height 33000. A pool that delegates Wcash
+candidate construction to the upgraded node's `createauxblock` does not need a
+Stratum wire-protocol change for the foundation output. Integrations that build
+or validate their own coinbase must follow the updated
+[pool compatibility contract](wcash-pool-compatibility.md).
+
+Different receivers give the two mining instances different coinbases and
+candidate hashes at the same tip. They do not eliminate normal `tip changed`
+retries. Preserve the pool's retry handling when the chain advances.
+
 ## Validation result
 
 The source commit is the merge of Wolf pull request 33 into `main`. It includes
@@ -126,16 +188,20 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as file:
     rows = json.load(file)
 
-assert [row["child_index"] for row in rows] == [0, 1], rows
-assert rows[0]["is_default"] is True, rows
-assert rows[1]["is_default"] is False, rows
-assert rows[0]["account_id"] == rows[1]["account_id"], rows
-assert rows[0]["address"] != rows[1]["address"], rows
-assert rows[0]["address"].startswith("W1"), rows
-assert rows[1]["address"].startswith("W1"), rows
-print("index_0=" + rows[0]["address"])
-print("index_1=" + rows[1]["address"])
-print("account_id=" + rows[0]["account_id"])
+indices = [row["child_index"] for row in rows]
+assert indices == sorted(set(indices)), rows
+by_index = {row["child_index"]: row for row in rows}
+assert 0 in by_index and 1 in by_index, rows
+first, second = by_index[0], by_index[1]
+assert first["is_default"] is True, rows
+assert second["is_default"] is False, rows
+assert len({row["account_id"] for row in rows}) == 1, rows
+assert first["address"] != second["address"], rows
+assert first["address"].startswith("W1"), rows
+assert second["address"].startswith("W1"), rows
+print("index_0=" + first["address"])
+print("index_1=" + second["address"])
+print("account_id=" + first["account_id"])
 PY
 ```
 

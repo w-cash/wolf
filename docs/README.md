@@ -60,3 +60,6 @@ workflow definition is not evidence of a successful run.
   examples were executed or only checked against source.
 - State untested boundaries: documentation changes do not certify consensus,
   deployments, wallet safety or a release.
+
+Foundation consensus upgrade: [fixed policy specification](wcash-foundation-fund-specification.md),
+and [operator migration and rollout](wcash-foundation-fund-upgrade.md).

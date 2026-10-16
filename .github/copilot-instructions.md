@@ -45,8 +45,10 @@ zebrad (CLI orchestration)
   independently. Parent-chain acceptance is not required for a Wcash winner.
 - Mainnet uses a 40,000-block slow start, Monero-style integer smooth decay and
   permanent 0.375-WEC tail emission. It has no halvings or fixed supply cap.
-- Reject any founders reward, development tax, funding stream, lockbox or other
-  protocol allocation in Wcash profiles.
+- Enforce the fixed 30% foundation allocation only at Mainnet heights
+  33000–621454. Fees belong entirely to the miner. Reject changes to its fixed
+  recipient, rate or term through operator configuration. Founders and lockbox remain zero.
+  The explicit local funding fixture is Regtest-only and must never ship.
 - Transparent and Ironwood are the only active Wcash value pools. Inherited
   zero-valued RPC compatibility fields do not activate Sprout, Sapling, legacy
   Orchard or lockbox value.

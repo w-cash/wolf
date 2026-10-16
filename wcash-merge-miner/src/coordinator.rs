@@ -30,9 +30,13 @@ use wcash_zcash_aux::{
 use zcash_address::unified::{Container, Receiver};
 use zcash_protocol::consensus::NetworkType;
 use zebra_chain::{
+    amount::MAX_WCASH_COINBASE_VALUE,
     block::{Block, Height},
     parameters::{
-        subsidy::{block_subsidy, miner_subsidy},
+        subsidy::{
+            block_subsidy, miner_subsidy, wcash_foundation_fund,
+            wcash_foundation_fund_output_index, WCASH_FOUNDATION_TEST_FIXTURE_ENABLED,
+        },
         Network, NetworkKind,
     },
     primitives::{WcashAddress, WcashAddressKind},
@@ -1143,6 +1147,11 @@ fn validate_wcash_payout_configuration(
     let payout = WcashAddress::try_from_encoded(encoded).map_err(|error| {
         MinerError::InvalidRequest(format!("invalid Wcash payout address: {error}"))
     })?;
+    if WCASH_FOUNDATION_TEST_FIXTURE_ENABLED && payout.network() != NetworkType::Regtest {
+        return Err(MinerError::InvalidRequest(
+            "wcash-funding-test-fixture coordinator accepts only isolated WcashRegtest".to_string(),
+        ));
+    }
     let network = match payout.network() {
         NetworkType::Test => Network::new_wcash_testnet(),
         NetworkType::Regtest => Network::new_wcash_regtest(),
@@ -1248,6 +1257,32 @@ fn validate_wcash_candidate_payout_with_authority(
             "cannot calculate Wcash block subsidy at height {height}: {error}"
         ))
     })?;
+    if candidate.coinbase_height() != Some(candidate_height) {
+        return Err(MinerError::InvalidParentTemplate(
+            "createauxblock payout height does not match the serialized candidate".to_string(),
+        ));
+    }
+    let fund_output_index = wcash_foundation_fund_output_index(
+        candidate_height,
+        network,
+        expected_block_subsidy,
+        &coinbase.outputs(),
+    )
+    .map_err(|error| {
+        MinerError::InvalidParentTemplate(format!(
+            "createauxblock mandatory Wcash foundation output is invalid: {error}"
+        ))
+    })?;
+    let fund_value = wcash_foundation_fund(candidate_height, network, expected_block_subsidy)
+        .map_or(0, |allocation| allocation.amount.zatoshis());
+    if advertised_value
+        .checked_add(fund_value)
+        .is_none_or(|total| total > MAX_WCASH_COINBASE_VALUE)
+    {
+        return Err(MinerError::InvalidParentTemplate(
+            "createauxblock total coinbase value exceeds the Wcash limit".to_string(),
+        ));
+    }
     let minimum_miner_payout = miner_subsidy(candidate_height, network, expected_block_subsidy)
         .map_err(|error| {
             MinerError::InvalidParentTemplate(format!(
@@ -1277,8 +1312,12 @@ fn validate_wcash_candidate_payout_with_authority(
             }
             let expected_script =
                 transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, *hash).script();
-            let value_zatoshis =
-                validate_transparent_wcash_payout(coinbase, &expected_script, advertised_value)?;
+            let value_zatoshis = validate_transparent_wcash_payout(
+                coinbase,
+                &expected_script,
+                advertised_value,
+                fund_output_index,
+            )?;
             Ok(ValidatedWcashCandidatePayout {
                 value_zatoshis,
                 verification: NativeWcashPayoutVerification::ExactTransparentRecipient,
@@ -1292,8 +1331,12 @@ fn validate_wcash_candidate_payout_with_authority(
             }
             let expected_script =
                 transparent::Address::from_script_hash(NetworkKind::Mainnet, *hash).script();
-            let value_zatoshis =
-                validate_transparent_wcash_payout(coinbase, &expected_script, advertised_value)?;
+            let value_zatoshis = validate_transparent_wcash_payout(
+                coinbase,
+                &expected_script,
+                advertised_value,
+                fund_output_index,
+            )?;
             Ok(ValidatedWcashCandidatePayout {
                 value_zatoshis,
                 verification: NativeWcashPayoutVerification::ExactTransparentRecipient,
@@ -1309,7 +1352,7 @@ fn validate_wcash_candidate_payout_with_authority(
                     "private Wcash payout has no matching incoming-viewing authority".to_string(),
                 ));
             };
-            if !coinbase.outputs().is_empty()
+            if coinbase.outputs().len() != usize::from(fund_output_index.is_some())
                 || coinbase.has_sapling_shielded_data()
                 || coinbase.has_orchard_shielded_data()
                 || coinbase.ironwood_actions().next().is_none()
@@ -1423,24 +1466,28 @@ fn validate_transparent_wcash_payout(
     coinbase: &zebra_chain::transaction::Transaction,
     expected_script: &transparent::Script,
     advertised_value: i64,
+    fund_output_index: Option<usize>,
 ) -> Result<u64, MinerError> {
-    if coinbase.outputs().is_empty()
+    let outputs = coinbase.outputs();
+    let miner_outputs = || {
+        outputs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != fund_output_index)
+            .map(|(_, output)| output)
+    };
+    if miner_outputs().next().is_none()
         || coinbase.has_sapling_shielded_data()
         || coinbase.has_orchard_shielded_data()
         || coinbase.has_ironwood_shielded_data()
-        || coinbase
-            .outputs()
-            .iter()
-            .any(|output| &output.lock_script != expected_script)
+        || miner_outputs().any(|output| &output.lock_script != expected_script)
     {
         return Err(MinerError::InvalidParentTemplate(
             "createauxblock candidate does not pay only the configured transparent Wcash address"
                 .to_string(),
         ));
     }
-    let actual_value = coinbase
-        .outputs()
-        .iter()
+    let actual_value = miner_outputs()
         .try_fold(0i64, |total, output| {
             total.checked_add(output.value().zatoshis())
         })
@@ -1997,6 +2044,15 @@ fn reconcile_pending_winner_with(
     journal: &ShareJournal,
     winner: &PendingWinner,
 ) -> Result<WinnerObservation, MinerError> {
+    if winner.key.chain == WinnerChain::Wcash {
+        // Journals can predate this consensus upgrade. Recheck current funding
+        // rules before either submitting exact bytes or crediting an observation.
+        validate_recovered_wcash_winner(
+            &winner.block_bytes,
+            winner.height,
+            &winner.block_hash_display,
+        )?;
+    }
     if winner.observed_on_best_chain || winner.conflicting_witness {
         let observation =
             observe_pending_winner_with(wcash_node, zcash, winner, winner.conflicting_witness);
@@ -2142,6 +2198,7 @@ fn wcash_confirmation_depth_checked(
             "durable Wcash winner bytes do not match their immutable metadata".to_string(),
         ));
     }
+    validate_recovered_wcash_funding(&expected_block)?;
     let witness = expected_block.header.solution.as_wcash().ok_or_else(|| {
         MinerError::InvalidRequest(
             "durable Wcash winner does not contain an auxiliary proof".to_string(),
@@ -3355,6 +3412,11 @@ pub(crate) fn validate_persisted_winner_block(
             "share journal winner metadata does not match its exact block".to_string(),
         ));
     }
+    if expected_version.is_some() {
+        // This shared gate also covers accounting reads and backend-journal
+        // recovery, so old no-fund winners cannot become trusted after upgrade.
+        validate_recovered_wcash_funding(&block)?;
+    }
     if expected_version.is_some()
         && block
             .header
@@ -3430,6 +3492,114 @@ pub(crate) fn validate_persisted_winner_block(
         block.hash().0
     };
     Ok(parent_hash)
+}
+
+fn validate_recovered_wcash_winner(
+    block_bytes: &[u8],
+    height: u32,
+    hash: &str,
+) -> Result<(), MinerError> {
+    let block: Block = block_bytes.zcash_deserialize_into().map_err(|error| {
+        MinerError::InvalidRequest(format!("retained Wcash winner is undecodable: {error}"))
+    })?;
+    if block.zcash_serialize_to_vec()? != block_bytes
+        || block.hash().0 != parse_display_hash(hash, "retained Wcash winner hash")?
+        || block.coinbase_height().map(u32::from) != Some(height)
+        || block.header.version != WCASH_BLOCK_WIRE_VERSION
+    {
+        return Err(MinerError::InvalidRequest(
+            "retained Wcash winner bytes do not match their immutable metadata".to_string(),
+        ));
+    }
+    validate_recovered_wcash_funding(&block)
+}
+
+/// Validate current funding rules independently of an older journal's attestation.
+///
+/// Historical payout authorities can differ from today's configured miner. Their
+/// original attribution remains bound to immutable coinbase bytes and job metadata;
+/// this check neither substitutes a new recipient nor rewrites retained winners.
+fn validate_recovered_wcash_funding(block: &Block) -> Result<(), MinerError> {
+    use zcash_protocol::consensus::BranchId;
+
+    let height = block.coinbase_height().ok_or_else(|| {
+        MinerError::InvalidRequest("retained Wcash winner has no coinbase height".to_string())
+    })?;
+    if height == Height::MIN {
+        return Ok(());
+    }
+    let coinbase = block.transactions.first().ok_or_else(|| {
+        MinerError::InvalidRequest("retained Wcash winner has no coinbase".to_string())
+    })?;
+    let network = match coinbase
+        .embedded_consensus_branch_id()
+        .and_then(|branch| BranchId::try_from(u32::from(branch)).ok())
+    {
+        Some(BranchId::WcashMainnetV1) => Network::try_new_wcash_mainnet().map_err(|error| {
+            MinerError::InvalidRequest(format!("cannot inspect retained Mainnet winner: {error}"))
+        })?,
+        Some(BranchId::WcashTestnetV3) => Network::new_wcash_testnet(),
+        Some(BranchId::WcashRegtestV1) => Network::new_wcash_regtest(),
+        _ => {
+            return Err(MinerError::InvalidRequest(
+                "retained Wcash winner has an unknown transaction domain; preserve the journal for operator review".to_string(),
+            ));
+        }
+    };
+    if WCASH_FOUNDATION_TEST_FIXTURE_ENABLED && !network.is_wcash_regtest() {
+        return Err(MinerError::InvalidRequest(
+            "funding-test-fixture cannot recover public-network Wcash winners".to_string(),
+        ));
+    }
+    let gross = block_subsidy(height, &network).map_err(|error| {
+        MinerError::InvalidRequest(format!("retained Wcash subsidy is invalid: {error}"))
+    })?;
+    let outputs = coinbase.outputs();
+    let fund_index = wcash_foundation_fund_output_index(height, &network, gross, &outputs)
+        .map_err(|error| MinerError::InvalidRequest(format!(
+            "retained Wcash winner violates the foundation policy: {error}; preserve the journal and use an upgraded validating node; incompatible winner bytes must not be replayed or credited"
+        )))?;
+    let has_miner_transparent = outputs.len() > usize::from(fund_index.is_some());
+    let has_ironwood = coinbase.ironwood_actions().next().is_some();
+    if coinbase.has_sapling_shielded_data()
+        || coinbase.has_orchard_shielded_data()
+        || has_miner_transparent == has_ironwood
+    {
+        return Err(MinerError::InvalidRequest(
+            "retained Wcash winner violates the miner payout-mode rules".to_string(),
+        ));
+    }
+    let transparent_value = outputs
+        .iter()
+        .try_fold(0i64, |sum, output| sum.checked_add(output.value.zatoshis()))
+        .ok_or_else(|| {
+            MinerError::InvalidRequest("retained Wcash output value overflows".to_string())
+        })?;
+    let ironwood_balance = coinbase
+        .ironwood_value_balance()
+        .ironwood_amount()
+        .zatoshis();
+    let total = transparent_value
+        .checked_sub(ironwood_balance)
+        .ok_or_else(|| {
+            MinerError::InvalidRequest("retained Wcash total coinbase value overflows".to_string())
+        })?;
+    if total < gross.zatoshis() || total > MAX_WCASH_COINBASE_VALUE {
+        return Err(MinerError::InvalidRequest(
+            "retained Wcash winner has an invalid total coinbase value".to_string(),
+        ));
+    }
+    if has_ironwood
+        && (ironwood_balance > 0
+            || !zebra_chain::primitives::zcash_note_encryption::ironwood_outputs_are_private_from_zero_ovk(
+                coinbase, &network, height,
+            ))
+    {
+        return Err(MinerError::InvalidRequest(
+            "retained Wcash winner violates the private Ironwood payout rules".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn read_bounded_journal_line<R: BufRead>(
@@ -5760,6 +5930,15 @@ mod tests {
             (Network::new_wcash_regtest(), NetworkType::Regtest),
         ] {
             let genesis = network.genesis_hash().to_string();
+            if WCASH_FOUNDATION_TEST_FIXTURE_ENABLED && !network.is_wcash_regtest() {
+                let payout = WcashAddress::from_transparent_p2pkh(network_type, [0; 20]);
+                assert_invalid_wcash_payout(
+                    &payout.encode(),
+                    &genesis,
+                    "only isolated WcashRegtest",
+                );
+                continue;
+            }
             for payout in [
                 WcashAddress::from_transparent_p2pkh(network_type, [0; 20]),
                 WcashAddress::from_transparent_p2sh(network_type, [1; 20]),
@@ -5816,6 +5995,9 @@ mod tests {
 
     #[test]
     fn wcash_payout_configuration_rejects_wrong_network_and_unsupported_types() {
+        if WCASH_FOUNDATION_TEST_FIXTURE_ENABLED {
+            return;
+        }
         let testnet = Network::new_wcash_testnet();
         let regtest = Network::new_wcash_regtest();
         let testnet_genesis = testnet.genesis_hash().to_string();
@@ -5857,6 +6039,37 @@ mod tests {
             &mainnet.encode(),
             &Network::Mainnet.genesis_hash().to_string(),
             "network does not match",
+        );
+    }
+
+    #[test]
+    fn foundation_fixture_configuration_refuses_public_networks() {
+        if !WCASH_FOUNDATION_TEST_FIXTURE_ENABLED {
+            return;
+        }
+        for (network, network_type) in [
+            (Network::new_wcash_testnet(), NetworkType::Test),
+            (Network::new_wcash_mainnet_for_tests(), NetworkType::Main),
+        ] {
+            let payout = WcashAddress::from_transparent_p2pkh(network_type, [0; 20]);
+            assert_invalid_wcash_payout(
+                &payout.encode(),
+                &network.genesis_hash().to_string(),
+                "only isolated WcashRegtest",
+            );
+        }
+        let network = Network::new_wcash_regtest();
+        let wrong = WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, [0; 20]);
+        assert_invalid_wcash_payout(
+            &wrong.encode(),
+            &Network::new_wcash_testnet().genesis_hash().to_string(),
+            "network does not match",
+        );
+        let tex = WcashAddress::from_tex(NetworkType::Regtest, [0; 20]);
+        assert_invalid_wcash_payout(
+            &tex.encode(),
+            &network.genesis_hash().to_string(),
+            "transparent or Unified with an Orchard receiver",
         );
     }
 
@@ -6246,6 +6459,369 @@ mod tests {
             validate_wcash_candidate_payout(&candidate, &payout, &network, reward, 1),
             "only the configured transparent Wcash address",
         );
+    }
+
+    fn retarget_wcash_payout_candidate(
+        candidate: &mut Block,
+        height: Height,
+        outputs: Vec<transparent::Output>,
+    ) {
+        let coinbase = candidate.transactions[0]
+            .as_ref()
+            .clone()
+            .with_transparent_inputs(wcash_coinbase_inputs(height))
+            .with_transparent_outputs(outputs);
+        candidate.transactions[0] = Arc::new(coinbase);
+    }
+
+    #[test]
+    fn foundation_coordinator_attests_each_boundary_from_serialized_outputs() {
+        let network = Network::new_wcash_mainnet_for_tests();
+        let payout = WcashAddress::from_transparent_p2pkh(NetworkType::Main, [0x71; 20]);
+        let miner_script =
+            transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, [0x71; 20]).script();
+        for (height, expected_fund, expected_miner) in [
+            (32_999, 0, 1_814_139_209),
+            (33_000, 544_258_255, 1_269_935_930),
+            (33_001, 544_274_748, 1_269_974_412),
+            (39_999, 659_690_483, 1_539_277_796),
+            (40_000, 659_706_976, 1_539_316_279),
+            (40_001, 659_706_976, 1_539_316_279),
+            (40_002, 659_706_190, 1_539_314_444),
+            (621_454, 329_853_744, 769_658_738),
+            (621_455, 0, 1_099_511_171),
+        ] {
+            let height = Height(height);
+            let subsidy = block_subsidy(height, &network).expect("subsidy exists");
+            let fund = wcash_foundation_fund(height, &network, subsidy);
+            let net = miner_subsidy(height, &network, subsidy)
+                .expect("miner subsidy exists")
+                .zatoshis();
+            assert_eq!(
+                fund.as_ref()
+                    .map_or(0, |allocation| allocation.amount.zatoshis()),
+                expected_fund
+            );
+            assert_eq!(net, expected_miner);
+            let fees = 12_345;
+            let miner = transparent::Output::new(
+                Amount::try_from(net + fees).expect("valid reward"),
+                miner_script.clone(),
+            );
+            let mut outputs = vec![miner.clone()];
+            outputs.extend(fund.as_ref().map(|allocation| allocation.output()));
+            let (mut candidate, _) = transparent_wcash_candidate([0x71; 20], net + fees);
+            retarget_wcash_payout_candidate(&mut candidate, height, outputs.clone());
+            let actual = validate_wcash_candidate_payout(
+                &candidate,
+                &payout,
+                &network,
+                net + fees,
+                height.0,
+            )
+            .expect("exact fund and net miner payout are accepted");
+            assert_eq!(
+                actual.value_zatoshis,
+                u64::try_from(net + fees).expect("positive reward")
+            );
+            outputs.reverse();
+            retarget_wcash_payout_candidate(&mut candidate, height, outputs);
+            validate_wcash_candidate_payout(&candidate, &payout, &network, net + fees, height.0)
+                .expect("fund and miner order is irrelevant");
+            assert_invalid_candidate_payout(
+                validate_wcash_candidate_payout(
+                    &candidate,
+                    &payout,
+                    &network,
+                    net + fees,
+                    height.0 + 1,
+                ),
+                "payout height does not match",
+            );
+            if fund.is_some() {
+                assert_invalid_candidate_payout(
+                    validate_wcash_candidate_payout(
+                        &candidate,
+                        &payout,
+                        &network,
+                        subsidy.zatoshis() + fees,
+                        height.0,
+                    ),
+                    "transparent outputs do not match coinbasevalue",
+                );
+                retarget_wcash_payout_candidate(&mut candidate, height, vec![miner]);
+                assert_invalid_candidate_payout(
+                    validate_wcash_candidate_payout(
+                        &candidate,
+                        &payout,
+                        &network,
+                        net + fees,
+                        height.0,
+                    ),
+                    "mandatory Wcash foundation output is invalid",
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "wcash-funding-test-fixture")]
+    #[test]
+    fn foundation_fixture_coordinator_requires_thirty_percent_in_both_miner_modes() {
+        let network = Network::new_wcash_regtest();
+        let height = Height(10);
+        let subsidy = block_subsidy(height, &network).expect("fixture subsidy exists");
+        let allocation =
+            wcash_foundation_fund(height, &network, subsidy).expect("fixture is active");
+        assert_eq!(subsidy.zatoshis(), 625_000_000);
+        assert_eq!(allocation.amount.zatoshis(), 187_500_000);
+        let incorrect_fund = transparent::Output::new(
+            Amount::try_from(125_000_000).expect("incorrect allocation amount fits"),
+            allocation.address.script(),
+        );
+        let (private_payout, ivk, recipient) = ironwood_wcash_recipient(NetworkType::Regtest, 30);
+        let authority = WcashPayoutAuthority::Ironwood {
+            recipient,
+            prepared_ivk: ivk.0.prepare(),
+        };
+        for fees in [0_i64, 12_345] {
+            let (mut transparent, payout) =
+                transparent_wcash_candidate([0x76; 20], 437_500_000 + fees);
+            let miner = transparent.transactions[0].outputs()[0].clone();
+            retarget_wcash_payout_candidate(
+                &mut transparent,
+                height,
+                vec![allocation.output(), miner],
+            );
+            validate_wcash_candidate_payout(
+                &transparent,
+                &payout,
+                &network,
+                437_500_000 + fees,
+                height.0,
+            )
+            .expect("30% transparent fund and all miner fees are accepted");
+            let mut private = private_wcash_candidate(
+                &[(recipient, u64::try_from(437_500_000 + fees).unwrap())],
+                None,
+            );
+            retarget_wcash_payout_candidate(&mut private, height, vec![allocation.output()]);
+            validate_wcash_candidate_payout_with_authority(
+                &private,
+                &private_payout,
+                &authority,
+                &network,
+                437_500_000 + fees,
+                height.0,
+            )
+            .expect("30% transparent fund with private miner payout is accepted");
+
+            let (mut incorrect_transparent, _) =
+                transparent_wcash_candidate([0x76; 20], 500_000_000 + fees);
+            let incorrect_miner = incorrect_transparent.transactions[0].outputs()[0].clone();
+            retarget_wcash_payout_candidate(
+                &mut incorrect_transparent,
+                height,
+                vec![incorrect_fund.clone(), incorrect_miner],
+            );
+            assert_invalid_candidate_payout(
+                validate_wcash_candidate_payout(
+                    &incorrect_transparent,
+                    &payout,
+                    &network,
+                    500_000_000 + fees,
+                    height.0,
+                ),
+                "mandatory Wcash foundation output is invalid",
+            );
+            let mut incorrect_private = private_wcash_candidate(
+                &[(recipient, u64::try_from(500_000_000 + fees).unwrap())],
+                None,
+            );
+            retarget_wcash_payout_candidate(
+                &mut incorrect_private,
+                height,
+                vec![incorrect_fund.clone()],
+            );
+            assert_invalid_candidate_payout(
+                validate_wcash_candidate_payout_with_authority(
+                    &incorrect_private,
+                    &private_payout,
+                    &authority,
+                    &network,
+                    500_000_000 + fees,
+                    height.0,
+                ),
+                "mandatory Wcash foundation output is invalid",
+            );
+        }
+    }
+
+    #[test]
+    fn foundation_coordinator_rejects_malformed_or_fee_inclusive_allocations() {
+        let network = Network::new_wcash_mainnet_for_tests();
+        let height = Height(40_001);
+        let subsidy = block_subsidy(height, &network).expect("subsidy exists");
+        let allocation = wcash_foundation_fund(height, &network, subsidy).expect("fund active");
+        let net = miner_subsidy(height, &network, subsidy)
+            .expect("miner subsidy exists")
+            .zatoshis();
+        let (mut candidate, payout) = transparent_wcash_candidate([0x72; 20], net);
+        let miner = candidate.transactions[0].outputs()[0].clone();
+        let fund = allocation.output();
+        let wrong_script =
+            transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, [0x73; 20]).script();
+        let amount = |atoms| Amount::try_from(atoms).expect("fixture amount fits");
+        let malformed_funds = [
+            vec![],
+            vec![transparent::Output::new(fund.value(), wrong_script)],
+            vec![transparent::Output::new(
+                amount(fund.value().zatoshis() - 1),
+                fund.lock_script.clone(),
+            )],
+            vec![transparent::Output::new(
+                amount(fund.value().zatoshis() + 1),
+                fund.lock_script.clone(),
+            )],
+            vec![
+                transparent::Output::new(
+                    amount(fund.value().zatoshis() - 1),
+                    fund.lock_script.clone(),
+                ),
+                transparent::Output::new(amount(1), fund.lock_script.clone()),
+            ],
+            // An incorrect allocation cannot satisfy the fixed policy.
+            vec![transparent::Output::new(
+                amount(subsidy.zatoshis() / 5),
+                fund.lock_script.clone(),
+            )],
+            // Ten atoms of fees must not increase the mandatory allocation by three atoms.
+            vec![transparent::Output::new(
+                amount((subsidy.zatoshis() + 10) * 3 / 10),
+                fund.lock_script.clone(),
+            )],
+        ];
+        for mut outputs in malformed_funds {
+            outputs.push(miner.clone());
+            retarget_wcash_payout_candidate(&mut candidate, height, outputs);
+            assert_invalid_candidate_payout(
+                validate_wcash_candidate_payout(&candidate, &payout, &network, net + 10, height.0),
+                "mandatory Wcash foundation output is invalid",
+            );
+        }
+        let mut wrong_miner = miner.clone();
+        wrong_miner.lock_script =
+            transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, [0x74; 20]).script();
+        retarget_wcash_payout_candidate(&mut candidate, height, vec![fund.clone(), wrong_miner]);
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout(&candidate, &payout, &network, net, height.0),
+            "only the configured transparent Wcash address",
+        );
+        retarget_wcash_payout_candidate(&mut candidate, height, vec![fund, miner]);
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout(
+                &candidate,
+                &payout,
+                &network,
+                MAX_WCASH_COINBASE_VALUE,
+                height.0,
+            ),
+            "total coinbase value exceeds the Wcash limit",
+        );
+    }
+
+    #[test]
+    fn foundation_coordinator_counts_one_identical_fund_output_and_all_miner_splits() {
+        let network = Network::new_wcash_mainnet_for_tests();
+        let height = Height(40_001);
+        let subsidy = block_subsidy(height, &network).expect("subsidy exists");
+        let allocation = wcash_foundation_fund(height, &network, subsidy).expect("fund active");
+        let fund = allocation.output();
+        let net = miner_subsidy(height, &network, subsidy)
+            .expect("miner subsidy exists")
+            .zatoshis();
+        let payout = WcashAddress::try_from_encoded(
+            &allocation
+                .address
+                .encode_wcash(&network)
+                .expect("correct namespace"),
+        )
+        .expect("fund destination parses");
+        let (mut candidate, _) = transparent_wcash_candidate([0x75; 20], net);
+        let remainder = transparent::Output::new(
+            Amount::try_from(net - fund.value().zatoshis()).expect("positive remainder"),
+            fund.lock_script.clone(),
+        );
+        retarget_wcash_payout_candidate(
+            &mut candidate,
+            height,
+            vec![fund.clone(), remainder, fund.clone()],
+        );
+        validate_wcash_candidate_payout(&candidate, &payout, &network, net, height.0).expect(
+            "one occurrence is mandatory and the identical donation belongs to the miner remainder",
+        );
+        let merged = transparent::Output::new(subsidy, fund.lock_script);
+        retarget_wcash_payout_candidate(&mut candidate, height, vec![merged]);
+        assert_invalid_candidate_payout(
+            validate_wcash_candidate_payout(&candidate, &payout, &network, net, height.0),
+            "mandatory Wcash foundation output is invalid",
+        );
+    }
+
+    #[test]
+    fn foundation_private_coordinator_preserves_exact_ivk_attribution_and_mixed_shape_rules() {
+        let network = Network::new_wcash_mainnet_for_tests();
+        let (payout, ivk, recipient) = ironwood_wcash_recipient(NetworkType::Main, 31);
+        let (_, _, wrong_recipient) = ironwood_wcash_recipient(NetworkType::Main, 32);
+        let authority = WcashPayoutAuthority::Ironwood {
+            recipient,
+            prepared_ivk: ivk.0.prepare(),
+        };
+        for height in [32_999, 33_000, 33_001, 40_000, 40_001, 621_454, 621_455] {
+            let height = Height(height);
+            let subsidy = block_subsidy(height, &network).expect("subsidy exists");
+            let fund = wcash_foundation_fund(height, &network, subsidy);
+            let net = miner_subsidy(height, &network, subsidy)
+                .expect("miner subsidy exists")
+                .zatoshis();
+            let value = u64::try_from(net).expect("positive reward");
+            let outputs: Vec<_> = fund
+                .as_ref()
+                .map(|allocation| allocation.output())
+                .into_iter()
+                .collect();
+            let mut candidate = private_wcash_candidate(&[(recipient, value)], None);
+            retarget_wcash_payout_candidate(&mut candidate, height, outputs.clone());
+            validate_wcash_candidate_payout_with_authority(
+                &candidate, &payout, &authority, &network, net, height.0,
+            )
+            .expect("private miner and independently verified public fund are accepted");
+            let mut wrong = private_wcash_candidate(&[(wrong_recipient, value)], None);
+            retarget_wcash_payout_candidate(&mut wrong, height, outputs.clone());
+            assert_invalid_candidate_payout(
+                validate_wcash_candidate_payout_with_authority(
+                    &wrong, &payout, &authority, &network, net, height.0,
+                ),
+                "unattributed Ironwood payout action",
+            );
+            let mut extra = outputs;
+            extra.push(fund.as_ref().map_or_else(
+                || {
+                    transparent::Output::new(
+                        Amount::zero(),
+                        transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, [0x77; 20])
+                            .script(),
+                    )
+                },
+                |allocation| allocation.output(),
+            ));
+            retarget_wcash_payout_candidate(&mut candidate, height, extra);
+            assert_invalid_candidate_payout(
+                validate_wcash_candidate_payout_with_authority(
+                    &candidate, &payout, &authority, &network, net, height.0,
+                ),
+                "does not use an Ironwood-only private payout",
+            );
+        }
     }
 
     #[test]
@@ -6672,6 +7248,171 @@ mod tests {
             .is_err(),
             "a nonempty but invalid AuxPoW witness must not survive journal recovery"
         );
+    }
+
+    fn recovered_foundation_fixture(
+        network: &Network,
+        height: Height,
+        include_fund: bool,
+    ) -> Block {
+        let subsidy = block_subsidy(height, network).expect("fixture subsidy exists");
+        let allocation = wcash_foundation_fund(height, network, subsidy);
+        let mut outputs = Vec::new();
+        let mut miner = subsidy;
+        if include_fund {
+            if let Some(allocation) = allocation {
+                miner = (subsidy - allocation.amount).expect("fund is below subsidy");
+                outputs.push(allocation.output());
+            }
+        }
+        outputs.push(transparent::Output::new(
+            miner,
+            transparent::Address::from_pub_key_hash(network.kind(), [0x61; 20]).script(),
+        ));
+        let transaction = Transaction::test_v6_for_network(
+            network,
+            height,
+            wcash_coinbase_inputs(height),
+            outputs,
+            LockTime::unlocked(),
+            height,
+        );
+        let mut block = Arc::unwrap_or_clone(wcash_regtest_genesis_block());
+        block.transactions = vec![Arc::new(transaction)];
+        Arc::make_mut(&mut block.header).solution =
+            Solution::for_wcash([1, 2, 3]).expect("small policy-test witness serializes");
+        block
+    }
+
+    fn recovered_foundation_network() -> (Network, Height, Height) {
+        if WCASH_FOUNDATION_TEST_FIXTURE_ENABLED {
+            (Network::new_wcash_regtest(), Height(10), Height(20))
+        } else {
+            (
+                Network::try_new_wcash_mainnet().expect("Mainnet parameters are frozen"),
+                Height(33_000),
+                Height(621_455),
+            )
+        }
+    }
+
+    #[test]
+    fn foundation_recovered_winner_policy_rechecks_both_boundaries() {
+        let (network, start, expiry) = recovered_foundation_network();
+        for height in [
+            start.previous().unwrap(),
+            start,
+            expiry.previous().unwrap(),
+            expiry,
+        ] {
+            let funded = recovered_foundation_fixture(&network, height, true);
+            validate_recovered_wcash_funding(&funded)
+                .expect("funded policy shape is valid independently of proof checking");
+            let legacy = recovered_foundation_fixture(&network, height, false);
+            if (start..expiry).contains(&height) {
+                let error = validate_recovered_wcash_funding(&legacy)
+                    .expect_err("legacy no-fund material must not inherit an old attestation");
+                assert!(error.to_string().contains("foundation policy"));
+                let bytes = legacy.zcash_serialize_to_vec().unwrap();
+                let error = validate_persisted_winner_block(
+                    &bytes,
+                    &display_hash(legacy.hash().0),
+                    height.0,
+                    PersistedWinnerBlockKind::Wcash,
+                )
+                .expect_err("shared accounting and backend recovery gate rejects this policy");
+                assert!(error.to_string().contains("foundation policy"));
+            } else {
+                validate_recovered_wcash_funding(&legacy)
+                    .expect("historical and expired rewards retain their original policy");
+            }
+        }
+    }
+
+    #[test]
+    fn foundation_incompatible_native_outbox_is_refused_before_rpc_or_credit() {
+        let (network, start, _) = recovered_foundation_network();
+        let legacy = recovered_foundation_fixture(&network, start, false);
+        let directory = tempdir().expect("temporary directory");
+        let journal = ShareJournal::open(directory.path().join("shares.jsonl"))
+            .expect("open disposable journal");
+        // The unreachable endpoint ensures a policy failure cannot depend on
+        // an upgraded node rejecting a submitted block or status observation.
+        let client = ZebraRpcClient::new(
+            RpcEndpoint::new("http://127.0.0.1:3/", None, None).unwrap(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        for observed in [false, true] {
+            let winner = PendingWinner {
+                key: WinnerKey {
+                    share_id: [0x62; 32],
+                    chain: WinnerChain::Wcash,
+                },
+                job_id: "63".repeat(32),
+                block_hash_display: display_hash(legacy.hash().0),
+                height: start.0,
+                block_bytes: legacy.zcash_serialize_to_vec().unwrap(),
+                observed_on_best_chain: observed,
+                conflicting_witness: false,
+            };
+            let error =
+                reconcile_pending_winner_with(&client, &unused_zcash_provider(), &journal, &winner)
+                    .expect_err("incompatible old material must not be submitted or credited");
+            assert!(error.to_string().contains("foundation policy"));
+        }
+    }
+
+    #[test]
+    fn foundation_recovered_policy_rejects_unknown_domain() {
+        let (network, start, _) = recovered_foundation_network();
+        let mut block = recovered_foundation_fixture(&network, start, true);
+        let coinbase = block.transactions[0].as_ref();
+        let outputs = coinbase.outputs();
+        let legacy_domain = Transaction::test_v6_with_bundles(
+            NetworkUpgrade::Nu6_3,
+            wcash_coinbase_inputs(start),
+            outputs,
+            LockTime::unlocked(),
+            start,
+            None,
+            None,
+        );
+        block.transactions[0] = Arc::new(legacy_domain);
+        assert!(validate_recovered_wcash_funding(&block)
+            .expect_err("a retained Wcash winner must carry a known Wcash domain")
+            .to_string()
+            .contains("unknown transaction domain"));
+    }
+
+    #[test]
+    fn foundation_recovered_private_policy_allows_only_one_transparent_fund() {
+        let (network, start, _) = recovered_foundation_network();
+        let subsidy = block_subsidy(start, &network).unwrap();
+        let fund = wcash_foundation_fund(start, &network, subsidy).unwrap();
+        let net = miner_subsidy(start, &network, subsidy).unwrap();
+        let (_, _, recipient) = ironwood_wcash_recipient(network.kind().into(), 93);
+        let mut block =
+            private_wcash_candidate(&[(recipient, u64::try_from(net.zatoshis()).unwrap())], None);
+        retarget_wcash_payout_candidate(&mut block, start, vec![fund.output()]);
+        // The unit note fixture uses NU6.3's generic domain. Bind its serialized
+        // v6 transaction to the selected Wcash network for recovery inspection.
+        let mut bytes = block.transactions[0].zcash_serialize_to_vec().unwrap();
+        let branch = zebra_chain::parameters::ConsensusBranchId::current(&network, start).unwrap();
+        bytes[8..12].copy_from_slice(&u32::from(branch).to_le_bytes());
+        block.transactions[0] = Arc::new(bytes.as_slice().zcash_deserialize_into().unwrap());
+        validate_recovered_wcash_funding(&block)
+            .expect("a retained private payout may include its one mandatory fund output");
+        retarget_wcash_payout_candidate(&mut block, start, vec![fund.output(), fund.output()]);
+        assert!(validate_recovered_wcash_funding(&block)
+            .expect_err("a second matching tuple is still an invalid private miner remainder")
+            .to_string()
+            .contains("payout-mode"));
+        retarget_wcash_payout_candidate(&mut block, start, vec![]);
+        assert!(validate_recovered_wcash_funding(&block)
+            .expect_err("a shielded substitute cannot satisfy recovery funding policy")
+            .to_string()
+            .contains("foundation policy"));
     }
 
     #[test]

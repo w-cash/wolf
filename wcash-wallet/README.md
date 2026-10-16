@@ -132,6 +132,22 @@ from the same seed. Mature outputs from multiple managed receivers may be
 combined by one `shield-coinbase` transaction into the account's existing
 Ironwood receiver.
 
+A coinbase can contain separate miner and foundation outputs to the same
+receiver. After `shield-coinbase --max-inputs 1` spends one mature output,
+synchronization verifies each remaining UTXO and reconciles the missing sibling
+against mined spending inputs at the pinned chain tip. Repeated synchronization
+and restoration from the same seed preserve the spent output's status. Missing
+spend history leaves recovery incomplete; a UTXO omission alone is not accepted
+as evidence that an output was spent. These checks use the selected node's mined
+address history and do not replace the endpoint trust requirements above.
+
+If recovery reaches its deadline, rerun `sync` with the same database. It reuses
+validated creator transactions and retains verified mined-spend progress across
+restarts. Before reusing spend evidence, it checks that the recorded chain anchor
+is still canonical and that the current output set matches. Reorgs, changed
+outputs or damaged cached evidence require fresh verification; spending remains
+blocked until recovery completes.
+
 Before assigning an added receiver to a pool, back up the wallet recovery data,
 record the child index in the operator inventory, and verify the address on the
 intended network. Rollback is operational: stop assigning new work to the added

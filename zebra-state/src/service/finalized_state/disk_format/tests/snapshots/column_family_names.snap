@@ -33,4 +33,5 @@ expression: cf_names
   "tx_loc_by_transparent_addr_loc",
   "utxo_by_out_loc",
   "utxo_loc_by_transparent_addr_loc",
+  "wcash_foundation_validation",
 ]
