@@ -78,3 +78,6 @@ Before a production rollout, require:
 
 Merge approval is not deployment approval. Roll out the new wallet binary
 separately, without changing the existing node, pool, listeners, or miner URLs.
+
+The dated validation evidence and exact operator commands for Molepool are in
+the [Molepool operator wallet handoff](wcash-wallet-molepool-handoff.md).
