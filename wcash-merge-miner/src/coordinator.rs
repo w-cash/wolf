@@ -1532,38 +1532,92 @@ fn reconcile_wcash_pool_winner(
     let _previous_hash =
         validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Wcash, &expected_hash)
             .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
-    let submission = if should_submit {
-        // `submitblock` is idempotent and remains valid after the candidate
-        // cache expires. The exact bytes were validated above and were durable
-        // before this reconciliation pass began.
-        Some(classify_wcash_submission(wcash_node.call_value(
-            "submitblock",
-            json!([hex::encode(snapshot.block_bytes())]),
-        )))
-    } else {
-        None
-    };
 
+    // A historical pending proof can outlive the chain height it tried to win.
+    // Before replaying its exact bytes, sample the canonical block at that
+    // height. A different canonical hash makes submission futile, and an equal
+    // hash still needs an exact AuxPoW-witness comparison before submission.
+    // Neither result invents a Wcash lifecycle state: the different-block path
+    // remains pending for a later recheck, while an exact or conflicting proof
+    // uses canonical observation or the existing quarantine path.
     let before = native_chain_tip_on_node(wcash_node)
         .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
-    let observation = wcash_confirmation_depth_checked(
-        wcash_node,
-        winner.height,
-        &expected_hash,
-        snapshot.block_bytes(),
-        should_submit,
-    )
-    .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
+    let preflight = if should_submit {
+        wcash_canonical_replay_preflight(
+            wcash_node,
+            before,
+            winner,
+            &expected_hash,
+            snapshot.block_bytes(),
+        )
+        .map_err(|error| PoolWinnerReconciliationError::new(error, true))?
+    } else {
+        WcashCanonicalReplayPreflight::BelowTip
+    };
+    if matches!(preflight, WcashCanonicalReplayPreflight::DifferentBlock) {
+        // This makes no lifecycle or accounting claim. If the tip raced the
+        // lookup, the next paced pass simply evaluates the canonical hash again.
+        return Ok(None);
+    }
+
+    let submission =
+        if should_submit && matches!(preflight, WcashCanonicalReplayPreflight::BelowTip) {
+            // `submitblock` is idempotent and remains valid after the candidate
+            // cache expires. The exact bytes were validated above and were durable
+            // before this reconciliation pass began.
+            Some(classify_wcash_submission(wcash_node.call_value(
+                "submitblock",
+                json!([hex::encode(snapshot.block_bytes())]),
+            )))
+        } else {
+            None
+        };
+
+    let observation = match preflight {
+        WcashCanonicalReplayPreflight::ConflictingWitness => WinnerObservation::ConflictingWitness,
+        WcashCanonicalReplayPreflight::BelowTip => wcash_confirmation_depth_checked(
+            wcash_node,
+            winner.height,
+            &expected_hash,
+            snapshot.block_bytes(),
+            should_submit,
+        )
+        .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?,
+        WcashCanonicalReplayPreflight::Exact => {
+            // Exact canonical bytes are stronger evidence than the volatile
+            // auxiliary-candidate cache. Its status may already have expired,
+            // so derive depth from the same tip that fenced the raw-block
+            // comparison. Candidate release waits for the after-tip fence.
+            let confirmations = before
+                .height
+                .checked_sub(winner.height)
+                .and_then(|depth| depth.checked_add(1))
+                .ok_or_else(|| {
+                    PoolWinnerReconciliationError::new(
+                        MinerError::RpcProtocol(
+                            "Wcash canonical replay preflight has an impossible confirmation depth"
+                                .to_string(),
+                        ),
+                        should_submit,
+                    )
+                })?;
+            WinnerObservation::Present { confirmations }
+        }
+        WcashCanonicalReplayPreflight::DifferentBlock => unreachable!("returned above"),
+    };
     let after = native_chain_tip_on_node(wcash_node)
         .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
     if before != after {
-        if should_submit {
+        if submission.is_some() {
             return Err(PoolWinnerReconciliationError::new(
                 MinerError::WinnerSubmissionDeferred { chain: "Wcash" },
                 true,
             ));
         }
         return Ok(None);
+    }
+    if matches!(preflight, WcashCanonicalReplayPreflight::Exact) {
+        release_wcash_candidate_best_effort(wcash_node, &expected_hash, snapshot.block_bytes());
     }
     let tip = pool_chain_tip(before);
     let observation = match observation {
@@ -1578,6 +1632,86 @@ fn reconcile_wcash_pool_winner(
         .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))?;
     pool_winner_transition(snapshot.lifecycle(), winner, observation)
         .map_err(|error| PoolWinnerReconciliationError::new(error, should_submit))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WcashCanonicalReplayPreflight {
+    /// The candidate height has not yet entered the sampled best chain.
+    BelowTip,
+    /// A different canonical block already occupies the candidate height.
+    DifferentBlock,
+    /// The exact retained Wcash bytes are the canonical block at that height.
+    Exact,
+    /// The canonical block ID matches, but its AuxPoW witness differs.
+    ConflictingWitness,
+}
+
+/// Attempts to drop an obsolete native candidate after exact canonical bytes
+/// proved the retained witness is already on the best chain. This is strictly
+/// housekeeping: canonical observation must not depend on a volatile cache.
+///
+/// `submitauxblock` can begin a submission before it reports whether its
+/// cache entry is stale. Therefore only invoke it after its non-mutating exact
+/// witness status also says `best_chain`; a stale status never causes a replay.
+fn release_wcash_candidate_best_effort(
+    node: &ZebraRpcClient,
+    expected_hash: &str,
+    expected_block_bytes: &[u8],
+) {
+    let Ok(expected_block) = expected_block_bytes.zcash_deserialize_into::<Block>() else {
+        return;
+    };
+    let Some(witness) = expected_block.header.solution.as_wcash() else {
+        return;
+    };
+    let witness_hex = hex::encode(witness.as_bytes());
+    let Ok(WcashAuxBlockStatus::BestChain { .. }) =
+        node.call::<WcashAuxBlockStatus>("getauxblockstatus", json!([expected_hash, witness_hex]))
+    else {
+        return;
+    };
+    let _release = node.call_value(
+        "submitauxblock",
+        json!([expected_hash, hex::encode(witness.as_bytes())]),
+    );
+}
+
+fn wcash_canonical_replay_preflight(
+    node: &ZebraRpcClient,
+    tip: NativeChainTip,
+    winner: &WinnerDescriptor,
+    expected_hash: &str,
+    expected_block_bytes: &[u8],
+) -> Result<WcashCanonicalReplayPreflight, MinerError> {
+    if tip.height < winner.height {
+        return Ok(WcashCanonicalReplayPreflight::BelowTip);
+    }
+    let canonical_hash_display: String = node.call("getblockhash", json!([winner.height]))?;
+    let canonical_hash =
+        parse_display_hash(&canonical_hash_display, "Wcash canonical winner hash")?;
+    if canonical_hash != *winner.block_hash_le.as_bytes() {
+        return Ok(WcashCanonicalReplayPreflight::DifferentBlock);
+    }
+    let canonical_bytes_hex: String = node.call("getblock", json!([canonical_hash_display, 0]))?;
+    let canonical_bytes = decode_bounded_hex(
+        &canonical_bytes_hex,
+        "Wcash canonical winner block",
+        MAX_CHILD_BLOCK_BYTES,
+    )?;
+    match classify_wcash_best_chain_block(
+        &canonical_bytes,
+        expected_block_bytes,
+        expected_hash,
+        winner.height,
+    )? {
+        WcashBestChainMatch::Exact => Ok(WcashCanonicalReplayPreflight::Exact),
+        WcashBestChainMatch::ConflictingWitness => {
+            Ok(WcashCanonicalReplayPreflight::ConflictingWitness)
+        }
+        WcashBestChainMatch::DifferentBlock => Err(MinerError::RpcProtocol(
+            "Wcash getblockhash and getblock disagree about the canonical winner".to_string(),
+        )),
+    }
 }
 
 fn reconcile_zcash_pool_winner(
@@ -2139,7 +2273,6 @@ enum WinnerObservation {
     Present { confirmations: u32 },
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WcashBestChainMatch {
     DifferentBlock,
@@ -2231,7 +2364,6 @@ fn wcash_confirmation_depth_checked(
     })
 }
 
-#[cfg(test)]
 fn classify_wcash_best_chain_block(
     actual_block_bytes: &[u8],
     expected_block_bytes: &[u8],
@@ -4287,6 +4419,36 @@ mod tests {
         )
     }
 
+    fn wcash_reconciliation_fixture() -> PoolBackendWinnerSnapshot {
+        let (_, _, block_hash, _, block_bytes) = valid_wcash_materialization_fixture();
+        let expected_hash = display_hash(block_hash);
+        let parent_hash = validate_persisted_winner_block(
+            &block_bytes,
+            &expected_hash,
+            1,
+            PersistedWinnerBlockKind::Wcash,
+        )
+        .expect("valid Wcash fixture binds its parent");
+        PoolBackendWinnerSnapshot::from_test_state(
+            crate::pool_backend_journal::JournalWinnerState {
+                share_id: Hex32::new([0x54; 32]),
+                job_id: Hex32::new([0x55; 32]),
+                winner: WinnerDescriptor {
+                    chain: MergedChain::Wcash,
+                    block_hash_le: Hex32::new(block_hash),
+                    height: 1,
+                    coinbase_txid_le: Hex32::new([0x56; 32]),
+                    reward_zat: 625_000_000,
+                    maturity_confirmations: 100,
+                },
+                parent_hash_le: Hex32::new(parent_hash),
+                block_bytes,
+                lifecycle: JournalWinnerLifecycle::Pending,
+                revision_event_seq: 1,
+            },
+        )
+    }
+
     fn read_test_rpc_request(stream: &mut std::net::TcpStream) -> serde_json::Value {
         // Accepted sockets inherit the listener's nonblocking mode on some
         // platforms. These scripted servers use blocking request framing.
@@ -4738,6 +4900,188 @@ mod tests {
         ));
         template_server.join().expect("template server exits");
         validator_server.join().expect("validator server exits");
+    }
+
+    #[test]
+    fn noncanonical_wcash_pending_winner_is_not_replayed() {
+        let snapshot = wcash_reconciliation_fixture();
+        let canonical_hash = display_hash([0x71; 32]);
+        let tip = json!({"blocks": 1, "bestblockhash": canonical_hash});
+        let (endpoint, server) = spawn_scripted_rpc_server(vec![tip, json!(canonical_hash)]);
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+
+        assert_eq!(
+            reconcile_wcash_pool_winner(&client, &snapshot)
+                .expect("stable losing proof is retained"),
+            None
+        );
+
+        let requests = server.join().expect("test RPC server exits");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().expect("RPC method"))
+                .collect::<Vec<_>>(),
+            ["getblockchaininfo", "getblockhash"]
+        );
+        assert_eq!(requests[1]["params"], json!([1]));
+    }
+
+    #[test]
+    fn malformed_wcash_preflight_hash_fails_closed_without_submission() {
+        let snapshot = wcash_reconciliation_fixture();
+        let tip_hash = display_hash([0x71; 32]);
+        let (endpoint, server) = spawn_scripted_rpc_server(vec![
+            json!({"blocks": 1, "bestblockhash": tip_hash}),
+            json!("malformed"),
+        ]);
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+
+        let error = reconcile_wcash_pool_winner(&client, &snapshot)
+            .expect_err("malformed canonical hash must block a replay");
+        assert!(error.submission_blocked());
+
+        let requests = server.join().expect("test RPC server exits");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().expect("RPC method"))
+                .collect::<Vec<_>>(),
+            ["getblockchaininfo", "getblockhash"]
+        );
+    }
+
+    #[test]
+    fn canonical_wcash_pending_winner_confirms_without_duplicate_submission() {
+        let snapshot = wcash_reconciliation_fixture();
+        let expected_hash = display_hash(*snapshot.winner().block_hash_le.as_bytes());
+        let canonical_bytes = hex::encode(snapshot.block_bytes());
+        let tip = json!({"blocks": 1, "bestblockhash": expected_hash});
+        let (endpoint, server) = spawn_scripted_rpc_server(vec![
+            tip.clone(),
+            json!(expected_hash),
+            json!(canonical_bytes),
+            tip,
+            json!({"state": "best_chain", "confirmations": 1}),
+            json!(true),
+        ]);
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+
+        assert!(matches!(
+            reconcile_wcash_pool_winner(&client, &snapshot),
+            Ok(Some(PoolBackendWinnerTransition::Observed {
+                confirmations: 1,
+                ..
+            }))
+        ));
+
+        let requests = server.join().expect("test RPC server exits");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().expect("RPC method"))
+                .collect::<Vec<_>>(),
+            [
+                "getblockchaininfo",
+                "getblockhash",
+                "getblock",
+                "getblockchaininfo",
+                "getauxblockstatus",
+                "submitauxblock",
+            ]
+        );
+    }
+
+    #[test]
+    fn canonical_wcash_pending_winner_confirms_when_candidate_status_is_unknown() {
+        let snapshot = wcash_reconciliation_fixture();
+        let expected_hash = display_hash(*snapshot.winner().block_hash_le.as_bytes());
+        let canonical_bytes = hex::encode(snapshot.block_bytes());
+        let tip = json!({"blocks": 1, "bestblockhash": expected_hash});
+        let (endpoint, server) = spawn_scripted_rpc_server(vec![
+            tip.clone(),
+            json!(expected_hash),
+            json!(canonical_bytes),
+            tip,
+            json!({"state": "unknown"}),
+        ]);
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+
+        assert!(matches!(
+            reconcile_wcash_pool_winner(&client, &snapshot),
+            Ok(Some(PoolBackendWinnerTransition::Observed {
+                confirmations: 1,
+                ..
+            }))
+        ));
+
+        let requests = server.join().expect("test RPC server exits");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().expect("RPC method"))
+                .collect::<Vec<_>>(),
+            [
+                "getblockchaininfo",
+                "getblockhash",
+                "getblock",
+                "getblockchaininfo",
+                "getauxblockstatus",
+            ]
+        );
+    }
+
+    #[test]
+    fn conflicting_canonical_wcash_witness_is_quarantined_without_submission() {
+        let snapshot = wcash_reconciliation_fixture();
+        let expected_hash = display_hash(*snapshot.winner().block_hash_le.as_bytes());
+        let mut conflicting: Block = snapshot
+            .block_bytes()
+            .zcash_deserialize_into()
+            .expect("fixture Wcash block parses");
+        Arc::make_mut(&mut conflicting.header).solution =
+            Solution::for_wcash([1, 2, 3]).expect("test witness serializes");
+        assert_eq!(
+            conflicting.hash().0,
+            *snapshot.winner().block_hash_le.as_bytes()
+        );
+        let conflicting_bytes = hex::encode(
+            conflicting
+                .zcash_serialize_to_vec()
+                .expect("conflicting Wcash block serializes"),
+        );
+        let tip = json!({"blocks": 1, "bestblockhash": expected_hash});
+        let (endpoint, server) = spawn_scripted_rpc_server(vec![
+            tip.clone(),
+            json!(expected_hash),
+            json!(conflicting_bytes),
+            tip,
+        ]);
+        let client = ZebraRpcClient::new(endpoint, Duration::from_secs(3))
+            .expect("construct test RPC client");
+
+        assert!(matches!(
+            reconcile_wcash_pool_winner(&client, &snapshot),
+            Ok(Some(PoolBackendWinnerTransition::Quarantined { .. }))
+        ));
+
+        let requests = server.join().expect("test RPC server exits");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().expect("RPC method"))
+                .collect::<Vec<_>>(),
+            [
+                "getblockchaininfo",
+                "getblockhash",
+                "getblock",
+                "getblockchaininfo",
+            ]
+        );
     }
 
     #[test]
