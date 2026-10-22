@@ -1566,10 +1566,24 @@ fn reconcile_wcash_pool_winner(
             // `submitblock` is idempotent and remains valid after the candidate
             // cache expires. The exact bytes were validated above and were durable
             // before this reconciliation pass began.
-            Some(classify_wcash_submission(wcash_node.call_value(
-                "submitblock",
-                json!([hex::encode(snapshot.block_bytes())]),
-            )))
+            crate::diagnostics::submission(
+                snapshot,
+                "winner_submission_attempt",
+                "exact_bytes_rpc",
+                None,
+            );
+            let result = classify_wcash_submission(
+                wcash_node.call_value("submitblock", json!([hex::encode(snapshot.block_bytes())])),
+            );
+            let outcome = match &result {
+                Ok(()) => "rpc_accepted",
+                Err(MinerError::WinnerSubmissionDeferred { .. }) => "incomplete",
+                Err(MinerError::RpcTransport(_) | MinerError::Io(_)) => "unavailable",
+                Err(MinerError::InvalidParentTemplate(_)) => "rejected",
+                Err(_) => "rpc_error",
+            };
+            crate::diagnostics::submission(snapshot, "winner_submission_result", outcome, None);
+            Some(result)
         } else {
             None
         };
@@ -1762,11 +1776,53 @@ fn reconcile_zcash_pool_winner(
             true,
             ParentWinnerTipPosition::ReadyForSubmission
             | ParentWinnerTipPosition::ExactWinnerOnTemplateChain,
-        ) => Some(
-            zcash
-                .replay_parent_bytes(snapshot.block_bytes(), winner.height, &expected_hash)
-                .map_err(|error| PoolWinnerReconciliationError::new(error, true))?,
-        ),
+        ) => {
+            crate::diagnostics::submission(
+                snapshot,
+                "winner_submission_attempt",
+                "exact_bytes_rpc",
+                None,
+            );
+            let report = match zcash.replay_parent_bytes(
+                snapshot.block_bytes(),
+                winner.height,
+                &expected_hash,
+            ) {
+                Ok(report) => report,
+                Err(error) => {
+                    crate::diagnostics::submission_error(snapshot, &error);
+                    return Err(PoolWinnerReconciliationError::new(error, true));
+                }
+            };
+            let mut counts = [0; 6];
+            for outcome in report.outcomes() {
+                let index = match outcome {
+                    ParentNodeOutcome::Accepted { .. } => 0,
+                    ParentNodeOutcome::KnownSideChain { .. } => 1,
+                    ParentNodeOutcome::Unconfirmed { .. } => 2,
+                    ParentNodeOutcome::Rejected { .. } => 3,
+                    ParentNodeOutcome::Unavailable { .. } => 4,
+                    ParentNodeOutcome::InvalidResponse { .. } => 5,
+                };
+                counts[index] += 1;
+            }
+            let outcome =
+                if report.is_confirmed() && report.delivery_admitted() && report.relays_succeeded()
+                {
+                    "best_chain_admitted"
+                } else if report.is_known_side_chain() {
+                    "side_chain"
+                } else {
+                    "incomplete"
+                };
+            crate::diagnostics::submission(
+                snapshot,
+                "winner_submission_result",
+                outcome,
+                Some(counts),
+            );
+            Some(report)
+        }
         (true, ParentWinnerTipPosition::DependencyBehind) => {
             return Err(PoolWinnerReconciliationError::new(
                 MinerError::WinnerSubmissionDeferred { chain: "Zcash" },

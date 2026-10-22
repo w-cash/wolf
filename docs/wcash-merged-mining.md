@@ -267,6 +267,48 @@ the full retained block; they cannot guarantee public-chain adoption or future
 availability. Keep monitoring independent receipt and canonical confirmation
 after deployment.
 
+At the normal `info` filter, correlate `rpc_gossip_admission` (queue admission),
+`request_started`, `peer_send_summary` (per-batch attempted/ok/failed counts),
+and `network_request_completed` by the public block hash. A batch with any failed
+peer send is a warning, including `partial_failure`; `all_failed` means every
+send in that batch failed. These counts describe service request outcomes,
+not independent receipt or canonical acceptance. An empty queued pass is silent;
+`peer_send_no_candidates` instead means the all-peer broadcast started with no
+ready or queued peer candidates. Different batches can cover the ready and
+previously busy peers of the same broadcast.
+
+Queue-full/closed admission failures, incomplete mined retries, ordinary-tip
+drops and peer-send failures remain visible without enabling blanket debug
+logging. Repeated failures use fixed-size 30-second warning budgets and report
+suppressed counts on the next admitted event. A permanent peer-set readiness
+failure emits `gossip_task_exit`. Diagnostics do not change delivery retries or
+best-effort peer-set return values. No diagnostic adds a network probe, disk
+sync, block validation or per-share event. Continue independent observation:
+even a completed peer request is not evidence of a remote chain's adoption.
+
+The native pool backend emits JSON diagnostics with
+`component="native_pool_backend"`. `winner_durable` follows successful journal
+fsync; an identical receipt replay emits no new discovery event.
+`winner_submission_attempt` and `winner_submission_result` identify actual
+submission calls. `winner_lifecycle_persisted` follows a successful durable CAS
+transition, with its new event sequence and confirmation depth when available.
+Stale CAS results and observation passes that make no transition stay silent.
+`winner_reconciliation`, `winner_persistence_failure` and `journal_failure`
+describe typed failures without raw RPC bodies, error payloads or paths.
+`observer_header_failure` distinguishes unavailable exact-header evidence from
+authoritative absence; it does not change the existing confirmation policy.
+
+Only fixed public metadata is copied into a 128-event nonblocking lossy queue.
+One writer owns a separate stderr descriptor and performs formatting and I/O;
+mining threads never wait for that writer. Repeated noisy events use a fixed
+128-key cache and a 32-record budget per 30 seconds. Durable lifecycle events
+and initial hard storage failures bypass that noisy-event budget, while the
+queue remains bounded. `suppressed_total` and `diagnostic_dropped_total` expose
+suppression and queue loss when output is available. A stalled or failed sink
+can still lose diagnostics: the preserved authoritative journal and independent
+exact-hash observation remain the recovery evidence. No new diagnostics run
+for ordinary shares, and no diagnostic adds an fsync or validation pass.
+
 The included ZIP-301 listener validates Equihash and both targets locally,
 requires authorization, assigns per-session nonce prefixes, rejects malformed,
 low-difficulty, duplicate, and stale shares, bounds frames and sessions, and

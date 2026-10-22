@@ -66,6 +66,24 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const HEADER_DIGEST_DOMAIN: &[u8] = b"wcash-pool/backend-journal-header/v2\0";
 const EVENT_DIGEST_DOMAIN: &[u8] = b"wcash-pool/backend-journal-event/v2\0";
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_APPEND_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_append_sync() {
+    FAIL_APPEND_SYNC.with(|failure| failure.set(true));
+}
+
+fn sync_append(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_APPEND_SYNC.with(|failure| failure.replace(false)) {
+        return Err(io::Error::from(io::ErrorKind::StorageFull));
+    }
+    file.sync_all()
+}
+
 /// An error that prevents safe creation, replay, or use of the backend journal.
 #[derive(Debug, Error)]
 pub enum PoolBackendJournalError {
@@ -1307,6 +1325,9 @@ impl PoolBackendJournal {
         };
         let persisted_blocks = encode_winner_blocks(&winner_blocks, event_seq)?;
         self.append_locked(&mut state, event, persisted_blocks)?;
+        for winner in &receipt.winners {
+            crate::diagnostics::durable(winner, &receipt.job_id, receipt.event_seq);
+        }
         Ok(JournalShareCommit {
             receipt,
             replayed: false,
@@ -1668,18 +1689,24 @@ impl PoolBackendJournal {
         if let Err(error) = verify_locked_journal_path(&state.file, &self.path, state.bytes_written)
         {
             state.poisoned = true;
+            crate::diagnostics::journal_error(&error);
             return Err(error);
         }
         if let Err(source) = state.file.write_all(&encoded) {
             state.poisoned = true;
-            return Err(journal_io("append to", &self.path, source));
+            let error = journal_io("append to", &self.path, source);
+            crate::diagnostics::journal_error(&error);
+            return Err(error);
         }
-        if let Err(source) = state.file.sync_all() {
+        if let Err(source) = sync_append(&state.file) {
             state.poisoned = true;
-            return Err(journal_io("fsync", &self.path, source));
+            let error = journal_io("fsync", &self.path, source);
+            crate::diagnostics::journal_error(&error);
+            return Err(error);
         }
         if let Err(error) = verify_locked_journal_path(&state.file, &self.path, new_length) {
             state.poisoned = true;
+            crate::diagnostics::journal_error(&error);
             return Err(error);
         }
 

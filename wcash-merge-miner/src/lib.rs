@@ -17,6 +17,7 @@
 pub mod accounting;
 mod coinbase;
 mod coordinator;
+mod diagnostics;
 mod error;
 mod job;
 pub mod native;
@@ -48,6 +49,10 @@ pub use coordinator::{
     CoordinatorConfig, GenerationRetirement, NativeMiningCoordinator, NativeMiningSupervisor,
     NativeWinnerBlock, NativeWinnerMaterial, PoolWinnerReconciliationError,
     WcashIncomingViewingKey, WinnerOutboxStatus,
+};
+pub use diagnostics::{
+    record_native_winner_persistence_failure, record_native_winner_reconciliation,
+    start_native_backend_diagnostics,
 };
 pub use error::MinerError;
 pub use job::{JobConfig, PreparedJob, SolvedAuxPow, EQUIHASH_SOLUTION_BYTES};

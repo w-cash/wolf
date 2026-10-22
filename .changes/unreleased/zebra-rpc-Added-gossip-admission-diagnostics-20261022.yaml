@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: Added
+body: "Log mined-block gossip queue admission and rate-limited queue-full or closed failures using public block identities and fixed outcome labels."
+time: 2026-10-22T18:45:00.000000000Z

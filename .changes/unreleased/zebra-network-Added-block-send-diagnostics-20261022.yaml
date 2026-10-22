@@ -1,0 +1,4 @@
+project: zebra-network
+kind: Added
+body: "Expose bounded block-broadcast peer-send outcome summaries and warnings for partial, all-failed and zero-candidate fanout, without changing delivery semantics."
+time: 2026-10-22T18:45:00.000000000Z

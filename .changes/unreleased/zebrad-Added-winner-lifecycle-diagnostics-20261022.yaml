@@ -1,0 +1,4 @@
+project: zebrad
+kind: Added
+body: "Add bounded durable-winner lifecycle diagnostics and visible gossip outcomes while keeping ordinary shares silent and independent receipt distinct from local submission."
+time: 2026-10-22T18:45:00.000000000Z
