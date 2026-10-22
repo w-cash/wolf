@@ -292,14 +292,12 @@ struct StatusOutput {
 
 #[tokio::main]
 async fn main() {
-    match run(Cli::parse()).await {
+    let cli = Cli::parse();
+    let payout_sign = matches!(&cli.command, Command::PayoutSign { .. });
+    match run(cli).await {
         Ok(()) => {}
         Err(error) => {
-            let output = CliFailure {
-                protocol_version: 1,
-                code: classify_cli_failure(&error),
-                error: error.to_string(),
-            };
+            let output = cli_failure(payout_sign, &error);
             if let Ok(encoded) = serde_json::to_string(&output) {
                 eprintln!("{encoded}");
             }
@@ -312,6 +310,9 @@ async fn main() {
 struct CliFailure {
     protocol_version: u32,
     code: CliFailureCode,
+    /// The v1 field stays non-empty for existing parsers, but payout-sign
+    /// failures must not carry paths, transaction identifiers, values, or
+    /// native-library diagnostics across the process boundary.
     error: String,
 }
 
@@ -322,6 +323,61 @@ enum CliFailureCode {
     Unavailable,
     IdempotencyConflict,
     Ambiguous,
+}
+
+/// Non-sensitive reason categories emitted only for explicit payout-sign
+/// rejections. These values are a stable, intentionally small protocol-v1
+/// allow-list; they must never contain native wallet error text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PayoutSignRejectionReasonCode {
+    /// The wallet rejected the request but has no intentionally exported
+    /// category for the condition.
+    Unknown,
+    FeeLimit,
+    ActivePendingTransaction,
+}
+
+impl PayoutSignRejectionReasonCode {
+    /// These complete values intentionally reuse the existing protocol-v1
+    /// `error` string. Adding a field would break strict older parsers.
+    const fn error_text(self) -> &'static str {
+        match self {
+            Self::Unknown => "payout_sign_rejected:unknown",
+            Self::FeeLimit => "payout_sign_rejected:fee_limit",
+            Self::ActivePendingTransaction => "payout_sign_rejected:active_pending_transaction",
+        }
+    }
+}
+
+fn cli_failure(payout_sign: bool, error: &CliError) -> CliFailure {
+    let code = classify_cli_failure(error);
+    CliFailure {
+        protocol_version: 1,
+        code,
+        error: if payout_sign && code == CliFailureCode::Rejected {
+            classify_payout_sign_rejection_reason(error)
+                .error_text()
+                .to_owned()
+        } else if payout_sign {
+            "payout_sign_failure".to_owned()
+        } else {
+            error.to_string()
+        },
+    }
+}
+
+fn classify_payout_sign_rejection_reason(error: &CliError) -> PayoutSignRejectionReasonCode {
+    match error {
+        // These variants are explicit, stable wallet states. Do not infer
+        // categories from diagnostic strings or native-library errors.
+        CliError::Wallet(WalletServiceError::PayoutFeeExceeded { .. }) => {
+            PayoutSignRejectionReasonCode::FeeLimit
+        }
+        CliError::Wallet(WalletServiceError::ActivePendingTransaction { .. }) => {
+            PayoutSignRejectionReasonCode::ActivePendingTransaction
+        }
+        _ => PayoutSignRejectionReasonCode::Unknown,
+    }
 }
 
 fn classify_cli_failure(error: &CliError) -> CliFailureCode {
@@ -1054,6 +1110,72 @@ mod tests {
                 CliFailureCode::Unavailable
             );
         }
+    }
+
+    #[test]
+    fn payout_sign_failure_uses_legacy_shape_and_redacts_details() {
+        let failure = cli_failure(
+            true,
+            &CliError::Wallet(WalletServiceError::PayoutFeeExceeded {
+                actual_zat: 123_456_789,
+                maximum_zat: 987_654_321,
+            }),
+        );
+        let encoded = serde_json::to_value(failure).unwrap();
+        assert_eq!(encoded["protocol_version"], 1);
+        assert_eq!(encoded["code"], "rejected");
+        assert_eq!(encoded["error"], "payout_sign_rejected:fee_limit");
+        let legacy: StrictLegacyFailure = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(
+            legacy,
+            StrictLegacyFailure {
+                protocol_version: 1,
+                code: "rejected".to_owned(),
+                error: "payout_sign_rejected:fee_limit".to_owned(),
+            }
+        );
+        let encoded = encoded.to_string();
+        assert!(!encoded.contains("123456789"));
+        assert!(!encoded.contains("987654321"));
+    }
+
+    #[test]
+    fn payout_sign_reason_uses_unknown_fallback_without_extra_field() {
+        let unclassified = cli_failure(
+            true,
+            &CliError::Wallet(WalletServiceError::Proposal(
+                "native detail must not cross the process boundary".to_owned(),
+            )),
+        );
+        let unclassified = serde_json::to_value(unclassified).unwrap();
+        assert_eq!(unclassified["error"], "payout_sign_rejected:unknown");
+        assert!(!unclassified
+            .to_string()
+            .contains("native detail must not cross the process boundary"));
+
+        let active_pending = cli_failure(
+            true,
+            &CliError::Wallet(WalletServiceError::ActivePendingTransaction {
+                txid: "must-not-appear".to_owned(),
+                expiry_height: 123_456,
+            }),
+        );
+        let active_pending = serde_json::to_value(active_pending).unwrap();
+        assert_eq!(
+            active_pending["error"],
+            "payout_sign_rejected:active_pending_transaction"
+        );
+        let active_pending = active_pending.to_string();
+        assert!(!active_pending.contains("must-not-appear"));
+        assert!(!active_pending.contains("123456"));
+    }
+
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    struct StrictLegacyFailure {
+        protocol_version: u32,
+        code: String,
+        error: String,
     }
 
     #[derive(Debug, Deserialize, Eq, PartialEq)]
