@@ -172,13 +172,12 @@ impl PendingGossip {
     }
 
     fn retry(&mut self, advertisement: Advertisement, now: Instant) {
-        let ready_at = now + GOSSIP_RETRY_DELAY;
         if advertisement.mined {
-            self.retries.push_back((advertisement, ready_at));
-        } else if self.committed.is_none() {
-            // A newer ordinary tip supersedes a failed ordinary advertisement.
-            self.committed = Some((advertisement, ready_at));
+            self.retries
+                .push_back((advertisement, now + GOSSIP_RETRY_DELAY));
         }
+        // Ordinary tip advertisements remain best-effort, as before the dispatcher.
+        // Retrying one could race the delayed tip reader and advertise an older tip.
     }
 
     fn complete(&mut self, advertisement: Advertisement) {
@@ -217,7 +216,7 @@ impl PendingGossip {
 
 enum AttemptOutcome {
     Completed,
-    Retry(&'static str),
+    Incomplete(&'static str),
     PermanentReadiness(BoxError),
 }
 
@@ -258,9 +257,9 @@ where
         match result {
             Ok(Ok(_)) => AttemptOutcome::Completed,
             Ok(Err(AttemptFailure::Readiness(error))) => AttemptOutcome::PermanentReadiness(error),
-            Ok(Err(AttemptFailure::Request)) => AttemptOutcome::Retry("request_error"),
-            Err(_) if request_started => AttemptOutcome::Retry("network_request_timeout"),
-            Err(_) => AttemptOutcome::Retry("service_readiness_timeout"),
+            Ok(Err(AttemptFailure::Request)) => AttemptOutcome::Incomplete("request_error"),
+            Err(_) if request_started => AttemptOutcome::Incomplete("network_request_timeout"),
+            Err(_) => AttemptOutcome::Incomplete("service_readiness_timeout"),
         }
     }
     .in_current_span()
@@ -292,6 +291,7 @@ async fn next_committed_tip(
 /// Readiness and request waits are bounded together; no detached broadcast tasks survive
 /// a timeout. If pending mined storage fills, the bounded RPC channel applies backpressure.
 /// Ordinary tip changes coalesce while every distinct pending mined hash is retained.
+/// Failed ordinary tip advertisements are best-effort and are not retried.
 /// These in-memory obligations do not survive a process restart and do not replace
 /// durable winner submission or independent observation by the pool backend.
 pub async fn gossip_best_tip_block_hashes<ZN>(
@@ -362,7 +362,7 @@ where
                             committed_tip = next_committed_tip(sync_status.clone(), chain_state.clone()).boxed();
                         }
                     },
-                    AttemptOutcome::Retry(reason) => {
+                    AttemptOutcome::Incomplete(reason) if advertisement.mined => {
                         let now = Instant::now();
                         pending.retry(advertisement, now);
                         metrics::counter!("sync.gossip.request.retries", "kind" => advertisement.kind(), "reason" => reason).increment(1);
@@ -374,6 +374,12 @@ where
                                 pending_mined = pending.mined_hashes.len(), reason, phase = "retry_queued",
                                 "block gossip request incomplete; pending mined hashes retained for retry");
                         }
+                    },
+                    AttemptOutcome::Incomplete(reason) => {
+                        metrics::counter!("sync.gossip.request.dropped", "kind" => advertisement.kind(), "reason" => reason).increment(1);
+                        debug!(hash = ?advertisement.hash, height = ?advertisement.height,
+                            attempt = advertisement.attempts, reason, phase = "attempt_dropped",
+                            "ordinary tip gossip request incomplete; best-effort attempt dropped");
                     },
                     AttemptOutcome::PermanentReadiness(error) => return Err(PeerSetReadiness(error)),
                 }

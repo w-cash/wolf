@@ -200,6 +200,44 @@ async fn stalled_response_does_not_block_a_fresh_mined_hash_or_leak_tasks() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn ordinary_timeout_is_best_effort_while_mined_timeout_is_retained() {
+    for mined in [false, true] {
+        let hash = block::Hash([21 + u8::from(mined); 32]);
+        let network = ControlledNetwork::default();
+        network.set_ready();
+        network.state.lock().unwrap().stalled_responses.insert(hash);
+        let mut pending = PendingGossip::default();
+        if mined {
+            pending.enqueue_mined(hash, block::Height(21), Instant::now());
+        } else {
+            pending.enqueue_committed(hash, block::Height(21), Instant::now());
+        }
+        let advertisement = pending.take_ready(Instant::now()).unwrap();
+        let attempt = tokio::spawn(broadcast_attempt(network.clone(), advertisement));
+        network.request_started.notified().await;
+        tokio::time::advance(TIPS_RESPONSE_TIMEOUT).await;
+        assert!(matches!(
+            attempt.await.unwrap(),
+            AttemptOutcome::Incomplete("network_request_timeout")
+        ));
+        assert_eq!(network.state.lock().unwrap().active_requests, 0);
+
+        pending.retry(advertisement, Instant::now());
+        let retained = pending.take_ready(Instant::now() + GOSSIP_RETRY_DELAY);
+        if mined {
+            assert_eq!(retained.unwrap().hash, hash);
+            assert!(pending.mined_hashes.contains(&hash));
+        } else {
+            assert!(
+                retained.is_none(),
+                "ordinary failures must not race delayed newer-tip observation with a stale retry"
+            );
+            assert!(pending.next_deadline().is_none());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn closing_mined_input_does_not_cancel_a_pending_retry() {
     let hash = block::Hash([5; 32]);
     let network = ControlledNetwork::default();
