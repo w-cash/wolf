@@ -3512,7 +3512,8 @@ async fn rpc_submitblock_errors() {
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (mined_sender, mut mined_receiver) = tokio::sync::mpsc::channel(1);
+    let (rpc, queue) = RpcImpl::new(
         Mainnet,
         Default::default(),
         Default::default(),
@@ -3526,7 +3527,7 @@ async fn rpc_submitblock_errors() {
         tip.clone(),
         MockAddressBookPeers::default(),
         rx,
-        None,
+        Some(mined_sender.clone()),
     );
 
     // Try to submit pre-populated blocks and assert that it responds with duplicate.
@@ -3537,7 +3538,31 @@ async fn rpc_submitblock_errors() {
             submit_block_response,
             Ok(SubmitBlockErrorResponse::Duplicate.into())
         );
+        let block: Block = block_bytes.zcash_deserialize_into().unwrap();
+        assert_eq!(
+            mined_receiver.try_recv().unwrap(),
+            (block.hash(), block.coinbase_height().unwrap()),
+            "an exact committed duplicate recreates its gossip obligation"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
+
+    let block_bytes = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.to_vec();
+    let block: Block = block_bytes.zcash_deserialize_into().unwrap();
+    let notification = (block.hash(), block.coinbase_height().unwrap());
+    mined_sender.send(notification).await.unwrap();
+    assert!(
+        rpc.submit_block(HexData(block_bytes.clone()), None)
+            .await
+            .is_err(),
+        "a full gossip channel must remain a retryable RPC error"
+    );
+    assert_eq!(mined_receiver.try_recv().unwrap(), notification);
+    drop(mined_receiver);
+    assert!(
+        rpc.submit_block(HexData(block_bytes), None).await.is_err(),
+        "a closed gossip channel cannot confirm reannouncement"
+    );
 
     let submit_block_response = rpc
         .submit_block(
@@ -3552,9 +3577,92 @@ async fn rpc_submitblock_errors() {
     );
 
     mempool.expect_no_requests().await;
+    queue.abort();
 
     // See zebrad's `integration::regtest::regtest_block_templates_are_valid_block_submissions`
     // for the success case.
+}
+
+#[tokio::test]
+async fn rpc_submitblock_duplicate_requires_exact_committed_zcash_bytes() {
+    let _init_guard = zebra_test::init();
+    if !zcash_historical_fixtures_are_compatible() {
+        return;
+    }
+    let bytes = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.to_vec();
+    let block: Arc<Block> = bytes.zcash_deserialize_into().unwrap();
+    let hash = block.hash();
+    let height = block.coinbase_height().unwrap();
+    let wrong_hash: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let mut wrong_bytes = block.as_ref().clone();
+    wrong_bytes.transactions.push(block.transactions[0].clone());
+
+    // A duplicate verifier result includes pending work. It is not proof of
+    // canonical commitment, and malformed state replies must fail closed.
+    for (committed, read_failure, expected_error) in [
+        (None, false, false),
+        (None, true, true),
+        (Some(wrong_hash), false, true),
+        (Some(Arc::new(wrong_bytes)), false, true),
+    ] {
+        let router = tower::service_fn(move |_| async move {
+            let error = zebra_consensus::router::RouterError::from(
+                zebra_consensus::VerifyCheckpointError::NewerRequest { height, hash },
+            );
+            Err::<Hash, BoxError>(error.into())
+        });
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let calls = read_calls.clone();
+        let read_state = tower::service_fn(move |request| {
+            assert!(matches!(request, ReadRequest::Block(requested) if requested == hash.into()));
+            calls.fetch_add(1, Ordering::SeqCst);
+            let committed = committed.clone();
+            async move {
+                if read_failure {
+                    Err::<ReadResponse, BoxError>("test state unavailable".into())
+                } else {
+                    Ok(ReadResponse::Block(committed))
+                }
+            }
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (mined_sender, mut mined_receiver) = tokio::sync::mpsc::channel(1);
+        let (rpc, queue) = RpcImpl::new(
+            Mainnet,
+            Default::default(),
+            Default::default(),
+            "0.0.1",
+            "RPC test",
+            MockService::build().for_unit_tests(),
+            MockService::build().for_unit_tests(),
+            read_state,
+            router,
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            Some(mined_sender),
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            rpc.submit_block(HexData(bytes.clone()), None),
+        )
+        .await
+        .expect("duplicate recovery has a bounded state fixture");
+        if expected_error {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result, Ok(SubmitBlockErrorResponse::Duplicate.into()));
+        }
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            mined_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        queue.abort();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

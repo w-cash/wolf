@@ -224,6 +224,49 @@ The native adapter enforces these rules before a job reaches an ASIC:
   into a valid-looking record. The parent-directory entry is synced before
   mining starts, and restart performs metadata-durable bounded tail recovery.
 
+### Parent winner delivery evidence
+
+Canonical acceptance, admission to the gossip queue, completion of a network
+request, and receipt by an independent peer are separate observations. Accepted
+shares and matching node tips alone do not establish delivery of a pool winner.
+Correlate the exact winning hash across submission, outgoing gossip and an
+independent observer before describing propagation as verified.
+
+A pending Zcash winner remains eligible for identical-byte replay when the
+template node has accepted that winner, including when it has become an
+ancestor of the current template tip. A competing canonical block makes that
+replay obsolete. Failed relay delivery or unconfirmed gossip admission retains
+pending work; neither is reward credit. Confirmation and maturity still require
+the existing independent canonical observations.
+
+An exact best-chain Zcash duplicate submitted through `submitblock` recreates
+its gossip notification. The node checks the committed bytes before doing so;
+queued, absent and noncanonical duplicates do not qualify. Queue admission
+failure returns an RPC error so the caller can retry the same bytes. This does
+not change Wcash's separate witness-aware submission protocol.
+Duplicate reannouncements have a global one-second admission interval shared
+by RPC handler clones. Throttled duplicates return a retryable RPC error;
+freshly accepted blocks bypass this limit. Failed queue admission does not
+consume the interval.
+Deploy and verify the matching node revision before relying on this behavior:
+an older or third-party node's `duplicate` response alone does not establish
+recreated gossip admission.
+
+Block gossip retains up to 64 distinct received mined notifications, including
+the active attempt, in addition to the existing bounded RPC channel. It bounds
+readiness and request completion together, retries incomplete requests, and
+gives current committed tips a bounded scheduling opportunity. A full pending
+set stops draining the RPC channel; it does not provide unlimited storage.
+These in-memory notifications do not survive a process restart. Recovery relies
+on the durable pending winner and identical-byte resubmission.
+
+The `sync.gossip` metrics distinguish queued mined work, backpressure, attempts,
+retries and completed network requests. Completion is not a peer receipt
+acknowledgment. Isolated tests can verify wire announcements and retrieval of
+the full retained block; they cannot guarantee public-chain adoption or future
+availability. Keep monitoring independent receipt and canonical confirmation
+after deployment.
+
 The included ZIP-301 listener validates Equihash and both targets locally,
 requires authorization, assigns per-session nonce prefixes, rejects malformed,
 low-difficulty, duplicate, and stale shares, bounds frames and sessions, and
