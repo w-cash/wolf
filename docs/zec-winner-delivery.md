@@ -27,6 +27,13 @@ Diagnostics follow the result or failure of a submission. A stalled diagnostic
 sink may lose text records but cannot hold a share or a block submission.
 Exact discovery records remain durable even if optional diagnostics cannot start.
 
+Pool delivery dispatches writable recipients concurrently. Each recipient checks
+its own network identity and current predecessor before submitting the retained
+bytes; an unavailable observer or another writable node cannot veto healthy
+recipients. Re-delivery of an observed winner requires that recipient's exact
+canonical hash below maturity. Strict all-node identity and confirmation checks
+still gate accounting after delivery. The read-only observer never submits.
+
 ## Independent report
 
 `scripts/zec-winner-tracking.py export --deployment UUID` reads the existing
@@ -69,3 +76,5 @@ retries, exact-byte replay after local observation/restart, competing/reorganize
 and matured candidates, stalled/broken diagnostic sinks, provider outages and
 fixed-height external reorg observations. Run them off production. No fabricated
 or historical block is submitted to mainnet as a test.
+Outer-supervisor fixtures must also hold each recipient or observer unavailable
+and prove that an eligible healthy recipient receives the exact bytes first.
