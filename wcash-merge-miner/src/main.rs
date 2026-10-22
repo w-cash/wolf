@@ -823,9 +823,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     let arguments = parse_native_job_arguments(arguments)?;
     let configured = configure_native(&arguments.connection)?;
     // Diagnostics must not become a new dependency of mining availability.
-    if wcash_merge_miner::start_native_backend_diagnostics().is_err() {
-        eprintln!("{{\"component\":\"native_pool_backend\",\"level\":\"WARN\",\"stage\":\"diagnostics_start_failed\",\"result\":\"writer_unavailable\"}}");
-    }
+    let _ = wcash_merge_miner::start_native_backend_diagnostics();
     let runtime = pool_backend_runtime_config()?;
     let facts = pool_backend_authority_facts(&configured)?;
 

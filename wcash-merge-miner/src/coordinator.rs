@@ -1566,12 +1566,6 @@ fn reconcile_wcash_pool_winner(
             // `submitblock` is idempotent and remains valid after the candidate
             // cache expires. The exact bytes were validated above and were durable
             // before this reconciliation pass began.
-            crate::diagnostics::submission(
-                snapshot,
-                "winner_submission_attempt",
-                "exact_bytes_rpc",
-                None,
-            );
             let result = classify_wcash_submission(
                 wcash_node.call_value("submitblock", json!([hex::encode(snapshot.block_bytes())])),
             );
@@ -1736,6 +1730,14 @@ fn reconcile_zcash_pool_winner(
     let winner = snapshot.winner();
     let expected_hash = display_hash(*winner.block_hash_le.as_bytes());
     let requires_submission = snapshot.lifecycle().requires_submission();
+    // Local observation does not prove external delivery. Existing durable
+    // bytes keep young canonical Zcash winners eligible for paced re-admission,
+    // including after node/backend restarts. This is not independent public
+    // receipt, and never changes the accounting lifecycle or Wcash behavior.
+    let observed_redelivery = matches!(
+        snapshot.lifecycle(),
+        JournalWinnerLifecycle::Observed { .. }
+    );
     let previous_hash =
         validate_pool_winner_material(snapshot, PersistedWinnerBlockKind::Zcash, &expected_hash)
             .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
@@ -1753,16 +1755,16 @@ fn reconcile_zcash_pool_winner(
     // it entered the durable outbox.
     // This also bounds duplicate winner bursts before a replacement job reaches
     // a fast ASIC.
-    let before = if requires_submission {
+    let before = if requires_submission || observed_redelivery {
         zcash.template_chain_tip()
     } else {
         zcash.consistent_chain_tip()
     }
     .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
-    let exact_winner_on_template = requires_submission
+    let exact_winner_on_template = (requires_submission || observed_redelivery)
         && zcash
             .template_winner_is_canonical(before, winner.height, *winner.block_hash_le.as_bytes())
-            .map_err(|error| PoolWinnerReconciliationError::new(error, true))?;
+            .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
     let tip_position = parent_winner_tip_position(
         before,
         winner.height,
@@ -1771,18 +1773,20 @@ fn reconcile_zcash_pool_winner(
     )
     .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
     let submission_required = parent_winner_submission_required(snapshot.lifecycle(), tip_position);
-    let submission = match (requires_submission, tip_position) {
+    let redeliver = observed_redelivery
+        && exact_winner_on_template
+        && before
+            .height
+            .checked_sub(winner.height)
+            .and_then(|depth| depth.checked_add(1))
+            .is_some_and(|depth| depth < winner.maturity_confirmations)
+        && zcash.claim_observed_parent_redelivery(*winner.block_hash_le.as_bytes(), Instant::now());
+    let submission = match (requires_submission || redeliver, tip_position) {
         (
             true,
             ParentWinnerTipPosition::ReadyForSubmission
             | ParentWinnerTipPosition::ExactWinnerOnTemplateChain,
         ) => {
-            crate::diagnostics::submission(
-                snapshot,
-                "winner_submission_attempt",
-                "exact_bytes_rpc",
-                None,
-            );
             let report = match zcash.replay_parent_bytes(
                 snapshot.block_bytes(),
                 winner.height,
@@ -1791,7 +1795,10 @@ fn reconcile_zcash_pool_winner(
                 Ok(report) => report,
                 Err(error) => {
                     crate::diagnostics::submission_error(snapshot, &error);
-                    return Err(PoolWinnerReconciliationError::new(error, true));
+                    return Err(PoolWinnerReconciliationError::new(
+                        error,
+                        requires_submission,
+                    ));
                 }
             };
             let mut counts = [0; 6];
@@ -1831,9 +1838,11 @@ fn reconcile_zcash_pool_winner(
         }
         _ => None,
     };
-    if submission.as_ref().is_some_and(|report| {
-        !report.relays_succeeded() || (report.is_confirmed() && !report.delivery_admitted())
-    }) {
+    if requires_submission
+        && submission.as_ref().is_some_and(|report| {
+            !report.relays_succeeded() || (report.is_confirmed() && !report.delivery_admitted())
+        })
+    {
         // Retain the exact bytes for another ordered reconciliation attempt.
         // A new parent job needs positive gossip admission from a confirming
         // pinned node or all configured relays. Configured independent relays
@@ -1844,10 +1853,10 @@ fn reconcile_zcash_pool_winner(
         ));
     }
     let noncanonical = requires_submission
-        && matches!(tip_position, ParentWinnerTipPosition::Overtaken)
-        || submission
-            .as_ref()
-            .is_some_and(ParentSubmissionReport::is_known_side_chain);
+        && (matches!(tip_position, ParentWinnerTipPosition::Overtaken)
+            || submission
+                .as_ref()
+                .is_some_and(ParentSubmissionReport::is_known_side_chain));
 
     // A successful submit advances the tip itself. Fence confirmation reads
     // with a new post-submit snapshot rather than requiring the pre-submit
@@ -1857,7 +1866,7 @@ fn reconcile_zcash_pool_winner(
         && !submission
             .as_ref()
             .is_some_and(|report| report.is_confirmed() || report.is_known_side_chain());
-    let observation_before = if submission.is_some() {
+    let observation_before = if submission.is_some() || observed_redelivery {
         zcash
             .consistent_chain_tip()
             .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))?
@@ -1887,7 +1896,12 @@ fn reconcile_zcash_pool_winner(
             submission_blocked = false;
         }
     }
-    if !parent_submission_completed_on_stable_tip(before, observation_before, submission.as_ref())
+    if requires_submission
+        && !parent_submission_completed_on_stable_tip(
+            before,
+            observation_before,
+            submission.as_ref(),
+        )
         .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))?
     {
         return Err(PoolWinnerReconciliationError::new(
@@ -5303,6 +5317,13 @@ mod tests {
     }
 
     fn parent_reconciliation_fixture(block: &Block) -> PoolBackendWinnerSnapshot {
+        parent_reconciliation_fixture_with_lifecycle(block, JournalWinnerLifecycle::Pending)
+    }
+
+    fn parent_reconciliation_fixture_with_lifecycle(
+        block: &Block,
+        lifecycle: JournalWinnerLifecycle,
+    ) -> PoolBackendWinnerSnapshot {
         PoolBackendWinnerSnapshot::from_test_state(
             crate::pool_backend_journal::JournalWinnerState {
                 share_id: Hex32::new([0x51; 32]),
@@ -5314,10 +5335,202 @@ mod tests {
                 },
                 parent_hash_le: Hex32::new(block.hash().0),
                 block_bytes: block.zcash_serialize_to_vec().unwrap(),
-                lifecycle: JournalWinnerLifecycle::Pending,
+                lifecycle,
                 revision_event_seq: 1,
             },
         )
+    }
+
+    #[test]
+    fn observed_parent_redelivery_cooldown_is_shared_bounded_and_restartable() {
+        let provider = unused_zcash_provider();
+        let now = Instant::now();
+        for byte in 0..128u8 {
+            assert!(provider.claim_observed_parent_redelivery([byte; 32], now));
+        }
+        assert!(!provider.claim_observed_parent_redelivery([128; 32], now));
+        assert!(!provider
+            .clone()
+            .claim_observed_parent_redelivery([0; 32], now + Duration::from_secs(4)));
+        assert!(provider.claim_observed_parent_redelivery([0; 32], now + Duration::from_secs(5)));
+        assert!(unused_zcash_provider().claim_observed_parent_redelivery([0; 32], now));
+    }
+
+    #[test]
+    fn observed_parent_readmits_exact_bytes_and_only_logs_after_the_result() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let own_tip = json!({"blocks":1,"bestblockhash":hash});
+        let header = json!({"hash":hash,"height":1,"confirmations":1});
+        let snapshot = parent_reconciliation_fixture_with_lifecycle(
+            &block,
+            JournalWinnerLifecycle::Observed {
+                tip: pool_tip(1, 0),
+                confirmations: 1,
+            },
+        );
+        let (template, a) = spawn_scripted_rpc_server(vec![
+            own_tip.clone(),
+            json!("duplicate"),
+            header.clone(),
+            own_tip.clone(),
+            header.clone(),
+            own_tip.clone(),
+            own_tip.clone(),
+            own_tip.clone(),
+            header.clone(),
+            own_tip.clone(),
+        ]);
+        let (validator, b) = spawn_scripted_rpc_server(vec![
+            json!("duplicate"),
+            header.clone(),
+            own_tip.clone(),
+            header.clone(),
+            own_tip.clone(),
+            own_tip.clone(),
+            header,
+            own_tip,
+        ]);
+        let provider = test_zcash_provider(template, validator);
+        let (_, events) = crate::diagnostics::capture(|| {
+            for _ in 0..2 {
+                assert!(matches!(
+                    reconcile_zcash_pool_winner(&provider, &snapshot),
+                    Ok(Some(PoolBackendWinnerTransition::Observed {
+                        confirmations: 1,
+                        ..
+                    }))
+                ));
+            }
+        });
+        assert_eq!(
+            events,
+            vec![("winner_submission_result", "best_chain_admitted")]
+        );
+        for server in [a, b] {
+            let requests = server.join().expect("observed delivery fixture exits");
+            let submissions = requests
+                .iter()
+                .filter(|request| request["method"] == "submitblock")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                submissions.len(),
+                1,
+                "the second audit respects the cooldown"
+            );
+            assert_eq!(
+                submissions[0]["params"],
+                json!([hex::encode(snapshot.block_bytes())])
+            );
+        }
+    }
+
+    #[test]
+    fn observed_parent_ancestor_readmission_failure_does_not_block_accounting() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let tip = json!({"blocks":2,"bestblockhash":"73".repeat(32)});
+        let header = json!({"hash":hash,"height":1,"confirmations":2});
+        let unconfirmed_header = json!({"hash":hash,"height":1,"confirmations":0});
+        let snapshot = parent_reconciliation_fixture_with_lifecycle(
+            &block,
+            JournalWinnerLifecycle::Observed {
+                tip: pool_tip(1, 0),
+                confirmations: 1,
+            },
+        );
+        for failed_submit in [
+            Ok(json!("rejected")),
+            Err(json!({"code":-28,"message":"temporarily unavailable"})),
+        ] {
+            let (template, a) = spawn_scripted_rpc_reply_server(
+                vec![
+                    Ok(tip.clone()),
+                    Ok(json!(hash)),
+                    Ok(tip.clone()),
+                    failed_submit.clone(),
+                    Ok(unconfirmed_header.clone()),
+                    Ok(tip.clone()),
+                    Ok(header.clone()),
+                    Ok(tip.clone()),
+                ],
+                |_, _| {},
+            );
+            let (validator, b) = spawn_scripted_rpc_reply_server(
+                vec![
+                    failed_submit,
+                    Ok(unconfirmed_header.clone()),
+                    Ok(tip.clone()),
+                    Ok(header.clone()),
+                    Ok(tip.clone()),
+                ],
+                |_, _| {},
+            );
+            let provider = test_zcash_provider(template, validator);
+            assert!(matches!(
+                reconcile_zcash_pool_winner(&provider, &snapshot),
+                Ok(Some(PoolBackendWinnerTransition::Observed {
+                    confirmations: 2,
+                    ..
+                }))
+            ));
+            for server in [a, b] {
+                assert_eq!(
+                    server
+                        .join()
+                        .unwrap()
+                        .iter()
+                        .filter(|request| request["method"] == "submitblock")
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn observed_parent_competing_or_deep_winner_is_status_only() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        for (height, canonical, confirmations) in [(0, false, 0), (1, false, 0), (100, true, 100)] {
+            let tip = json!({"blocks":height,"bestblockhash":if height == 0 { display_hash(block.header.previous_block_hash.0) } else { "73".repeat(32) }});
+            let header = json!({"hash":hash,"height":1,"confirmations":confirmations});
+            let mut replies = vec![tip.clone()];
+            if height > 1 {
+                replies.extend([json!(hash), tip.clone()]);
+            }
+            replies.extend([tip.clone(), header.clone(), tip.clone()]);
+            let (template, a) = spawn_scripted_rpc_server(replies);
+            let (validator, b) = spawn_scripted_rpc_server(vec![tip.clone(), header, tip]);
+            let snapshot = parent_reconciliation_fixture_with_lifecycle(
+                &block,
+                JournalWinnerLifecycle::Observed {
+                    tip: pool_tip(1, 0),
+                    confirmations: 1,
+                },
+            );
+            let result =
+                reconcile_zcash_pool_winner(&test_zcash_provider(template, validator), &snapshot)
+                    .unwrap();
+            assert!(if canonical {
+                matches!(
+                    result,
+                    Some(PoolBackendWinnerTransition::Matured {
+                        confirmations: 100,
+                        ..
+                    })
+                )
+            } else {
+                matches!(result, Some(PoolBackendWinnerTransition::Orphaned { .. }))
+            });
+            for server in [a, b] {
+                assert!(server
+                    .join()
+                    .unwrap()
+                    .iter()
+                    .all(|request| request["method"] != "submitblock"));
+            }
+        }
     }
 
     #[test]

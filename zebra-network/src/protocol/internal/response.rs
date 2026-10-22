@@ -14,6 +14,37 @@ use proptest_derive::Arbitrary;
 
 use InventoryResponse::*;
 
+/// Local transport outcomes for a Zcash mined-block advertisement.
+///
+/// A successful send only flushes an inventory hash to the local transport. It is
+/// not an acknowledgment of remote receipt, block validation, or chain adoption.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
+pub struct MinedBlockAdvertisement {
+    /// Successful sends to peers other than configured sidecars or loopback peers.
+    /// These peers are not necessarily independently operated.
+    pub non_local_sent: usize,
+    /// Successful sends to configured sidecars or loopback peers.
+    pub local_sent: usize,
+    /// Peer service requests that returned errors.
+    pub failed: usize,
+}
+
+impl MinedBlockAdvertisement {
+    /// The number of completed peer service requests in this report.
+    pub fn attempted(&self) -> usize {
+        self.non_local_sent
+            .saturating_add(self.local_sent)
+            .saturating_add(self.failed)
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.non_local_sent = self.non_local_sent.saturating_add(other.non_local_sent);
+        self.local_sent = self.local_sent.saturating_add(other.local_sent);
+        self.failed = self.failed.saturating_add(other.failed);
+    }
+}
+
 /// A response to a network request, represented in internal format.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
@@ -27,6 +58,10 @@ pub enum Response {
     ///
     /// (Inventory requests provide a list of missing hashes if none of the hashes were available.)
     Nil,
+
+    /// Local outcomes of a Zcash [`Request::AdvertiseBlockToAll`](super::Request::AdvertiseBlockToAll).
+    /// This metadata is never sent as a wire response.
+    MinedBlockAdvertisement(MinedBlockAdvertisement),
 
     /// A list of peers, used to respond to `GetPeers`.
     ///
@@ -88,6 +123,11 @@ impl fmt::Display for Response {
         f.write_str(&match self {
             Response::Nil => "Nil".to_string(),
 
+            Response::MinedBlockAdvertisement(report) => format!(
+                "MinedBlockAdvertisement {{ non_local_sent: {}, local_sent: {}, failed: {} }}",
+                report.non_local_sent, report.local_sent, report.failed
+            ),
+
             Response::Peers(peers) => format!("Peers {{ peers: {} }}", peers.len()),
 
             Response::Pong(duration) => format!("Pong {{ latency: {duration:?} }}"),
@@ -133,6 +173,8 @@ impl Response {
     pub fn command(&self) -> &'static str {
         match self {
             Response::Nil => "Nil",
+
+            Response::MinedBlockAdvertisement(_) => "MinedBlockAdvertisement",
 
             Response::Peers(_) => "Peers",
 

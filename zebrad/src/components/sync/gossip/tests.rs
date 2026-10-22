@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
@@ -21,7 +21,10 @@ struct NetworkState {
     active_requests: usize,
     max_active_requests: usize,
     requests: Vec<block::Hash>,
+    mined_requests: Vec<block::Hash>,
+    ordinary_requests: Vec<block::Hash>,
     stalled_responses: HashSet<block::Hash>,
+    mined_reports: HashMap<block::Hash, zn::MinedBlockAdvertisement>,
 }
 
 #[derive(Clone, Default)]
@@ -62,15 +65,34 @@ impl Service<zn::Request> for ControlledNetwork {
     }
 
     fn call(&mut self, request: zn::Request) -> Self::Future {
+        let mined = matches!(request, zn::Request::AdvertiseBlockToAll(_));
         let hash = match request {
             zn::Request::AdvertiseBlockToAll(hash) | zn::Request::AdvertiseBlock(hash, _) => hash,
             _ => panic!("block gossip only sends block advertisements"),
         };
         let mut state = self.state.lock().unwrap();
         state.requests.push(hash);
+        if mined {
+            state.mined_requests.push(hash);
+        } else {
+            state.ordinary_requests.push(hash);
+        }
         state.active_requests += 1;
         state.max_active_requests = state.max_active_requests.max(state.active_requests);
         let stalled = state.stalled_responses.contains(&hash);
+        let response =
+            if mined {
+                zn::Response::MinedBlockAdvertisement(
+                    state.mined_reports.get(&hash).copied().unwrap_or(
+                        zn::MinedBlockAdvertisement {
+                            non_local_sent: 1,
+                            ..Default::default()
+                        },
+                    ),
+                )
+            } else {
+                zn::Response::Nil
+            };
         drop(state);
         self.request_started.notify_one();
         let guard = ActiveRequest(Arc::clone(&self.state));
@@ -79,7 +101,7 @@ impl Service<zn::Request> for ControlledNetwork {
             if stalled {
                 std::future::pending().await
             } else {
-                Ok(zn::Response::Nil)
+                Ok(response)
             }
         }
         .boxed()
@@ -429,4 +451,189 @@ async fn saturated_pending_storage_applies_backpressure_and_recovers_without_los
     assert_eq!(network.state.lock().unwrap().max_active_requests, 1);
     assert_eq!(sender.capacity(), 4);
     task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_and_local_only_mined_transport_retries_survive_ordinary_observation() {
+    let hash = block::Hash([104; 32]);
+    let network = ControlledNetwork::default();
+    network.set_ready();
+    network.state.lock().unwrap().mined_reports.insert(
+        hash,
+        zn::MinedBlockAdvertisement {
+            failed: 1,
+            ..Default::default()
+        },
+    );
+    let (sender, receiver) = mpsc::channel(4);
+    let (task, mut tip, mut syncs) = start_gossip(network.clone(), receiver);
+    sender.try_send((hash, block::Height(104))).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), network.request_started.notified())
+        .await
+        .unwrap();
+    yield_tasks().await;
+    assert_eq!(network.state.lock().unwrap().mined_requests.len(), 1);
+
+    // A local sidecar can now receive the inventory, including ordinary tip gossip.
+    // Its observation must not complete the distinct mined delivery obligation.
+    network.state.lock().unwrap().mined_reports.insert(
+        hash,
+        zn::MinedBlockAdvertisement {
+            local_sent: 1,
+            ..Default::default()
+        },
+    );
+    syncs.push_obtain_tips_length(0);
+    tip.set_finalized_tip(zebra_state::ChainTipBlock {
+        hash,
+        height: block::Height(104),
+        time: std::time::SystemTime::UNIX_EPOCH.into(),
+        transactions: Vec::new(),
+        transaction_hashes: Arc::from([]),
+        previous_block_hash: block::Hash([103; 32]),
+    });
+    for _ in 0..10 {
+        tokio::time::advance(GOSSIP_RETRY_DELAY).await;
+        yield_tasks().await;
+    }
+    let before_recovery = {
+        let state = network.state.lock().unwrap();
+        assert!(state.ordinary_requests.contains(&hash));
+        assert!(
+            state.mined_requests.len() > 2,
+            "local-only sends remain retryable"
+        );
+        assert_eq!(state.max_active_requests, 1);
+        state.mined_requests.len()
+    };
+
+    // A partial fanout with a non-local transport success can finish this attempt.
+    // The durable backend still needs independent receipt/adoption evidence.
+    network.state.lock().unwrap().mined_reports.insert(
+        hash,
+        zn::MinedBlockAdvertisement {
+            non_local_sent: 1,
+            local_sent: 1,
+            failed: 1,
+        },
+    );
+    tokio::time::timeout(GOSSIP_RETRY_DELAY + Duration::from_secs(1), async {
+        loop {
+            if network.state.lock().unwrap().mined_requests.len() > before_recovery {
+                break;
+            }
+            network.request_started.notified().await;
+        }
+    })
+    .await
+    .expect("the retained winner retries after a non-local peer recovers");
+    yield_tasks().await;
+    tokio::time::advance(PEER_GOSSIP_DELAY + TIPS_RESPONSE_TIMEOUT).await;
+    yield_tasks().await;
+    assert_eq!(
+        network.state.lock().unwrap().mined_requests.len(),
+        before_recovery + 1
+    );
+    assert!(!task.is_finished());
+    task.abort();
+    let _ = task.await;
+}
+
+/// Exercise the tip watcher and dispatch loop together while both traffic kinds stall.
+#[tokio::test(start_paused = true)]
+async fn newer_committed_tip_progresses_while_mined_delivery_retries() {
+    let first_tip = block::Hash([101; 32]);
+    let newer_tip = block::Hash([102; 32]);
+    let mined = block::Hash([103; 32]);
+    let network = ControlledNetwork::default();
+    network.set_ready();
+    network
+        .state
+        .lock()
+        .unwrap()
+        .stalled_responses
+        .extend([first_tip, mined]);
+    let (sender, receiver) = mpsc::channel(4);
+    let (task, mut tip_sender, mut recent_syncs) = start_gossip(network.clone(), receiver);
+    recent_syncs.push_obtain_tips_length(0);
+
+    // The watcher only consumes tip metadata, so no validation/state fixture is needed.
+    let tip_block = |hash, height, previous_block_hash| zebra_state::ChainTipBlock {
+        hash,
+        height,
+        time: std::time::SystemTime::UNIX_EPOCH.into(),
+        transactions: Vec::new(),
+        transaction_hashes: Arc::from([]),
+        previous_block_hash,
+    };
+    tip_sender.set_finalized_tip(tip_block(
+        first_tip,
+        block::Height(101),
+        block::Hash([100; 32]),
+    ));
+    tokio::time::timeout(
+        PEER_GOSSIP_DELAY + Duration::from_secs(1),
+        network.request_started.notified(),
+    )
+    .await
+    .expect("the first real tip change reaches an ordinary gossip attempt");
+    assert_eq!(network.requests(), vec![first_tip]);
+
+    // Queue mined work while A's ordinary request is still stalled, then advance to B.
+    sender.try_send((mined, block::Height(103))).unwrap();
+    tip_sender.set_finalized_tip(tip_block(newer_tip, block::Height(102), first_tip));
+    tokio::time::timeout(
+        TIPS_RESPONSE_TIMEOUT + Duration::from_secs(1),
+        network.request_started.notified(),
+    )
+    .await
+    .expect("the timed-out ordinary request releases the dispatcher for mined work");
+    assert_eq!(network.requests(), vec![first_tip, mined]);
+
+    tokio::time::timeout(PEER_GOSSIP_DELAY + TIPS_RESPONSE_TIMEOUT * 5, async {
+        loop {
+            if network.requests().contains(&newer_tip) {
+                break;
+            }
+            network.request_started.notified().await;
+        }
+    })
+    .await
+    .expect("the newer committed tip progresses while mined requests remain incomplete");
+
+    // Keep the mined request stalled through another retry opportunity. A must stay dropped.
+    tokio::time::timeout(
+        TIPS_RESPONSE_TIMEOUT + GOSSIP_RETRY_DELAY + Duration::from_secs(1),
+        async {
+            loop {
+                if network
+                    .requests()
+                    .iter()
+                    .filter(|hash| **hash == mined)
+                    .count()
+                    >= 2
+                {
+                    break;
+                }
+                network.request_started.notified().await;
+            }
+        },
+    )
+    .await
+    .expect("the mined notification survives its timeout and is retried");
+    let requests = network.requests();
+    assert_eq!(
+        requests.iter().filter(|hash| **hash == first_tip).count(),
+        1,
+        "an obsolete ordinary tip is never retried after the chain advances"
+    );
+    assert_eq!(
+        requests.iter().filter(|hash| **hash == newer_tip).count(),
+        1,
+        "the current tip receives its ordinary best-effort attempt"
+    );
+    assert_eq!(network.state.lock().unwrap().max_active_requests, 1);
+    assert!(!task.is_finished());
+    task.abort();
+    let _ = task.await;
 }

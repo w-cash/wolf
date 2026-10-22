@@ -241,13 +241,6 @@ where
             // This can be a buffered service call, not physical peer readiness.
             request_started = true;
             let request = advertisement.request();
-            // Retries already have a paced warning below. Do not print once per
-            // retry or format a request that might acquire private fields later.
-            if advertisement.attempts == 1 {
-                info!(hash = ?advertisement.hash, height = ?advertisement.height,
-                    kind = advertisement.kind(), attempt = advertisement.attempts,
-                    phase = "request_started", "block gossip network request started");
-            }
             ready
                 .call(request)
                 .await
@@ -255,7 +248,35 @@ where
         })
         .await;
         match result {
-            Ok(Ok(_)) => AttemptOutcome::Completed,
+            Ok(Ok(zn::Response::MinedBlockAdvertisement(report))) if advertisement.mined => {
+                if report.non_local_sent > 0 {
+                    info!(hash = ?advertisement.hash, height = ?advertisement.height,
+                        attempt = advertisement.attempts, attempted = report.attempted(),
+                        non_local_sent = report.non_local_sent, local_sent = report.local_sent,
+                        failed = report.failed, phase = "mined_transport_result",
+                        "mined block inventory transport completed; independent peer receipt is unconfirmed");
+                    AttemptOutcome::Completed
+                } else {
+                    if advertisement.attempts == 1 {
+                        warn!(hash = ?advertisement.hash, height = ?advertisement.height,
+                            attempt = advertisement.attempts, attempted = report.attempted(),
+                            non_local_sent = report.non_local_sent, local_sent = report.local_sent,
+                            failed = report.failed, phase = "mined_transport_result",
+                            "mined block has no non-local transport success; retained for retry");
+                    }
+                    let reason = if report.local_sent > 0 {
+                        "local_only_transport"
+                    } else if report.failed > 0 {
+                        "all_peer_sends_failed"
+                    } else {
+                        "no_peer_candidates"
+                    };
+                    AttemptOutcome::Incomplete(reason)
+                }
+            },
+            // Wcash and ordinary tip advertisements retain their best-effort contract.
+            Ok(Ok(zn::Response::Nil)) => AttemptOutcome::Completed,
+            Ok(Ok(_)) => AttemptOutcome::Incomplete("unexpected_network_response"),
             Ok(Err(AttemptFailure::Readiness(error))) => AttemptOutcome::PermanentReadiness(error),
             Ok(Err(AttemptFailure::Request)) => AttemptOutcome::Incomplete("request_error"),
             Err(_) if request_started => AttemptOutcome::Incomplete("network_request_timeout"),
@@ -291,6 +312,8 @@ async fn next_committed_tip(
 /// Readiness and request waits are bounded together; no detached broadcast tasks survive
 /// a timeout. If pending mined storage fills, the bounded RPC channel applies backpressure.
 /// Ordinary tip changes coalesce while every distinct pending mined hash is retained.
+/// Zcash mined attempts also require a transport success beyond configured sidecars
+/// and loopback peers; this is not evidence of independent receipt or adoption.
 /// Failed ordinary tip advertisements are best-effort and are not retried.
 /// These in-memory obligations do not survive a process restart and do not replace
 /// durable winner submission or independent observation by the pool backend.
@@ -377,7 +400,7 @@ where
                         let now = Instant::now();
                         pending.retry(advertisement, now);
                         metrics::counter!("sync.gossip.request.retries", "kind" => advertisement.kind(), "reason" => reason).increment(1);
-                        if last_warning.is_none_or(|previous| now.duration_since(previous) >= GOSSIP_WARNING_INTERVAL) {
+                        if advertisement.attempts == 1 || last_warning.is_none_or(|previous| now.duration_since(previous) >= GOSSIP_WARNING_INTERVAL) {
                             last_warning = Some(now);
                             warn!(hash = ?advertisement.hash, height = ?advertisement.height,
                                 attempt = advertisement.attempts,

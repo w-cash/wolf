@@ -5,7 +5,13 @@
 //! from a genuine Zcash `getblocktemplate`, checked locally, and submitted in
 //! proposal mode to every configured validation node before miners can see it.
 
-use std::{collections::HashSet, fmt, sync::Arc, thread, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 use hex::FromHex;
 use serde_json::{json, Value};
@@ -48,6 +54,8 @@ use crate::{
 const HEADER_INPUT_BYTES: usize = 108;
 const PARENT_BLOCK_LIMIT: usize = 2_000_000;
 const MAX_OBSERVER_RELAY_BLOCKS: u32 = 32;
+const OBSERVED_PARENT_REDELIVERY_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_OBSERVED_PARENT_REDELIVERY_COOLDOWNS: usize = 128;
 
 /// Strict local projection of the parent fields used to build an exact job.
 ///
@@ -393,6 +401,7 @@ pub struct NativeZcashProvider {
     expected_parent_payout_commitment: [u8; 32],
     expected_parent_payout_address: ZcashAddress,
     allow_lagging_proposal_validators: bool,
+    observed_parent_redelivery: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
 }
 
 /// Exact chain tip sampled from one or more pinned consensus nodes.
@@ -454,7 +463,26 @@ impl NativeZcashProvider {
             expected_parent_payout_commitment,
             expected_parent_payout_address,
             allow_lagging_proposal_validators,
+            observed_parent_redelivery: Arc::default(),
         })
+    }
+
+    /// Paces background re-admission only; initial winner submission never waits
+    /// for this optional in-memory schedule. Durable bytes and lifecycle, rather
+    /// than this cooldown, recreate the obligation after a process restart.
+    pub(crate) fn claim_observed_parent_redelivery(&self, hash_le: [u8; 32], now: Instant) -> bool {
+        let Ok(mut recent) = self.observed_parent_redelivery.try_lock() else {
+            return false;
+        };
+        recent.retain(|_, last| {
+            now.saturating_duration_since(*last) < OBSERVED_PARENT_REDELIVERY_INTERVAL
+        });
+        if recent.contains_key(&hash_le) || recent.len() >= MAX_OBSERVED_PARENT_REDELIVERY_COOLDOWNS
+        {
+            return false;
+        }
+        recent.insert(hash_le, now);
+        true
     }
 
     /// Builds and independently proposal-validates one exact parent job.

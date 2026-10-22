@@ -140,7 +140,7 @@ use crate::{
     },
     protocol::{
         external::{connection_limit_key, InventoryHash},
-        internal::{Request, Response},
+        internal::{MinedBlockAdvertisement, Request, Response},
     },
     BoxError, Config, PeerError, PeerSocketAddr, SharedPeerError,
 };
@@ -1214,27 +1214,48 @@ where
         peers: Vec<D::Key>,
     ) -> <Self as tower::Service<Request>>::Future {
         let broadcast = BlockBroadcast::from_request(&req);
+        let report_mined =
+            matches!(req, Request::AdvertiseBlockToAll(_)) && !self.network.uses_wcash_consensus();
         let futs = FuturesUnordered::new();
         for key in peers {
+            let is_local = self.zcashd_compat_peer_keys.contains(&key)
+                || key.ip().to_canonical().is_loopback();
             let mut svc = self
                 .take_ready_service(&key)
                 .expect("selected peers are ready");
-            futs.push(svc.call(req.clone()).map_err(|_| ()));
+            futs.push(
+                svc.call(req.clone())
+                    .map(move |result| (is_local, result.is_ok())),
+            );
             self.push_unready(key, svc);
         }
 
         async move {
-            let results = futs.collect::<Vec<Result<_, _>>>().await;
+            let results = futs.collect::<Vec<_>>().await;
+            let mut report = MinedBlockAdvertisement::default();
+            for (is_local, succeeded) in results {
+                if !succeeded {
+                    report.failed += 1;
+                } else if is_local {
+                    report.local_sent += 1;
+                } else {
+                    report.non_local_sent += 1;
+                }
+            }
+            let ok = report.non_local_sent + report.local_sent;
             if let Some(broadcast) = broadcast {
-                let ok = results.iter().filter(|result| result.is_ok()).count();
-                broadcast.completed(ok, results.len() - ok);
+                broadcast.completed(ok, report.failed);
             }
             tracing::debug!(
-                ok.len = results.iter().filter(|r| r.is_ok()).count(),
-                err.len = results.iter().filter(|r| r.is_err()).count(),
+                ok.len = ok,
+                err.len = report.failed,
                 "sent peer request to multiple peers"
             );
-            Ok(Response::Nil)
+            if report_mined {
+                Ok(Response::MinedBlockAdvertisement(report))
+            } else {
+                Ok(Response::Nil)
+            }
         }
         .boxed()
     }
@@ -1335,13 +1356,22 @@ where
         };
 
         async move {
-            let _ = send_multiple_fut.await?;
+            let mut response = send_multiple_fut.await?;
             while let Some(queued_broadcast) = queued_broadcast_fut_receiver.recv().await {
                 // The client cancels its request if this response future is dropped.
                 // Drive queued deliveries just like the initially ready peers.
-                queued_broadcast.await?;
+                match (&mut response, queued_broadcast.await?) {
+                    (
+                        Response::MinedBlockAdvertisement(total),
+                        Response::MinedBlockAdvertisement(batch),
+                    ) => {
+                        total.merge(batch);
+                    }
+                    (Response::Nil, Response::Nil) => {}
+                    _ => return Err("inconsistent mined broadcast transport report".into()),
+                }
             }
-            Ok(Response::Nil)
+            Ok(response)
         }
         .boxed()
     }
