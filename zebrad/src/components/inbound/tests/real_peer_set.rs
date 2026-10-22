@@ -838,6 +838,7 @@ mod submitblock_test {
         // Set up a tracing subscriber with a custom writer
         let subscriber = fmt()
             .with_max_level(Level::INFO)
+            .with_ansi(false)
             .with_writer(move || TestWriter(log_sink.clone())) // Write logs to an in-memory buffer
             .finish();
 
@@ -846,15 +847,20 @@ mod submitblock_test {
         let (sync_status, _recent_syncs) = SyncStatus::new();
 
         // State
+        let network = if Network::Mainnet.is_compatible_with_compiled_consensus() {
+            Network::Mainnet
+        } else {
+            Network::new_wcash_regtest()
+        };
         let state_config = StateConfig::ephemeral();
         let (_state_service, _read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zebra_state::init(state_config, &Network::Mainnet, Height::MAX, 0).await;
+            zebra_state::init(state_config, &network, Height::MAX, 0).await;
 
         let config_listen_addr = "127.0.0.1:0".parse().unwrap();
 
         // Network
         let network_config = NetworkConfig {
-            network: Network::Mainnet,
+            network,
             listen_addr: config_listen_addr,
 
             // Stop Zebra making outbound connections
@@ -883,10 +889,15 @@ mod submitblock_test {
 
         // Start the block gossip task with a SubmitBlockChannel
         let submitblock_channel = SubmitBlockChannel::new();
+        let mut hash_bytes = [1; 32];
+        hash_bytes[0] = 0x12;
+        hash_bytes[31] = 0xab;
+        let hash = block::Hash(hash_bytes);
+        let height = block::Height(1);
         // Send a block to the channel
         submitblock_channel
             .sender()
-            .send((block::Hash([1; 32]), block::Height(1)))
+            .send((hash, height))
             .await
             .unwrap();
         let gossip_task_handle = tokio::spawn(
@@ -902,12 +913,26 @@ mod submitblock_test {
         // Wait for the block gossip task to process the block
         tokio::time::sleep(PEER_GOSSIP_DELAY).await;
 
-        // Check that the block was processed as a mnined block by the gossip task
-        let captured_logs = logs.lock().unwrap();
-        let log_output = String::from_utf8(captured_logs.clone()).unwrap();
+        // Release the writer buffer before assertions so a failed expectation
+        // cannot poison it while background tasks shut down.
+        let captured_logs = logs.lock().unwrap().clone();
+        let log_output = String::from_utf8(captured_logs).unwrap();
 
         assert!(log_output.contains("initializing block gossip task"));
-        assert!(log_output.contains("sending mined block broadcast"));
+        let public_hash = format!("hash={hash:?}");
+        let public_height = format!("height={height:?}");
+        assert!(log_output
+            .lines()
+            .any(|line| { line.contains("phase=\"queued\"") && line.contains(&public_hash) }));
+        // This fixture has no external peer. A started request identifies the
+        // mined-channel work; it establishes neither completion nor receipt.
+        assert!(log_output.lines().any(|line| {
+            line.contains("block gossip network request started")
+                && line.contains("phase=\"request_started\"")
+                && line.contains("kind=\"mined\"")
+                && line.contains(&public_hash)
+                && line.contains(&public_height)
+        }));
 
         std::mem::drop(gossip_task_handle);
 
