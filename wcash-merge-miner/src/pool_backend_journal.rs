@@ -3714,6 +3714,39 @@ mod tests {
             .next_submission_required_winner_state_before(None, usize::MAX)
             .expect("Pending delivery remains retryable")
             .is_some());
+        // Exercise the public supervisor wrapper against unavailable recipients,
+        // then reopen the real authoritative journal. Failed independent
+        // delivery must neither retire the Pending proof nor rewrite its bytes.
+        let before_failed_delivery = fs::read(&path).unwrap();
+        let snapshot = crate::PoolBackendWinnerSnapshot::from_test_state(recovery[0].1.clone());
+        let supervisor = crate::coordinator::tests::test_pool_supervisor(
+            directory.path(),
+            crate::rpc::RpcEndpoint::new("http://127.0.0.1:1/", None, None).unwrap(),
+            crate::rpc::RpcEndpoint::new("http://127.0.0.1:2/", None, None).unwrap(),
+            crate::rpc::RpcEndpoint::new("http://127.0.0.1:3/", None, None).unwrap(),
+            Vec::new(),
+            vec![crate::rpc::RpcEndpoint::new("http://127.0.0.1:4/", None, None).unwrap()],
+        );
+        let failure = supervisor
+            .reconcile_pool_backend_winner(&snapshot)
+            .unwrap_err();
+        assert!(failure.submission_blocked());
+        assert_eq!(snapshot.lifecycle(), &JournalWinnerLifecycle::Pending);
+        assert_eq!(snapshot.block_bytes(), block_bytes);
+        assert_eq!(fs::read(&path).unwrap(), before_failed_delivery);
+        drop(supervisor);
+        drop(journal);
+        let journal = open(&path, &config);
+        let (_, recovered_after_failure) = journal.winner_recovery_state().unwrap();
+        assert_eq!(
+            recovered_after_failure[0].1.lifecycle,
+            JournalWinnerLifecycle::Pending
+        );
+        assert_eq!(recovered_after_failure[0].1.block_bytes, block_bytes);
+        assert_eq!(
+            recovered_after_failure[0].1.revision_event_seq,
+            commit.receipt.event_seq
+        );
         let tip = ChainTip {
             block_hash_le: Hex32::new(block_hash),
             height: 1,

@@ -1,0 +1,8 @@
+project: zebrad
+kind: Fixed
+body: >-
+  Check each writable recipient's identity and candidate eligibility in its own
+  parallel delivery task, so an unavailable observer or another recipient cannot
+  suppress healthy ZEC sends. Keep strict accounting checks after delivery and
+  preserve Wcash submission behavior.
+time: 2026-10-23T00:00:00.000000000Z

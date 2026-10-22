@@ -411,6 +411,11 @@ pub(crate) struct NativeChainTip {
     pub(crate) height: u32,
 }
 
+#[derive(Clone, Copy)]
+struct PoolParentReplayPolicy {
+    canonical_depth_limit: Option<u32>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct BlockchainInfoTip {
     blocks: u32,
@@ -894,6 +899,38 @@ impl NativeZcashProvider {
         height: u32,
         expected_hash: &str,
     ) -> Result<ParentSubmissionReport, MinerError> {
+        self.replay_parent_bytes_with_policy(block_bytes, height, expected_hash, None)
+    }
+
+    /// Delivers one pool winner independently to each identity-bound writable
+    /// recipient. An absent depth limit permits the exact predecessor or our
+    /// canonical winner; a depth limit permits only our young canonical winner.
+    /// Read-only observers never participate in delivery. Their identity and
+    /// status remain mandatory for the caller's later accounting observation.
+    pub(crate) fn replay_pool_parent_bytes(
+        &self,
+        block_bytes: &[u8],
+        height: u32,
+        expected_hash: &str,
+        canonical_depth_limit: Option<u32>,
+    ) -> Result<ParentSubmissionReport, MinerError> {
+        self.replay_parent_bytes_with_policy(
+            block_bytes,
+            height,
+            expected_hash,
+            Some(PoolParentReplayPolicy {
+                canonical_depth_limit,
+            }),
+        )
+    }
+
+    fn replay_parent_bytes_with_policy(
+        &self,
+        block_bytes: &[u8],
+        height: u32,
+        expected_hash: &str,
+        pool_policy: Option<PoolParentReplayPolicy>,
+    ) -> Result<ParentSubmissionReport, MinerError> {
         if block_bytes.len() > PARENT_BLOCK_LIMIT {
             return Err(MinerError::InvalidParentTemplate(
                 "solved parent block exceeds the consensus size limit".to_string(),
@@ -915,6 +952,8 @@ impl NativeZcashProvider {
                 "durable parent winner height does not match its coinbase".to_string(),
             ));
         }
+        let previous_hash_le = persisted.header.previous_block_hash.0;
+        let expected_genesis_hash = self.expected_parent_network.genesis_hash().to_string();
 
         let mut nodes = Vec::with_capacity(self.proposal_validators.len() + 1);
         nodes.push(&self.template_node);
@@ -929,7 +968,36 @@ impl NativeZcashProvider {
             let authoritative = nodes
                 .into_iter()
                 .map(|node| {
+                    let expected_genesis_hash = &expected_genesis_hash;
                     scope.spawn(move || {
+                        if let Some(policy) = pool_policy {
+                            let eligibility = self
+                                .require_node_genesis(node, expected_genesis_hash)
+                                .and_then(|()| {
+                                    pool_parent_recipient_is_eligible(
+                                        node,
+                                        height,
+                                        expected.0,
+                                        previous_hash_le,
+                                        policy.canonical_depth_limit,
+                                    )
+                                });
+                            match eligibility {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    return (
+                                        ParentNodeOutcome::Unavailable {
+                                            endpoint: node.label().to_string(),
+                                            reason: "recipient has neither the exact predecessor nor an eligible canonical winner".to_string(),
+                                        },
+                                        false,
+                                    );
+                                }
+                                Err(error) => {
+                                    return (parent_recipient_error(node, error), false);
+                                }
+                            }
+                        }
                         submit_parent_to_node(node, block_bytes, height, expected_hash)
                     })
                 })
@@ -938,7 +1006,40 @@ impl NativeZcashProvider {
                 .broadcast_nodes
                 .iter()
                 .map(|node| {
+                    let expected_genesis_hash = &expected_genesis_hash;
                     scope.spawn(move || {
+                        if let Some(policy) = pool_policy {
+                            let eligibility = self
+                                .require_standard_node_genesis(node, expected_genesis_hash)
+                                .and_then(|()| {
+                                    pool_parent_recipient_is_eligible(
+                                        node,
+                                        height,
+                                        expected.0,
+                                        previous_hash_le,
+                                        policy.canonical_depth_limit,
+                                    )
+                                });
+                            match eligibility {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    return ParentRelayOutcome::Unavailable {
+                                        endpoint: node.label().to_string(),
+                                        reason: "recipient has neither the exact predecessor nor an eligible canonical winner".to_string(),
+                                    };
+                                }
+                                Err(error) => {
+                                    return match parent_recipient_error(node, error) {
+                                        ParentNodeOutcome::Unavailable { endpoint, reason } => {
+                                            ParentRelayOutcome::Unavailable { endpoint, reason }
+                                        }
+                                        _ => ParentRelayOutcome::InvalidResponse {
+                                            endpoint: node.label().to_string(),
+                                        },
+                                    };
+                                }
+                            }
+                        }
                         submit_parent_to_broadcast_node(node, block_bytes, height, expected_hash)
                     })
                 })
@@ -1204,6 +1305,12 @@ impl NativeZcashProvider {
             self.require_standard_node_genesis(observer, expected_genesis_hash)?;
         }
         Ok(())
+    }
+
+    /// Rechecks every configured endpoint before a pool accounting observation.
+    /// This must follow independent delivery, never gate its writable workers.
+    pub(crate) fn require_pool_observation_identity(&self) -> Result<(), MinerError> {
+        self.require_network_identity(&self.expected_parent_network.genesis_hash().to_string())
     }
 
     fn require_standard_node_genesis(
@@ -2247,6 +2354,60 @@ fn conservative_parent_confirmation_depth(
 
 fn is_transient_parent_rpc_failure(error: &MinerError) -> bool {
     matches!(error, MinerError::RpcTransport(_) | MinerError::Io(_))
+}
+
+/// A lagging or unavailable sibling must not withhold bytes from this node.
+/// Its own exact chain fences delivery; only the later all-node observation
+/// can authorize accounting. Competing evidence does not prove block retention.
+fn pool_parent_recipient_is_eligible(
+    node: &ZebraRpcClient,
+    height: u32,
+    expected_hash_le: [u8; 32],
+    previous_hash_le: [u8; 32],
+    canonical_depth_limit: Option<u32>,
+) -> Result<bool, MinerError> {
+    let before = native_chain_tip_on_node(node)?;
+    if canonical_depth_limit.is_none()
+        && height.checked_sub(1) == Some(before.height)
+        && before.block_hash_le == previous_hash_le
+    {
+        return Ok(true);
+    }
+    let Some(depth) = before
+        .height
+        .checked_sub(height)
+        .and_then(|depth| depth.checked_add(1))
+    else {
+        return Ok(false);
+    };
+    if canonical_depth_limit.is_some_and(|limit| depth >= limit) {
+        return Ok(false);
+    }
+    if before.height == height {
+        return Ok(before.block_hash_le == expected_hash_le);
+    }
+    let canonical_hash: String = node.call("getblockhash", json!([height]))?;
+    let canonical_hash: block::Hash =
+        parse_template_hex(&canonical_hash, "Zcash canonical winner hash")?;
+    if native_chain_tip_on_node(node)? != before {
+        return Err(MinerError::WinnerSubmissionDeferred { chain: "Zcash" });
+    }
+    Ok(canonical_hash.0 == expected_hash_le)
+}
+
+fn parent_recipient_error(node: &ZebraRpcClient, error: MinerError) -> ParentNodeOutcome {
+    match error {
+        MinerError::NetworkIdentityMismatch { .. }
+        | MinerError::RpcProtocol(_)
+        | MinerError::RpcResponseTooLarge(_)
+        | MinerError::RpcConfiguration(_) => ParentNodeOutcome::InvalidResponse {
+            endpoint: node.label().to_string(),
+        },
+        error => ParentNodeOutcome::Unavailable {
+            endpoint: node.label().to_string(),
+            reason: error.to_string(),
+        },
+    }
 }
 
 fn submit_parent_to_node(
