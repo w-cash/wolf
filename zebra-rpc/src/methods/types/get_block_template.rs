@@ -945,6 +945,9 @@ where
     /// so they can be advertised to peers.
     mined_block_sender: mpsc::Sender<(block::Hash, block::Height)>,
 
+    /// Global duplicate-only gossip admission time, shared by handler clones.
+    duplicate_gossip_admission: Arc<Mutex<Option<tokio::time::Instant>>>,
+
     /// Caches the most recently built coinbase transaction, so short-polling miners don't re-run
     /// the shielded-coinbase proof on every request within a block.
     coinbase_cache: CoinbaseCache,
@@ -983,6 +986,7 @@ where
             sync_status,
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
+            duplicate_gossip_admission: Arc::new(Mutex::new(None)),
             coinbase_cache: CoinbaseCache::default(),
             template_cache: Some(precompute::TemplateCache::default()),
         }
@@ -1039,6 +1043,44 @@ where
         height: block::Height,
     ) -> Result<(), TrySendError<(block::Hash, block::Height)>> {
         self.mined_block_sender.try_send((block, height))
+    }
+
+    /// Reannounces a positively checked canonical duplicate at most once per
+    /// second across all handler clones. Freshly accepted blocks bypass this
+    /// limit; denied or failed admission remains a retryable RPC error.
+    pub(crate) fn advertise_committed_duplicate(
+        &self,
+        block: block::Hash,
+        height: block::Height,
+    ) -> RpcResult<()> {
+        let mut last_admission = self.duplicate_gossip_admission.lock().map_err(|_| {
+            ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "duplicate gossip admission state unavailable; retry the same submission",
+                None,
+            )
+        })?;
+        let now = tokio::time::Instant::now();
+        if last_admission.is_some_and(|previous| {
+            now.duration_since(previous) < std::time::Duration::from_secs(1)
+        }) {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "duplicate gossip admission limited; retry the same submission after one second",
+                None,
+            ));
+        }
+        self.mined_block_sender
+            .try_send((block, height))
+            .map_err(|_| {
+                ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "committed duplicate could not be queued for gossip; retry the same submission",
+                    None,
+                )
+            })?;
+        *last_admission = Some(now);
+        Ok(())
     }
 
     /// Randomizes the coinbase data, if miner parameters are set.

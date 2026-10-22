@@ -1314,15 +1314,22 @@ where
 
     /// Broadcasts the same request to all ready peers, ignoring return values.
     fn broadcast_all(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
+        // Snapshot peers that were already busy before sending moves ready peers
+        // into the unready set. Initially ready peers must not be queued twice.
+        let queued_broadcast = self.queue_broadcast_all_unready(&req);
         let ready_peers = self.ready_services.keys().copied().collect();
         let send_multiple_fut = self.send_multiple(req.clone(), ready_peers);
-        let Some(mut queued_broadcast_fut_receiver) = self.queue_broadcast_all_unready(&req) else {
+        let Some(mut queued_broadcast_fut_receiver) = queued_broadcast else {
             return send_multiple_fut;
         };
 
         async move {
             let _ = send_multiple_fut.await?;
-            while queued_broadcast_fut_receiver.recv().await.is_some() {}
+            while let Some(queued_broadcast) = queued_broadcast_fut_receiver.recv().await {
+                // The client cancels its request if this response future is dropped.
+                // Drive queued deliveries just like the initially ready peers.
+                queued_broadcast.await?;
+            }
             Ok(Response::Nil)
         }
         .boxed()

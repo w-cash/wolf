@@ -3263,7 +3263,46 @@ where
         };
 
         let response = match chain_error {
-            Ok(source) if source.is_duplicate_request() => SubmitBlockErrorResponse::Duplicate,
+            Ok(source) if source.is_duplicate_request() => {
+                // The original notification might have failed admission or been
+                // lost during a restart. Only a fresh best-chain read can recreate
+                // that obligation: a verifier duplicate can also be merely queued.
+                // Wcash needs its separate witness-aware submission path.
+                if !self.network.uses_wcash_consensus() {
+                    let response = self
+                        .read_state
+                        .clone()
+                        .oneshot(zebra_state::ReadRequest::Block(block_hash.into()))
+                        .await
+                        .map_misc_error()?;
+                    let zebra_state::ReadResponse::Block(committed) = response else {
+                        return Err(ErrorObject::borrowed(
+                            ErrorCode::InternalError.code(),
+                            "unexpected committed duplicate block response",
+                            None,
+                        ));
+                    };
+                    if let Some(committed) = committed {
+                        if committed.hash() != block_hash
+                            || committed.coinbase_height() != Some(height)
+                            || committed.zcash_serialize_to_vec().map_misc_error()? != block_bytes
+                        {
+                            return Err(ErrorObject::borrowed(
+                                ErrorCode::InternalError.code(),
+                                "committed duplicate does not match the submitted Zcash block",
+                                None,
+                            ));
+                        }
+                        self.gbt.advertise_committed_duplicate(block_hash, height)?;
+                        tracing::info!(
+                            ?block_hash,
+                            ?height,
+                            "committed Zcash duplicate queued for gossip"
+                        );
+                    }
+                }
+                SubmitBlockErrorResponse::Duplicate
+            }
 
             // Currently, these match arms return Reject for the older duplicate in a queue,
             // but queued duplicates should be DuplicateInconclusive.

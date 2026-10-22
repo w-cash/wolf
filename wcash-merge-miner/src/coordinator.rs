@@ -1518,6 +1518,7 @@ enum PoolWinnerObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParentWinnerTipPosition {
     ReadyForSubmission,
+    ExactWinnerOnTemplateChain,
     Overtaken,
     DependencyBehind,
 }
@@ -1730,11 +1731,12 @@ fn reconcile_zcash_pool_winner(
     // it. Status-only reconciliation still requires an exact multi-node tip
     // before it can credit the winner.
     //
-    // Once a stable best chain has already reached this candidate's height,
-    // replaying a losing proof can only produce Zebra's generic `rejected`
-    // response.
-    // The exact proof was validated before it entered the durable outbox, so
-    // retain it as a noncanonical proof and monitor it without resubmission.
+    // A genuinely competing block at this candidate's height makes replay
+    // obsolete. Our own locally accepted block must remain replayable while
+    // independent relay delivery is pending, including after a restart.
+    // Only a genuinely competing candidate is retained as a noncanonical proof
+    // and monitored without resubmission; the exact proof was validated before
+    // it entered the durable outbox.
     // This also bounds duplicate winner bursts before a replacement job reaches
     // a fast ASIC.
     let before = if requires_submission {
@@ -1743,11 +1745,24 @@ fn reconcile_zcash_pool_winner(
         zcash.consistent_chain_tip()
     }
     .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
-    let tip_position = parent_winner_tip_position(before, winner.height, previous_hash)
-        .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
+    let exact_winner_on_template = requires_submission
+        && zcash
+            .template_winner_is_canonical(before, winner.height, *winner.block_hash_le.as_bytes())
+            .map_err(|error| PoolWinnerReconciliationError::new(error, true))?;
+    let tip_position = parent_winner_tip_position(
+        before,
+        winner.height,
+        previous_hash,
+        exact_winner_on_template,
+    )
+    .map_err(|error| PoolWinnerReconciliationError::new(error, requires_submission))?;
     let submission_required = parent_winner_submission_required(snapshot.lifecycle(), tip_position);
     let submission = match (requires_submission, tip_position) {
-        (true, ParentWinnerTipPosition::ReadyForSubmission) => Some(
+        (
+            true,
+            ParentWinnerTipPosition::ReadyForSubmission
+            | ParentWinnerTipPosition::ExactWinnerOnTemplateChain,
+        ) => Some(
             zcash
                 .replay_parent_bytes(snapshot.block_bytes(), winner.height, &expected_hash)
                 .map_err(|error| PoolWinnerReconciliationError::new(error, true))?,
@@ -1760,13 +1775,13 @@ fn reconcile_zcash_pool_winner(
         }
         _ => None,
     };
-    if submission
-        .as_ref()
-        .is_some_and(|report| !report.relays_succeeded())
-    {
+    if submission.as_ref().is_some_and(|report| {
+        !report.relays_succeeded() || (report.is_confirmed() && !report.delivery_admitted())
+    }) {
         // Retain the exact bytes for another ordered reconciliation attempt.
-        // A new parent job must not build past a block until the independent
-        // standard relay has confirmed that exact block on its best chain.
+        // A new parent job needs positive gossip admission from a confirming
+        // pinned node or all configured relays. Configured independent relays
+        // must still confirm the exact block on their best chains.
         return Err(PoolWinnerReconciliationError::new(
             MinerError::WinnerSubmissionDeferred { chain: "Zcash" },
             true,
@@ -1796,11 +1811,25 @@ fn reconcile_zcash_pool_winner(
     // A competing block can also fill the candidate height while submitblock
     // is in flight. Delivery of this obsolete candidate no longer blocks new
     // work; the next status pass classifies it without inventing reward credit.
-    if parent_winner_tip_position(observation_before, winner.height, previous_hash)
-        .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))?
-        == ParentWinnerTipPosition::Overtaken
-    {
-        submission_blocked = false;
+    if submission_blocked {
+        let exact_winner_on_template = zcash
+            .template_winner_is_canonical(
+                observation_before,
+                winner.height,
+                *winner.block_hash_le.as_bytes(),
+            )
+            .map_err(|error| PoolWinnerReconciliationError::new(error, true))?;
+        if parent_winner_tip_position(
+            observation_before,
+            winner.height,
+            previous_hash,
+            exact_winner_on_template,
+        )
+        .map_err(|error| PoolWinnerReconciliationError::new(error, true))?
+            == ParentWinnerTipPosition::Overtaken
+        {
+            submission_blocked = false;
+        }
     }
     if !parent_submission_completed_on_stable_tip(before, observation_before, submission.as_ref())
         .map_err(|error| PoolWinnerReconciliationError::new(error, submission_blocked))?
@@ -1853,6 +1882,7 @@ fn parent_winner_tip_position(
     tip: NativeChainTip,
     winner_height: u32,
     previous_hash_le: [u8; 32],
+    exact_winner_on_template: bool,
 ) -> Result<ParentWinnerTipPosition, MinerError> {
     let predecessor_height = winner_height.checked_sub(1).ok_or_else(|| {
         MinerError::InvalidRequest("a parent winner cannot have height zero".to_string())
@@ -1863,6 +1893,9 @@ fn parent_winner_tip_position(
     if tip.height == predecessor_height && tip.block_hash_le == previous_hash_le {
         return Ok(ParentWinnerTipPosition::ReadyForSubmission);
     }
+    if tip.height >= winner_height && exact_winner_on_template {
+        return Ok(ParentWinnerTipPosition::ExactWinnerOnTemplateChain);
+    }
     Ok(ParentWinnerTipPosition::Overtaken)
 }
 
@@ -1871,7 +1904,11 @@ fn parent_winner_submission_required(
     tip_position: ParentWinnerTipPosition,
 ) -> bool {
     lifecycle.requires_submission()
-        && matches!(tip_position, ParentWinnerTipPosition::ReadyForSubmission)
+        && matches!(
+            tip_position,
+            ParentWinnerTipPosition::ReadyForSubmission
+                | ParentWinnerTipPosition::ExactWinnerOnTemplateChain
+        )
 }
 
 fn parent_submission_completed_on_stable_tip(
@@ -4696,6 +4733,15 @@ mod tests {
         template_node: RpcEndpoint,
         proposal_validator: RpcEndpoint,
     ) -> NativeZcashProvider {
+        test_zcash_provider_with_delivery_nodes(template_node, proposal_validator, vec![], vec![])
+    }
+
+    fn test_zcash_provider_with_delivery_nodes(
+        template_node: RpcEndpoint,
+        proposal_validator: RpcEndpoint,
+        broadcast_nodes: Vec<RpcEndpoint>,
+        observer_nodes: Vec<RpcEndpoint>,
+    ) -> NativeZcashProvider {
         let config = NativeZcashConfig::new(
             template_node,
             vec![proposal_validator],
@@ -4707,7 +4753,10 @@ mod tests {
                 .parse()
                 .expect("valid Zcash testnet address"),
         )
-        .expect("valid test parent-node configuration");
+        .expect("valid test parent-node configuration")
+        .with_broadcast_nodes(broadcast_nodes)
+        .and_then(|config| config.with_observer_nodes(observer_nodes))
+        .expect("delivery and observer endpoints are distinct");
         NativeZcashProvider::connect(config).expect("construct test parent clients")
     }
 
@@ -5216,6 +5265,356 @@ mod tests {
     }
 
     #[test]
+    fn pending_parent_retries_identical_bytes_after_partial_delivery() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let previous =
+            json!({"blocks":0,"bestblockhash":display_hash(block.header.previous_block_hash.0)});
+        let own_tip = json!({"blocks":1,"bestblockhash":hash});
+        let header = json!({"hash":hash,"height":1,"confirmations":1});
+        let snapshot = parent_reconciliation_fixture(&block);
+        let (template, a) = spawn_scripted_rpc_server(vec![
+            previous,
+            serde_json::Value::Null,
+            header.clone(),
+            own_tip.clone(),
+            json!("duplicate"),
+            header.clone(),
+            own_tip.clone(),
+            header.clone(),
+            own_tip.clone(),
+        ]);
+        let (validator, b) = spawn_scripted_rpc_server(vec![
+            serde_json::Value::Null,
+            header.clone(),
+            json!("duplicate"),
+            header.clone(),
+            own_tip.clone(),
+            header.clone(),
+            own_tip.clone(),
+        ]);
+        let (relay, c) = spawn_scripted_rpc_reply_server(
+            vec![
+                Err(json!({"code":-28,"message":"relay unavailable"})),
+                Ok(serde_json::Value::Null),
+                Ok(header.clone()),
+                Ok(header.clone()),
+            ],
+            |_, _| {},
+        );
+        let (observer, d) = spawn_scripted_rpc_server(vec![own_tip.clone(), header, own_tip]);
+        let provider = test_zcash_provider_with_delivery_nodes(
+            template,
+            validator,
+            vec![relay],
+            vec![observer],
+        );
+
+        let error = reconcile_zcash_pool_winner(&provider, &snapshot)
+            .expect_err("local acceptance cannot replace independent relay delivery");
+        assert!(error.submission_blocked());
+        assert_eq!(snapshot.lifecycle(), &JournalWinnerLifecycle::Pending);
+        assert!(matches!(
+            reconcile_zcash_pool_winner(&provider, &snapshot),
+            Ok(Some(PoolBackendWinnerTransition::Observed {
+                confirmations: 1,
+                ..
+            }))
+        ));
+        let expected_bytes = hex::encode(snapshot.block_bytes());
+        for server in [a, b, c] {
+            let requests = server.join().expect("submission RPC fixture exits");
+            let submissions = requests
+                .iter()
+                .filter(|request| request["method"] == "submitblock")
+                .collect::<Vec<_>>();
+            assert_eq!(submissions.len(), 2);
+            assert!(submissions
+                .iter()
+                .all(|request| request["params"] == json!([expected_bytes])));
+        }
+        let observer_requests = d.join().expect("observer RPC fixture exits");
+        assert_eq!(
+            observer_requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["getblockchaininfo", "getblockheader", "getblockchaininfo"]
+        );
+    }
+
+    #[test]
+    fn canonical_parent_without_gossip_admission_remains_pending_and_retries() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let own_tip = json!({"blocks":1,"bestblockhash":hash});
+        let header = json!({"hash":hash,"height":1,"confirmations":1});
+        let unavailable = Err(json!({"code":0,"message":"gossip channel unavailable"}));
+        let snapshot = parent_reconciliation_fixture(&block);
+        for failed_submission in [
+            unavailable.clone(),
+            Ok(json!("duplicate-inconclusive")),
+            Ok(json!("rejected")),
+            Ok(json!({"unexpected":true})),
+        ] {
+            let (template, a) = spawn_scripted_rpc_reply_server(
+                vec![
+                    Ok(own_tip.clone()),
+                    failed_submission.clone(),
+                    Ok(header.clone()),
+                    Ok(own_tip.clone()),
+                    Ok(json!("duplicate")),
+                    Ok(header.clone()),
+                    Ok(own_tip.clone()),
+                    Ok(header.clone()),
+                    Ok(own_tip.clone()),
+                ],
+                |_, _| {},
+            );
+            let (validator, b) = spawn_scripted_rpc_reply_server(
+                vec![
+                    failed_submission,
+                    Ok(header.clone()),
+                    unavailable.clone(),
+                    Ok(header.clone()),
+                    Ok(own_tip.clone()),
+                    Ok(header.clone()),
+                    Ok(own_tip.clone()),
+                ],
+                |_, _| {},
+            );
+            let provider = test_zcash_provider(template, validator);
+            let error = reconcile_zcash_pool_winner(&provider, &snapshot)
+                .expect_err("canonical headers cannot stand in for gossip admission");
+            assert!(error.submission_blocked());
+            assert_eq!(snapshot.lifecycle(), &JournalWinnerLifecycle::Pending);
+            assert!(matches!(
+                reconcile_zcash_pool_winner(&provider, &snapshot),
+                Ok(Some(PoolBackendWinnerTransition::Observed {
+                    confirmations: 1,
+                    ..
+                }))
+            ));
+            for server in [a, b] {
+                let requests = server.join().expect("admission RPC fixture exits");
+                let submissions = requests
+                    .iter()
+                    .filter(|request| request["method"] == "submitblock")
+                    .collect::<Vec<_>>();
+                assert_eq!(submissions.len(), 2);
+                assert!(submissions.iter().all(|request| {
+                    request["params"] == json!([hex::encode(snapshot.block_bytes())])
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn direct_parent_submission_distinguishes_canonical_status_from_gossip_admission() {
+        let block = mainnet_block_one();
+        let bytes = block.zcash_serialize_to_vec().unwrap();
+        let hash = display_hash(block.hash().0);
+        let header = json!({"hash":hash,"height":1,"confirmations":1});
+        let unavailable = Err(json!({"code":0,"message":"gossip channel unavailable"}));
+        let responses = vec![
+            unavailable.clone(),
+            Ok(header.clone()),
+            unavailable.clone(),
+            Ok(header.clone()),
+        ];
+        let (template, a) = spawn_scripted_rpc_reply_server(responses.clone(), |_, _| {});
+        let (validator, b) = spawn_scripted_rpc_reply_server(responses, |_, _| {});
+        let provider = test_zcash_provider(template, validator);
+        let report = provider.replay_parent_bytes(&bytes, 1, &hash).unwrap();
+        assert!(
+            report.is_confirmed(),
+            "canonical evidence remains available"
+        );
+        assert!(!report.delivery_admitted());
+        assert!(matches!(
+            provider.submit_parent_bytes(&bytes, 1, &hash),
+            Err(MinerError::WinnerSubmissionDeferred { chain: "Zcash" })
+        ));
+        a.join().expect("template RPC fixture exits");
+        b.join().expect("validator RPC fixture exits");
+    }
+
+    #[test]
+    fn pending_parent_delivery_retries_when_own_winner_is_a_canonical_ancestor() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let tip = json!({"blocks":2,"bestblockhash":"73".repeat(32)});
+        let header = json!({"hash":hash,"height":1,"confirmations":2});
+        let snapshot = parent_reconciliation_fixture(&block);
+        let (template, a) = spawn_scripted_rpc_server(vec![
+            tip.clone(),
+            json!(hash),
+            tip.clone(),
+            serde_json::Value::Null,
+            header.clone(),
+            tip.clone(),
+            header.clone(),
+            tip.clone(),
+        ]);
+        let (validator, b) = spawn_scripted_rpc_server(vec![
+            serde_json::Value::Null,
+            header.clone(),
+            tip.clone(),
+            header.clone(),
+            tip.clone(),
+        ]);
+        let (relay, c) = spawn_scripted_rpc_server(vec![
+            serde_json::Value::Null,
+            header.clone(),
+            header.clone(),
+        ]);
+        let (observer, d) = spawn_scripted_rpc_server(vec![tip.clone(), header, tip]);
+        let provider = test_zcash_provider_with_delivery_nodes(
+            template,
+            validator,
+            vec![relay],
+            vec![observer],
+        );
+
+        assert!(matches!(
+            reconcile_zcash_pool_winner(&provider, &snapshot),
+            Ok(Some(PoolBackendWinnerTransition::Observed {
+                confirmations: 2,
+                ..
+            }))
+        ));
+        for server in [a, b, c] {
+            let requests = server.join().expect("delivery RPC fixture exits");
+            let submissions = requests
+                .iter()
+                .filter(|request| request["method"] == "submitblock")
+                .collect::<Vec<_>>();
+            assert_eq!(submissions.len(), 1);
+            assert_eq!(
+                submissions[0]["params"],
+                json!([hex::encode(snapshot.block_bytes())])
+            );
+        }
+        assert!(d
+            .join()
+            .expect("observer RPC fixture exits")
+            .iter()
+            .all(|request| request["method"] != "submitblock"));
+    }
+
+    #[test]
+    fn locally_accepted_parent_stays_pending_until_relay_confirmation() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let own_tip = json!({"blocks":1,"bestblockhash":hash});
+        let header = json!({"hash":hash,"height":1,"confirmations":1});
+        let snapshot = parent_reconciliation_fixture(&block);
+        for relay_replies in [
+            vec![
+                Ok(serde_json::Value::Null),
+                Ok(json!({"hash":hash,"height":1,"confirmations":0})),
+            ],
+            vec![Ok(json!({"unexpected":true}))],
+            vec![Err(json!({"code":-28,"message":"relay unavailable"}))],
+        ] {
+            let (template, a) = spawn_scripted_rpc_server(vec![
+                own_tip.clone(),
+                serde_json::Value::Null,
+                header.clone(),
+            ]);
+            let (validator, b) =
+                spawn_scripted_rpc_server(vec![serde_json::Value::Null, header.clone()]);
+            let (relay, c) = spawn_scripted_rpc_reply_server(relay_replies, |_, _| {});
+            let provider =
+                test_zcash_provider_with_delivery_nodes(template, validator, vec![relay], vec![]);
+            let error = reconcile_zcash_pool_winner(&provider, &snapshot)
+                .expect_err("ambiguous relay delivery cannot retire a Pending proof");
+            assert!(error.submission_blocked());
+            assert_eq!(snapshot.lifecycle(), &JournalWinnerLifecycle::Pending);
+            for server in [a, b, c] {
+                let requests = server.join().expect("delivery RPC fixture exits");
+                assert!(requests
+                    .iter()
+                    .any(|request| request["method"] == "submitblock"));
+            }
+        }
+    }
+
+    #[test]
+    fn parent_ancestry_races_and_malformed_hashes_defer_without_submission() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let tip = json!({"blocks":2,"bestblockhash":"73".repeat(32)});
+        let snapshot = parent_reconciliation_fixture(&block);
+        for replies in [
+            vec![
+                tip.clone(),
+                json!(hash),
+                json!({"blocks":3,"bestblockhash":"74".repeat(32)}),
+            ],
+            vec![
+                tip.clone(),
+                json!(hash),
+                json!({"blocks":2,"bestblockhash":"74".repeat(32)}),
+            ],
+            vec![tip.clone(), json!("malformed")],
+        ] {
+            let (template, server) = spawn_scripted_rpc_server(replies);
+            let provider = test_zcash_provider(
+                template,
+                RpcEndpoint::new("http://127.0.0.1:1/", None, None).unwrap(),
+            );
+            let error = reconcile_zcash_pool_winner(&provider, &snapshot)
+                .expect_err("uncertain ancestry cannot suppress durable delivery");
+            assert!(error.submission_blocked());
+            assert!(server
+                .join()
+                .expect("ancestry RPC fixture exits")
+                .iter()
+                .all(|request| request["method"] != "submitblock"));
+        }
+    }
+
+    #[test]
+    fn genuinely_competing_parent_is_status_only_at_its_height_and_above() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let competing_hash = "73".repeat(32);
+        let absent_header = json!({"hash":hash,"height":1,"confirmations":0});
+        let snapshot = parent_reconciliation_fixture(&block);
+        for height in [1, 2] {
+            let tip = json!({"blocks":height,"bestblockhash":competing_hash});
+            let mut replies = vec![tip.clone()];
+            if height > 1 {
+                replies.extend([json!(competing_hash), tip.clone()]);
+            }
+            replies.extend([absent_header.clone(), tip.clone()]);
+            let (template, a) = spawn_scripted_rpc_server(replies);
+            let (validator, b) =
+                spawn_scripted_rpc_server(vec![absent_header.clone(), tip.clone()]);
+            let (observer, c) = spawn_scripted_rpc_server(vec![absent_header.clone(), tip]);
+            let (relay, d) = spawn_scripted_rpc_server(vec![absent_header.clone()]);
+            let provider = test_zcash_provider_with_delivery_nodes(
+                template,
+                validator,
+                vec![relay],
+                vec![observer],
+            );
+            assert!(matches!(
+                reconcile_zcash_pool_winner(&provider, &snapshot),
+                Ok(Some(PoolBackendWinnerTransition::SideChain { .. }))
+            ));
+            for server in [a, b, c, d] {
+                assert!(server
+                    .join()
+                    .expect("status-only RPC fixture exits")
+                    .iter()
+                    .all(|request| request["method"] != "submitblock"));
+            }
+        }
+    }
+
+    #[test]
     fn confirmed_parent_advancing_tip_does_not_pause_mining() {
         let block = mainnet_block_one();
         let hash = display_hash(block.hash().0);
@@ -5440,14 +5839,28 @@ mod tests {
     }
 
     #[test]
-    fn parent_winner_tip_position_only_submits_on_its_exact_predecessor() {
+    fn pending_parent_delivery_retries_after_its_own_tip_advanced() {
+        let own_tip = NativeChainTip {
+            block_hash_le: [0x51; 32],
+            height: 10,
+        };
+        let position = parent_winner_tip_position(own_tip, 10, [0x41; 32], true)
+            .expect("the retained winner has a valid height");
+        assert!(
+            parent_winner_submission_required(&JournalWinnerLifecycle::Pending, position),
+            "local acceptance must not suppress delivery retry to an independent relay"
+        );
+    }
+
+    #[test]
+    fn parent_winner_tip_position_distinguishes_exact_and_competing_blocks() {
         let previous_hash = [0x41; 32];
         let exact_predecessor = NativeChainTip {
             block_hash_le: previous_hash,
             height: 9,
         };
         assert_eq!(
-            parent_winner_tip_position(exact_predecessor, 10, previous_hash).unwrap(),
+            parent_winner_tip_position(exact_predecessor, 10, previous_hash, false).unwrap(),
             ParentWinnerTipPosition::ReadyForSubmission
         );
         assert_eq!(
@@ -5458,6 +5871,7 @@ mod tests {
                 },
                 10,
                 previous_hash,
+                false,
             )
             .unwrap(),
             ParentWinnerTipPosition::Overtaken,
@@ -5471,10 +5885,11 @@ mod tests {
                 },
                 10,
                 previous_hash,
+                false,
             )
             .unwrap(),
             ParentWinnerTipPosition::Overtaken,
-            "a filled candidate height must not be replayed",
+            "a genuinely competing filled height must not be replayed",
         );
         assert_eq!(
             parent_winner_tip_position(
@@ -5484,11 +5899,12 @@ mod tests {
                 },
                 10,
                 previous_hash,
+                false,
             )
             .unwrap(),
             ParentWinnerTipPosition::DependencyBehind,
         );
-        assert!(parent_winner_tip_position(exact_predecessor, 0, previous_hash).is_err());
+        assert!(parent_winner_tip_position(exact_predecessor, 0, previous_hash, false).is_err());
     }
 
     #[test]

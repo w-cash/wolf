@@ -914,3 +914,340 @@ mod submitblock_test {
         Ok(())
     }
 }
+
+/// Exercise the complete advertisement wire path, rather than inferring delivery from logs.
+mod mined_block_delivery {
+    use std::{
+        collections::HashSet,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use futures::task::AtomicWaker;
+    use tokio::sync::{mpsc, Notify};
+    use tower::Service;
+    use zebra_chain::serialization::ZcashSerialize;
+    use zebra_state::{ChainTipChange, ChainTipSender};
+
+    use super::*;
+
+    type PeerSet = Buffer<BoxService<Request, Response, BoxError>, Request>;
+
+    /// Only local peers supplied by the test can enter this network.
+    async fn network() -> (PeerSet, SocketAddr, ChainTipSender, ChainTipChange) {
+        let network = Network::Mainnet;
+        let (tip_sender, latest_tip, tip_change) = ChainTipSender::new(None, &network);
+        let config = NetworkConfig {
+            network,
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            initial_mainnet_peers: IndexSet::new(),
+            initial_testnet_peers: IndexSet::new(),
+            cache_dir: CacheDir::disabled(),
+            max_connections_per_ip: 2,
+            ..NetworkConfig::default()
+        };
+        let fixture: block::Block = zebra_test::vectors::BLOCK_MAINNET_10_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let fixture = Arc::new(fixture);
+        let inbound = tower::service_fn(move |request| {
+            let fixture = fixture.clone();
+            async move {
+                Ok::<_, BoxError>(match request {
+                    Request::BlocksByHash(hashes) => Response::Blocks(
+                        hashes
+                            .into_iter()
+                            .map(|hash| {
+                                if hash == fixture.hash() {
+                                    Available((fixture.clone(), None))
+                                } else {
+                                    Missing(hash)
+                                }
+                            })
+                            .collect(),
+                    ),
+                    Request::Peers => Response::Peers(Vec::new()),
+                    _ => Response::Nil,
+                })
+            }
+        });
+        let (peer_set, address_book, _) =
+            zebra_network::init(config, inbound, latest_tip, "local gossip test".into()).await;
+        let listen_addr = address_book.lock().unwrap().local_listener_socket_addr();
+        assert!(listen_addr.ip().is_loopback());
+        assert_ne!(listen_addr.port(), 0);
+        (peer_set, listen_addr, tip_sender, tip_change)
+    }
+
+    struct IndependentPeer {
+        // Keep the independent TCP connection alive for the test.
+        client: zebra_network::Client,
+        adverts: mpsc::Receiver<block::Hash>,
+        find_requests: mpsc::Receiver<oneshot::Sender<()>>,
+    }
+
+    async fn connect_peer(listen_addr: SocketAddr) -> IndependentPeer {
+        let (adverts_tx, adverts) = mpsc::channel(16);
+        let (find_tx, find_requests) = mpsc::channel(1);
+        let inbound = tower::service_fn(move |request| {
+            let adverts_tx = adverts_tx.clone();
+            let find_tx = find_tx.clone();
+            async move {
+                Ok::<_, BoxError>(match request {
+                    Request::AdvertiseBlock(hash, _) => {
+                        adverts_tx.send(hash).await.unwrap();
+                        Response::Nil
+                    }
+                    Request::FindBlocks { .. } => {
+                        let (release, wait) = oneshot::channel();
+                        find_tx.send(release).await.unwrap();
+                        wait.await.unwrap();
+                        Response::BlockHashes(Vec::new())
+                    }
+                    Request::Peers => Response::Peers(Vec::new()),
+                    _ => Response::Nil,
+                })
+            }
+        });
+        let client = tokio::time::timeout(
+            Duration::from_secs(3),
+            connect_isolated_tcp_direct_with_inbound(
+                &Network::Mainnet,
+                listen_addr,
+                "independent local peer".into(),
+                inbound,
+            ),
+        )
+        .await
+        .expect("local TCP handshake is bounded")
+        .expect("local TCP handshake succeeds");
+        IndependentPeer {
+            client,
+            adverts,
+            find_requests,
+        }
+    }
+
+    fn fixture() -> (block::Hash, Height) {
+        let block: block::Block = zebra_test::vectors::BLOCK_MAINNET_10_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        (block.hash(), block.coinbase_height().unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mined_block_reaches_independent_peer() {
+        let _init_guard = zebra_test::init();
+        let (peer_set, listen_addr, _tip_sender, chain_tip) = network().await;
+        let mut peer = connect_peer(listen_addr).await;
+        let (sync_status, _recent_syncs) = SyncStatus::new();
+        let submitted = SubmitBlockChannel::new();
+        let sender = submitted.sender();
+        let gossip = tokio::spawn(sync::gossip_best_tip_block_hashes(
+            sync_status,
+            chain_tip,
+            peer_set,
+            Some(submitted.receiver()),
+        ));
+        let winner = fixture();
+        sender.send(winner).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(3), peer.adverts.recv())
+            .await
+            .expect("the independent peer receives the wire advertisement promptly")
+            .expect("the independent peer remains connected");
+        assert_eq!(received, winner.0);
+        let downloaded = tokio::time::timeout(Duration::from_secs(3), async {
+            peer.client
+                .ready()
+                .await
+                .unwrap()
+                .call(Request::BlocksByHash(iter::once(received).collect()))
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("the announced block is retrievable over the independent TCP connection");
+        let Response::Blocks(blocks) = downloaded else {
+            panic!("the peer requested a block");
+        };
+        let [Available((block, _))] = blocks.as_slice() else {
+            panic!("the announced fixture block must be available");
+        };
+        assert_eq!(
+            block.zcash_serialize_to_vec().unwrap(),
+            *zebra_test::vectors::BLOCK_MAINNET_10_BYTES,
+            "the complete block bytes cross the real wire unchanged"
+        );
+        assert!(!gossip.is_finished());
+        gossip.abort();
+        let _ = gossip.await;
+    }
+
+    /// Hold service readiness without replacing the real TCP delivery service.
+    #[derive(Clone)]
+    struct ReadinessGate {
+        inner: PeerSet,
+        blocked: Arc<AtomicBool>,
+        waker: Arc<AtomicWaker>,
+        pending: Arc<Notify>,
+    }
+
+    impl Service<Request> for ReadinessGate {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = <PeerSet as Service<Request>>::Future;
+
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.waker.register(cx.waker());
+            if self.blocked.load(Ordering::SeqCst) {
+                self.pending.notify_one();
+                Poll::Pending
+            } else {
+                self.inner.poll_ready(cx)
+            }
+        }
+
+        fn call(&mut self, request: Request) -> Self::Future {
+            self.inner.call(request)
+        }
+    }
+
+    #[tokio::test]
+    async fn mined_block_recovers_after_readiness_stall() {
+        let _init_guard = zebra_test::init();
+        let (peer_set, listen_addr, _tip_sender, chain_tip) = network().await;
+        let mut peer = connect_peer(listen_addr).await;
+        let gate = ReadinessGate {
+            inner: peer_set,
+            blocked: Arc::new(AtomicBool::new(true)),
+            waker: Arc::new(AtomicWaker::new()),
+            pending: Arc::new(Notify::new()),
+        };
+        let (sync_status, _recent_syncs) = SyncStatus::new();
+        let (sender, receiver) = mpsc::channel(4);
+        let gossip = tokio::spawn(sync::gossip_best_tip_block_hashes(
+            sync_status,
+            chain_tip,
+            gate.clone(),
+            Some(receiver),
+        ));
+        let first = fixture();
+        let second = (block::Hash([2; 32]), Height(11));
+        sender.send(first).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), gate.pending.notified())
+            .await
+            .expect("the test explicitly observes the readiness stall");
+        sender.send(second).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sender.capacity() != 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a readiness stall does not stop receiving mined blocks");
+        assert!(peer.adverts.try_recv().is_err());
+
+        // Outlast one delivery attempt, then require retry to use the real network.
+        tokio::time::sleep(sync::TIPS_RESPONSE_TIMEOUT + Duration::from_millis(100)).await;
+        gate.blocked.store(false, Ordering::SeqCst);
+        gate.waker.wake();
+        let mut received = HashSet::new();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while received.len() < 2 {
+                received.insert(peer.adverts.recv().await.unwrap());
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("both retained hashes must reach the independent peer; received {received:?}")
+        });
+        assert_eq!(received, HashSet::from([first.0, second.0]));
+        assert!(!gossip.is_finished());
+        gossip.abort();
+        let _ = gossip.await;
+    }
+
+    #[tokio::test]
+    async fn mined_block_reaches_busy_peer_after_recovery() {
+        let _init_guard = zebra_test::init();
+        let (mut peer_set, listen_addr, _tip_sender, _chain_tip) = network().await;
+        let mut first = connect_peer(listen_addr).await;
+        let request_network = peer_set.clone();
+        let find = tokio::spawn(request_network.oneshot(Request::FindBlocks {
+            known_blocks: Vec::new(),
+            stop: None,
+        }));
+        let release = tokio::time::timeout(Duration::from_secs(3), first.find_requests.recv())
+            .await
+            .expect("the only connected peer is held busy")
+            .unwrap();
+        // A connection can buffer one additional request while awaiting the first
+        // response. Occupy that slot before adding a second, ready peer.
+        let request_network = peer_set.clone();
+        let mut queued_find = tokio::spawn(request_network.oneshot(Request::FindBlocks {
+            known_blocks: Vec::new(),
+            stop: None,
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut queued_find)
+                .await
+                .is_err()
+        );
+        let mut second = connect_peer(listen_addr).await;
+        let hash = fixture().0;
+        let broadcast_network = peer_set.clone();
+        let broadcast = tokio::spawn(broadcast_network.oneshot(Request::AdvertiseBlockToAll(hash)));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), second.adverts.recv())
+                .await
+                .expect("the ready peer receives the mined hash")
+                .unwrap(),
+            hash
+        );
+        assert!(first.adverts.try_recv().is_err());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), find)
+            .await
+            .expect("the held request finishes")
+            .unwrap()
+            .unwrap();
+        let release = tokio::time::timeout(Duration::from_secs(3), first.find_requests.recv())
+            .await
+            .expect("the queued request is released before the owed advertisement")
+            .unwrap();
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), queued_find)
+            .await
+            .expect("the second held request finishes")
+            .unwrap()
+            .unwrap();
+
+        // Readiness polling drives delivery to peers which have become available.
+        let drive = tokio::spawn(async move {
+            for _ in 0..100 {
+                let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                    peer_set.ready().await.unwrap().call(Request::Peers).await
+                })
+                .await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let delivered = tokio::time::timeout(Duration::from_secs(3), first.adverts.recv())
+            .await
+            .expect("the formerly busy independent peer receives the queued hash")
+            .unwrap();
+        assert_eq!(delivered, hash);
+        tokio::time::timeout(Duration::from_secs(3), broadcast)
+            .await
+            .expect("the broadcast completes after both peer deliveries")
+            .unwrap()
+            .unwrap();
+        drive.abort();
+        let _ = drive.await;
+    }
+}

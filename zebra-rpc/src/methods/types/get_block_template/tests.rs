@@ -57,6 +57,59 @@ use super::{
     MinerParams, WcashAuxRequest,
 };
 
+#[tokio::test(start_paused = true)]
+async fn committed_duplicate_gossip_admission_is_global_and_retryable() {
+    let router: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let handler = super::GetBlockTemplateHandler::new(
+        &Network::Mainnet,
+        Config::default(),
+        router,
+        MockSyncStatus::default(),
+        Some(sender),
+    );
+    let first = handler.clone();
+    let second = handler.clone();
+    let (a, b) = tokio::join!(
+        tokio::spawn(async move {
+            first.advertise_committed_duplicate(block::Hash([1; 32]), Height(1))
+        }),
+        tokio::spawn(async move {
+            second.advertise_committed_duplicate(block::Hash([2; 32]), Height(2))
+        }),
+    );
+    assert_ne!(a.unwrap().is_ok(), b.unwrap().is_ok());
+    receiver.try_recv().unwrap();
+    assert!(handler
+        .advertise_committed_duplicate(block::Hash([3; 32]), Height(3))
+        .is_err());
+
+    // New consensus-accepted blocks are never throttled by duplicate traffic.
+    handler
+        .advertise_mined_block(block::Hash([4; 32]), Height(4))
+        .unwrap();
+    assert_eq!(receiver.try_recv().unwrap().0, block::Hash([4; 32]));
+    tokio::time::advance(Duration::from_secs(1)).await;
+
+    handler
+        .advertise_mined_block(block::Hash([5; 32]), Height(5))
+        .unwrap();
+    assert!(handler
+        .advertise_committed_duplicate(block::Hash([6; 32]), Height(6))
+        .is_err());
+    receiver.try_recv().unwrap();
+    // Failed admission must not consume the interval: retry without advancing time.
+    handler
+        .advertise_committed_duplicate(block::Hash([6; 32]), Height(6))
+        .unwrap();
+    assert_eq!(receiver.try_recv().unwrap().0, block::Hash([6; 32]));
+    drop(receiver);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(handler
+        .advertise_committed_duplicate(block::Hash([7; 32]), Height(7))
+        .is_err());
+}
+
 /// A clean Wcash network must be able to serve its first mining template after
 /// locally committing genesis, even before project-owned seed peers exist.
 /// Mainnet receives this exception only at height zero; its stale-tip protection

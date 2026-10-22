@@ -3675,6 +3675,21 @@ mod tests {
                 pending_zcash: 1,
             }
         );
+        // A crash after local submission but before relay delivery must leave
+        // the same immutable bytes in the submission-required recovery lane.
+        drop(journal);
+        let journal = open(&path, &config);
+        let (_, recovery) = journal
+            .winner_recovery_state()
+            .expect("recover Pending proof");
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].1.lifecycle, JournalWinnerLifecycle::Pending);
+        assert_eq!(recovery[0].1.block_bytes, block_bytes);
+        assert_eq!(recovery[0].1.share_id, commit.receipt.share_id);
+        assert!(journal
+            .next_submission_required_winner_state_before(None, usize::MAX)
+            .expect("Pending delivery remains retryable")
+            .is_some());
         let tip = ChainTip {
             block_hash_le: Hex32::new(block_hash),
             height: 1,

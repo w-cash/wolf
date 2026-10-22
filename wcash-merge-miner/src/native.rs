@@ -852,6 +852,9 @@ impl NativeZcashProvider {
                 "no parent node confirmed the submitted block on its best chain".to_string(),
             ));
         }
+        if !report.delivery_admitted() || !report.relays_succeeded() {
+            return Err(MinerError::WinnerSubmissionDeferred { chain: "Zcash" });
+        }
         Ok(report)
     }
 
@@ -894,7 +897,7 @@ impl NativeZcashProvider {
             .into_iter()
             .filter(|node| seen.insert(node.label().to_string()))
             .collect::<Vec<_>>();
-        let (outcomes, relay_outcomes) = thread::scope(|scope| {
+        let (outcomes, relay_outcomes, pinned_delivery_admitted) = thread::scope(|scope| {
             let authoritative = nodes
                 .into_iter()
                 .map(|node| {
@@ -912,10 +915,14 @@ impl NativeZcashProvider {
                     })
                 })
                 .collect::<Vec<_>>();
+            let mut pinned_delivery_admitted = false;
             let outcomes = authoritative
                 .into_iter()
                 .map(|handle| match handle.join() {
-                    Ok(outcome) => outcome,
+                    Ok((outcome, admitted)) => {
+                        pinned_delivery_admitted |= admitted;
+                        outcome
+                    }
                     Err(_) => ParentNodeOutcome::Unavailable {
                         endpoint: "parent submission worker".to_string(),
                         reason: "submission worker panicked".to_string(),
@@ -932,11 +939,12 @@ impl NativeZcashProvider {
                     },
                 })
                 .collect::<Vec<_>>();
-            (outcomes, relay_outcomes)
+            (outcomes, relay_outcomes, pinned_delivery_admitted)
         });
         Ok(ParentSubmissionReport {
             outcomes,
             relay_outcomes,
+            pinned_delivery_admitted,
         })
     }
 
@@ -1050,6 +1058,30 @@ impl NativeZcashProvider {
     /// remain mandatory before accounting credits the winner.
     pub(crate) fn template_chain_tip(&self) -> Result<NativeChainTip, MinerError> {
         native_chain_tip_on_node(&self.template_node)
+    }
+
+    /// Distinguishes our locally accepted winner from a competing filled height.
+    /// This read-only submission preflight never replaces independent accounting
+    /// observations. An ancestor lookup is fenced against a changing template tip.
+    pub(crate) fn template_winner_is_canonical(
+        &self,
+        tip: NativeChainTip,
+        height: u32,
+        expected_hash_le: [u8; 32],
+    ) -> Result<bool, MinerError> {
+        if tip.height < height {
+            return Ok(false);
+        }
+        if tip.height == height {
+            return Ok(tip.block_hash_le == expected_hash_le);
+        }
+        let canonical_hash: String = self.template_node.call("getblockhash", json!([height]))?;
+        let canonical_hash: block::Hash =
+            parse_template_hex(&canonical_hash, "Zcash canonical winner hash")?;
+        if self.template_chain_tip()? != tip {
+            return Err(MinerError::WinnerSubmissionDeferred { chain: "Zcash" });
+        }
+        Ok(canonical_hash.0 == expected_hash_le)
     }
 
     /// Requires every configured parent node to remain on the exact job tip.
@@ -1903,6 +1935,7 @@ impl ValidatedNativeShare {
 pub struct ParentSubmissionReport {
     outcomes: Vec<ParentNodeOutcome>,
     relay_outcomes: Vec<ParentRelayOutcome>,
+    pinned_delivery_admitted: bool,
 }
 
 impl ParentSubmissionReport {
@@ -1924,6 +1957,14 @@ impl ParentSubmissionReport {
         self.relay_outcomes
             .iter()
             .all(|outcome| matches!(outcome, ParentRelayOutcome::Delivered { .. }))
+    }
+
+    /// Canonical status alone does not establish gossip admission. A successful
+    /// submit response from a confirming pinned node or every configured relay
+    /// is required. Neither result proves independent P2P receipt.
+    pub(crate) fn delivery_admitted(&self) -> bool {
+        self.pinned_delivery_admitted
+            || (!self.relay_outcomes.is_empty() && self.relays_succeeded())
     }
 
     /// Returns the standard broadcast-only node outcomes.
@@ -2175,8 +2216,21 @@ fn submit_parent_to_node(
     block_bytes: &[u8],
     height: u32,
     expected_hash: &str,
-) -> ParentNodeOutcome {
+) -> (ParentNodeOutcome, bool) {
     let submission = node.call_value("submitblock", json!([hex::encode(block_bytes)]));
+    let admitted = matches!(&submission, Ok(Value::Null))
+        || matches!(&submission, Ok(Value::String(reason)) if reason.eq_ignore_ascii_case("duplicate"));
+    let outcome = classify_parent_submission_on_node(node, height, expected_hash, submission);
+    let admitted = admitted && matches!(outcome, ParentNodeOutcome::Accepted { .. });
+    (outcome, admitted)
+}
+
+fn classify_parent_submission_on_node(
+    node: &ZebraRpcClient,
+    height: u32,
+    expected_hash: &str,
+    submission: Result<Value, MinerError>,
+) -> ParentNodeOutcome {
     match parent_confirmation_depth_on_node(node, height, expected_hash) {
         Ok(Some(_)) => {
             return ParentNodeOutcome::Accepted {
