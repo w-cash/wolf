@@ -4161,13 +4161,16 @@ mod tests {
     }
 
     #[test]
-    fn winner_diagnostics_follow_durability_replay_and_cas() {
+    fn winner_commit_is_silent_and_lifecycle_diagnostics_follow_cas() {
         let directory = private_temp_dir();
         let path = directory.path().join("diagnostics.journal");
         let config = config();
         let ((journal, winner, _), durable) =
             crate::diagnostics::capture(|| zcash_winner_journal(&path, &config));
-        assert_eq!(durable, vec![("winner_durable", "fsync_completed")]);
+        assert!(
+            durable.is_empty(),
+            "share commit must not log before worker wake"
+        );
         let (_, retained) = journal.next_winner_state(None).unwrap().unwrap();
         let (replay, events) = crate::diagnostics::capture(|| {
             journal.append_share_committed(

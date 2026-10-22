@@ -209,6 +209,10 @@ pub enum Request {
     /// [`Request::AdvertiseBlock`] except that the peer set will route
     /// this request to all available ready peers. Used by the gossip task
     /// to broadcast mined blocks to all ready peers.
+    ///
+    /// The Zcash peer set returns [`Response::MinedBlockAdvertisement`](super::Response::MinedBlockAdvertisement)
+    /// with local transport outcomes. Wcash retains the best-effort [`Response::Nil`](super::Response::Nil).
+    /// Individual peer clients return `Nil`; neither result is a remote receipt acknowledgment.
     AdvertiseBlockToAll(block::Hash),
 
     /// Request the contents of this node's mempool.

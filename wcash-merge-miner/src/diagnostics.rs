@@ -224,16 +224,6 @@ fn diagnostic_writer() -> io::Result<std::fs::File> {
     ))
 }
 
-pub(crate) fn durable(winner: &WinnerDescriptor, job: &Hex32, event_seq: u64) {
-    let mut event = Event::new(
-        Some(Winner::new(winner, job, event_seq)),
-        "winner_durable",
-        "fsync_completed",
-    );
-    event.noisy = false;
-    record(event);
-}
-
 pub(crate) fn lifecycle(
     snapshot: &PoolBackendWinnerSnapshot,
     stage: &'static str,
@@ -615,7 +605,7 @@ mod tests {
                 job: [0; 32],
                 event_seq: 1,
             };
-            let event = Event::new(Some(winner), "winner_submission_attempt", "exact_bytes_rpc");
+            let event = Event::new(Some(winner), "winner_submission_result", "incomplete");
             reporter.record(&mut output, event, now, 0).unwrap();
         }
         assert_eq!(

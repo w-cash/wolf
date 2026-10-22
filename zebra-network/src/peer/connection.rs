@@ -1521,7 +1521,9 @@ where
 
         // TODO: split response handler into its own method
         match rsp.clone() {
-            Response::Nil => { /* generic success, do nothing */ }
+            Response::Nil | Response::MinedBlockAdvertisement(_) => {
+                // Local-only outcomes do not encode a response to a remote peer.
+            }
             Response::Peers(addrs) => {
                 if let Err(e) = self.peer_tx.send(Message::Addr(addrs)).await {
                     self.fail_with(e).await;

@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Retain Zcash mined gossip after failed or local-only sends, re-admit retained immature canonical ZEC winners in background audits, and add independent read-only ZEC tracking without share logging."
+time: 2026-10-23T00:00:00.000000000Z

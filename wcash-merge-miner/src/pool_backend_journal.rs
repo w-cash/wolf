@@ -1325,9 +1325,6 @@ impl PoolBackendJournal {
         };
         let persisted_blocks = encode_winner_blocks(&winner_blocks, event_seq)?;
         self.append_locked(&mut state, event, persisted_blocks)?;
-        for winner in &receipt.winners {
-            crate::diagnostics::durable(winner, &receipt.job_id, receipt.event_seq);
-        }
         Ok(JournalShareCommit {
             receipt,
             replayed: false,
@@ -3840,6 +3837,22 @@ mod tests {
                 },
             )
             .expect("observe winner through revision CAS");
+        drop(journal);
+        let journal = open(&path, &config);
+        let (_, recovered_observed) = journal
+            .next_unsettled_winner_state(None)
+            .unwrap()
+            .expect("observed proof remains available to the background audit after restart");
+        assert_eq!(recovered_observed.block_bytes, block_bytes);
+        assert_eq!(recovered_observed.share_id, commit.receipt.share_id);
+        assert_eq!(recovered_observed.revision_event_seq, observed.event_seq());
+        assert!(matches!(
+            recovered_observed.lifecycle,
+            JournalWinnerLifecycle::Observed {
+                confirmations: 1,
+                ..
+            }
+        ));
         journal
             .compare_and_transition_winner(
                 &commit.receipt.share_id,

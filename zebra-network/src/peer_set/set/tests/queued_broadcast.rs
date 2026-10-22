@@ -31,14 +31,13 @@ fn failed_peer_broadcasts_preserve_best_effort_return_semantics() {
             .ready()
             .await
             .unwrap()
-            .call(Request::AdvertiseBlockToAll(block::Hash([9; 32])));
+            .call(Request::AdvertiseBlock(block::Hash([9; 32]), None));
         for handle in &mut handles {
             let request = handle
                 .try_to_receive_outbound_client_request()
                 .request()
                 .unwrap();
-            // Cancel each actual service response. Diagnostic changes must not
-            // turn a completed best-effort fanout into a new retry policy.
+            // Ordinary broadcasts must keep their best-effort return contract.
             drop(request.tx);
         }
         assert_eq!(broadcast.await.unwrap(), Response::Nil);

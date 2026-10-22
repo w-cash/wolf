@@ -924,12 +924,11 @@ mod submitblock_test {
         assert!(log_output
             .lines()
             .any(|line| { line.contains("phase=\"queued\"") && line.contains(&public_hash) }));
-        // This fixture has no external peer. A started request identifies the
-        // mined-channel work; it establishes neither completion nor receipt.
+        // This fixture has no peer. Log the bounded attempt's result rather
+        // than formatting optional diagnostics before sending the request.
         assert!(log_output.lines().any(|line| {
-            line.contains("block gossip network request started")
-                && line.contains("phase=\"request_started\"")
-                && line.contains("kind=\"mined\"")
+            line.contains("phase=\"retry_queued\"")
+                && line.contains("reason=\"network_request_timeout\"")
                 && line.contains(&public_hash)
                 && line.contains(&public_height)
         }));
