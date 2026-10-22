@@ -133,6 +133,7 @@ use crate::{
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{LoadTrackedClient, MinimumPeerVersion},
     peer_set::{
+        broadcast_log::BlockBroadcast,
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
@@ -1212,6 +1213,7 @@ where
         req: Request,
         peers: Vec<D::Key>,
     ) -> <Self as tower::Service<Request>>::Future {
+        let broadcast = BlockBroadcast::from_request(&req);
         let futs = FuturesUnordered::new();
         for key in peers {
             let mut svc = self
@@ -1223,6 +1225,10 @@ where
 
         async move {
             let results = futs.collect::<Vec<Result<_, _>>>().await;
+            if let Some(broadcast) = broadcast {
+                let ok = results.iter().filter(|result| result.is_ok()).count();
+                broadcast.completed(ok, results.len() - ok);
+            }
             tracing::debug!(
                 ok.len = results.iter().filter(|r| r.is_ok()).count(),
                 err.len = results.iter().filter(|r| r.is_err()).count(),
@@ -1314,6 +1320,11 @@ where
 
     /// Broadcasts the same request to all ready peers, ignoring return values.
     fn broadcast_all(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
+        if self.ready_services.is_empty() && self.cancel_handles.is_empty() {
+            if let Some(broadcast) = BlockBroadcast::from_request(&req) {
+                broadcast.no_candidates();
+            }
+        }
         // Snapshot peers that were already busy before sending moves ready peers
         // into the unready set. Initially ready peers must not be queued twice.
         let queued_broadcast = self.queue_broadcast_all_unready(&req);

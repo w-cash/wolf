@@ -1235,7 +1235,19 @@ impl PoolBackendActor {
             return Err(PoolBackendActorError::WinnerAuthorityMismatch);
         }
         let state = self.lock_state()?;
-        state
+        let (stage, confirmations) = match &transition {
+            PoolBackendWinnerTransition::SideChain { .. } => ("side_chain", None),
+            PoolBackendWinnerTransition::Observed { confirmations, .. } => {
+                ("observed", Some(*confirmations))
+            }
+            PoolBackendWinnerTransition::Orphaned { .. } => ("orphaned", None),
+            PoolBackendWinnerTransition::Quarantined { .. } => ("quarantined", None),
+            PoolBackendWinnerTransition::Requeued { .. } => ("requeued", None),
+            PoolBackendWinnerTransition::Matured { confirmations, .. } => {
+                ("matured", Some(*confirmations))
+            }
+        };
+        let event = state
             .journal
             .compare_and_transition_winner(
                 &expected.state.share_id,
@@ -1243,7 +1255,10 @@ impl PoolBackendActor {
                 expected.state.revision_event_seq,
                 transition.into(),
             )
-            .map_err(winner_transition_error)
+            .map_err(winner_transition_error)?;
+        drop(state);
+        crate::diagnostics::lifecycle(expected, stage, event.event_seq(), confirmations);
+        Ok(event)
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, ActorState>, PoolBackendActorError> {
@@ -2119,6 +2134,14 @@ fn unhealthy_backend(message: &'static str) -> PoolBackendHandlerError {
 }
 
 fn journal_handler_error(error: PoolBackendJournalError) -> PoolBackendHandlerError {
+    if !matches!(
+        error,
+        PoolBackendJournalError::Io { .. } | PoolBackendJournalError::PathChanged { .. }
+    ) {
+        // Actual append I/O/path failures were recorded at their poisoning
+        // boundary; repeated poisoned/capacity errors are independently paced.
+        crate::diagnostics::journal_error(&error);
+    }
     match error {
         PoolBackendJournalError::ShareConflict { .. } => attribution_conflict(),
         _ => unhealthy_backend("authoritative journal operation failed"),
@@ -4135,6 +4158,117 @@ mod tests {
                 .expect("journal watermark"),
             2
         );
+    }
+
+    #[test]
+    fn winner_diagnostics_follow_durability_replay_and_cas() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("diagnostics.journal");
+        let config = config();
+        let ((journal, winner, _), durable) =
+            crate::diagnostics::capture(|| zcash_winner_journal(&path, &config));
+        assert_eq!(durable, vec![("winner_durable", "fsync_completed")]);
+        let (_, retained) = journal.next_winner_state(None).unwrap().unwrap();
+        let (replay, events) = crate::diagnostics::capture(|| {
+            journal.append_share_committed(
+                retained.job_id.clone(),
+                retained.share_id.clone(),
+                retained.parent_hash_le.clone(),
+                vec![winner.clone()],
+                identity(),
+                TargetLe::new([0xff; 32]),
+                JournalWinnerBlocks {
+                    wcash: None,
+                    zcash: Some(retained.block_bytes.clone()),
+                },
+            )
+        });
+        assert!(replay.unwrap().replayed);
+        assert!(events.is_empty(), "a replay is not a newly durable winner");
+        let actor = actor_from_journal(journal, Arc::new(TestClock::new()));
+        let snapshot = actor.next_winner_snapshot(None).unwrap().unwrap();
+        let transition = PoolBackendWinnerTransition::Observed {
+            tip: ChainTip {
+                block_hash_le: winner.block_hash_le.clone(),
+                height: winner.height,
+            },
+            confirmations: 1,
+        };
+        let (_, events) = crate::diagnostics::capture(|| {
+            actor
+                .compare_and_apply_winner_transition(&snapshot, transition.clone())
+                .unwrap();
+            assert!(matches!(
+                actor.compare_and_apply_winner_transition(&snapshot, transition),
+                Err(PoolBackendActorError::WinnerRevisionConflict)
+            ));
+            crate::record_native_winner_reconciliation(&snapshot, None);
+        });
+        assert_eq!(events, vec![("winner_lifecycle_persisted", "observed")]);
+    }
+
+    #[test]
+    fn failed_winner_fsync_never_emits_durable_success() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("failed-sync.journal");
+        let config = config();
+        let (journal, winner, _) = zcash_winner_journal(&path, &config);
+        let (_, retained) = journal.next_winner_state(None).unwrap().unwrap();
+        let (result, events) = crate::diagnostics::capture(|| {
+            crate::pool_backend_journal::fail_next_append_sync();
+            journal.append_share_committed(
+                retained.job_id,
+                Hex32::new([0x99; 32]),
+                retained.parent_hash_le,
+                vec![winner],
+                identity(),
+                TargetLe::new([0xff; 32]),
+                JournalWinnerBlocks {
+                    wcash: None,
+                    zcash: Some(retained.block_bytes),
+                },
+            )
+        });
+        assert!(matches!(
+            result,
+            Err(crate::pool_backend_journal::PoolBackendJournalError::Io {
+                operation: "fsync",
+                ..
+            })
+        ));
+        assert_eq!(events, vec![("journal_failure", "io_error")]);
+        assert!(matches!(
+            journal.current_event_seq(),
+            Err(crate::pool_backend_journal::PoolBackendJournalError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn ordinary_share_diagnostics_are_silent() {
+        let directory = private_temp_dir();
+        let path = directory.path().join("ordinary-diagnostics.journal");
+        let journal = create_journal(&path, &config());
+        let descriptor = job(11);
+        journal
+            .append_event(BackendEvent::JobActivated {
+                event_seq: 0,
+                job: descriptor.clone(),
+            })
+            .unwrap();
+        let (_, events) = crate::diagnostics::capture(|| {
+            journal
+                .append_share_committed(
+                    descriptor.job_id,
+                    Hex32::new([0x97; 32]),
+                    Hex32::new([0x98; 32]),
+                    Vec::new(),
+                    identity(),
+                    TargetLe::new([0xff; 32]),
+                    JournalWinnerBlocks::default(),
+                )
+                .unwrap();
+        });
+        assert!(events.is_empty());
     }
 
     #[test]

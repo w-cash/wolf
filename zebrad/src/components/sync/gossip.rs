@@ -110,7 +110,7 @@ impl PendingGossip {
             queued_at: now,
         });
         metrics::counter!("sync.gossip.mined.enqueued").increment(1);
-        debug!(
+        info!(
             ?hash,
             ?height,
             phase = "queued",
@@ -241,13 +241,13 @@ where
             // This can be a buffered service call, not physical peer readiness.
             request_started = true;
             let request = advertisement.request();
-            let log_msg = if advertisement.mined {
-                "sending mined block broadcast"
-            } else {
-                "sending committed block broadcast"
-            };
-            info!(height = ?advertisement.height, ?request, attempt = advertisement.attempts,
-                phase = "request_started", log_msg);
+            // Retries already have a paced warning below. Do not print once per
+            // retry or format a request that might acquire private fields later.
+            if advertisement.attempts == 1 {
+                info!(hash = ?advertisement.hash, height = ?advertisement.height,
+                    kind = advertisement.kind(), attempt = advertisement.attempts,
+                    phase = "request_started", "block gossip network request started");
+            }
             ready
                 .call(request)
                 .await
@@ -310,6 +310,9 @@ where
     let mut attempt: Option<BoxFuture<'static, AttemptOutcome>> = None;
     let mut active: Option<Advertisement> = None;
     let mut last_warning: Option<Instant> = None;
+    let mut suppressed_warnings = 0_u64;
+    let mut last_ordinary_warning: Option<Instant> = None;
+    let mut suppressed_ordinary_warnings = 0_u64;
 
     loop {
         if attempt.is_none() {
@@ -328,7 +331,15 @@ where
         };
         tokio::select! {
             result = &mut committed_tip => {
-                let ((hash, height), updated_chain_state) = result?;
+                let ((hash, height), updated_chain_state) = result.inspect_err(|error| {
+                    let reason = match error {
+                        TipChange(_) => "tip_change_closed",
+                        SyncStatus(_) => "sync_status_closed",
+                        PeerSetReadiness(_) => "peer_set_readiness",
+                    };
+                    error!(phase = "gossip_task_exit", reason,
+                        "block gossip task stopped; independent receipt is unconfirmed");
+                })?;
                 chain_state = updated_chain_state;
                 pending.enqueue_committed(hash, height, Instant::now());
                 committed_tip = next_committed_tip(sync_status.clone(), chain_state.clone()).boxed();
@@ -351,8 +362,8 @@ where
                     AttemptOutcome::Completed => {
                         pending.complete(advertisement);
                         metrics::counter!("sync.gossip.request.completed", "kind" => advertisement.kind()).increment(1);
-                        debug!(hash = ?advertisement.hash, height = ?advertisement.height,
-                            attempt = advertisement.attempts, phase = "network_request_completed",
+                        info!(hash = ?advertisement.hash, height = ?advertisement.height,
+                            kind = advertisement.kind(), attempt = advertisement.attempts, phase = "network_request_completed",
                             "block gossip network request completed; independent peer receipt is not confirmed");
                         if advertisement.mined
                             && mined_block_receiver.as_ref().is_none_or(|rx| rx.is_empty())
@@ -371,17 +382,34 @@ where
                             warn!(hash = ?advertisement.hash, height = ?advertisement.height,
                                 attempt = advertisement.attempts,
                                 pending_seconds = now.duration_since(advertisement.queued_at).as_secs(),
-                                pending_mined = pending.mined_hashes.len(), reason, phase = "retry_queued",
+                                pending_mined = pending.mined_hashes.len(), reason,
+                                suppressed = suppressed_warnings, phase = "retry_queued",
                                 "block gossip request incomplete; pending mined hashes retained for retry");
+                            suppressed_warnings = 0;
+                        } else {
+                            suppressed_warnings = suppressed_warnings.saturating_add(1);
                         }
                     },
                     AttemptOutcome::Incomplete(reason) => {
                         metrics::counter!("sync.gossip.request.dropped", "kind" => advertisement.kind(), "reason" => reason).increment(1);
-                        debug!(hash = ?advertisement.hash, height = ?advertisement.height,
-                            attempt = advertisement.attempts, reason, phase = "attempt_dropped",
-                            "ordinary tip gossip request incomplete; best-effort attempt dropped");
+                        let now = Instant::now();
+                        if last_ordinary_warning.is_none_or(|previous| now.duration_since(previous) >= GOSSIP_WARNING_INTERVAL) {
+                            last_ordinary_warning = Some(now);
+                            warn!(hash = ?advertisement.hash, height = ?advertisement.height,
+                                attempt = advertisement.attempts, reason,
+                                suppressed = suppressed_ordinary_warnings, phase = "attempt_dropped",
+                                "ordinary tip gossip request incomplete; best-effort attempt dropped");
+                            suppressed_ordinary_warnings = 0;
+                        } else {
+                            suppressed_ordinary_warnings = suppressed_ordinary_warnings.saturating_add(1);
+                        }
                     },
-                    AttemptOutcome::PermanentReadiness(error) => return Err(PeerSetReadiness(error)),
+                    AttemptOutcome::PermanentReadiness(error) => {
+                        error!(hash = ?advertisement.hash, height = ?advertisement.height,
+                            phase = "gossip_task_exit", reason = "peer_set_readiness",
+                            "block gossip task stopped; independent receipt is unconfirmed");
+                        return Err(PeerSetReadiness(error));
+                    },
                 }
             },
             _ = async {

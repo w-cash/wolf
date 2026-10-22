@@ -140,6 +140,7 @@ tonic-prost-build = { workspace = true }
 which = { workspace = true }
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
 http-body = { workspace = true }
 insta = { workspace = true, features = ["redactions", "json", "ron"] }

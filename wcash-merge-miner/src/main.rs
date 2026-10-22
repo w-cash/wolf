@@ -478,18 +478,24 @@ fn reconcile_pool_backend_snapshot(
         Ok(Some(transition)) => {
             match actor.compare_and_apply_winner_transition(snapshot, transition) {
                 Ok(_) | Err(PoolBackendActorError::WinnerRevisionConflict) => Ok(()),
-                Err(error) => Err(format!("winner lifecycle persistence failed: {error}")),
+                Err(_) => {
+                    wcash_merge_miner::record_native_winner_persistence_failure(snapshot);
+                    Err(
+                        "winner lifecycle persistence failed; inspect bounded winner diagnostics"
+                            .into(),
+                    )
+                }
             }
         }
         Ok(None) => Ok(()),
         Err(error) if is_retryable_winner_reconciliation_error(error.miner_error()) => {
-            eprintln!(
-                "winner reconciliation dependency unavailable (submission_blocked={}): exact bytes remain durable: {error}",
-                error.submission_blocked(),
-            );
+            wcash_merge_miner::record_native_winner_reconciliation(snapshot, Some(&error));
             Ok(())
         }
-        Err(error) => Err(format!("winner reconciliation failed closed: {error}")),
+        Err(error) => {
+            wcash_merge_miner::record_native_winner_reconciliation(snapshot, Some(&error));
+            Err("winner reconciliation failed closed; inspect bounded winner diagnostics".into())
+        }
     }
 }
 
@@ -816,6 +822,10 @@ fn pool_backend_authority_json_fields(
 fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let arguments = parse_native_job_arguments(arguments)?;
     let configured = configure_native(&arguments.connection)?;
+    // Diagnostics must not become a new dependency of mining availability.
+    if wcash_merge_miner::start_native_backend_diagnostics().is_err() {
+        eprintln!("{{\"component\":\"native_pool_backend\",\"level\":\"WARN\",\"stage\":\"diagnostics_start_failed\",\"result\":\"writer_unavailable\"}}");
+    }
     let runtime = pool_backend_runtime_config()?;
     let facts = pool_backend_authority_facts(&configured)?;
 

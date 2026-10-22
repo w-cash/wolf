@@ -1,3 +1,4 @@
+mod broadcast_log;
 pub(crate) mod candidate_set;
 mod initialize;
 mod inventory_registry;

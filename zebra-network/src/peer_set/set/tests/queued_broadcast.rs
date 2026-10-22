@@ -14,6 +14,38 @@ use crate::{
 use super::{PeerSetBuilder, PeerVersions};
 
 #[test]
+fn failed_peer_broadcasts_preserve_best_effort_return_semantics() {
+    let (runtime, _init_guard) = zebra_test::init_async();
+    let _guard = runtime.enter();
+    let peers = PeerVersions {
+        peer_versions: vec![CURRENT_NETWORK_PROTOCOL_VERSION],
+    };
+    let (discovered, mut handles) = peers.mock_peer_discovery();
+    let (minimum_version, _best_tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum_version)
+            .build();
+        let broadcast = peer_set
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::AdvertiseBlockToAll(block::Hash([9; 32])));
+        for handle in &mut handles {
+            let request = handle
+                .try_to_receive_outbound_client_request()
+                .request()
+                .unwrap();
+            // Cancel each actual service response. Diagnostic changes must not
+            // turn a completed best-effort fanout into a new retry policy.
+            drop(request.tx);
+        }
+        assert_eq!(broadcast.await.unwrap(), Response::Nil);
+    });
+}
+
+#[test]
 fn queued_mined_broadcast_keeps_peer_request_alive() {
     let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();

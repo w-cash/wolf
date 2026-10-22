@@ -3294,11 +3294,6 @@ where
                             ));
                         }
                         self.gbt.advertise_committed_duplicate(block_hash, height)?;
-                        tracing::info!(
-                            ?block_hash,
-                            ?height,
-                            "committed Zcash duplicate queued for gossip"
-                        );
                     }
                 }
                 SubmitBlockErrorResponse::Duplicate

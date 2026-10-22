@@ -7869,6 +7869,7 @@ dependencies = [
  "tracing",
  "tracing-error",
  "tracing-futures",
+ "tracing-subscriber",
  "zebra-chain",
  "zebra-test",
 ]
@@ -7936,6 +7937,7 @@ dependencies = [
  "tonic-reflection",
  "tower 0.4.13",
  "tracing",
+ "tracing-subscriber",
  "wcash-zcash-aux",
  "which",
  "zcash_address",

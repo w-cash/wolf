@@ -1,6 +1,7 @@
 //! Types and functions for the `getblocktemplate` RPC.
 
 pub mod constants;
+mod gossip_log;
 pub mod parameters;
 pub(crate) mod precompute;
 pub mod proposal;
@@ -1042,7 +1043,9 @@ where
         block: block::Hash,
         height: block::Height,
     ) -> Result<(), TrySendError<(block::Hash, block::Height)>> {
-        self.mined_block_sender.try_send((block, height))
+        let result = self.mined_block_sender.try_send((block, height));
+        gossip_log::record(block, height, false, &result);
+        result
     }
 
     /// Reannounces a positively checked canonical duplicate at most once per
@@ -1070,16 +1073,20 @@ where
                 None,
             ));
         }
-        self.mined_block_sender
-            .try_send((block, height))
-            .map_err(|_| {
-                ErrorObject::borrowed(
-                    ErrorCode::InternalError.code(),
-                    "committed duplicate could not be queued for gossip; retry the same submission",
-                    None,
-                )
-            })?;
-        *last_admission = Some(now);
+        let result = self.mined_block_sender.try_send((block, height));
+        // Release the existing admission lock before formatting any diagnostic.
+        if result.is_ok() {
+            *last_admission = Some(now);
+        }
+        drop(last_admission);
+        gossip_log::record(block, height, true, &result);
+        result.map_err(|_| {
+            ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "committed duplicate could not be queued for gossip; retry the same submission",
+                None,
+            )
+        })?;
         Ok(())
     }
 

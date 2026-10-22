@@ -985,13 +985,23 @@ impl NativeZcashProvider {
         nodes.push(&self.template_node);
         nodes.extend(self.proposal_validators.iter());
         nodes.extend(self.broadcast_nodes.iter());
+        let observer_start = nodes.len();
         nodes.extend(self.observer_nodes.iter());
         thread::scope(|scope| {
             nodes
                 .into_iter()
-                .map(|node| {
+                .enumerate()
+                .map(|(index, node)| {
                     scope.spawn(move || {
-                        parent_confirmation_depth_on_node(node, height, expected_hash)
+                        let result = parent_confirmation_depth_on_node(node, height, expected_hash);
+                        if index >= observer_start {
+                            crate::diagnostics::observer_header_result(
+                                height,
+                                expected_hash,
+                                &result,
+                            );
+                        }
+                        result
                     })
                 })
                 .collect::<Vec<_>>()
