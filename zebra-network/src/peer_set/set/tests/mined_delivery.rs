@@ -15,6 +15,14 @@ use crate::{
 
 use super::PeerSetBuilder;
 
+fn mainnet_mined_response(report: MinedBlockAdvertisement) -> Response {
+    if Network::Mainnet.uses_wcash_consensus() {
+        Response::Nil
+    } else {
+        Response::MinedBlockAdvertisement(report)
+    }
+}
+
 fn mock_discovery(
     addresses: &[PeerSocketAddr],
 ) -> (
@@ -117,7 +125,7 @@ async fn zcash_mined_reports_distinguish_failures_sidecars_and_non_local_sends()
                 .await
                 .unwrap()
                 .unwrap(),
-            Response::MinedBlockAdvertisement(expected)
+            mainnet_mined_response(expected)
         );
     }
 }
@@ -226,7 +234,7 @@ async fn queued_mined_report_preserves_ready_and_recovered_peer_outcomes() {
             .unwrap()
             .unwrap()
             .unwrap(),
-        Response::MinedBlockAdvertisement(MinedBlockAdvertisement {
+        mainnet_mined_response(MinedBlockAdvertisement {
             non_local_sent: 1,
             local_sent: 1,
             failed: 0
@@ -275,7 +283,7 @@ async fn timed_out_mined_fanout_cancels_peer_work_and_next_attempt_recovers() {
         .unwrap();
     assert_eq!(
         retry.await.unwrap(),
-        Response::MinedBlockAdvertisement(MinedBlockAdvertisement {
+        mainnet_mined_response(MinedBlockAdvertisement {
             non_local_sent: 1,
             ..Default::default()
         })
