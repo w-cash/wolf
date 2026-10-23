@@ -78,3 +78,38 @@ fixed-height external reorg observations. Run them off production. No fabricated
 or historical block is submitted to mainnet as a test.
 Outer-supervisor fixtures must also hold each recipient or observer unavailable
 and prove that an eligible healthy recipient receives the exact bytes first.
+
+## Fresh ZEC announcement scheduling
+
+Zcash gossip owns at most two concurrent attempts: the existing fair general
+lane and one lane reserved for a fresh RPC-submitted hash. An older stalled
+announcement therefore cannot by itself hold a fresh hash behind its six-second
+deadline. Existing attempts remain owned until completion or their deadline;
+retries keep their one-second pacing and share the same readiness/request
+deadline. When both lanes
+are occupied, further hashes wait within the existing bounded pending storage.
+The Wcash profile retains its single-attempt scheduling policy.
+
+The Zcash peer set retains up to 64 queued fanouts in enqueue order, skipping a
+full caller channel so other retained work can progress. Queue overflow
+returns an explicit retryable failure before issuing any new wire calls. A
+disconnected peer or cancelled caller releases its unsent obligations. Cleanup
+of those recipient sets preserves response futures already handed to an active
+caller. Cancelling that caller or reaching its deadline still cancels its owned
+attempt. A connected busy peer remains owed delivery. Wcash retains its previous
+latest-hash replacement behavior.
+Queued sends still require the peer set to be polled.
+
+Advertisement result and failure records include `queue_wait_ms`,
+`readiness_wait_ms`, `request_elapsed_ms`, `total_elapsed_ms`, and `lane`.
+The queue timing excludes deliberate retry pacing; total elapsed time includes
+the complete retained lifecycle. No per-share log or new pre-dispatch INFO
+record is added. An RPC-submitted hash is not automatically a pool discovery:
+correlate it with the durable winner journal before reporting it as one.
+
+Paused-clock fixtures reproduce head-of-line waiting and recipient cleanup
+failures. Local TCP fixtures hold an older announcement open, then request and
+compare the complete bytes for the fresh block. These tests exercise real local
+wire delivery without sending test blocks to public peers. They do not establish
+future public receipt, validation or canonical inclusion, and two occupied lanes
+can still delay subsequent announcements.

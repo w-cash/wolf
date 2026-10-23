@@ -749,6 +749,7 @@ async fn setup(
         chain_tip_change,
         peer_set.clone(),
         Some(submitblock_channel.receiver()),
+        false,
     ));
 
     let tx_gossip_task_handle = tokio::spawn(gossip_mempool_transaction_id(
@@ -906,6 +907,7 @@ mod submitblock_test {
                 chain_tip_change,
                 peer_set.clone(),
                 Some(submitblock_channel.receiver()),
+                false,
             )
             .in_current_span(),
         );
@@ -921,7 +923,7 @@ mod submitblock_test {
         assert!(log_output.contains("initializing block gossip task"));
         let public_hash = format!("hash={hash:?}");
         let public_height = format!("height={height:?}");
-        assert!(log_output
+        assert!(!log_output
             .lines()
             .any(|line| { line.contains("phase=\"queued\"") && line.contains(&public_hash) }));
         // This fixture has no peer. Log the bounded attempt's result rather
@@ -951,8 +953,8 @@ mod mined_block_delivery {
         time::Duration,
     };
 
-    use futures::task::AtomicWaker;
-    use tokio::sync::{mpsc, Notify};
+    use futures::{future::BoxFuture, task::AtomicWaker};
+    use tokio::sync::{mpsc, watch, Notify};
     use tower::Service;
     use zebra_chain::serialization::ZcashSerialize;
     use zebra_state::{ChainTipChange, ChainTipSender};
@@ -1076,6 +1078,7 @@ mod mined_block_delivery {
             chain_tip,
             peer_set,
             Some(submitted.receiver()),
+            false,
         ));
         let winner = fixture();
         sender.send(winner).await.unwrap();
@@ -1110,6 +1113,209 @@ mod mined_block_delivery {
         assert!(!gossip.is_finished());
         gossip.abort();
         let _ = gossip.await;
+    }
+
+    /// Stall one selected advertisement while keeping the actual TCP peer set usable.
+    #[derive(Clone)]
+    struct AdvertisementGate {
+        inner: PeerSet,
+        held_hash: block::Hash,
+        released: watch::Sender<bool>,
+        started: Arc<Notify>,
+        active: Arc<AtomicBool>,
+    }
+
+    struct HeldAdvertisement(Arc<AtomicBool>);
+
+    impl Drop for HeldAdvertisement {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl Service<Request> for AdvertisementGate {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = BoxFuture<'static, Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(cx)
+        }
+
+        fn call(&mut self, request: Request) -> Self::Future {
+            let held = match &request {
+                Request::AdvertiseBlock(hash, _) | Request::AdvertiseBlockToAll(hash) => {
+                    *hash == self.held_hash
+                }
+                _ => false,
+            };
+            if !held {
+                return self.inner.call(request).boxed();
+            }
+
+            // Move the service whose readiness permit belongs to this request.
+            let replacement = self.inner.clone();
+            let mut inner = std::mem::replace(&mut self.inner, replacement);
+            let mut released = self.released.subscribe();
+            self.active.store(true, Ordering::SeqCst);
+            let guard = HeldAdvertisement(self.active.clone());
+            self.started.notify_one();
+            async move {
+                let _guard = guard;
+                tokio::time::timeout(Duration::from_secs(4), released.wait_for(|value| *value))
+                    .await
+                    .map_err(|_| std::io::Error::other("fixture advertisement hold expired"))?
+                    .map_err(|_| std::io::Error::other("fixture release channel closed"))?;
+                inner.call(request).await
+            }
+            .boxed()
+        }
+    }
+
+    /// Cancel the owned gossip future even if an assertion panics.
+    struct GossipTaskGuard(Option<JoinHandle<Result<(), BlockGossipError>>>);
+
+    impl Drop for GossipTaskGuard {
+        fn drop(&mut self) {
+            if let Some(task) = &self.0 {
+                task.abort();
+            }
+        }
+    }
+
+    /// Compare the original single-lane policy with ZEC's fresh-notification lane.
+    /// Block 9 is held before delivery; the real TCP peer must retrieve block 10.
+    /// These are existing valid Mainnet fixtures, not fabricated production blocks.
+    async fn fresh_block_wire_priority(hold_mined: bool, prioritize_fresh_mined: bool) {
+        let _init_guard = zebra_test::init();
+        let (peer_set, listen_addr, mut tip, chain_tip) = network().await;
+        let mut peer = connect_peer(listen_addr).await;
+        let previous: block::Block = zebra_test::vectors::BLOCK_MAINNET_9_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let previous_hash = previous.hash();
+        let previous_height = previous.coinbase_height().unwrap();
+        let (released, _release_receiver) = watch::channel(false);
+        let gate = AdvertisementGate {
+            inner: peer_set,
+            held_hash: previous_hash,
+            released,
+            started: Arc::new(Notify::new()),
+            active: Arc::new(AtomicBool::new(false)),
+        };
+        let (sync_status, mut recent_syncs) = SyncStatus::new();
+        recent_syncs.push_obtain_tips_length(0);
+        let submitted = SubmitBlockChannel::new();
+        let sender = submitted.sender();
+        let mut gossip = GossipTaskGuard(Some(tokio::spawn(sync::gossip_best_tip_block_hashes(
+            sync_status,
+            chain_tip,
+            gate.clone(),
+            Some(submitted.receiver()),
+            prioritize_fresh_mined,
+        ))));
+
+        if hold_mined {
+            sender.send((previous_hash, previous_height)).await.unwrap();
+        } else {
+            tip.set_finalized_tip(zebra_state::ChainTipBlock {
+                hash: previous_hash,
+                height: previous_height,
+                time: previous.header.time,
+                transactions: Vec::new(),
+                transaction_hashes: Arc::from([]),
+                previous_block_hash: previous.header.previous_block_hash,
+            });
+        }
+        tokio::time::timeout(
+            sync::PEER_GOSSIP_DELAY + Duration::from_secs(1),
+            gate.started.notified(),
+        )
+        .await
+        .expect("the selected old attempt must be demonstrably held first");
+        assert!(gate.active.load(Ordering::SeqCst));
+
+        let winner = fixture();
+        sender.send(winner).await.unwrap();
+        if !prioritize_fresh_mined {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), peer.adverts.recv())
+                    .await
+                    .is_err(),
+                "the baseline policy must reproduce head-of-line blocking on the actual TCP path"
+            );
+            assert!(gate.active.load(Ordering::SeqCst));
+            gate.released.send_replace(true);
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let received = peer.adverts.recv().await.unwrap();
+                if received == winner.0 {
+                    break;
+                }
+                assert_eq!(
+                    received, previous_hash,
+                    "only the two fixture hashes are sent"
+                );
+            }
+            let downloaded = peer
+                .client
+                .ready()
+                .await
+                .unwrap()
+                .call(Request::BlocksByHash(iter::once(winner.0).collect()))
+                .await
+                .unwrap();
+            let Response::Blocks(blocks) = downloaded else {
+                panic!("the independent TCP peer requested the fresh block");
+            };
+            let [Available((block, _))] = blocks.as_slice() else {
+                panic!("the advertised fixture block must be available");
+            };
+            assert_eq!(
+                block.zcash_serialize_to_vec().unwrap(),
+                *zebra_test::vectors::BLOCK_MAINNET_10_BYTES,
+                "the fresh block crosses the complete INV/GetData/block wire path unchanged"
+            );
+        })
+        .await
+        .expect("the fresh block must cross the real TCP path promptly");
+
+        if prioritize_fresh_mined {
+            assert!(
+                gate.active.load(Ordering::SeqCst) && !*gate.released.borrow(),
+                "fresh INV and full block bytes must arrive before releasing the older attempt"
+            );
+        }
+        gate.released.send_replace(true);
+        let task = gossip.0.take().unwrap();
+        task.abort();
+        let _ = task.await;
+        assert!(
+            !gate.active.load(Ordering::SeqCst),
+            "cancelling gossip also drops its owned held request future"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn baseline_fresh_block_waits_for_stalled_ordinary_attempt_over_tcp() {
+        fresh_block_wire_priority(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_zcash_block_bypasses_stalled_ordinary_attempt_over_tcp() {
+        fresh_block_wire_priority(false, true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn baseline_fresh_block_waits_for_stalled_mined_attempt_over_tcp() {
+        fresh_block_wire_priority(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_zcash_block_bypasses_stalled_mined_attempt_over_tcp() {
+        fresh_block_wire_priority(true, true).await;
     }
 
     /// Hold service readiness without replacing the real TCP delivery service.
@@ -1159,6 +1365,7 @@ mod mined_block_delivery {
             chain_tip,
             gate.clone(),
             Some(receiver),
+            false,
         ));
         let first = fixture();
         let second = (block::Hash([2; 32]), Height(11));

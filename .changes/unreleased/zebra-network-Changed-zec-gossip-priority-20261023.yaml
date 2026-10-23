@@ -1,0 +1,4 @@
+project: zebra-network
+kind: Changed
+body: "Retain concurrent Zcash block fanouts in a bounded queue, return an explicit retryable error when it is full, and release unsent obligations for disconnected peers or cancelled callers. Wcash retains its latest-hash replacement policy."
+time: 2026-10-23T08:14:23.000000000Z
