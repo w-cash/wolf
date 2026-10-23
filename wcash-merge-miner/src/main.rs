@@ -8,8 +8,8 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc, Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
     },
     thread,
     time::{Duration, Instant, SystemTime},
@@ -32,15 +32,17 @@ use wcash_merge_miner::{
     },
     CoordinatorConfig, GenerationRetirement, JobConfig, MinerError, NativeMiningCoordinator,
     NativeMiningSupervisor, NativePoolBackendRetainedJob, NativeZcashConfig, NativeZcashNetwork,
-    PoolBackendActor, PoolBackendActorError, PoolBackendLiveWinnerScheduler,
-    PoolBackendRetainedJob, PoolBackendWinnerAuditScheduler, PoolBackendWinnerKey,
-    PoolBackendWinnerSnapshot, PreparedJob, ShareProcessor, WcashIncomingViewingKey,
-    Zip301ClientConfig, Zip301Config, Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
+    PoolBackendActor, PoolBackendActorError, PoolBackendRetainedJob, PoolBackendWinnerWorkers,
+    PreparedJob, ShareProcessor, WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config,
+    Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
 };
 use wcash_pool_protocol::{Hex32, JobInvalidationReason, TargetBe, TargetLe};
 use wcash_zcash_aux::{Target, WCASH_AUXILIARY_CHAIN_ID};
 use zcash_address::ZcashAddress;
 use zebra_chain::block::genesis::WCASH_TESTNET_GENESIS_HASH;
+
+#[cfg(test)]
+use wcash_merge_miner::is_retryable_winner_reconciliation_error;
 
 const DEFAULT_BIND: &str = "127.0.0.1:28237";
 const DEFAULT_SHARE_JOURNAL: &str = ".wcash-share-journal-v2.jsonl";
@@ -341,24 +343,6 @@ struct PoolBackendListenerWorkers {
     threads: Vec<thread::JoinHandle<()>>,
 }
 
-struct PoolBackendWinnerWorker {
-    shutdown: Arc<AtomicBool>,
-    live_wake: thread::Thread,
-    audit_wake: thread::Thread,
-    live_thread: Option<thread::JoinHandle<()>>,
-    audit_thread: Option<thread::JoinHandle<()>>,
-}
-
-#[derive(Default)]
-struct PoolBackendWinnerClaims {
-    keys: Mutex<Vec<PoolBackendWinnerKey>>,
-}
-
-struct PoolBackendWinnerClaim {
-    claims: Arc<PoolBackendWinnerClaims>,
-    key: PoolBackendWinnerKey,
-}
-
 struct ActivePoolBackendGeneration {
     job_id: Hex32,
     retained: Arc<NativePoolBackendRetainedJob>,
@@ -434,216 +418,6 @@ impl PoolBackendRetirementWorker {
 }
 
 impl Drop for PoolBackendRetirementWorker {
-    fn drop(&mut self) {
-        let _ = self.request_shutdown();
-    }
-}
-
-impl PoolBackendWinnerClaims {
-    fn claim(
-        self: &Arc<Self>,
-        key: PoolBackendWinnerKey,
-    ) -> Result<Option<PoolBackendWinnerClaim>, io::Error> {
-        let mut keys = self
-            .keys
-            .lock()
-            .map_err(|_| io::Error::other("winner reconciliation claims mutex is poisoned"))?;
-        if keys.contains(&key) {
-            return Ok(None);
-        }
-        keys.push(key.clone());
-        Ok(Some(PoolBackendWinnerClaim {
-            claims: Arc::clone(self),
-            key,
-        }))
-    }
-}
-
-impl Drop for PoolBackendWinnerClaim {
-    fn drop(&mut self) {
-        if let Ok(mut keys) = self.claims.keys.lock() {
-            if let Some(position) = keys.iter().position(|key| key == &self.key) {
-                keys.swap_remove(position);
-            }
-        }
-    }
-}
-
-fn reconcile_pool_backend_snapshot(
-    supervisor: &NativeMiningSupervisor,
-    actor: &PoolBackendActor,
-    snapshot: &PoolBackendWinnerSnapshot,
-) -> Result<(), String> {
-    match supervisor.reconcile_pool_backend_winner(snapshot) {
-        Ok(Some(transition)) => {
-            match actor.compare_and_apply_winner_transition(snapshot, transition) {
-                Ok(_) | Err(PoolBackendActorError::WinnerRevisionConflict) => Ok(()),
-                Err(_) => {
-                    wcash_merge_miner::record_native_winner_persistence_failure(snapshot);
-                    Err(
-                        "winner lifecycle persistence failed; inspect bounded winner diagnostics"
-                            .into(),
-                    )
-                }
-            }
-        }
-        Ok(None) => Ok(()),
-        Err(error) if is_retryable_winner_reconciliation_error(error.miner_error()) => {
-            wcash_merge_miner::record_native_winner_reconciliation(snapshot, Some(&error));
-            Ok(())
-        }
-        Err(error) => {
-            wcash_merge_miner::record_native_winner_reconciliation(snapshot, Some(&error));
-            Err("winner reconciliation failed closed; inspect bounded winner diagnostics".into())
-        }
-    }
-}
-
-impl PoolBackendWinnerWorker {
-    fn spawn(
-        supervisor: Arc<NativeMiningSupervisor>,
-        actor: Arc<PoolBackendActor>,
-        shutdown: Arc<AtomicBool>,
-        failure: mpsc::Sender<String>,
-    ) -> Result<Self, io::Error> {
-        let claims = Arc::new(PoolBackendWinnerClaims::default());
-        let audit_before = Arc::new(AtomicUsize::new(0));
-
-        let live_shutdown = Arc::clone(&shutdown);
-        let live_actor = Arc::clone(&actor);
-        let live_supervisor = Arc::clone(&supervisor);
-        let live_claims = Arc::clone(&claims);
-        let live_audit_before = Arc::clone(&audit_before);
-        let live_failure = failure.clone();
-        let live_thread = thread::Builder::new()
-            .name("wcash-live-winner-submission".to_string())
-            .spawn(move || {
-                let mut scheduler = PoolBackendLiveWinnerScheduler::default();
-                loop {
-                    if live_shutdown.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let snapshot = match scheduler.next(&live_actor) {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            let _ = live_failure
-                                .send(format!("live winner scheduling failed: {error}"));
-                            break;
-                        }
-                    };
-                    let Some(snapshot) = snapshot else {
-                        live_audit_before.store(scheduler.audit_before(), Ordering::Release);
-                        thread::park();
-                        continue;
-                    };
-                    let claim = match live_claims.claim(snapshot.key()) {
-                        Ok(Some(claim)) => claim,
-                        Ok(None) => continue,
-                        Err(error) => {
-                            let _ = live_failure.send(error.to_string());
-                            break;
-                        }
-                    };
-                    live_audit_before.store(scheduler.audit_before(), Ordering::Release);
-                    if let Err(error) =
-                        reconcile_pool_backend_snapshot(&live_supervisor, &live_actor, &snapshot)
-                    {
-                        let _ = live_failure.send(error);
-                        break;
-                    }
-                    drop(claim);
-                }
-            })?;
-        let live_wake = live_thread.thread().clone();
-        if let Err(error) = actor.register_winner_worker(live_wake.clone()) {
-            shutdown.store(true, Ordering::Release);
-            live_wake.unpark();
-            let _ = live_thread.join();
-            return Err(io::Error::other(format!(
-                "live winner worker registration failed: {error}"
-            )));
-        }
-
-        let audit_shutdown = Arc::clone(&shutdown);
-        let audit_actor = Arc::clone(&actor);
-        let audit_claims = Arc::clone(&claims);
-        let audit_failure = failure;
-        let audit_thread = match thread::Builder::new()
-            .name("wcash-winner-audit".to_string())
-            .spawn(move || {
-                let mut scheduler = PoolBackendWinnerAuditScheduler::default();
-                loop {
-                    if audit_shutdown.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let work =
-                        match scheduler.next(&audit_actor, audit_before.load(Ordering::Acquire)) {
-                            Ok(work) => work,
-                            Err(error) => {
-                                let _ = audit_failure
-                                    .send(format!("winner audit scheduling failed: {error}"));
-                                break;
-                            }
-                        };
-                    if let Some(snapshot) = work.snapshot() {
-                        let claim = match audit_claims.claim(snapshot.key()) {
-                            Ok(Some(claim)) => Some(claim),
-                            Ok(None) => None,
-                            Err(error) => {
-                                let _ = audit_failure.send(error.to_string());
-                                break;
-                            }
-                        };
-                        if let Some(claim) = claim {
-                            if let Err(error) =
-                                reconcile_pool_backend_snapshot(&supervisor, &audit_actor, snapshot)
-                            {
-                                let _ = audit_failure.send(error);
-                                break;
-                            }
-                            drop(claim);
-                        }
-                    }
-                    thread::park_timeout(work.delay());
-                }
-            }) {
-            Ok(thread) => thread,
-            Err(error) => {
-                shutdown.store(true, Ordering::Release);
-                live_wake.unpark();
-                let _ = live_thread.join();
-                return Err(error);
-            }
-        };
-        let audit_wake = audit_thread.thread().clone();
-        Ok(Self {
-            shutdown,
-            live_wake,
-            audit_wake,
-            live_thread: Some(live_thread),
-            audit_thread: Some(audit_thread),
-        })
-    }
-
-    fn request_shutdown(&mut self) -> Result<(), io::Error> {
-        self.shutdown.store(true, Ordering::Release);
-        self.live_wake.unpark();
-        self.audit_wake.unpark();
-        if let Some(worker) = self.live_thread.take() {
-            worker.join().map_err(|_| {
-                io::Error::other("live winner submission worker panicked during shutdown")
-            })?;
-        }
-        if let Some(worker) = self.audit_thread.take() {
-            worker
-                .join()
-                .map_err(|_| io::Error::other("winner audit worker panicked during shutdown"))?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for PoolBackendWinnerWorker {
     fn drop(&mut self) {
         let _ = self.request_shutdown();
     }
@@ -850,7 +624,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
     let (listener_failure_tx, listener_failure_rx) = mpsc::channel::<String>();
-    let mut winner_worker = PoolBackendWinnerWorker::spawn(
+    let mut winner_worker = PoolBackendWinnerWorkers::spawn(
         Arc::clone(&supervisor),
         Arc::clone(&actor),
         Arc::clone(&shutdown),
@@ -1137,25 +911,6 @@ fn wait_for_pool_backend_retry(
         };
         thread::sleep(remaining.min(Duration::from_millis(100)));
     }
-}
-
-fn is_retryable_winner_reconciliation_error(error: &MinerError) -> bool {
-    matches!(error, MinerError::WinnerSubmissionDeferred { .. })
-        // Winner reconciliation is observational and the exact winner bytes
-        // are already durable. Zebra can briefly publish a new
-        // `getblockchaininfo` tip before its height/hash index serves the
-        // matching `getblockhash` or `getblock` lookup. Defer that pass rather
-        // than terminating the whole Stratum backend. Keep these broad RPC
-        // codes fatal during job preparation, where they are not sufficient
-        // evidence that retrying is safe.
-        || matches!(
-            error,
-            MinerError::RpcError {
-                code: Some(-1 | -5),
-                ..
-            }
-        )
-        || is_retryable_native_preparation_error(error)
 }
 
 fn pool_backend_generations_share_any_tip(

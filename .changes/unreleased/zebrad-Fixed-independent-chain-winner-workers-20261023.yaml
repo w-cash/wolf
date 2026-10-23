@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Native merged-mining winner submission and retry workers are independent for Zcash and Wcash, so one chain's RPC or observation work does not occupy the other chain's worker. Exact winner bytes, journal format, fork choice and accounting rules are preserved."
+time: 2026-10-23T15:55:00.000000000Z

@@ -29,6 +29,7 @@ mod pool_backend_identity;
 mod pool_backend_journal;
 mod pool_backend_listener;
 mod pool_backend_transport;
+mod pool_backend_workers;
 pub mod protocol;
 pub mod rpc;
 pub mod zip301;
@@ -68,6 +69,9 @@ pub use pool_backend_actor::{
     PoolBackendValidatedShare, PoolBackendWinnerAuditScheduler, PoolBackendWinnerKey,
     PoolBackendWinnerScheduler, PoolBackendWinnerSnapshot, PoolBackendWinnerTransition,
     PoolBackendWinnerWork,
+};
+pub use pool_backend_workers::{
+    is_retryable_winner_reconciliation_error, PoolBackendWinnerWorkers,
 };
 pub use zip301::{serve_zip301_loopback, ShareProcessor, Zip301Config, Zip301LoopbackListener};
 pub use zip301_client::{mine_zip301_once, Zip301AcceptedShare, Zip301ClientConfig};
