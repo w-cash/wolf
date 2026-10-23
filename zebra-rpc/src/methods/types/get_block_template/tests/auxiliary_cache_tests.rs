@@ -385,7 +385,7 @@ fn auxiliary_cache_fee_eviction_preserves_active_builders_and_their_waiters() {
 fn auxiliary_private_wcash_proof_repro_rebuilds_twice_before_fix_and_once_with_shared_cache() {
     use orchard::keys::{FullViewingKey, Scope, SpendingKey};
     use std::time::Instant;
-    use zcash_address::unified::{Container, Receiver};
+    use zcash_address::unified::{Encoding, Receiver};
     use zcash_protocol::consensus::NetworkType;
     use zebra_chain::primitives::WcashAddress;
 
