@@ -107,12 +107,12 @@ fn external_ip(ip: IpAddr) -> bool {
                 return external_ip(IpAddr::V4(mapped));
             }
             let segments = ip.segments();
-            !ip.is_unspecified()
-                && !ip.is_loopback()
-                && !ip.is_multicast()
-                && !ip.is_unique_local()
-                && !ip.is_unicast_link_local()
-                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || segments[0] == 0x2001 && segments[1] == 0x0db8)
         }
     }
 }
