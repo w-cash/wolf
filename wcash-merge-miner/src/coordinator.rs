@@ -5296,6 +5296,7 @@ pub(crate) mod tests {
         canonical_replies: std::collections::VecDeque<serde_json::Value>,
         header: serde_json::Value,
         headers: std::collections::VecDeque<serde_json::Value>,
+        parent_status: Option<serde_json::Value>,
         submissions: std::collections::VecDeque<Result<serde_json::Value, serde_json::Value>>,
     }
 
@@ -5314,6 +5315,7 @@ pub(crate) mod tests {
                 canonical_replies: Default::default(),
                 header: json!({"hash":hash,"height":1,"confirmations":confirmations}),
                 headers: Default::default(),
+                parent_status: None,
                 submissions: Default::default(),
             }
         }
@@ -5391,7 +5393,10 @@ pub(crate) mod tests {
                     "getblockstatus" if request["params"] == json!([fixture.genesis]) => {
                         Ok(fixture.genesis_status.clone())
                     }
-                    "getblockstatus" => Ok(json!({"state":"unknown"})),
+                    "getblockstatus" => Ok(fixture
+                        .parent_status
+                        .clone()
+                        .unwrap_or_else(|| json!({"state":"unknown"}))),
                     "getblockchaininfo" => Ok(fixture
                         .tips
                         .pop_front()
@@ -5475,6 +5480,104 @@ pub(crate) mod tests {
             directory.join("native-share-journal.jsonl"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn retained_parent_winner_delivers_while_same_height_catchup_holds_preparation() {
+        // These local RPC observations exercise supervisor thread isolation,
+        // not consensus verification or fork-choice selection.
+        let directory = tempdir().unwrap();
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let own_tip = json!({"blocks":1,"bestblockhash":hash});
+        let competing_tip = json!({"blocks":1,"bestblockhash":"73".repeat(32)});
+        let snapshot = parent_reconciliation_fixture(&block);
+        let expected_bytes = hex::encode(snapshot.block_bytes());
+        let (delivery_tx, delivery_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let (template, template_server) = spawn_pool_rpc_with_hook(
+            PoolRpcFixture::new(own_tip.clone(), &hash, 1),
+            move |request| {
+                if request["method"] == "submitblock" {
+                    delivery_tx.send(request["params"].clone()).unwrap();
+                }
+            },
+        );
+        let mut validator_fixture = PoolRpcFixture::new(competing_tip, &hash, 0);
+        validator_fixture.parent_status =
+            Some(json!({"state":"side_chain","hash":hash,"height":1}));
+        let held_hash = hash.clone();
+        let mut release_rx = Some(release_rx);
+        let (validator, validator_server) =
+            spawn_pool_rpc_with_hook(validator_fixture, move |request| {
+                if request["method"] == "getblockstatus" && request["params"] == json!([held_hash])
+                {
+                    if let Some(release_rx) = release_rx.take() {
+                        entered_tx.send(()).unwrap();
+                        release_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("test releases same-height catch-up RPC");
+                    }
+                }
+            });
+        let (observer, observer_server) =
+            spawn_pool_rpc(PoolRpcFixture::new(own_tip.clone(), &hash, 1));
+        let mut child_fixture = PoolRpcFixture::new(own_tip, &hash, 1);
+        child_fixture.genesis = Network::new_wcash_regtest().genesis_hash().to_string();
+        let (child, child_server) = spawn_pool_rpc(child_fixture);
+        let supervisor = Arc::new(test_pool_supervisor(
+            directory.path(),
+            child,
+            template,
+            validator,
+            vec![],
+            vec![observer],
+        ));
+        let preparing = Arc::clone(&supervisor);
+        let catchup_worker = thread::spawn(move || preparing.prepare_generation());
+        let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+        if entered.is_err() {
+            let _ = release_tx.send(());
+            let _ = catchup_worker.join();
+            panic!("same-height catch-up must enter its held status RPC");
+        }
+        assert!(
+            supervisor.generation_preparation.try_lock().is_err(),
+            "the actual generation-preparation lock remains held"
+        );
+        let submitting = Arc::clone(&supervisor);
+        let winner_worker = thread::spawn(move || {
+            let result = submitting.reconcile_pool_backend_winner(&snapshot);
+            (result, snapshot)
+        });
+        let received = delivery_rx.recv_timeout(Duration::from_secs(2));
+        // Release every held request before checking the delivery assertion.
+        release_tx.send(()).unwrap();
+        let catchup_result = catchup_worker.join().unwrap();
+        let (winner_result, snapshot) = winner_worker.join().unwrap();
+        assert_eq!(
+            received.expect("healthy template receives before catch-up is released"),
+            json!([expected_bytes])
+        );
+        assert!(matches!(
+            catchup_result,
+            Err(MinerError::ParentTipMismatch { .. })
+        ));
+        assert!(matches!(
+            winner_result.unwrap_err().miner_error(),
+            MinerError::ParentTipMismatch { .. }
+        ));
+        assert_eq!(snapshot.lifecycle(), &JournalWinnerLifecycle::Pending);
+        assert_eq!(hex::encode(snapshot.block_bytes()), expected_bytes);
+        let template_requests = template_server.finish();
+        let submissions = pool_rpc_submissions(&template_requests);
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0]["params"], json!([expected_bytes]));
+        for server in [validator_server, observer_server, child_server] {
+            assert!(pool_rpc_submissions(&server.finish()).is_empty());
+        }
     }
 
     #[test]

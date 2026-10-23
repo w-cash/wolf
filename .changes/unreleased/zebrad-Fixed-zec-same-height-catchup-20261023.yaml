@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Native merged-mining preparation can deliver an unknown same-height Zcash observer block directly to a work node with the same predecessor, while preserving consensus fork choice, exact-tip gates and independent winner delivery. Known side chains are not resubmitted and ambiguous catch-up retries are bounded."
+time: 2026-10-23T13:10:00.000000000Z

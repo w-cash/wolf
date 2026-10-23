@@ -34,6 +34,31 @@ recipients. Re-delivery of an observed winner requires that recipient's exact
 canonical hash below maturity. Strict all-node identity and confirmation checks
 still gate accounting after delivery. The read-only observer never submits.
 
+## Local same-height catch-up
+
+When the public-chain observer and a work node report different hashes at the
+same height, the backend can offer the observer's unknown block directly to
+that work node. Both nodes must have the same canonical predecessor, and the
+observer's exact serialized block, hash, coinbase height and previous hash must
+match the sampled tip. Observer and recipient tip checks fence the write.
+The recipient performs its ordinary consensus validation and fork choice;
+only exact resulting tip agreement permits preparation to continue.
+
+A block already known on the recipient's side chain is never resubmitted or
+forced into its best chain. Pending or ambiguous writes are limited to one
+attempt per recipient/hash every five seconds in a separate 128-entry cache.
+The retry check precedes another block download. A post-commit gossip-admission
+error or canonical-duplicate throttle is advisory only when authoritative tip
+checks prove convergence; otherwise preparation remains deferred. Hard protocol
+failures remain errors.
+
+This affects preparation only. It adds no share-path logging, does not acquire
+the winner-delivery cooldown, and retains all existing network, proposal, payout
+and exact-tip gates. Already matching nodes take the existing fast path.
+An ahead work node or a deeper fork is not forced backward. The optimization
+does not remove ordinary block-rollover races or guarantee immediate convergence
+when the recipient legitimately prefers another branch.
+
 ## Independent report
 
 `scripts/zec-winner-tracking.py export --deployment UUID` reads the existing
