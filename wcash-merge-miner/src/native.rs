@@ -56,6 +56,12 @@ const PARENT_BLOCK_LIMIT: usize = 2_000_000;
 const MAX_OBSERVER_RELAY_BLOCKS: u32 = 32;
 const OBSERVED_PARENT_REDELIVERY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_OBSERVED_PARENT_REDELIVERY_COOLDOWNS: usize = 128;
+const SAME_HEIGHT_OBSERVER_RELAY_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_SAME_HEIGHT_OBSERVER_RELAYS: usize = 128;
+
+#[cfg(test)]
+#[path = "native/catchup_tests.rs"]
+mod catchup_tests;
 
 /// Strict local projection of the parent fields used to build an exact job.
 ///
@@ -402,6 +408,7 @@ pub struct NativeZcashProvider {
     expected_parent_payout_address: ZcashAddress,
     allow_lagging_proposal_validators: bool,
     observed_parent_redelivery: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
+    same_height_observer_relays: Arc<Mutex<HashMap<(String, [u8; 32]), Instant>>>,
 }
 
 /// Exact chain tip sampled from one or more pinned consensus nodes.
@@ -469,6 +476,7 @@ impl NativeZcashProvider {
             expected_parent_payout_address,
             allow_lagging_proposal_validators,
             observed_parent_redelivery: Arc::default(),
+            same_height_observer_relays: Arc::default(),
         })
     }
 
@@ -618,8 +626,11 @@ impl NativeZcashProvider {
         if node_tip == observer_tip {
             return Ok(());
         }
-        if node_tip.height >= observer_tip.height {
+        if node_tip.height > observer_tip.height {
             return Err(parent_tip_mismatch(observer_tip, node, node_tip));
+        }
+        if node_tip.height == observer_tip.height {
+            return self.relay_equal_height_observer_block(observer, observer_tip, node, node_tip);
         }
 
         let relay_count = observer_tip.height - node_tip.height;
@@ -640,7 +651,7 @@ impl NativeZcashProvider {
         }
 
         // Prove the local node is on the observer's canonical prefix before
-        // relaying anything. An equal-height mismatch is never repaired here.
+        // relaying a bounded sequence of missing blocks.
         let observer_prefix: String = observer
             .call("getblockhash", json!([node_tip.height]))
             .map_err(|error| reclassify_observer_lookup_tip_race(observer, observer_tip, error))?;
@@ -714,6 +725,171 @@ impl NativeZcashProvider {
             return Err(parent_tip_mismatch(observer_tip, node, actual));
         }
         Ok(())
+    }
+
+    /// Offers one unknown sibling through ordinary consensus validation. A known
+    /// side chain never becomes a forced tip or a repeated gossip obligation.
+    fn relay_equal_height_observer_block(
+        &self,
+        observer: &ZebraRpcClient,
+        observer_tip: NativeChainTip,
+        node: &ZebraRpcClient,
+        node_tip: NativeChainTip,
+    ) -> Result<(), MinerError> {
+        let Some(parent_height) = observer_tip.height.checked_sub(1) else {
+            return Err(parent_tip_mismatch(observer_tip, node, node_tip));
+        };
+        let expected_hash = display_hex(observer_tip.block_hash_le);
+        let membership = validate_parent_block_status(
+            node.call("getblockstatus", json!([expected_hash]))?,
+            observer_tip.height,
+            &expected_hash,
+        )?;
+        match membership {
+            ParentCommittedMembership::BestChain => {
+                return self.require_observer_relay_convergence(observer, observer_tip, node);
+            }
+            ParentCommittedMembership::SideChain => {
+                return Err(parent_tip_mismatch(observer_tip, node, node_tip));
+            }
+            ParentCommittedMembership::Unknown => {}
+        }
+        if self.same_height_observer_relay_is_recent(
+            node,
+            observer_tip.block_hash_le,
+            Instant::now(),
+        ) {
+            return Err(parent_tip_mismatch(observer_tip, node, node_tip));
+        }
+
+        let node_parent: String = node.call("getblockhash", json!([parent_height]))?;
+        let observer_parent: String = observer
+            .call("getblockhash", json!([parent_height]))
+            .map_err(|error| reclassify_observer_lookup_tip_race(observer, observer_tip, error))?;
+        let parent_hash: block::Hash =
+            parse_template_hex(&observer_parent, "observer common predecessor")?;
+        if !node_parent.eq_ignore_ascii_case(&observer_parent) {
+            return Err(parent_tip_mismatch(observer_tip, node, node_tip));
+        }
+        let observer_canonical: String = observer
+            .call("getblockhash", json!([observer_tip.height]))
+            .map_err(|error| reclassify_observer_lookup_tip_race(observer, observer_tip, error))?;
+        if !observer_canonical.eq_ignore_ascii_case(&expected_hash) {
+            let actual = native_chain_tip_on_node(observer)?;
+            return Err(parent_tip_mismatch(observer_tip, observer, actual));
+        }
+        let raw_hex: String = observer
+            .call("getblock", json!([expected_hash, 0]))
+            .map_err(|error| reclassify_observer_lookup_tip_race(observer, observer_tip, error))?;
+        let block_bytes =
+            decode_template_bytes(&raw_hex, "observer sibling block", PARENT_BLOCK_LIMIT)?;
+        let block: Block = block_bytes
+            .as_slice()
+            .zcash_deserialize_into()
+            .map_err(|error| {
+                MinerError::RpcProtocol(format!(
+                    "observer returned an invalid sibling block: {error}"
+                ))
+            })?;
+        if block.zcash_serialize_to_vec()? != block_bytes
+            || block.hash().0 != observer_tip.block_hash_le
+            || block.coinbase_height() != Some(Height(observer_tip.height))
+            || block.header.previous_block_hash != parent_hash
+        {
+            return Err(MinerError::RpcProtocol(
+                "observer sibling bytes do not match their exact tip, height and predecessor"
+                    .to_string(),
+            ));
+        }
+
+        let actual_observer = native_chain_tip_on_node(observer)?;
+        if actual_observer != observer_tip {
+            return Err(parent_tip_mismatch(observer_tip, observer, actual_observer));
+        }
+        let actual_node = native_chain_tip_on_node(node)?;
+        if actual_node == observer_tip {
+            return Ok(());
+        }
+        if actual_node != node_tip {
+            return Err(parent_tip_mismatch(observer_tip, node, actual_node));
+        }
+        if !self.claim_same_height_observer_relay(node, observer_tip.block_hash_le, Instant::now())
+        {
+            return Err(parent_tip_mismatch(observer_tip, node, actual_node));
+        }
+        // A successful RPC response alone never releases work. The recipient
+        // chooses its own best chain; ambiguous writes retain only a paced
+        // catch-up retry and never acquire the winner-delivery lock.
+        if let Err(error) = node.call_value("submitblock", json!([raw_hex])) {
+            // Queue admission can fail after consensus commit, and a P2P race
+            // can make this a throttled canonical duplicate. Do not terminate
+            // the mining backend for these ambiguous application results.
+            if !is_transient_parent_rpc_failure(&error)
+                && !matches!(
+                    error,
+                    MinerError::RpcError {
+                        code: Some(0 | -32603),
+                        ..
+                    }
+                )
+            {
+                return Err(error);
+            }
+        }
+        self.require_observer_relay_convergence(observer, observer_tip, node)
+    }
+
+    fn same_height_observer_relay_is_recent(
+        &self,
+        node: &ZebraRpcClient,
+        hash_le: [u8; 32],
+        now: Instant,
+    ) -> bool {
+        let Ok(recent) = self.same_height_observer_relays.try_lock() else {
+            return true;
+        };
+        recent
+            .get(&(node.label().to_owned(), hash_le))
+            .is_some_and(|last| {
+                now.saturating_duration_since(*last) < SAME_HEIGHT_OBSERVER_RELAY_INTERVAL
+            })
+    }
+
+    fn require_observer_relay_convergence(
+        &self,
+        observer: &ZebraRpcClient,
+        observer_tip: NativeChainTip,
+        node: &ZebraRpcClient,
+    ) -> Result<(), MinerError> {
+        let actual_node = native_chain_tip_on_node(node)?;
+        let actual_observer = native_chain_tip_on_node(observer)?;
+        if actual_observer != observer_tip {
+            return Err(parent_tip_mismatch(observer_tip, observer, actual_observer));
+        }
+        if actual_node != observer_tip {
+            return Err(parent_tip_mismatch(observer_tip, node, actual_node));
+        }
+        Ok(())
+    }
+
+    fn claim_same_height_observer_relay(
+        &self,
+        node: &ZebraRpcClient,
+        hash_le: [u8; 32],
+        now: Instant,
+    ) -> bool {
+        let Ok(mut recent) = self.same_height_observer_relays.try_lock() else {
+            return false;
+        };
+        recent.retain(|_, last| {
+            now.saturating_duration_since(*last) < SAME_HEIGHT_OBSERVER_RELAY_INTERVAL
+        });
+        let key = (node.label().to_owned(), hash_le);
+        if recent.contains_key(&key) || recent.len() >= MAX_SAME_HEIGHT_OBSERVER_RELAYS {
+            return false;
+        }
+        recent.insert(key, now);
+        true
     }
 
     fn validate_parent_proposal(

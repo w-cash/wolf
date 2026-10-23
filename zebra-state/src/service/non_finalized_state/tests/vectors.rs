@@ -863,6 +863,95 @@ fn equal_length_goes_to_more_work_for_network(network: Network) -> Result<()> {
     Ok(())
 }
 
+/// Exercise real state insertion and `Chain::cmp`, not a mocked RPC tip.
+///
+/// `FakeChainHelper` and `Prepare` bypass semantic verification, including proof
+/// of work. This fixture tests local fork selection after that boundary; it is
+/// not a consensus-valid mined block or a P2P propagation test.
+#[test]
+fn equal_work_sibling_exchange_converges_for_opposite_arrival_orders() -> Result<()> {
+    let _init_guard = zebra_test::init();
+    let mut tested_networks = 0;
+
+    for network in zcash_test_networks() {
+        // Pre-Heartwood fixtures can use the empty ephemeral history tree.
+        let parent: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
+        let first_sibling = parent.make_fake_child().set_work(3);
+        let mut second_sibling = first_sibling.clone();
+        Arc::make_mut(&mut Arc::make_mut(&mut second_sibling).header).nonce[0] ^= 1;
+
+        assert_ne!(first_sibling.hash(), second_sibling.hash());
+        assert_eq!(
+            first_sibling.header.previous_block_hash,
+            second_sibling.header.previous_block_hash,
+        );
+        assert_eq!(
+            first_sibling.header.difficulty_threshold,
+            second_sibling.header.difficulty_threshold,
+        );
+        assert_eq!(
+            first_sibling.coinbase_height(),
+            second_sibling.coinbase_height(),
+        );
+
+        // Zebra breaks equal-work ties by raw tip-hash bytes, not arrival time.
+        let (preferred, side_chain) = if first_sibling.hash().0 > second_sibling.hash().0 {
+            (first_sibling, second_sibling)
+        } else {
+            (second_sibling, first_sibling)
+        };
+        let preferred_hash = preferred.hash();
+        let side_chain_hash = side_chain.hash();
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )?;
+        finalized_state
+            .set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
+
+        let mut observer = NonFinalizedState::new(&network);
+        observer.commit_new_chain(parent.prepare(), &finalized_state)?;
+        let mut recipient = observer.clone();
+
+        observer.commit_block(preferred.clone().prepare(), &finalized_state)?;
+        recipient.commit_block(side_chain.clone().prepare(), &finalized_state)?;
+        assert_ne!(observer.best_tip(), recipient.best_tip());
+        assert_eq!(
+            observer.best_chain().unwrap().partial_cumulative_work,
+            recipient.best_chain().unwrap().partial_cumulative_work,
+        );
+        assert!(observer.best_chain().unwrap() > recipient.best_chain().unwrap());
+
+        // Exchanging the missing siblings converges in both arrival orders.
+        // Receiving a known lower-ranked fork must not force a tip change.
+        let observer_tip_before_exchange = observer.best_tip();
+        observer.commit_block(side_chain.prepare(), &finalized_state)?;
+        assert_eq!(observer.best_tip(), observer_tip_before_exchange);
+        recipient.commit_block(preferred.prepare(), &finalized_state)?;
+        assert_eq!(observer.best_tip(), recipient.best_tip());
+
+        for state in [&observer, &recipient] {
+            assert_eq!(state.chain_count(), 2);
+            assert_eq!(state.best_tip().unwrap().1, preferred_hash);
+            assert!(state.any_chain_contains(&side_chain_hash));
+            assert!(!state
+                .best_chain()
+                .unwrap()
+                .contains_block_hash(side_chain_hash));
+        }
+        tested_networks += 1;
+    }
+
+    // Wcash intentionally excludes historical Zcash fixtures; a ZEC build must
+    // actually exercise both compatible built-in networks rather than pass empty.
+    let expected_networks = if uses_wcash_consensus() { 0 } else { 2 };
+    assert_eq!(tested_networks, expected_networks);
+
+    Ok(())
+}
+
 #[test]
 fn history_tree_is_updated() -> Result<()> {
     for network in zcash_test_networks() {
