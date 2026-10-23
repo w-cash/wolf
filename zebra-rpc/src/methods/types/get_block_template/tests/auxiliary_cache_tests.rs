@@ -382,6 +382,10 @@ fn auxiliary_cache_fee_eviction_preserves_active_builders_and_their_waiters() {
 
 #[cfg(feature = "wcash-consensus")]
 #[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "Expose the old/new proof measurements only in this local regression test"
+)]
 fn auxiliary_private_wcash_proof_repro_rebuilds_twice_before_fix_and_once_with_shared_cache() {
     use orchard::keys::{FullViewingKey, Scope, SpendingKey};
     use std::time::Instant;
@@ -498,9 +502,5 @@ fn auxiliary_private_wcash_proof_repro_rebuilds_twice_before_fix_and_once_with_s
         "later pool requests retain the exact completed private proof"
     );
     assert_eq!(builds.load(Ordering::SeqCst), 1);
-    #[expect(
-        clippy::print_stderr,
-        reason = "Expose the old/new proof measurements only in this local regression test"
-    )]
     eprintln!("auxiliary_private_proof_repro legacy_builds=2 fixed_builds=1 legacy_request_ms={legacy_request_ms:?} fixed_request_ms={fixed_request_ms:?} legacy_total_ms={} fixed_total_ms={}", legacy_elapsed.as_millis(), fixed_elapsed.as_millis());
 }
