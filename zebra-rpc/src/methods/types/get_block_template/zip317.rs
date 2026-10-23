@@ -72,17 +72,10 @@ pub fn select_mempool_transactions(
     // The fake coinbase only depends on the height and miner parameters (its fee is always zero),
     // so it's constant per block. Reuse the same per-block cache as the real coinbase to avoid
     // re-proving a shielded coinbase on every `getblocktemplate` call just to read its size.
-    let fake_coinbase_tx = match coinbase_cache.and_then(|cache| cache.get(height, Amount::zero()))
-    {
-        Some(cached) => cached,
-        None => {
-            let coinbase =
-                TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero())?;
-            if let Some(cache) = coinbase_cache {
-                cache.store(height, Amount::zero(), coinbase.clone());
-            }
-            coinbase
-        }
+    let build = || TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero());
+    let fake_coinbase_tx = match coinbase_cache {
+        Some(cache) => cache.try_get_or_build(height, Amount::zero(), build)?,
+        None => build()?,
     };
     // Charge the exact child-specific coinbase bytes and sigops before selecting
     // transactions. The v2 carrier is a raw 44-byte script suffix, so its

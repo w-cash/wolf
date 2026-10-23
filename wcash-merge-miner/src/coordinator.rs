@@ -5630,6 +5630,107 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn retained_parent_winner_delivers_while_wcash_candidate_proof_response_is_blocked() {
+        // A held loopback response models an unfinished Wcash candidate proof.
+        // This exercises the actual supervisor's transport/lock isolation, not
+        // proof generation, consensus acceptance, or independent public receipt.
+        let directory = tempdir().unwrap();
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let own_tip = json!({"blocks":1,"bestblockhash":hash});
+        let snapshot = parent_reconciliation_fixture(&block);
+        let expected_bytes = hex::encode(snapshot.block_bytes());
+        let (delivery_tx, delivery_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (template, template_server) = spawn_pool_rpc_with_hook(
+            PoolRpcFixture::new(own_tip.clone(), &hash, 1),
+            move |request| {
+                if request["method"] == "submitblock" {
+                    delivery_tx.send(request["params"].clone()).unwrap();
+                }
+            },
+        );
+        let (validator, validator_server) = spawn_pool_rpc(PoolRpcFixture::new(own_tip, &hash, 1));
+        let (child, child_server) = spawn_scripted_rpc_reply_server(
+            vec![
+                Ok(json!(Network::new_wcash_regtest()
+                    .genesis_hash()
+                    .to_string())),
+                Err(json!({"code":-32001,"message":"bounded fixture preparation stop"})),
+            ],
+            move |index, request| {
+                if index == 1 {
+                    assert_eq!(request["method"], "createauxblock");
+                    entered_tx.send(request["params"].clone()).unwrap();
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("test releases the held Wcash proof response");
+                }
+            },
+        );
+        let supervisor = Arc::new(test_pool_supervisor(
+            directory.path(),
+            child,
+            template,
+            validator,
+            vec![],
+            vec![],
+        ));
+        let expected_recipient = supervisor.config.wcash_payout_address.clone();
+        let preparing = Arc::clone(&supervisor);
+        let preparation_worker = thread::spawn(move || preparing.prepare_generation());
+        let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+        if entered.is_err() {
+            let _ = release_tx.send(());
+            let _ = preparation_worker.join();
+            let _ = child_server.join();
+            let _ = template_server.finish();
+            let _ = validator_server.finish();
+            panic!("preparation must reach its held Wcash candidate RPC");
+        }
+        let preparation_lock_held = supervisor.generation_preparation.try_lock().is_err();
+        let submitting = Arc::clone(&supervisor);
+        let winner_worker = thread::spawn(move || {
+            let result = submitting.reconcile_pool_backend_winner(&snapshot);
+            (result, snapshot)
+        });
+        let delivered_before_release = delivery_rx.recv_timeout(Duration::from_secs(2));
+        // Release every held request before assertions and thread cleanup.
+        let _ = release_tx.send(());
+        let preparation_result = preparation_worker.join().unwrap();
+        let (winner_result, snapshot) = winner_worker.join().unwrap();
+        let child_requests = child_server.join().unwrap();
+        let template_requests = template_server.finish();
+        let validator_requests = validator_server.finish();
+        assert!(preparation_lock_held);
+        assert_eq!(entered.unwrap(), json!([expected_recipient]));
+        assert_eq!(
+            delivered_before_release
+                .expect("retained ZEC bytes arrive before the Wcash proof response is released"),
+            json!([expected_bytes])
+        );
+        assert!(matches!(
+            preparation_result,
+            Err(MinerError::RpcError { code: -32001, .. })
+        ));
+        assert!(winner_result.is_ok());
+        assert_eq!(hex::encode(snapshot.block_bytes()), expected_bytes);
+        assert_eq!(
+            child_requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["getblockhash", "createauxblock"]
+        );
+        for requests in [&template_requests, &validator_requests] {
+            let submissions = pool_rpc_submissions(requests);
+            assert_eq!(submissions.len(), 1);
+            assert_eq!(submissions[0]["params"], json!([expected_bytes]));
+        }
+    }
+
+    #[test]
     fn outer_parent_delivery_reaches_healthy_recipient_before_any_stalled_role_is_released() {
         let block = mainnet_block_one();
         let hash = display_hash(block.hash().0);

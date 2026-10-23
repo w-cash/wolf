@@ -993,6 +993,139 @@ fn coinbase_cache_recovers_after_singleflight_builder_panics() {
     assert_eq!(cache.get(height, fee), Some(expected));
 }
 
+#[test]
+fn coinbase_cache_fallible_builder_preserves_error_and_releases_waiter() {
+    use super::CoinbaseCache;
+
+    let network = Network::Mainnet;
+    let height = Height(2_000_000);
+    let fee = Amount::zero();
+    let params = MinerParams::from(
+        Address::decode(
+            &network,
+            default_miner_address(network.kind(), &MinerAddressType::Transparent),
+        )
+        .expect("hard-coded transparent address is valid"),
+    );
+    let expected = TransactionTemplate::new_coinbase(&network, height, &params, fee)
+        .expect("the transparent test coinbase is valid");
+    let cache = CoinbaseCache::default();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let failed_cache = cache.clone();
+    let failed = thread::spawn(move || {
+        failed_cache.try_get_or_build(height, fee, || {
+            started_tx
+                .send(())
+                .expect("the test is waiting for the builder");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the test releases the failed builder");
+            Err("original proof error")
+        })
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the proof builder starts");
+    let entry = cache.0.lock().expect("cache is not poisoned")[&(height, fee)].clone();
+    let recovered_cache = cache.clone();
+    let recovered_coinbase = expected.clone();
+    let recovered = thread::spawn(move || {
+        recovered_cache.try_get_or_build(height, fee, || Ok::<_, &str>(recovered_coinbase))
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while Arc::strong_count(&entry) < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the waiter joins the proof entry"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    release_tx
+        .send(())
+        .expect("the failing builder is listening");
+    assert_eq!(
+        failed.join().expect("proof worker does not panic"),
+        Err("original proof error")
+    );
+    assert_eq!(
+        recovered.join().expect("waiter does not panic"),
+        Ok(expected.clone())
+    );
+    assert_eq!(cache.get(height, fee), Some(expected));
+}
+
+#[test]
+fn zip317_sizing_waits_for_the_existing_prewarm_proof() {
+    use super::{zip317::select_mempool_transactions, CoinbaseCache};
+
+    let network = Network::Mainnet;
+    let height = Height(2_000_000);
+    let fee = Amount::zero();
+    let params = MinerParams::from(
+        Address::decode(
+            &network,
+            default_miner_address(network.kind(), &MinerAddressType::Transparent),
+        )
+        .expect("hard-coded transparent address is valid"),
+    );
+    let expected = TransactionTemplate::new_coinbase(&network, height, &params, fee)
+        .expect("the transparent test coinbase is valid");
+    let cache = CoinbaseCache::default();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let warming_cache = cache.clone();
+    let warming_coinbase = expected.clone();
+    let warmer = thread::spawn(move || {
+        warming_cache.try_get_or_build(height, fee, || {
+            started_tx
+                .send(())
+                .expect("the test is waiting for prewarming");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the test releases the prewarm proof");
+            Ok::<_, &str>(warming_coinbase)
+        })
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the prewarm builder starts");
+    let entry = cache.0.lock().expect("cache is not poisoned")[&(height, fee)].clone();
+    let sizing_cache = cache.clone();
+    let sizing = thread::spawn(move || {
+        select_mempool_transactions(
+            &network,
+            height,
+            &params,
+            vec![],
+            Default::default(),
+            Some(&sizing_cache),
+            None,
+        )
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while Arc::strong_count(&entry) < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ZIP-317 joins the existing proof instead of building a second one"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    release_tx
+        .send(())
+        .expect("the prewarm builder is listening");
+    assert_eq!(
+        warmer.join().expect("prewarm does not panic"),
+        Ok(expected.clone())
+    );
+    assert!(sizing
+        .join()
+        .expect("ZIP-317 worker does not panic")
+        .expect("ZIP-317 selection succeeds")
+        .is_empty());
+    assert_eq!(cache.get(height, fee), Some(expected));
+}
+
 /// Verifies that fee churn beyond the cache cap (4 entries) evicts stale nonzero-fee entries
 /// while preserving the zero-fee sizing coinbase. Without this, the cap would clear the
 /// entire map — including the zero-fee entry — recreating the original #10907 churn.

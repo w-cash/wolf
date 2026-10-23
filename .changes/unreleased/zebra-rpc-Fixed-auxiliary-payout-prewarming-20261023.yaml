@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: Fixed
+body: "Prewarm the next Wcash coinbase proofs for caller-selected pool payouts with bounded background work and shared sizing proofs, preserving recipient, height and fee isolation."
+time: 2026-10-23T21:00:00.000000000Z

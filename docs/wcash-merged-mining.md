@@ -80,9 +80,21 @@ Repeated requests with exactly the same miner parameters, height and fees can
 reuse a proof-complete private coinbase across RPC clones. A recipient change
 never reuses another recipient's coinbase or configured block template. The
 existing height/fee limits, single-builder behavior, proposal verification and
-tip fences still apply. A cold entry, changed height or fees, or recipient-cache
-eviction can still require proving; ordinary configured-recipient prewarming
-does not promise a ready alternate-recipient proof.
+tip fences still apply.
+
+After successfully issuing a candidate for an alternate payout, the node also
+prewarms that recipient's next-height coinbases: zero fees for transaction
+sizing, and the last selected fee total when nonzero. This uses one bounded
+background worker, isolated from the configured payout's template reserve,
+candidate leases and block submission. Matching requests share in-progress
+proofs rather than starting duplicate sizing proofs. The prewarmer keeps at
+most four recipient requests and only warms the adjacent height, preserving
+the current job's cached proof.
+
+Prewarming is best effort. The first request, a new fee total, recipient-cache
+eviction, restart, reorg, or blocks arriving before the next proof is ready can
+still require proving on demand. A proof is reused only for its exact recipient,
+height and fees; a previous fee total is never substituted into a new candidate.
 
 `createauxblock.coinbasevalue` is the miner's **net** payout including all fees:
 `subsidy - foundation + fees`. It excludes the compulsory transparent foundation
