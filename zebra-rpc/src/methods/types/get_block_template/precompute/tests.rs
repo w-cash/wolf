@@ -276,3 +276,144 @@ async fn a_subscription_reports_each_later_publish() {
         "a subscription that has seen every publish should keep waiting",
     );
 }
+
+/// Exercise the private cached-return path so initial RPC admission cannot hide
+/// a missing late readiness check. No updater, proof solver or network is run.
+#[tokio::test(flavor = "multi_thread")]
+async fn quiet_wcash_cached_return_rechecks_peers_and_actual_sync() {
+    use crate::{config::mining::default_miner_address_for_network, methods::RpcImpl};
+    use tower::buffer::Buffer;
+    use zebra_chain::{chain_sync_status::MockSyncStatus, chain_tip::mock::MockChainTip};
+    use zebra_network::{
+        address_book_peers::MockAddressBookPeers,
+        types::{MetaAddr, PeerServices},
+        Version,
+    };
+    use zebra_node_services::{mempool, BoxError};
+    use zebra_state::{ReadRequest, ReadResponse};
+    use zebra_test::mock_service::MockService;
+
+    let _init_guard = zebra_test::init();
+    let network = Network::new_wcash_mainnet_for_tests();
+    let tip_height = Height(38628);
+    let tip_hash = block::Hash([17; 32]);
+    let now = chrono::Utc::now();
+    let peers = || {
+        MockAddressBookPeers::new(
+            ["8.8.8.8:48233", "1.1.1.1:48233"]
+                .into_iter()
+                .map(|addr| {
+                    MetaAddr::new_connected(
+                        addr.parse().unwrap(),
+                        &PeerServices::NODE_NETWORK,
+                        false,
+                        "/quiet-cache-fixture/".to_owned(),
+                        Version(170160),
+                    )
+                    .into_new_meta_addr(std::time::Instant::now(), now.try_into().unwrap())
+                })
+                .collect(),
+        )
+    };
+    let configuration = Config {
+        miner_address: Some(
+            default_miner_address_for_network(&network, &MinerAddressType::Transparent)
+                .unwrap()
+                .parse()
+                .unwrap(),
+        ),
+        ..Default::default()
+    };
+    let miner_params = MinerParams::new(&network, configuration.clone()).unwrap();
+    let chain_info = GetBlockTemplateChainInfo {
+        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+        tip_height,
+        tip_hash,
+        cur_time: DateTime32::from(1792764000),
+        min_time: DateTime32::from(1792763999),
+        max_time: DateTime32::from(1792764060),
+        chain_history_root: Some([23; 32].into()),
+    };
+    let long_poll_id = LongPollInput::new(
+        tip_height,
+        tip_hash,
+        chain_info.max_time,
+        std::iter::empty(),
+    )
+    .generate_id();
+    let template = BlockTemplateResponse::new_internal(
+        &network,
+        &CoinbaseCache::default(),
+        &miner_params,
+        None,
+        &chain_info,
+        long_poll_id,
+        vec![],
+        None,
+    )
+    .unwrap();
+
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(tip_height);
+    tip_sender.send_best_tip_hash(tip_hash);
+    tip_sender.send_best_tip_block_time(now - chrono::Duration::hours(6));
+    tip_sender.send_estimated_distance_to_network_chain_tip(Some(288));
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+    let mempool: MockService<mempool::Request, mempool::Response, _, BoxError> =
+        MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_log_sender, log_receiver) = tokio::sync::watch::channel(None);
+    let (mut rpc, queue) = RpcImpl::new(
+        network,
+        configuration,
+        false,
+        "fixture",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        state,
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        sync.clone(),
+        tip,
+        peers(),
+        log_receiver,
+        None,
+    );
+    rpc.gbt.template_cache().unwrap().publish(template);
+    let responder = tokio::spawn(async move {
+        for _ in 0..3 {
+            read_state
+                .expect_request(ReadRequest::Tip)
+                .await
+                .respond(ReadResponse::Tip(Some((tip_height, tip_hash))));
+        }
+    });
+
+    let first = rpc
+        .precomputed_block_template(None, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.previous_block_hash, tip_hash);
+    rpc.address_book = MockAddressBookPeers::default();
+    assert_eq!(
+        rpc.precomputed_block_template(None, None)
+            .await
+            .unwrap_err()
+            .code(),
+        -10
+    );
+    rpc.address_book = peers();
+    sync.set_is_close_to_tip(false);
+    assert_eq!(
+        rpc.precomputed_block_template(None, None)
+            .await
+            .unwrap_err()
+            .code(),
+        -10
+    );
+    responder.await.unwrap();
+    queue.abort();
+}

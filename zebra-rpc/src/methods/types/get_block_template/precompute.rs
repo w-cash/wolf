@@ -32,6 +32,7 @@ use zebra_chain::{
     parameters::Network,
 };
 use zebra_consensus::error::TransactionError;
+use zebra_network::AddressBookPeers;
 use zebra_node_services::mempool::MempoolService;
 use zebra_state::ReadState;
 
@@ -41,7 +42,7 @@ use crate::{
 };
 
 use super::{
-    check_synced_to_tip, constants::MEMPOOL_LONG_POLL_INTERVAL, fetch_chain_info,
+    check_synced_to_tip_for_template, constants::MEMPOOL_LONG_POLL_INTERVAL, fetch_chain_info,
     fetch_mempool_transactions, zip317::select_mempool_transactions, BlockTemplateResponse,
     CoinbaseCache, MinerParams,
 };
@@ -277,7 +278,7 @@ impl TemplateCache {
 ///
 /// Runs until the task is aborted.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
+pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus, AddressBook>(
     network: Network,
     miner_params: MinerParams,
     coinbase_cache: CoinbaseCache,
@@ -286,11 +287,13 @@ pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
     read_state: ReadStateService,
     mut latest_chain_tip: Tip,
     sync_status: SyncStatus,
+    address_book: AddressBook,
 ) where
     Mempool: MempoolService,
     ReadStateService: ReadState,
     Tip: ChainTip + Clone + Send + Sync + 'static,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
+    AddressBook: AddressBookPeers + Send + Sync + 'static,
 {
     // Zero-fee coinbases for the next few heights, built while we're idle. A shielded coinbase
     // takes seconds to prove, so a single future proof is not enough when blocks arrive in a burst.
@@ -302,9 +305,12 @@ pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
     loop {
         // `getblocktemplate` returns an error until Zebra is synced to the tip, so there's nothing
         // to precompute before then.
-        if let Err(error) =
-            check_synced_to_tip(&network, latest_chain_tip.clone(), sync_status.clone())
-        {
+        if let Err(error) = check_synced_to_tip_for_template(
+            &network,
+            latest_chain_tip.clone(),
+            sync_status.clone(),
+            &address_book,
+        ) {
             tracing::trace!(
                 ?error,
                 "waiting to sync to the tip before building templates"

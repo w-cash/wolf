@@ -160,6 +160,32 @@ ordinary exact Zcash block proposal and retain ordinary Zcash consensus. For
 the durable native pool backend they also need the read-only `getblockstatus`
 method described above; this does not require the private GBT extension.
 
+## Wcash mining-template readiness
+
+After genesis, Wcash Mainnet template admission requires a committed local tip,
+the sync service reporting close to tip, and at least two recently responding
+external full-node IPs. Each peer must advertise `NODE_NETWORK` and have an
+actual response within the network heartbeat window, currently 119 seconds.
+Gossiped last-seen times, future timestamps, loopback and private addresses
+do not qualify. Different ports or IPv4-mapped IPv6 forms of the same IP count
+as one peer.
+
+A quiet canonical chain can remain at the same height for hours. A network
+height estimated from the tip's old timestamp is not an observed chain height
+and does not, by itself, establish missing blocks. Wcash template admission
+uses actual sync status and recent peer responses instead of rejecting work
+solely because that timestamp estimate has advanced.
+
+The [readiness check](../zebra-rpc/src/methods/types/get_block_template/wcash_template_sync.rs)
+guards template precomputation, new templates, and cached or long-poll returns.
+`createauxblock` checks readiness again after proposal validation, immediately
+before inserting the candidate into its cache. Losing sync or qualifying peers
+therefore prevents new work from being published even when a template is cached.
+These checks read the existing address book; they add no network probes or
+per-share logging. Zcash template policy, proposal validation, consensus and
+winning-block submission remain unchanged, as do the Wcash genesis bootstrap
+and testing-network rules.
+
 ## Pool safety rules
 
 The native adapter enforces these rules before a job reaches an ASIC:
