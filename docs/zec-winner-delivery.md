@@ -2,7 +2,8 @@
 
 This focused change follows the operator's direct request on October 23, 2026:
 repair ZEC delivery and add tracking without per-share logging or diagnostic
-work delaying submission. Wcash delivery and accounting policy are unchanged.
+work delaying submission. Wcash submission policy and both chains' accounting
+rules are unchanged.
 
 ## Delivery design
 
@@ -33,6 +34,55 @@ bytes; an unavailable observer or another writable node cannot veto healthy
 recipients. Re-delivery of an observed winner requires that recipient's exact
 canonical hash below maturity. Strict all-node identity and confirmation checks
 still gate accounting after delivery. The read-only observer never submits.
+
+## Independent chain workers
+
+The backend owns four winner workers: one live first-attempt worker and one
+retry/audit worker for each chain. A slow Wcash submission or status check no
+longer occupies Zcash's worker, and a slow Zcash recipient does not occupy
+Wcash's worker. This also applies when one share qualifies on both chains:
+both exact proofs are committed atomically, then each chain can submit through
+its own worker. The receipt order and durable journal format do not change.
+
+Each live worker follows its chain's durable winners and publishes an exclusive
+audit bound only after claiming the selected proof. Its audit worker cannot
+take a fresh proof before that first attempt. Shared claims prevent concurrent
+reconciliation of the same share and chain. Recovery retains exact bytes and
+selects pending work separately for each chain. A filtered scan that reaches its
+inspection budget continues scanning rather than sleeping before the journal
+tail, so a run of other-chain proofs cannot strand new work.
+
+The scheduler owns four persistent workers; existing per-recipient RPC fanout
+remains unchanged. Work within each live lane remains serial. Local validation,
+journal durability, recipient identity and predecessor checks, RPC deadlines,
+and peer transport can still take time or defer delivery. Independent chain
+scheduling is not a zero-delay guarantee or evidence that a public peer received
+a future winner.
+
+## ZEC submission timings
+
+Result records identify the public winner hash, job, height and recipient role
+with a numeric index. They separate recipient preflight, the `submitblock` call,
+post-call canonical classification, and diagnostic queue wait. The measured
+submit-call interval includes local request construction, client queueing and
+network time; it is not a wire-send timestamp. No endpoint credentials, response
+text, block bytes or wallet material are added to these records.
+
+A bounded, nonblocking in-memory cache records the same-process time immediately
+after a new ZEC winner's durable commit. When available, this permits
+commit-to-reconciliation and commit-to-submit measurements. Replayed commits do
+not reset the origin. Restarts, eviction or metadata contention leave origin
+and attempt fields unknown rather than inventing a zero. These clocks do not
+measure hardware discovery or the time before journal durability.
+
+Timing records follow results and use the existing lossy, paced diagnostic
+channel. The first same-process attempt bypasses the writer's retry-rate
+suppression, including all recipient results and the aggregate result. Later
+and unknown-origin attempts remain paced. Sink stalls, full queues and
+repeated-result suppression can omit text;
+drop and suppression counters make that limitation visible. The durable winner
+journal remains authoritative, and timing collection adds no RPC, disk sync,
+sleep or formatting before submission.
 
 ## Local same-height catch-up
 
@@ -103,6 +153,11 @@ fixed-height external reorg observations. Run them off production. No fabricated
 or historical block is submitted to mainnet as a test.
 Outer-supervisor fixtures must also hold each recipient or observer unavailable
 and prove that an eligible healthy recipient receives the exact bytes first.
+Chain-worker fixtures must hold Wcash and Zcash independently, including the
+counterpart of a dual winner, and prove that the other chain dispatches before
+release. Cover same-chain serialization, filtered scans beyond their inspection
+budget, independent restart recovery, live/audit claim exclusion, and complete
+worker cleanup after partial startup failure or shutdown.
 
 ## Fresh ZEC announcement scheduling
 

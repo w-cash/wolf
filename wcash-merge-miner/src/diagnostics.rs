@@ -27,17 +27,21 @@ const CAPACITY: usize = 128;
 const RECENT_KEYS: usize = 128;
 const INTERVAL: Duration = Duration::from_secs(30);
 const NOISY_BURST: u64 = 32;
+const TIMING_ORIGINS: usize = 128;
 static DIAGNOSTICS: OnceLock<Diagnostics> = OnceLock::new();
 static STARTUP: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 thread_local! {
     static CAPTURE: std::cell::RefCell<Option<Vec<Event>>> = const { std::cell::RefCell::new(None) };
+    static TIMING_CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<Event>>>>> = const { std::cell::RefCell::new(None) };
 }
 
 struct Diagnostics {
     sender: SyncSender<Event>,
     dropped: Arc<AtomicU64>,
+    timing_origins: Mutex<VecDeque<ZecOrigin>>,
+    timing_dropped: Arc<AtomicU64>,
 }
 
 impl Diagnostics {
@@ -47,15 +51,284 @@ impl Diagnostics {
             Self {
                 sender,
                 dropped: Arc::default(),
+                timing_origins: Mutex::new(VecDeque::with_capacity(TIMING_ORIGINS)),
+                timing_dropped: Arc::default(),
             },
             receiver,
         )
     }
 
-    fn record(&self, event: Event) {
+    fn record(&self, mut event: Event) {
+        event.timing_metadata_dropped_total = self.timing_dropped.load(Ordering::Relaxed);
         if self.sender.try_send(event).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn note_commit(&self, key: ZecOriginKey, committed_at: Instant) {
+        let Ok(mut origins) = self.timing_origins.try_lock() else {
+            self.timing_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if origins.iter().any(|origin| origin.key == key) {
+            return;
+        }
+        if origins.len() == TIMING_ORIGINS {
+            origins.pop_front();
+            self.timing_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        origins.push_back(ZecOrigin {
+            key,
+            committed_at,
+            attempts: 0,
+        });
+    }
+
+    fn begin_attempt(&self, key: ZecOriginKey) -> Option<(Instant, u64)> {
+        let Ok(mut origins) = self.timing_origins.try_lock() else {
+            self.timing_dropped.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let origin = origins.iter_mut().find(|origin| origin.key == key)?;
+        origin.attempts = origin.attempts.saturating_add(1);
+        Some((origin.committed_at, origin.attempts))
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ZecOriginKey {
+    share: [u8; 32],
+    job: [u8; 32],
+    hash: [u8; 32],
+}
+
+struct ZecOrigin {
+    key: ZecOriginKey,
+    committed_at: Instant,
+    attempts: u64,
+}
+
+/// Captures only a newly durable ZEC winner, without printing or waiting for a sink.
+pub(crate) fn note_zec_winner_committed(
+    share_id: &Hex32,
+    job_id: &Hex32,
+    winner: &WinnerDescriptor,
+) {
+    if winner.chain != MergedChain::Zcash {
+        return;
+    }
+    if let Some(diagnostics) = DIAGNOSTICS.get() {
+        diagnostics.note_commit(
+            ZecOriginKey {
+                share: *share_id.as_bytes(),
+                job: *job_id.as_bytes(),
+                hash: *winner.block_hash_le.as_bytes(),
+            },
+            Instant::now(),
+        );
+    }
+}
+
+/// Same-process timings start after durability, never at hardware discovery.
+#[derive(Clone)]
+pub(crate) struct ZecWinnerAttempt {
+    winner: Winner,
+    started: Instant,
+    fanout_started: Instant,
+    committed_at: Option<Instant>,
+    attempt_number: Option<u64>,
+    redelivery: bool,
+    #[cfg(test)]
+    capture: Option<Arc<Mutex<Vec<Event>>>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ZecRecipientRole {
+    Template,
+    Validator,
+    Relay,
+}
+
+impl ZecRecipientRole {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Template => "template",
+            Self::Validator => "validator",
+            Self::Relay => "relay",
+        }
+    }
+}
+
+/// Local clocks only; this adds no read RPC or pre-send diagnostic.
+pub(crate) struct ZecRecipientTiming {
+    attempt: ZecWinnerAttempt,
+    role: ZecRecipientRole,
+    index: usize,
+    started: Instant,
+    preflight_finished: Option<Instant>,
+    submit_finished: Option<Instant>,
+    rpc_result: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+struct ZecTiming {
+    role: Option<&'static str>,
+    index: Option<usize>,
+    attempt_number: Option<u64>,
+    redelivery: bool,
+    commit_to_reconciliation_ms: Option<u64>,
+    reconciliation_to_submit_start_ms: Option<u64>,
+    commit_to_submit_start_ms: Option<u64>,
+    reconciliation_to_submit_complete_ms: Option<u64>,
+    commit_to_submit_complete_ms: Option<u64>,
+    preflight_ms: Option<u64>,
+    submit_rpc_ms: Option<u64>,
+    classification_ms: Option<u64>,
+    elapsed_ms: u64,
+    fanout_elapsed_ms: Option<u64>,
+    rpc_result: Option<&'static str>,
+}
+
+fn elapsed_ms(later: Instant, earlier: Instant) -> u64 {
+    u64::try_from(later.saturating_duration_since(earlier).as_millis()).unwrap_or(u64::MAX)
+}
+
+impl ZecWinnerAttempt {
+    pub(crate) fn for_snapshot(snapshot: &PoolBackendWinnerSnapshot, started: Instant) -> Self {
+        let origin = DIAGNOSTICS.get().and_then(|diagnostics| {
+            diagnostics.begin_attempt(ZecOriginKey {
+                share: *snapshot.share_id().as_bytes(),
+                job: *snapshot.job_id().as_bytes(),
+                hash: *snapshot.winner().block_hash_le.as_bytes(),
+            })
+        });
+        Self {
+            winner: Winner::snapshot(snapshot),
+            started,
+            fanout_started: Instant::now(),
+            committed_at: origin.map(|(at, _)| at),
+            attempt_number: origin.map(|(_, number)| number),
+            redelivery: !snapshot.lifecycle().requires_submission(),
+            #[cfg(test)]
+            capture: TIMING_CAPTURE.with(|capture| capture.borrow().clone()),
+        }
+    }
+
+    pub(crate) fn recipient(self, role: ZecRecipientRole, index: usize) -> ZecRecipientTiming {
+        ZecRecipientTiming {
+            attempt: self,
+            role,
+            index,
+            started: Instant::now(),
+            preflight_finished: None,
+            submit_finished: None,
+            rpc_result: None,
+        }
+    }
+
+    fn emit(&self, mut event: Event) {
+        // Preserve the first same-process attempt through unrelated retry bursts.
+        // The producer's bounded, lossy channel and drop counter still apply.
+        event.noisy = self.attempt_number != Some(1);
+        #[cfg(test)]
+        if let Some(capture) = &self.capture {
+            capture.lock().unwrap().push(event);
+            return;
+        }
+        record(event);
+    }
+
+    pub(crate) fn completed(&self, result: &'static str, counts: Option<[usize; 6]>) {
+        let finished = Instant::now();
+        let mut event = Event::new(Some(self.winner), "winner_submission_result", result);
+        event.counts = counts;
+        event.warning = result != "best_chain_admitted";
+        event.timing = Some(self.base_timing(finished));
+        self.emit(event);
+    }
+
+    pub(crate) fn failed(&self, error: &MinerError) {
+        self.completed(error_class(error), None);
+    }
+
+    fn base_timing(&self, finished: Instant) -> ZecTiming {
+        ZecTiming {
+            role: None,
+            index: None,
+            attempt_number: self.attempt_number,
+            redelivery: self.redelivery,
+            commit_to_reconciliation_ms: self.committed_at.map(|at| elapsed_ms(self.started, at)),
+            reconciliation_to_submit_start_ms: None,
+            commit_to_submit_start_ms: None,
+            reconciliation_to_submit_complete_ms: None,
+            commit_to_submit_complete_ms: None,
+            preflight_ms: None,
+            submit_rpc_ms: None,
+            classification_ms: None,
+            elapsed_ms: elapsed_ms(finished, self.started),
+            fanout_elapsed_ms: Some(elapsed_ms(finished, self.fanout_started)),
+            rpc_result: None,
+        }
+    }
+}
+
+impl ZecRecipientTiming {
+    pub(crate) fn preflight_finished(&mut self) {
+        self.preflight_finished = Some(Instant::now());
+    }
+
+    pub(crate) fn submitted(&mut self, result: &Result<serde_json::Value, MinerError>) {
+        self.submit_finished = Some(Instant::now());
+        self.rpc_result = Some(match result {
+            Ok(serde_json::Value::Null) => "rpc_accepted",
+            Ok(serde_json::Value::String(reason)) if reason.eq_ignore_ascii_case("duplicate") => {
+                "duplicate"
+            }
+            Ok(serde_json::Value::String(_)) => "rpc_string_result",
+            Ok(_) => "invalid_response",
+            Err(error) => error_class(error),
+        });
+    }
+
+    pub(crate) fn completed(self, result: &'static str) {
+        let finished = Instant::now();
+        let event = self.result_event(result, finished);
+        self.attempt.emit(event);
+    }
+
+    fn result_event(&self, result: &'static str, finished: Instant) -> Event {
+        let preflight_finished = self.preflight_finished.unwrap_or(finished);
+        let mut timing = self.attempt.base_timing(finished);
+        timing.role = Some(self.role.name());
+        timing.index = Some(self.index);
+        timing.preflight_ms = Some(elapsed_ms(preflight_finished, self.started));
+        timing.submit_rpc_ms = self
+            .submit_finished
+            .map(|at| elapsed_ms(at, preflight_finished));
+        timing.classification_ms = self.submit_finished.map(|at| elapsed_ms(finished, at));
+        timing.reconciliation_to_submit_start_ms = self
+            .submit_finished
+            .map(|_| elapsed_ms(preflight_finished, self.attempt.started));
+        timing.commit_to_submit_start_ms = self.submit_finished.and_then(|_| {
+            self.attempt
+                .committed_at
+                .map(|commit| elapsed_ms(preflight_finished, commit))
+        });
+        timing.reconciliation_to_submit_complete_ms = self
+            .submit_finished
+            .map(|at| elapsed_ms(at, self.attempt.started));
+        timing.commit_to_submit_complete_ms = self.submit_finished.and_then(|at| {
+            self.attempt
+                .committed_at
+                .map(|commit| elapsed_ms(at, commit))
+        });
+        timing.elapsed_ms = elapsed_ms(finished, self.started);
+        timing.fanout_elapsed_ms = None;
+        timing.rpc_result = self.rpc_result;
+        let mut event = Event::new(Some(self.attempt.winner), "winner_recipient_result", result);
+        event.warning = result != "best_chain";
+        event.timing = Some(timing);
+        event
     }
 }
 
@@ -111,6 +384,9 @@ struct Event {
     operation: Option<&'static str>,
     os_error: Option<i32>,
     io_kind: Option<&'static str>,
+    queued_at: Instant,
+    timing: Option<ZecTiming>,
+    timing_metadata_dropped_total: u64,
 }
 
 impl Event {
@@ -136,6 +412,9 @@ impl Event {
             operation: None,
             os_error: None,
             io_kind: None,
+            queued_at: Instant::now(),
+            timing: None,
+            timing_metadata_dropped_total: 0,
         }
     }
 }
@@ -171,6 +450,7 @@ pub fn start_native_backend_diagnostics() -> io::Result<()> {
     let mut writer = diagnostic_writer()?;
     let (diagnostics, receiver) = Diagnostics::channel(CAPACITY);
     let dropped = Arc::clone(&diagnostics.dropped);
+    let timing_dropped = Arc::clone(&diagnostics.timing_dropped);
     thread::Builder::new()
         .name("wcash-diagnostics".into())
         .spawn(move || {
@@ -194,7 +474,12 @@ pub fn start_native_backend_diagnostics() -> io::Result<()> {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
                 if reporter
-                    .summary(&mut writer, Instant::now(), dropped.load(Ordering::Relaxed))
+                    .summary(
+                        &mut writer,
+                        Instant::now(),
+                        dropped.load(Ordering::Relaxed),
+                        timing_dropped.load(Ordering::Relaxed),
+                    )
                     .is_err()
                 {
                     break;
@@ -251,15 +536,6 @@ pub(crate) fn submission(
     event.warning = stage == "winner_submission_result"
         && !matches!(result, "rpc_accepted" | "best_chain_admitted");
     record(event);
-}
-
-pub(crate) fn submission_error(snapshot: &PoolBackendWinnerSnapshot, error: &MinerError) {
-    submission(
-        snapshot,
-        "winner_submission_result",
-        error_class(error),
-        None,
-    );
 }
 
 pub(crate) fn observer_header_result(
@@ -392,8 +668,35 @@ pub(crate) fn capture<R>(run: impl FnOnce() -> R) -> (R, Vec<(&'static str, &'st
     )
 }
 
+#[cfg(test)]
+pub(crate) fn capture_zec_timings<R>(run: impl FnOnce() -> R) -> (R, Vec<serde_json::Value>) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    TIMING_CAPTURE.with(|capture| *capture.borrow_mut() = Some(Arc::clone(&captured)));
+    let result = run();
+    TIMING_CAPTURE.with(|capture| *capture.borrow_mut() = None);
+    let mut output = Vec::new();
+    let mut reporter = Reporter::new(Instant::now());
+    for mut event in captured.lock().unwrap().drain(..) {
+        event.noisy = false;
+        reporter
+            .record(&mut output, event, Instant::now(), 0)
+            .unwrap();
+    }
+    let values = output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    (result, values)
+}
+
 #[derive(Eq, PartialEq)]
-struct Key(Option<(&'static str, [u8; 32])>, &'static str, &'static str);
+struct Key(
+    Option<(&'static str, [u8; 32])>,
+    &'static str,
+    &'static str,
+    Option<(&'static str, usize)>,
+);
 
 struct Reporter {
     recent: VecDeque<(Key, Instant, u64)>,
@@ -402,6 +705,7 @@ struct Reporter {
     suppressed: u64,
     reported_suppressed: u64,
     reported_dropped: u64,
+    reported_timing_dropped: u64,
     last_summary: Instant,
 }
 
@@ -414,6 +718,7 @@ impl Reporter {
             suppressed: 0,
             reported_suppressed: 0,
             reported_dropped: 0,
+            reported_timing_dropped: 0,
             last_summary: now,
         }
     }
@@ -438,6 +743,9 @@ impl Reporter {
                     .or_else(|| event.observation.map(|o| ("Zcash", o.hash_be))),
                 event.stage,
                 event.result,
+                event
+                    .timing
+                    .and_then(|timing| timing.role.zip(timing.index)),
             );
             if let Some((_, previous, count)) = self
                 .recent
@@ -470,6 +778,23 @@ impl Reporter {
                 "job_id":hex::encode(w.job),"event_seq":w.event_seq})
         });
         let observation = event.observation.map(|o| json!({"chain":"Zcash","role":"observer","hash":hex::encode(o.hash_be),"height":o.height}));
+        let timing = event.timing.map(|timing| json!({
+            "origin":if timing.commit_to_reconciliation_ms.is_some() {"post_durable_commit_same_process"} else {"reconciliation_entry_only"},
+            "recipient_role":timing.role,"recipient_index":timing.index,
+            "attempt_number":timing.attempt_number,
+            "attempt_kind":match timing.attempt_number {Some(1)=>"first_observed_attempt",Some(_)=>"later_observed_attempt",None=>"unknown_origin"},
+            "delivery_kind":if timing.redelivery {"observed_redelivery"} else {"required_submission"},
+            "commit_to_reconciliation_ms":timing.commit_to_reconciliation_ms,
+            "reconciliation_to_submit_start_ms":timing.reconciliation_to_submit_start_ms,
+            "commit_to_submit_start_ms":timing.commit_to_submit_start_ms,
+            "reconciliation_to_submit_complete_ms":timing.reconciliation_to_submit_complete_ms,
+            "commit_to_submit_complete_ms":timing.commit_to_submit_complete_ms,
+            "preflight_ms":timing.preflight_ms,"submit_rpc_ms":timing.submit_rpc_ms,
+            "classification_ms":timing.classification_ms,"elapsed_ms":timing.elapsed_ms,
+            "fanout_elapsed_ms":timing.fanout_elapsed_ms,"submit_attempted":timing.submit_rpc_ms.is_some(),
+            "rpc_result":timing.rpc_result,
+            "asserts_hardware_discovery_time":false
+        }));
         let value = json!({"component":"native_pool_backend","level":if event.warning {"WARN"} else {"INFO"},
             "stage":event.stage,"result":event.result,"winner":winner,"observation":observation,"confirmations":event.confirmations,
             "node_outcome_counts":event.counts.map(|counts| json!({
@@ -478,24 +803,37 @@ impl Reporter {
             "submission_blocked":event.submission_blocked,
             "operation":event.operation,"os_error":event.os_error,"io_kind":event.io_kind,"suppressed_since_previous":suppressed,
             "suppressed_total":self.suppressed,"diagnostic_dropped_total":dropped,
+            "timing_metadata_dropped_total":event.timing_metadata_dropped_total,
+            "diagnostic_queue_wait_ms":elapsed_ms(now,event.queued_at),"timing":timing,
             "asserts_independent_peer_receipt":false});
         write_record(writer, &value)
     }
 
-    fn summary(&mut self, writer: &mut impl Write, now: Instant, dropped: u64) -> io::Result<()> {
+    fn summary(
+        &mut self,
+        writer: &mut impl Write,
+        now: Instant,
+        dropped: u64,
+        timing_dropped: u64,
+    ) -> io::Result<()> {
         if now.duration_since(self.last_summary) < INTERVAL {
             return Ok(());
         }
         self.last_summary = now;
-        if self.reported_suppressed == self.suppressed && self.reported_dropped == dropped {
+        if self.reported_suppressed == self.suppressed
+            && self.reported_dropped == dropped
+            && self.reported_timing_dropped == timing_dropped
+        {
             return Ok(());
         }
         self.reported_suppressed = self.suppressed;
         self.reported_dropped = dropped;
+        self.reported_timing_dropped = timing_dropped;
         write_record(
             writer,
             &json!({"component":"native_pool_backend","level":"WARN",
-            "stage":"diagnostic_output_summary","suppressed_total":self.suppressed,"diagnostic_dropped_total":dropped}),
+            "stage":"diagnostic_output_summary","suppressed_total":self.suppressed,"diagnostic_dropped_total":dropped,
+            "timing_metadata_dropped_total":timing_dropped}),
         )
     }
 }
@@ -512,6 +850,271 @@ fn write_record(writer: &mut impl Write, value: &serde_json::Value) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn timing_fixture(now: Instant) -> ZecWinnerAttempt {
+        ZecWinnerAttempt {
+            winner: Winner {
+                chain: "Zcash",
+                hash_le: [1; 32],
+                height: 42,
+                job: [2; 32],
+                event_seq: 7,
+            },
+            started: now + Duration::from_millis(30),
+            fanout_started: now + Duration::from_millis(35),
+            committed_at: Some(now),
+            attempt_number: Some(1),
+            redelivery: false,
+            capture: None,
+        }
+    }
+
+    #[test]
+    fn zec_timing_origin_is_exact_bounded_and_never_reset_by_replay() {
+        let (diagnostics, _receiver) = Diagnostics::channel(1);
+        let now = Instant::now();
+        let key = ZecOriginKey {
+            share: [1; 32],
+            job: [2; 32],
+            hash: [3; 32],
+        };
+        diagnostics.note_commit(key, now);
+        diagnostics.note_commit(key, now + Duration::from_secs(5));
+        assert_eq!(diagnostics.begin_attempt(key), Some((now, 1)));
+        assert_eq!(diagnostics.begin_attempt(key), Some((now, 2)));
+        let different_share = ZecOriginKey {
+            share: [4; 32],
+            ..key
+        };
+        assert!(diagnostics.begin_attempt(different_share).is_none());
+        for byte in 1..=128u8 {
+            diagnostics.note_commit(
+                ZecOriginKey {
+                    hash: [byte; 32],
+                    ..different_share
+                },
+                now,
+            );
+        }
+        assert_eq!(
+            diagnostics.timing_origins.lock().unwrap().len(),
+            TIMING_ORIGINS
+        );
+        assert!(diagnostics.begin_attempt(key).is_none());
+        assert_eq!(diagnostics.timing_dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn zec_origin_contention_drops_metadata_without_waiting_or_touching_sink() {
+        let (diagnostics, receiver) = Diagnostics::channel(1);
+        let now = Instant::now();
+        let key = ZecOriginKey {
+            share: [1; 32],
+            job: [2; 32],
+            hash: [3; 32],
+        };
+        let _held = diagnostics.timing_origins.lock().unwrap();
+        diagnostics.note_commit(key, now);
+        assert!(diagnostics.begin_attempt(key).is_none());
+        assert_eq!(diagnostics.timing_dropped.load(Ordering::Relaxed), 2);
+        assert!(
+            receiver.try_recv().is_err(),
+            "origin capture never prints before submission"
+        );
+    }
+
+    #[test]
+    fn zec_recipient_timings_separate_preflight_rpc_classification_and_sink_lag() {
+        let now = Instant::now();
+        let recipient = ZecRecipientTiming {
+            attempt: timing_fixture(now),
+            role: ZecRecipientRole::Validator,
+            index: 0,
+            started: now + Duration::from_millis(40),
+            preflight_finished: Some(now + Duration::from_millis(50)),
+            submit_finished: Some(now + Duration::from_millis(80)),
+            rpc_result: Some("rpc_accepted"),
+        };
+        let mut event = recipient.result_event("best_chain", now + Duration::from_millis(100));
+        event.queued_at = now + Duration::from_millis(100);
+        let mut output = Vec::new();
+        Reporter::new(now)
+            .record(&mut output, event, now + Duration::from_millis(120), 0)
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(row["timing"]["commit_to_reconciliation_ms"], 30);
+        assert_eq!(row["timing"]["preflight_ms"], 10);
+        assert_eq!(row["timing"]["submit_rpc_ms"], 30);
+        assert_eq!(row["timing"]["classification_ms"], 20);
+        assert_eq!(row["timing"]["reconciliation_to_submit_start_ms"], 20);
+        assert_eq!(row["timing"]["commit_to_submit_start_ms"], 50);
+        assert_eq!(row["timing"]["reconciliation_to_submit_complete_ms"], 50);
+        assert_eq!(row["timing"]["commit_to_submit_complete_ms"], 80);
+        assert_eq!(row["diagnostic_queue_wait_ms"], 20);
+        assert_eq!(row["level"], "INFO");
+        assert_eq!(row["timing"]["asserts_hardware_discovery_time"], false);
+    }
+
+    #[test]
+    fn zec_timing_unknown_origin_and_not_attempted_are_null_not_zero() {
+        let now = Instant::now();
+        let mut attempt = timing_fixture(now);
+        attempt.committed_at = None;
+        attempt.attempt_number = None;
+        let recipient = attempt.recipient(ZecRecipientRole::Template, 0);
+        let event = recipient.result_event("not_eligible", Instant::now());
+        let mut output = Vec::new();
+        Reporter::new(now)
+            .record(&mut output, event, Instant::now(), 0)
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(row["timing"]["origin"], "reconciliation_entry_only");
+        assert!(row["timing"]["commit_to_reconciliation_ms"].is_null());
+        assert!(row["timing"]["reconciliation_to_submit_start_ms"].is_null());
+        assert!(row["timing"]["commit_to_submit_start_ms"].is_null());
+        assert!(row["timing"]["commit_to_submit_complete_ms"].is_null());
+        assert!(row["timing"]["submit_rpc_ms"].is_null());
+        assert!(row["timing"]["classification_ms"].is_null());
+        assert!(row["timing"]["rpc_result"].is_null());
+    }
+
+    #[test]
+    fn zec_recipient_roles_have_separate_bounded_retry_keys() {
+        let now = Instant::now();
+        let mut reporter = Reporter::new(now);
+        let mut output = Vec::new();
+        for role in [
+            ZecRecipientRole::Template,
+            ZecRecipientRole::Validator,
+            ZecRecipientRole::Relay,
+        ] {
+            let mut attempt = timing_fixture(now);
+            attempt.attempt_number = Some(2);
+            let event = attempt.recipient(role, 0).result_event("best_chain", now);
+            reporter.record(&mut output, event, now, 0).unwrap();
+            reporter.record(&mut output, event, now, 0).unwrap();
+        }
+        assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 3);
+        assert_eq!(reporter.suppressed, 3);
+        assert_eq!(reporter.recent.len(), 3);
+    }
+
+    #[test]
+    fn initial_zec_timings_survive_unrelated_retry_budget_but_later_attempts_are_bounded() {
+        let now = Instant::now();
+        let mut reporter = Reporter::new(now);
+        let mut output = Vec::new();
+        for byte in 0..u8::try_from(NOISY_BURST).unwrap() {
+            let winner = Winner {
+                chain: "Wcash",
+                hash_le: [byte; 32],
+                ..timing_fixture(now).winner
+            };
+            reporter
+                .record(
+                    &mut output,
+                    Event::new(Some(winner), "winner_reconciliation", "submission_deferred"),
+                    now,
+                    0,
+                )
+                .unwrap();
+        }
+        assert_eq!(reporter.burst, NOISY_BURST);
+        output.clear();
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut attempt = timing_fixture(now);
+        attempt.capture = Some(Arc::clone(&captured));
+        for role in [
+            ZecRecipientRole::Template,
+            ZecRecipientRole::Validator,
+            ZecRecipientRole::Relay,
+        ] {
+            attempt.clone().recipient(role, 0).completed("best_chain");
+        }
+        attempt.completed("best_chain_admitted", Some([2, 0, 0, 0, 0, 0]));
+        for attempt_number in [Some(2), None] {
+            attempt.attempt_number = attempt_number;
+            if attempt_number.is_none() {
+                attempt.committed_at = None;
+            }
+            attempt
+                .clone()
+                .recipient(ZecRecipientRole::Template, 0)
+                .completed("best_chain");
+            attempt.completed("best_chain_admitted", Some([2, 0, 0, 0, 0, 0]));
+        }
+        for event in captured.lock().unwrap().drain(..) {
+            reporter
+                .record(&mut output, event, Instant::now(), 0)
+                .unwrap();
+        }
+        let rows = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|row| row["timing"]["attempt_number"] == 1));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["stage"] == "winner_recipient_result")
+                .count(),
+            3
+        );
+        assert_eq!(rows[3]["stage"], "winner_submission_result");
+        assert_eq!(reporter.suppressed, 4);
+        assert_eq!(reporter.burst, NOISY_BURST);
+    }
+
+    #[test]
+    fn zec_timing_full_or_broken_sink_preserves_nonblocking_drop_counters() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let now = Instant::now();
+        let event = timing_fixture(now)
+            .recipient(ZecRecipientRole::Template, 0)
+            .result_event("best_chain", now);
+        let (diagnostics, receiver) = Diagnostics::channel(1);
+        for _ in 0..10_000 {
+            diagnostics.record(event);
+        }
+        assert_eq!(diagnostics.dropped.load(Ordering::Relaxed), 9_999);
+        let event = receiver.recv().unwrap();
+        assert_eq!(
+            Reporter::new(now)
+                .record(&mut Broken, event, now, 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        drop(receiver);
+        diagnostics.record(event);
+        assert_eq!(diagnostics.dropped.load(Ordering::Relaxed), 10_000);
+    }
+
+    #[test]
+    fn zec_timing_rpc_error_details_are_never_formatted() {
+        let now = Instant::now();
+        let mut recipient = timing_fixture(now).recipient(ZecRecipientRole::Template, 0);
+        recipient.preflight_finished();
+        recipient.submitted(&Err(MinerError::RpcProtocol(
+            "PRIVATE_ENDPOINT_OR_RESPONSE".into(),
+        )));
+        let event = recipient.result_event("invalid_response", Instant::now());
+        let mut output = Vec::new();
+        Reporter::new(now)
+            .record(&mut output, event, Instant::now(), 0)
+            .unwrap();
+        assert!(!String::from_utf8(output).unwrap().contains("PRIVATE_"));
+    }
 
     #[test]
     fn saturated_sink_does_not_wait_for_writer() {
@@ -729,6 +1332,24 @@ mod tests {
         event.operation = Some("fsync recovered");
         event.os_error = Some(i32::MIN);
         event.io_kind = Some("permission_denied");
+        event.timing_metadata_dropped_total = u64::MAX;
+        event.timing = Some(ZecTiming {
+            role: Some("validator"),
+            index: Some(usize::MAX),
+            attempt_number: Some(u64::MAX),
+            redelivery: true,
+            commit_to_reconciliation_ms: Some(u64::MAX),
+            reconciliation_to_submit_start_ms: Some(u64::MAX),
+            commit_to_submit_start_ms: Some(u64::MAX),
+            reconciliation_to_submit_complete_ms: Some(u64::MAX),
+            commit_to_submit_complete_ms: Some(u64::MAX),
+            preflight_ms: Some(u64::MAX),
+            submit_rpc_ms: Some(u64::MAX),
+            classification_ms: Some(u64::MAX),
+            elapsed_ms: u64::MAX,
+            fanout_elapsed_ms: Some(u64::MAX),
+            rpc_result: Some("transport_unavailable"),
+        });
         let mut reporter = Reporter::new(now);
         reporter.suppressed = u64::MAX;
         let mut sink = Sink::default();
@@ -738,7 +1359,7 @@ mod tests {
         serde_json::from_slice::<serde_json::Value>(&sink.bytes).unwrap();
         let first_length = sink.bytes.len();
         reporter
-            .summary(&mut sink, now + INTERVAL, u64::MAX)
+            .summary(&mut sink, now + INTERVAL, u64::MAX, 0)
             .unwrap();
         assert_eq!(sink.writes, 2);
         assert!(sink.bytes.len() - first_length < 4096);

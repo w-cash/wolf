@@ -46,6 +46,7 @@ use zebra_chain::{
 };
 
 use crate::{
+    diagnostics::{ZecRecipientRole, ZecRecipientTiming, ZecWinnerAttempt},
     rpc::{RpcEndpoint, ZebraRpcClient, DEFAULT_RPC_TIMEOUT},
     MinerError, PreparedJob, SolvedAuxPow, EQUIHASH_SOLUTION_BYTES,
     NATIVE_COINBASE_MATURITY_CONFIRMATIONS, NATIVE_JOB_MAX_AGE_MILLISECONDS,
@@ -1075,7 +1076,7 @@ impl NativeZcashProvider {
         height: u32,
         expected_hash: &str,
     ) -> Result<ParentSubmissionReport, MinerError> {
-        self.replay_parent_bytes_with_policy(block_bytes, height, expected_hash, None)
+        self.replay_parent_bytes_with_policy(block_bytes, height, expected_hash, None, None)
     }
 
     /// Delivers one pool winner independently to each identity-bound writable
@@ -1089,6 +1090,7 @@ impl NativeZcashProvider {
         height: u32,
         expected_hash: &str,
         canonical_depth_limit: Option<u32>,
+        timing: ZecWinnerAttempt,
     ) -> Result<ParentSubmissionReport, MinerError> {
         self.replay_parent_bytes_with_policy(
             block_bytes,
@@ -1097,6 +1099,7 @@ impl NativeZcashProvider {
             Some(PoolParentReplayPolicy {
                 canonical_depth_limit,
             }),
+            Some(timing),
         )
     }
 
@@ -1106,6 +1109,7 @@ impl NativeZcashProvider {
         height: u32,
         expected_hash: &str,
         pool_policy: Option<PoolParentReplayPolicy>,
+        timing: Option<ZecWinnerAttempt>,
     ) -> Result<ParentSubmissionReport, MinerError> {
         if block_bytes.len() > PARENT_BLOCK_LIMIT {
             return Err(MinerError::InvalidParentTemplate(
@@ -1143,9 +1147,19 @@ impl NativeZcashProvider {
         let (outcomes, relay_outcomes, pinned_delivery_admitted) = thread::scope(|scope| {
             let authoritative = nodes
                 .into_iter()
-                .map(|node| {
+                .enumerate()
+                .map(|(index, node)| {
                     let expected_genesis_hash = &expected_genesis_hash;
+                    let timing = timing.clone();
                     scope.spawn(move || {
+                        let mut recipient_timing = timing.map(|attempt| {
+                            let (role, index) = if index == 0 {
+                                (ZecRecipientRole::Template, 0)
+                            } else {
+                                (ZecRecipientRole::Validator, index - 1)
+                            };
+                            attempt.recipient(role, index)
+                        });
                         if let Some(policy) = pool_policy {
                             let eligibility = self
                                 .require_node_genesis(node, expected_genesis_hash)
@@ -1161,6 +1175,9 @@ impl NativeZcashProvider {
                             match eligibility {
                                 Ok(true) => {}
                                 Ok(false) => {
+                                    if let Some(timing) = recipient_timing {
+                                        timing.completed("not_eligible");
+                                    }
                                     return (
                                         ParentNodeOutcome::Unavailable {
                                             endpoint: node.label().to_string(),
@@ -1170,20 +1187,32 @@ impl NativeZcashProvider {
                                     );
                                 }
                                 Err(error) => {
-                                    return (parent_recipient_error(node, error), false);
+                                    let outcome = parent_recipient_error(node, error);
+                                    if let Some(timing) = recipient_timing {
+                                        timing.completed(parent_outcome_class(&outcome));
+                                    }
+                                    return (outcome, false);
                                 }
                             }
                         }
-                        submit_parent_to_node(node, block_bytes, height, expected_hash)
+                        if let Some(timing) = recipient_timing.as_mut() {
+                            timing.preflight_finished();
+                        }
+                        submit_parent_to_node(node, block_bytes, height, expected_hash, recipient_timing)
                     })
                 })
                 .collect::<Vec<_>>();
             let relays = self
                 .broadcast_nodes
                 .iter()
-                .map(|node| {
+                .enumerate()
+                .map(|(index, node)| {
                     let expected_genesis_hash = &expected_genesis_hash;
+                    let timing = timing.clone();
                     scope.spawn(move || {
+                        let mut recipient_timing = timing.map(|attempt| {
+                            attempt.recipient(ZecRecipientRole::Relay, index)
+                        });
                         if let Some(policy) = pool_policy {
                             let eligibility = self
                                 .require_standard_node_genesis(node, expected_genesis_hash)
@@ -1199,13 +1228,16 @@ impl NativeZcashProvider {
                             match eligibility {
                                 Ok(true) => {}
                                 Ok(false) => {
+                                    if let Some(timing) = recipient_timing {
+                                        timing.completed("not_eligible");
+                                    }
                                     return ParentRelayOutcome::Unavailable {
                                         endpoint: node.label().to_string(),
                                         reason: "recipient has neither the exact predecessor nor an eligible canonical winner".to_string(),
                                     };
                                 }
                                 Err(error) => {
-                                    return match parent_recipient_error(node, error) {
+                                    let outcome = match parent_recipient_error(node, error) {
                                         ParentNodeOutcome::Unavailable { endpoint, reason } => {
                                             ParentRelayOutcome::Unavailable { endpoint, reason }
                                         }
@@ -1213,10 +1245,17 @@ impl NativeZcashProvider {
                                             endpoint: node.label().to_string(),
                                         },
                                     };
+                                    if let Some(timing) = recipient_timing {
+                                        timing.completed(parent_relay_outcome_class(&outcome));
+                                    }
+                                    return outcome;
                                 }
                             }
                         }
-                        submit_parent_to_broadcast_node(node, block_bytes, height, expected_hash)
+                        if let Some(timing) = recipient_timing.as_mut() {
+                            timing.preflight_finished();
+                        }
+                        submit_parent_to_broadcast_node(node, block_bytes, height, expected_hash, recipient_timing)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -2591,13 +2630,40 @@ fn submit_parent_to_node(
     block_bytes: &[u8],
     height: u32,
     expected_hash: &str,
+    mut timing: Option<ZecRecipientTiming>,
 ) -> (ParentNodeOutcome, bool) {
     let submission = node.call_value("submitblock", json!([hex::encode(block_bytes)]));
+    if let Some(timing) = timing.as_mut() {
+        timing.submitted(&submission);
+    }
     let admitted = matches!(&submission, Ok(Value::Null))
         || matches!(&submission, Ok(Value::String(reason)) if reason.eq_ignore_ascii_case("duplicate"));
     let outcome = classify_parent_submission_on_node(node, height, expected_hash, submission);
     let admitted = admitted && matches!(outcome, ParentNodeOutcome::Accepted { .. });
+    if let Some(timing) = timing {
+        timing.completed(parent_outcome_class(&outcome));
+    }
     (outcome, admitted)
+}
+
+fn parent_outcome_class(outcome: &ParentNodeOutcome) -> &'static str {
+    match outcome {
+        ParentNodeOutcome::Accepted { .. } => "best_chain",
+        ParentNodeOutcome::KnownSideChain { .. } => "side_chain",
+        ParentNodeOutcome::Unconfirmed { .. } => "unconfirmed",
+        ParentNodeOutcome::Rejected { .. } => "rejected",
+        ParentNodeOutcome::Unavailable { .. } => "unavailable",
+        ParentNodeOutcome::InvalidResponse { .. } => "invalid_response",
+    }
+}
+
+fn parent_relay_outcome_class(outcome: &ParentRelayOutcome) -> &'static str {
+    match outcome {
+        ParentRelayOutcome::Delivered { .. } => "best_chain",
+        ParentRelayOutcome::Rejected { .. } => "rejected",
+        ParentRelayOutcome::Unavailable { .. } => "unavailable",
+        ParentRelayOutcome::InvalidResponse { .. } => "invalid_response",
+    }
 }
 
 fn classify_parent_submission_on_node(
@@ -2656,27 +2722,34 @@ fn submit_parent_to_broadcast_node(
     block_bytes: &[u8],
     height: u32,
     expected_hash: &str,
+    mut timing: Option<ZecRecipientTiming>,
 ) -> ParentRelayOutcome {
     let endpoint = node.label().to_string();
-    let outcome = classify_parent_broadcast_response(
-        endpoint.clone(),
-        node.call_value("submitblock", json!([hex::encode(block_bytes)])),
-    );
-    if !matches!(outcome, ParentRelayOutcome::Delivered { .. }) {
-        return outcome;
+    let submission = node.call_value("submitblock", json!([hex::encode(block_bytes)]));
+    if let Some(timing) = timing.as_mut() {
+        timing.submitted(&submission);
     }
-    match parent_confirmation_depth_on_node(node, height, expected_hash) {
-        Ok(Some(_)) => ParentRelayOutcome::Delivered { endpoint },
-        Ok(None) => ParentRelayOutcome::Unavailable {
-            endpoint,
-            reason: "submitted block is not yet confirmed on the relay best chain".to_string(),
-        },
-        Err(error) if is_transient_parent_rpc_failure(&error) => ParentRelayOutcome::Unavailable {
-            endpoint,
-            reason: error.to_string(),
-        },
-        Err(_) => ParentRelayOutcome::InvalidResponse { endpoint },
+    let mut outcome = classify_parent_broadcast_response(endpoint.clone(), submission);
+    if matches!(outcome, ParentRelayOutcome::Delivered { .. }) {
+        outcome = match parent_confirmation_depth_on_node(node, height, expected_hash) {
+            Ok(Some(_)) => ParentRelayOutcome::Delivered { endpoint },
+            Ok(None) => ParentRelayOutcome::Unavailable {
+                endpoint,
+                reason: "submitted block is not yet confirmed on the relay best chain".to_string(),
+            },
+            Err(error) if is_transient_parent_rpc_failure(&error) => {
+                ParentRelayOutcome::Unavailable {
+                    endpoint,
+                    reason: error.to_string(),
+                }
+            }
+            Err(_) => ParentRelayOutcome::InvalidResponse { endpoint },
+        };
     }
+    if let Some(timing) = timing {
+        timing.completed(parent_relay_outcome_class(&outcome));
+    }
+    outcome
 }
 
 fn classify_parent_broadcast_response(

@@ -222,12 +222,28 @@ pub struct PoolBackendWinnerScheduler {
 /// a separate audit worker cannot take fresh work first.
 #[derive(Debug, Default)]
 pub struct PoolBackendLiveWinnerScheduler {
+    chain: Option<MergedChain>,
+    has_pending_scan: bool,
     journal_stream: Option<CanonicalUuid>,
     first_attempt_next: usize,
     recovery_first_attempts: VecDeque<PoolBackendWinnerSnapshot>,
 }
 
 impl PoolBackendLiveWinnerScheduler {
+    /// Selects only this chain while preserving the mixed-chain default API.
+    pub fn for_chain(chain: MergedChain) -> Self {
+        Self {
+            chain: Some(chain),
+            ..Self::default()
+        }
+    }
+
+    /// True when a bounded scan stopped before the durable tail.
+    /// Callers must yield and continue rather than park waiting for new shares.
+    pub const fn has_pending_scan(&self) -> bool {
+        self.has_pending_scan
+    }
+
     /// Returns one recovery or newly appended pending proof without delay.
     pub fn next(
         &mut self,
@@ -246,6 +262,7 @@ impl PoolBackendLiveWinnerScheduler {
             self.first_attempt_next = tail;
             self.recovery_first_attempts = recovery
                 .into_iter()
+                .filter(|(_, state)| self.chain.is_none_or(|chain| state.winner.chain == chain))
                 .map(|(winner_ordinal, state)| PoolBackendWinnerSnapshot {
                     journal_stream,
                     winner_ordinal,
@@ -258,14 +275,17 @@ impl PoolBackendLiveWinnerScheduler {
             return Ok(Some(recovery));
         }
         let state = actor.lock_state()?;
-        Ok(state
+        let (winner, has_more) = state
             .journal
-            .next_first_attempt_winner_state(&mut self.first_attempt_next)?
-            .map(|(winner_ordinal, state)| PoolBackendWinnerSnapshot {
+            .next_first_attempt_winner_state_for_chain(&mut self.first_attempt_next, self.chain)?;
+        self.has_pending_scan = has_more;
+        Ok(
+            winner.map(|(winner_ordinal, state)| PoolBackendWinnerSnapshot {
                 journal_stream,
                 winner_ordinal,
                 state,
-            }))
+            }),
+        )
     }
 
     /// Exclusive durable ordinal below which historical work is safe.
@@ -281,6 +301,7 @@ impl PoolBackendLiveWinnerScheduler {
 /// Historical retries and lifecycle audits isolated from live submissions.
 #[derive(Debug, Default)]
 pub struct PoolBackendWinnerAuditScheduler {
+    chain: Option<MergedChain>,
     journal_stream: Option<CanonicalUuid>,
     submission_after: Option<PoolBackendWinnerKey>,
     submission_pass_complete: bool,
@@ -289,6 +310,14 @@ pub struct PoolBackendWinnerAuditScheduler {
 }
 
 impl PoolBackendWinnerAuditScheduler {
+    /// Restricts retries and all lifecycle audit tiers to one independent chain.
+    pub fn for_chain(chain: MergedChain) -> Self {
+        Self {
+            chain: Some(chain),
+            ..Self::default()
+        }
+    }
+
     /// Selects submission retries first, then paced status and maturity work.
     pub fn next(
         &mut self,
@@ -308,6 +337,7 @@ impl PoolBackendWinnerAuditScheduler {
             if let Some(snapshot) = actor.next_submission_required_winner_snapshot_before(
                 self.submission_after.as_ref(),
                 before_ordinal,
+                self.chain,
             )? {
                 self.submission_after = Some(snapshot.key());
                 return Ok(PoolBackendWinnerWork {
@@ -320,9 +350,11 @@ impl PoolBackendWinnerAuditScheduler {
             self.submission_pass_complete = true;
         }
 
-        let (snapshot, completes_pass, delay) = match actor
-            .next_unsettled_winner_snapshot_before(self.unsettled_after.as_ref(), before_ordinal)?
-        {
+        let (snapshot, completes_pass, delay) = match actor.next_unsettled_winner_snapshot_before(
+            self.unsettled_after.as_ref(),
+            before_ordinal,
+            self.chain,
+        )? {
             Some(snapshot) => {
                 self.unsettled_after = Some(snapshot.key());
                 (Some(snapshot), false, WINNER_HISTORICAL_STEP_INTERVAL)
@@ -337,6 +369,7 @@ impl PoolBackendWinnerAuditScheduler {
                 let snapshot = actor.next_matured_winner_snapshot_before(
                     self.matured_after.as_ref(),
                     before_ordinal,
+                    self.chain,
                 )?;
                 self.matured_after = snapshot.as_ref().map(PoolBackendWinnerSnapshot::key);
                 (snapshot, true, Duration::from_secs(1))
@@ -700,7 +733,7 @@ pub enum PoolBackendActorError {
     #[error("winner reconciliation authority does not match this backend journal")]
     WinnerAuthorityMismatch,
 
-    /// Exactly one reconciliation worker can receive live-winner wakeups.
+    /// Live-winner wakeup registration is bounded and may be set only once.
     #[error("winner reconciliation worker is already registered")]
     WinnerWorkerAlreadyRegistered,
 
@@ -809,7 +842,7 @@ pub struct PoolBackendActor {
     authority_fields: AuthorityFields,
     clock: Arc<dyn ActorClock>,
     state: Mutex<ActorState>,
-    winner_worker: Mutex<Option<thread::Thread>>,
+    winner_worker: Mutex<Option<Vec<thread::Thread>>>,
 }
 
 impl PoolBackendActor {
@@ -871,12 +904,23 @@ impl PoolBackendActor {
         })
     }
 
-    /// Registers the single reconciliation worker that receives live-winner
-    /// wakeups after durable share commit.
+    /// Registers one compatibility reconciliation worker for durable wakeups.
     pub fn register_winner_worker(
         &self,
         worker: thread::Thread,
     ) -> Result<(), PoolBackendActorError> {
+        self.register_winner_workers(vec![worker])
+    }
+
+    /// Registers at most one live worker per chain. Every durable winner wakes
+    /// both lanes, so filtered cursors can advance across opposite-chain entries.
+    pub fn register_winner_workers(
+        &self,
+        workers: Vec<thread::Thread>,
+    ) -> Result<(), PoolBackendActorError> {
+        if workers.is_empty() || workers.len() > 2 {
+            return Err(PoolBackendActorError::WinnerWorkerAlreadyRegistered);
+        }
         let mut registered = self
             .winner_worker
             .lock()
@@ -884,18 +928,20 @@ impl PoolBackendActor {
         if registered.is_some() {
             return Err(PoolBackendActorError::WinnerWorkerAlreadyRegistered);
         }
-        *registered = Some(worker);
+        *registered = Some(workers);
         Ok(())
     }
 
     fn wake_winner_worker(&self) -> Result<(), PoolBackendActorError> {
-        if let Some(worker) = self
+        if let Some(workers) = self
             .winner_worker
             .lock()
             .map_err(|_| PoolBackendActorError::MutexPoisoned)?
             .as_ref()
         {
-            worker.unpark();
+            for worker in workers {
+                worker.unpark();
+            }
         }
         Ok(())
     }
@@ -1107,24 +1153,22 @@ impl PoolBackendActor {
         &self,
         after: Option<&PoolBackendWinnerKey>,
         before_ordinal: usize,
+        chain: Option<MergedChain>,
     ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
-        self.next_winner_snapshot_before_with(
-            after,
-            before_ordinal,
-            PoolBackendJournal::next_submission_required_winner_state_before,
-        )
+        self.next_winner_snapshot_before_with(after, before_ordinal, |journal, after, before| {
+            journal.next_submission_required_winner_state_before_for_chain(after, before, chain)
+        })
     }
 
     fn next_unsettled_winner_snapshot_before(
         &self,
         after: Option<&PoolBackendWinnerKey>,
         before_ordinal: usize,
+        chain: Option<MergedChain>,
     ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
-        self.next_winner_snapshot_before_with(
-            after,
-            before_ordinal,
-            PoolBackendJournal::next_unsettled_winner_state_before,
-        )
+        self.next_winner_snapshot_before_with(after, before_ordinal, |journal, after, before| {
+            journal.next_winner_state_by_maturity_before(after, Some(false), before, chain)
+        })
     }
 
     /// Returns the next matured winner in durable order for low-rate audits.
@@ -1139,12 +1183,11 @@ impl PoolBackendActor {
         &self,
         after: Option<&PoolBackendWinnerKey>,
         before_ordinal: usize,
+        chain: Option<MergedChain>,
     ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
-        self.next_winner_snapshot_before_with(
-            after,
-            before_ordinal,
-            PoolBackendJournal::next_matured_winner_state_before,
-        )
+        self.next_winner_snapshot_before_with(after, before_ordinal, |journal, after, before| {
+            journal.next_winner_state_by_maturity_before(after, Some(true), before, chain)
+        })
     }
 
     fn next_winner_snapshot_with(
@@ -1175,11 +1218,12 @@ impl PoolBackendActor {
         &self,
         after: Option<&PoolBackendWinnerKey>,
         before_ordinal: usize,
-        select: fn(
+        select: impl FnOnce(
             &PoolBackendJournal,
             Option<usize>,
             usize,
-        ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError>,
+        )
+            -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError>,
     ) -> Result<Option<PoolBackendWinnerSnapshot>, PoolBackendActorError> {
         if after.is_some_and(|key| key.journal_stream != self.authority_fields.journal_stream) {
             return Err(PoolBackendActorError::WinnerAuthorityMismatch);
@@ -1509,6 +1553,17 @@ impl PoolBackendActor {
             )
             .map_err(journal_handler_error)?;
         let wake_winner_worker = !commit.replayed && !commit.receipt.winners.is_empty();
+        if !commit.replayed {
+            for winner in &commit.receipt.winners {
+                if winner.chain == MergedChain::Zcash {
+                    crate::diagnostics::note_zec_winner_committed(
+                        &commit.receipt.share_id,
+                        &commit.receipt.job_id,
+                        winner,
+                    );
+                }
+            }
+        }
         state.shares.insert(
             share_id,
             StoredShare {
@@ -2159,7 +2214,7 @@ fn winner_transition_error(error: PoolBackendJournalError) -> PoolBackendActorEr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -4823,4 +4878,5 @@ mod tests {
             JournalWinnerLifecycle::Orphaned { .. }
         ));
     }
+    include!("pool_backend_actor/independent_submission_tests.rs");
 }

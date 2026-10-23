@@ -1720,6 +1720,7 @@ fn reconcile_zcash_pool_winner(
     zcash: &NativeZcashProvider,
     snapshot: &PoolBackendWinnerSnapshot,
 ) -> Result<Option<PoolBackendWinnerTransition>, PoolWinnerReconciliationError> {
+    let reconciliation_started = Instant::now();
     let winner = snapshot.winner();
     let expected_hash = display_hash(*winner.block_hash_le.as_bytes());
     let requires_submission = snapshot.lifecycle().requires_submission();
@@ -1742,15 +1743,18 @@ fn reconcile_zcash_pool_winner(
     let redeliver = observed_redelivery
         && zcash.claim_observed_parent_redelivery(*winner.block_hash_le.as_bytes(), Instant::now());
     let submission = if requires_submission || redeliver {
+        let timing =
+            crate::diagnostics::ZecWinnerAttempt::for_snapshot(snapshot, reconciliation_started);
         let report = match zcash.replay_pool_parent_bytes(
             snapshot.block_bytes(),
             winner.height,
             &expected_hash,
             observed_redelivery.then_some(winner.maturity_confirmations),
+            timing.clone(),
         ) {
             Ok(report) => report,
             Err(error) => {
-                crate::diagnostics::submission_error(snapshot, &error);
+                timing.failed(&error);
                 return Err(PoolWinnerReconciliationError::new(
                     error,
                     requires_submission,
@@ -1777,7 +1781,7 @@ fn reconcile_zcash_pool_winner(
             } else {
                 "incomplete"
             };
-        crate::diagnostics::submission(snapshot, "winner_submission_result", outcome, Some(counts));
+        timing.completed(outcome, Some(counts));
         Some(report)
     } else {
         None
@@ -5791,6 +5795,62 @@ pub(crate) mod tests {
             .claim_observed_parent_redelivery([0; 32], now + Duration::from_secs(4)));
         assert!(provider.claim_observed_parent_redelivery([0; 32], now + Duration::from_secs(5)));
         assert!(unused_zcash_provider().claim_observed_parent_redelivery([0; 32], now));
+    }
+
+    #[test]
+    fn zcash_recipient_timing_separates_submit_and_classification_after_results() {
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let snapshot = parent_reconciliation_fixture(&block);
+        let own_tip = json!({"blocks":1,"bestblockhash":hash});
+        let delayed_rpc = |request: &serde_json::Value| match request["method"].as_str() {
+            Some("submitblock") => thread::sleep(Duration::from_millis(25)),
+            Some("getblockheader") => thread::sleep(Duration::from_millis(25)),
+            _ => {}
+        };
+        let (template, a) =
+            spawn_pool_rpc_with_hook(PoolRpcFixture::new(own_tip.clone(), &hash, 1), delayed_rpc);
+        let (validator, b) =
+            spawn_pool_rpc_with_hook(PoolRpcFixture::new(own_tip, &hash, 1), delayed_rpc);
+        let provider = test_zcash_provider(template, validator);
+        let (result, rows) = crate::diagnostics::capture_zec_timings(|| {
+            reconcile_zcash_pool_winner(&provider, &snapshot)
+        });
+        assert!(result.is_ok());
+        let recipient_rows = rows
+            .iter()
+            .filter(|row| row["stage"] == "winner_recipient_result")
+            .collect::<Vec<_>>();
+        assert_eq!(recipient_rows.len(), 2);
+        let mut roles = recipient_rows
+            .iter()
+            .map(|row| row["timing"]["recipient_role"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        roles.sort_unstable();
+        assert_eq!(roles, ["template", "validator"]);
+        for row in recipient_rows {
+            assert_eq!(row["winner"]["hash"], hash);
+            assert_eq!(row["winner"]["height"], 1);
+            assert_eq!(row["result"], "best_chain");
+            assert_eq!(row["level"], "INFO");
+            assert_eq!(row["timing"]["rpc_result"], "rpc_accepted");
+            assert!(row["timing"]["submit_rpc_ms"].as_u64().unwrap() >= 20);
+            assert!(row["timing"]["classification_ms"].as_u64().unwrap() >= 20);
+            assert!(row["timing"]["reconciliation_to_submit_start_ms"].is_u64());
+            assert!(
+                row["timing"]["commit_to_submit_start_ms"].is_null(),
+                "a restarted or uncaptured origin is not fabricated as zero"
+            );
+        }
+        let aggregate = rows
+            .iter()
+            .find(|row| row["stage"] == "winner_submission_result")
+            .unwrap();
+        assert_eq!(aggregate["result"], "best_chain_admitted");
+        assert!(aggregate["timing"]["fanout_elapsed_ms"].as_u64().unwrap() >= 45);
+        for server in [a, b] {
+            assert_eq!(pool_rpc_submissions(&server.finish()).len(), 1);
+        }
     }
 
     #[test]

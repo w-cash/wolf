@@ -741,6 +741,8 @@ impl JournalWinnerTransition {
     }
 }
 
+type FirstAttemptWinnerState = (Option<(usize, JournalWinnerState)>, bool);
+
 /// Durable private state for one winner, reconstructed during journal replay.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct JournalWinnerState {
@@ -1387,7 +1389,7 @@ impl PoolBackendJournal {
         &self,
         after_ordinal: Option<usize>,
     ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
-        self.next_winner_state_by_maturity_before(after_ordinal, Some(false), usize::MAX)
+        self.next_winner_state_by_maturity_before(after_ordinal, Some(false), usize::MAX, None)
     }
 
     /// Returns the next submission-required winner below an exclusive durable
@@ -1396,10 +1398,24 @@ impl PoolBackendJournal {
     /// The live first-attempt lane publishes the bound only after claiming all
     /// earlier work. Historical retries therefore cannot take a newly appended
     /// proof before its latency-sensitive first attempt.
+    #[cfg(test)]
     pub(crate) fn next_submission_required_winner_state_before(
         &self,
         after_ordinal: Option<usize>,
         before_ordinal: usize,
+    ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
+        self.next_submission_required_winner_state_before_for_chain(
+            after_ordinal,
+            before_ordinal,
+            None,
+        )
+    }
+
+    pub(crate) fn next_submission_required_winner_state_before_for_chain(
+        &self,
+        after_ordinal: Option<usize>,
+        before_ordinal: usize,
+        chain: Option<MergedChain>,
     ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
         let state = self.lock_state()?;
         ensure_usable(&state)?;
@@ -1417,6 +1433,9 @@ impl PoolBackendJournal {
             .take(before_ordinal)
             .skip(start)
         {
+            if chain.is_some_and(|required| key.chain != required) {
+                continue;
+            }
             let event_seq = next_event_seq(&state)?;
             let winner = state.semantic.winners.get(key).ok_or_else(|| {
                 semantic(event_seq, "winner index references absent private state")
@@ -1428,16 +1447,6 @@ impl PoolBackendJournal {
         Ok(None)
     }
 
-    /// Returns the next non-matured winner below an exclusive durable ordinal
-    /// bound.
-    pub(crate) fn next_unsettled_winner_state_before(
-        &self,
-        after_ordinal: Option<usize>,
-        before_ordinal: usize,
-    ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
-        self.next_winner_state_by_maturity_before(after_ordinal, Some(false), before_ordinal)
-    }
-
     /// Inspects a bounded slice of newly retained winners for a first attempt.
     ///
     /// Advance over every inspected entry, including non-pending entries and
@@ -1447,6 +1456,16 @@ impl PoolBackendJournal {
         &self,
         next_ordinal: &mut usize,
     ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
+        self.next_first_attempt_winner_state_for_chain(next_ordinal, None)
+            .map(|(winner, _)| winner)
+    }
+
+    /// The boolean distinguishes a bounded slice boundary from the durable tail.
+    pub(crate) fn next_first_attempt_winner_state_for_chain(
+        &self,
+        next_ordinal: &mut usize,
+        chain: Option<MergedChain>,
+    ) -> Result<FirstAttemptWinnerState, PoolBackendJournalError> {
         const MAX_INSPECTED_WINNERS: usize = 256;
         let state = self.lock_state()?;
         ensure_usable(&state)?;
@@ -1459,17 +1478,23 @@ impl PoolBackendJournal {
             .skip(*next_ordinal)
             .take(MAX_INSPECTED_WINNERS)
         {
-            let winner = state.semantic.winners.get(key).ok_or_else(|| {
-                semantic(event_seq, "winner index references absent private state")
-            })?;
             *next_ordinal = index
                 .checked_add(1)
                 .ok_or(PoolBackendJournalError::Overflow)?;
+            if chain.is_some_and(|required| key.chain != required) {
+                continue;
+            }
+            let winner = state.semantic.winners.get(key).ok_or_else(|| {
+                semantic(event_seq, "winner index references absent private state")
+            })?;
             if matches!(winner.lifecycle, JournalWinnerLifecycle::Pending) {
-                return Ok(Some((index, winner.clone())));
+                return Ok((
+                    Some((index, winner.clone())),
+                    *next_ordinal < state.semantic.winner_order.len(),
+                ));
             }
         }
-        Ok(None)
+        Ok((None, *next_ordinal < state.semantic.winner_order.len()))
     }
 
     /// Returns the next reversibly matured winner for low-rate reorg audits.
@@ -1477,17 +1502,7 @@ impl PoolBackendJournal {
         &self,
         after_ordinal: Option<usize>,
     ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
-        self.next_winner_state_by_maturity_before(after_ordinal, Some(true), usize::MAX)
-    }
-
-    /// Returns the next reversibly matured winner below an exclusive durable
-    /// ordinal bound.
-    pub(crate) fn next_matured_winner_state_before(
-        &self,
-        after_ordinal: Option<usize>,
-        before_ordinal: usize,
-    ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
-        self.next_winner_state_by_maturity_before(after_ordinal, Some(true), before_ordinal)
+        self.next_winner_state_by_maturity_before(after_ordinal, Some(true), usize::MAX, None)
     }
 
     fn next_winner_state_by_maturity(
@@ -1495,14 +1510,15 @@ impl PoolBackendJournal {
         after_ordinal: Option<usize>,
         matured: Option<bool>,
     ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
-        self.next_winner_state_by_maturity_before(after_ordinal, matured, usize::MAX)
+        self.next_winner_state_by_maturity_before(after_ordinal, matured, usize::MAX, None)
     }
 
-    fn next_winner_state_by_maturity_before(
+    pub(crate) fn next_winner_state_by_maturity_before(
         &self,
         after_ordinal: Option<usize>,
         matured: Option<bool>,
         before_ordinal: usize,
+        chain: Option<MergedChain>,
     ) -> Result<Option<(usize, JournalWinnerState)>, PoolBackendJournalError> {
         let state = self.lock_state()?;
         ensure_usable(&state)?;
@@ -1520,6 +1536,9 @@ impl PoolBackendJournal {
             .take(before_ordinal)
             .skip(start)
         {
+            if chain.is_some_and(|required| key.chain != required) {
+                continue;
+            }
             let event_seq = next_event_seq(&state)?;
             let winner = state.semantic.winners.get(key).ok_or_else(|| {
                 semantic(event_seq, "winner index references absent private state")
