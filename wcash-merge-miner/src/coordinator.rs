@@ -5712,7 +5712,10 @@ pub(crate) mod tests {
         );
         assert!(matches!(
             preparation_result,
-            Err(MinerError::RpcError { code: -32001, .. })
+            Err(MinerError::RpcError {
+                code: Some(-32001),
+                ..
+            })
         ));
         assert!(winner_result.is_ok());
         assert_eq!(hex::encode(snapshot.block_bytes()), expected_bytes);

@@ -262,6 +262,50 @@ fn auxiliary_cache_fee_churn_is_bounded_on_the_real_build_insertion_path() {
 }
 
 #[test]
+fn auxiliary_prewarm_capacity_skips_without_evicting_any_existing_proof() {
+    let cache = CoinbaseCache::default();
+    let recipient = params(0x67);
+    let base = Height(2_000_000);
+    let builds = AtomicUsize::new(0);
+    let mut retained = Vec::new();
+    for height in [base, Height(base.0 + 1), Height(base.0 + 2)] {
+        for amount in 0i64..4 {
+            let fee = Amount::try_from(amount).unwrap();
+            let expected = coinbase(&recipient, height, fee);
+            let warmed = cache
+                .try_prewarm(height, fee, || {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, ()>(expected.clone())
+                })
+                .unwrap();
+            assert_eq!(warmed, Some(expected.clone()));
+            retained.push((height, fee, expected));
+        }
+    }
+    assert_eq!(builds.load(Ordering::SeqCst), 12);
+    // A fourth height, fifth fee, and already-ready key must all leave the
+    // bounded cache intact without calling even a cheap speculative builder.
+    for (height, fee) in [
+        (Height(base.0 + 3), Amount::zero()),
+        (base, Amount::try_from(4i64).unwrap()),
+        (base, Amount::zero()),
+    ] {
+        let skipped = cache
+            .try_prewarm(height, fee, || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ()>(coinbase(&recipient, height, fee))
+            })
+            .unwrap();
+        assert!(skipped.is_none());
+    }
+    assert_eq!(builds.load(Ordering::SeqCst), 12);
+    assert_eq!(cache.0.lock().unwrap().len(), 12);
+    for (height, fee, expected) in retained {
+        assert_eq!(cache.get(height, fee), Some(expected));
+    }
+}
+
+#[test]
 fn auxiliary_cache_fee_eviction_preserves_active_builders_and_their_waiters() {
     let cache = CoinbaseCache::default();
     let height = NetworkUpgrade::Nu5
