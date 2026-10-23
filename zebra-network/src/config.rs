@@ -67,11 +67,14 @@ const ZCASH_TESTNET_SEED_PEERS: [&str; 3] = [
     "testnet.seeder.zfnd.org:18233",
 ];
 
-const WCASH_MAINNET_SEED_PEERS: [&str; 4] = [
+const WCASH_MAINNET_SEED_PEERS: [&str; 7] = [
     "node.w.cash:48233",
     "187.124.113.200:48233",
     "2.24.93.205:48233",
     "5.183.8.145:48233",
+    "node.wcash.net:48233",
+    "node.wcash.io:48233",
+    "node.wcash.space:48233",
 ];
 
 /// Configuration for networking code.

@@ -109,7 +109,7 @@ fn default_config_uses_ipv6() {
         assert_eq!(config.network, Network::new_wcash_testnet());
         assert!(config.network.uses_wcash_consensus());
         assert!(!config.network.is_regtest());
-        assert_eq!(config.initial_mainnet_peers.len(), 4);
+        assert_eq!(config.initial_mainnet_peers.len(), 7);
         assert!(config.initial_testnet_peers.is_empty());
         assert!(config.initial_peer_hostnames().is_empty());
     }
@@ -180,6 +180,9 @@ fn wcash_mainnet_config_round_trips_with_frozen_anchor() {
 fn wcash_mainnet_uses_its_own_seed_peers_unless_overridden() {
     let minimal: Config =
         toml::from_str("network = 'WcashMainnet'").expect("minimal Wcash Mainnet config parses");
+    assert!(minimal.network.is_wcash_mainnet());
+    assert_eq!(minimal.listen_addr.port(), 48233);
+    assert!(minimal.initial_testnet_peers.is_empty());
     assert_eq!(
         minimal.initial_peer_hostnames(),
         [
@@ -187,6 +190,9 @@ fn wcash_mainnet_uses_its_own_seed_peers_unless_overridden() {
             "187.124.113.200:48233".to_string(),
             "2.24.93.205:48233".to_string(),
             "5.183.8.145:48233".to_string(),
+            "node.wcash.net:48233".to_string(),
+            "node.wcash.io:48233".to_string(),
+            "node.wcash.space:48233".to_string(),
         ]
         .into(),
     );
@@ -198,6 +204,27 @@ fn wcash_mainnet_uses_its_own_seed_peers_unless_overridden() {
         overridden.initial_peer_hostnames(),
         ["other.example:48233".to_string()].into(),
     );
+}
+
+#[test]
+fn wcash_mainnet_explicit_seed_choices_survive_round_trip() {
+    for peers in [
+        Vec::<String>::new(),
+        vec![
+            "other.example:48233".to_string(),
+            "backup.example:48233".to_string(),
+        ],
+    ] {
+        let source = format!("network = 'WcashMainnet'\ninitial_mainnet_peers = {peers:?}");
+        let config: Config = toml::from_str(&source).expect("explicit Mainnet peer choices parse");
+        let expected = peers.into_iter().collect::<indexmap::IndexSet<_>>();
+        assert_eq!(config.initial_peer_hostnames(), expected);
+
+        let encoded = toml::to_string(&config).expect("Mainnet peer choices serialize");
+        let decoded: Config = toml::from_str(&encoded).expect("Mainnet peer choices deserialize");
+        assert_eq!(decoded, config);
+        assert_eq!(decoded.initial_peer_hostnames(), expected);
+    }
 }
 
 #[test]

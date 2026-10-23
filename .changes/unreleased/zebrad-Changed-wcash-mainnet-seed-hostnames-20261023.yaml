@@ -1,0 +1,4 @@
+project: zebrad
+kind: Changed
+body: "Extend Wcash Mainnet discovery with node.wcash.net, node.wcash.io, and node.wcash.space on port 48233 alongside the four existing seeds; document DNS and public peer verification."
+time: 2026-10-23T17:52:31+01:00
