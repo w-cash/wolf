@@ -435,7 +435,7 @@ fn auxiliary_private_wcash_proof_repro_rebuilds_twice_before_fix_and_once_with_s
         )
         .unwrap();
         let bundle = coinbase.ironwood_bundle().unwrap();
-        let notes = bundle.decrypt_outputs_with_keys(&[ivk.clone()]);
+        let notes = bundle.decrypt_outputs_with_keys(std::slice::from_ref(&ivk));
         assert!(!notes.is_empty());
         assert!(notes
             .iter()
@@ -449,7 +449,7 @@ fn auxiliary_private_wcash_proof_repro_rebuilds_twice_before_fix_and_once_with_s
         );
         assert!(
             bundle
-                .decrypt_outputs_with_keys(&[wrong_ivk.clone()])
+                .decrypt_outputs_with_keys(std::slice::from_ref(&wrong_ivk))
                 .is_empty(),
             "a different fixture recipient cannot recover the miner reward"
         );
@@ -498,5 +498,9 @@ fn auxiliary_private_wcash_proof_repro_rebuilds_twice_before_fix_and_once_with_s
         "later pool requests retain the exact completed private proof"
     );
     assert_eq!(builds.load(Ordering::SeqCst), 1);
+    #[expect(
+        clippy::print_stderr,
+        reason = "Expose the old/new proof measurements only in this local regression test"
+    )]
     eprintln!("auxiliary_private_proof_repro legacy_builds=2 fixed_builds=1 legacy_request_ms={legacy_request_ms:?} fixed_request_ms={fixed_request_ms:?} legacy_total_ms={} fixed_total_ms={}", legacy_elapsed.as_millis(), fixed_elapsed.as_millis());
 }
