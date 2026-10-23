@@ -334,19 +334,26 @@ fn broadcast_all_queued_removes_banned_peers() {
         peer_set.bans_receiver = bans_rx;
 
         let banned_addr: PeerSocketAddr = SocketAddr::new(banned_ip, 1).into();
+        // Keep this peer connected-but-busy so the test exercises the ban
+        // filter, rather than passing through disconnected-peer cleanup.
+        let (cancel, _cancel_receiver) =
+            crate::peer_set::set::oneshot::channel::<crate::peer_set::set::CancelClientWork>();
+        peer_set.cancel_handles.insert(banned_addr, cancel);
         let mut remaining_peers = HashSet::new();
         remaining_peers.insert(banned_addr);
 
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        peer_set.queued_broadcast_all = Some((Request::Peers, sender, remaining_peers));
+        peer_set
+            .queued_broadcast_all
+            .push_back((Request::Peers, sender, remaining_peers));
 
         peer_set.broadcast_all_queued();
 
-        if let Some((_req, _sender, remaining_peers)) = peer_set.queued_broadcast_all.take() {
-            assert!(remaining_peers.is_empty());
-        } else {
-            assert!(receiver.try_recv().is_ok());
-        }
+        assert!(peer_set.queued_broadcast_all.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     });
 }
 

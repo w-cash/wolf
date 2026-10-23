@@ -1,0 +1,4 @@
+project: zebrad
+kind: Changed
+body: "Fresh RPC-submitted Zcash block announcements can proceed while an older gossip attempt is stalled. Result and failure logs distinguish queue, readiness and request time. Wcash keeps its existing single-attempt scheduling policy."
+time: 2026-10-23T08:14:23.000000000Z

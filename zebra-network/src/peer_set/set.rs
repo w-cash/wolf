@@ -94,7 +94,7 @@
 //! [ZIP-201]: https://zips.z.cash/zip-0201
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     convert,
     fmt::Debug,
     marker::PhantomData,
@@ -240,7 +240,7 @@ where
     inventory_registry: InventoryRegistry,
 
     /// Stores requests that should be routed to peers once they are ready.
-    queued_broadcast_all: Option<(
+    queued_broadcast_all: VecDeque<(
         Request,
         tokio::sync::mpsc::Sender<ResponseFuture>,
         HashSet<D::Key>,
@@ -390,7 +390,7 @@ where
             ready_services: HashMap::new(),
             // Request Routing
             inventory_registry: InventoryRegistry::new(inv_stream),
-            queued_broadcast_all: None,
+            queued_broadcast_all: VecDeque::new(),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             zcashd_compat_peer_keys: HashSet::new(),
             queued_sidecar_broadcast: None,
@@ -865,6 +865,7 @@ where
             // making `poll_unready` drop the service.
             let _ = handle.send(CancelClientWork);
         }
+        self.prune_queued_broadcast_all();
     }
 
     /// Adds a ready service to the ready list if it's for a peer with a supported version.
@@ -1348,7 +1349,10 @@ where
         }
         // Snapshot peers that were already busy before sending moves ready peers
         // into the unready set. Initially ready peers must not be queued twice.
-        let queued_broadcast = self.queue_broadcast_all_unready(&req);
+        let queued_broadcast = match self.queue_broadcast_all_unready(&req) {
+            Ok(queued) => queued,
+            Err(error) => return async move { Err(error) }.boxed(),
+        };
         let ready_peers = self.ready_services.keys().copied().collect();
         let send_multiple_fut = self.send_multiple(req.clone(), ready_peers);
         let Some(mut queued_broadcast_fut_receiver) = queued_broadcast else {
@@ -1382,51 +1386,82 @@ where
     fn queue_broadcast_all_unready(
         &mut self,
         req: &Request,
-    ) -> Option<tokio::sync::mpsc::Receiver<ResponseFuture>> {
+    ) -> Result<Option<tokio::sync::mpsc::Receiver<ResponseFuture>>, BoxError> {
+        self.prune_queued_broadcast_all();
         if !self.cancel_handles.is_empty() {
             /// How many broadcast all futures to send to the channel until the peer set should wait for the channel consumer
             /// to read a message before continuing to send the queued broadcast request to peers that were originally unready.
             const QUEUED_BROADCAST_FUTS_CHANNEL_SIZE: usize = 3;
+            const MAX_QUEUED_ZCASH_BROADCASTS: usize = 64;
+
+            if self.network.uses_wcash_consensus() {
+                // Preserve the existing Wcash best-effort replacement policy.
+                self.queued_broadcast_all.clear();
+            } else if self.queued_broadcast_all.len() >= MAX_QUEUED_ZCASH_BROADCASTS {
+                return Err("queued Zcash block broadcasts are full; retry required".into());
+            }
 
             let (sender, receiver) = tokio::sync::mpsc::channel(QUEUED_BROADCAST_FUTS_CHANNEL_SIZE);
             let unready_peers: HashSet<_> = self.cancel_handles.keys().cloned().collect();
             let queued = (req.clone(), sender, unready_peers);
 
-            // Drop the existing queued broadcast all request, if any.
-            self.queued_broadcast_all = Some(queued);
+            // Concurrent Zcash attempts must not replace an older live obligation.
+            self.queued_broadcast_all.push_back(queued);
 
-            Some(receiver)
+            Ok(Some(receiver))
         } else {
-            None
+            Ok(None)
         }
+    }
+
+    /// Release cancelled callers and peers that can no longer receive queued work.
+    fn prune_queued_broadcast_all(&mut self) {
+        let ready = &self.ready_services;
+        let busy = &self.cancel_handles;
+        self.queued_broadcast_all.retain_mut(|(_, sender, peers)| {
+            peers.retain(|key| ready.contains_key(key) || busy.contains_key(key));
+            !sender.is_closed() && !peers.is_empty()
+        });
     }
 
     /// Broadcasts the same requests to all ready peers which were unready when
     /// [`PeerSet::broadcast_all()`] was last called, ignoring return values.
     fn broadcast_all_queued(&mut self) {
-        let Some((req, sender, mut remaining_peers)) = self.queued_broadcast_all.take() else {
-            return;
-        };
-
+        self.prune_queued_broadcast_all();
         let bans = self.bans_receiver.borrow().clone();
-        remaining_peers.retain(|addr| !bans.contains_key(&addr.ip()));
-
-        let Ok(reserved_send_slot) = sender.try_reserve() else {
-            self.queued_broadcast_all = Some((req, sender, remaining_peers));
-            return;
-        };
-
-        let peers: Vec<_> = self
-            .ready_services
-            .keys()
-            .filter(|ready_peer| remaining_peers.remove(ready_peer))
-            .copied()
-            .collect();
-
-        reserved_send_slot.send(self.send_multiple(req.clone(), peers).boxed());
-
-        if !remaining_peers.is_empty() {
-            self.queued_broadcast_all = Some((req, sender, remaining_peers));
+        // Visit each bounded obligation once. A full caller channel must not
+        // prevent another queued hash from reaching a different ready peer.
+        for _ in 0..self.queued_broadcast_all.len() {
+            let (req, sender, mut remaining_peers) = self
+                .queued_broadcast_all
+                .pop_front()
+                .expect("the loop visits the initially queued obligations once");
+            remaining_peers.retain(|addr| !bans.contains_key(&addr.ip()));
+            if remaining_peers.is_empty() {
+                continue;
+            }
+            let Ok(reserved_send_slot) = sender.try_reserve() else {
+                if !sender.is_closed() {
+                    self.queued_broadcast_all
+                        .push_back((req, sender, remaining_peers));
+                }
+                continue;
+            };
+            let peers: Vec<_> = self
+                .ready_services
+                .keys()
+                .filter(|ready_peer| remaining_peers.remove(ready_peer))
+                .copied()
+                .collect();
+            if !peers.is_empty() {
+                reserved_send_slot.send(self.send_multiple(req.clone(), peers).boxed());
+            } else {
+                drop(reserved_send_slot);
+            }
+            if !remaining_peers.is_empty() {
+                self.queued_broadcast_all
+                    .push_back((req, sender, remaining_peers));
+            }
         }
     }
 
@@ -1598,6 +1633,7 @@ where
         let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
 
         let ready_peers = self.poll_peers(cx)?;
+        self.prune_queued_broadcast_all();
 
         // These metrics should run last, to report the most up-to-date information.
         self.log_peer_set_size();

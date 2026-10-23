@@ -636,6 +636,7 @@ impl StartCmd {
                 chain_tip_change.clone(),
                 peer_set.clone(),
                 Some(submit_block_channel.receiver()),
+                !config.network.network.uses_wcash_consensus(),
             )
             .in_current_span(),
         );
