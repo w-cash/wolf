@@ -31,9 +31,10 @@ use wcash_merge_miner::{
         DEFAULT_ZIP301_VALIDATION_LIMIT,
     },
     CoordinatorConfig, GenerationRetirement, JobConfig, MinerError, NativeMiningCoordinator,
-    NativeMiningSupervisor, NativePoolBackendRetainedJob, NativeZcashConfig, NativeZcashNetwork,
-    PoolBackendActor, PoolBackendActorError, PoolBackendRetainedJob, PoolBackendWinnerWorkers,
-    PreparedJob, ShareProcessor, WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config,
+    NativeMiningSupervisor, NativePoolBackendRetainedJob, NativePreparationTiming,
+    NativeZcashConfig, NativeZcashNetwork, PoolBackendActor, PoolBackendActorError,
+    PoolBackendRetainedJob, PoolBackendWinnerWorkers, PreparationPhase, PreparedJob,
+    ShareProcessor, WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config,
     Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
 };
 use wcash_pool_protocol::{Hex32, JobInvalidationReason, TargetBe, TargetLe};
@@ -692,12 +693,14 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
-        let coordinator = match supervisor.prepare_generation() {
+        let mut preparation_timing = NativePreparationTiming::new();
+        let coordinator = match supervisor.prepare_generation_timed(&mut preparation_timing) {
             Ok(coordinator) => {
                 preparation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
                 coordinator
             }
             Err(error) if is_retryable_native_preparation_error(&error) => {
+                preparation_timing.finish_error(&error);
                 let retry_delay = native_preparation_retry_delay(&error, preparation_backoff);
                 eprintln!(
                     "transient native backend preparation failure: {error}; retrying in {} millisecond(s)",
@@ -743,9 +746,19 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                 preparation_backoff = next_native_preparation_backoff(&error, preparation_backoff);
                 continue;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                preparation_timing.finish_error(&error);
+                return Err(error.into());
+            }
         };
-        let retained = Arc::new(NativePoolBackendRetainedJob::new(coordinator)?);
+        preparation_timing.enter(PreparationPhase::Activation);
+        let retained = match NativePoolBackendRetainedJob::new(coordinator) {
+            Ok(retained) => Arc::new(retained),
+            Err(error) => {
+                preparation_timing.finish_activation_failed();
+                return Err(error.into());
+            }
+        };
         let descriptor = retained.descriptor();
         let job_id = descriptor.job_id.clone();
         let superseded_grace = if active.is_some() {
@@ -754,6 +767,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
             Duration::ZERO
         };
         if let Err(error) = actor.activate_job(retained.clone(), superseded_grace) {
+            preparation_timing.finish_activation_failed();
             let mut retained = Arc::try_unwrap(retained).map_err(|_| {
                 MinerError::InvalidRequest(
                     "private backend retained a generation after failed activation".to_string(),
@@ -766,6 +780,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
             }
             return Err(error.into());
         }
+        preparation_timing.finish_ok();
         let activation_output = print_json(&json!({
             "command": "native-pool-backend",
             "result": "job_activated",

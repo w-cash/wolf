@@ -84,6 +84,57 @@ drop and suppression counters make that limitation visible. The durable winner
 journal remains authoritative, and timing collection adds no RPC, disk sync,
 sleep or formatting before submission.
 
+## Job preparation timings
+
+`job_preparation_result` is emitted after backend actor activation, or after a
+failed preparation attempt returns. Successful attempts below one second are
+silent. The record separates network identity, candidate retirement, observer
+catch-up, Wcash candidate RPC, local child decoding and payout validation,
+Zcash template and proposal checks, exact-tip fences, generation journal work
+and actor activation. Repeated phases accumulate exclusive monotonic durations;
+parallel requests within a phase contribute caller elapsed time, not a sum of
+overlapping request times. Cleanup during preparation error unwinding remains
+part of the last active phase. Retirement after actor-activation failure occurs
+after that failure record and is not included.
+
+Only fixed phase names, safe error classes and public candidate heights are
+recorded. The preparation thread keeps a fixed-size stack timer and uses the
+existing bounded, paced diagnostic channel only after the result. It adds no
+RPC, per-share record, synchronous diagnostic write or winner-path lock. Full
+queues or a stalled writer can omit optional text; existing drop and
+suppression counters remain the visibility boundary.
+
+These records measure preparation through durable actor activation. They do
+not include the preceding retry sleep, projector ingestion or delivery of a
+Stratum notification to an ASIC. PostgreSQL `backend_events.recorded_at` is
+projection time, so it must not be treated as an exact backend activation or
+hardware-notification timestamp. Existing ZEC winner timing records have a
+separate scope.
+
+## Alternate Wcash payout cache
+
+A merged job still needs a valid Wcash candidate before the Zcash proposal can
+commit to it. If `createauxblock` requests a private recipient different from
+the node's configured recipient, repeatedly creating an isolated coinbase cache
+repeats shielded proving even when child height and fees have not changed.
+Ordinary template prewarming for the configured recipient does not warm that
+alternate recipient.
+
+The Wcash RPC handler retains at most four alternate-recipient coinbase caches
+across request clones. Exact miner parameters isolate recipients, coinbase data,
+memo and payout commitments. Each cache retains the existing height, fee and
+single-builder gates. The recipient-map lock is released before proving or
+waiting; an evicted entry remains valid for requests already holding its cache.
+Alternate requests never consume the configured recipient's precomputed block
+template. Every candidate still passes payout, proposal and exact-tip checks.
+
+This removes repeated same-height proving while an entry remains cached; a
+new height, changed fee total or eviction can still require a proof. It is not
+a zero-latency guarantee. The cache change requires an updated **Wcash node**;
+the preparation records require an updated **native backend**. Updating only
+the backend cannot repair node-side cache reuse. Neither change enables ZEC
+payouts or changes recipient configuration, consensus or winner submission.
+
 ## Local same-height catch-up
 
 When the public-chain observer and a work node report different hashes at the

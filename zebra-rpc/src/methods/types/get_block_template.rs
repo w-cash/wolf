@@ -11,7 +11,7 @@ pub mod zip317;
 mod tests;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt::{self},
     sync::{Arc, Condvar, Mutex},
 };
@@ -798,22 +798,7 @@ impl CoinbaseCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         retain_adjacent_coinbase_heights(&mut map, height);
-        // Only 2 entries are ever useful (zero-fee fake + current real-fee coinbase), but mempool
-        // fee churn can accumulate stale entries within a block. Cap at 4 to stay well above the
-        // useful set while preventing unbounded growth. When evicting, preserve the zero-fee sizing
-        // coinbase — losing it recreates the churn this cache exists to prevent.
-        let entries_at_height = map
-            .keys()
-            .filter(|(entry_height, _)| *entry_height == height)
-            .count();
-        if !map.contains_key(&(height, fee)) && entries_at_height >= 4 {
-            let evict_key = map.keys().copied().find(|&(entry_height, entry_fee)| {
-                entry_height == height && entry_fee != Amount::<NonNegative>::zero()
-            });
-            if let Some(key) = evict_key {
-                map.remove(&key);
-            }
-        }
+        bound_coinbase_fee_entries(&mut map, height, fee);
         if let Some(entry) = map.get(&(height, fee)) {
             let mut state = entry
                 .state
@@ -846,6 +831,7 @@ impl CoinbaseCache {
             match map.get(&(height, fee)) {
                 Some(entry) => (Arc::clone(entry), false),
                 None => {
+                    bound_coinbase_fee_entries(&mut map, height, fee);
                     let entry = Arc::new(CoinbaseCacheEntry::building());
                     map.insert((height, fee), Arc::clone(&entry));
                     (entry, true)
@@ -919,11 +905,99 @@ impl CoinbaseCache {
     }
 }
 
+/// Only the zero-fee sizing proof and the current fee total are normally useful.
+/// Bound both insertion paths so persistent recipient caches cannot grow with
+/// mempool fee churn. Preserve zero-fee work; an evicted builder/waiter keeps
+/// owning its entry Arc and is never redirected to another key's coinbase.
+fn bound_coinbase_fee_entries(
+    map: &mut HashMap<(block::Height, Amount<NonNegative>), Arc<CoinbaseCacheEntry>>,
+    height: block::Height,
+    fee: Amount<NonNegative>,
+) {
+    const MAX_FEE_ENTRIES_PER_HEIGHT: usize = 4;
+    if map.contains_key(&(height, fee)) {
+        return;
+    }
+    let entries = map
+        .keys()
+        .filter(|(entry_height, _)| *entry_height == height)
+        .count();
+    if entries >= MAX_FEE_ENTRIES_PER_HEIGHT {
+        let evict = map.keys().copied().find(|&(entry_height, entry_fee)| {
+            entry_height == height && entry_fee != Amount::<NonNegative>::zero()
+        });
+        if let Some(key) = evict {
+            map.remove(&key);
+        }
+    }
+}
+
 fn retain_adjacent_coinbase_heights(
     map: &mut HashMap<(block::Height, Amount<NonNegative>), Arc<CoinbaseCacheEntry>>,
     requested: block::Height,
 ) {
     map.retain(|&(height, _), _| height.0.abs_diff(requested.0) <= 1);
+}
+
+/// Bounds alternate `createauxblock` recipients independently of each cache's
+/// existing adjacent-height and fee-entry limits.
+const MAX_AUXILIARY_COINBASE_RECIPIENTS: usize = 4;
+
+#[derive(Clone)]
+struct AuxiliaryCoinbaseCache {
+    params: MinerParams,
+    cache: CoinbaseCache,
+}
+
+impl AuxiliaryCoinbaseCache {
+    fn matches(&self, params: &MinerParams) -> bool {
+        self.params.addr == params.addr
+            && self.params.data == params.data
+            && self.params.memo == params.memo
+            && self.params.parent_payout_address_commitment
+                == params.parent_payout_address_commitment
+    }
+}
+
+/// Shared only by clones of one configured handler. Proof work and per-key
+/// singleflight waits happen after this small recipient map has been unlocked.
+#[derive(Clone)]
+struct AuxiliaryCoinbaseCaches(Arc<Mutex<VecDeque<AuxiliaryCoinbaseCache>>>);
+
+impl Default for AuxiliaryCoinbaseCaches {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(VecDeque::with_capacity(
+            MAX_AUXILIARY_COINBASE_RECIPIENTS,
+        ))))
+    }
+}
+
+impl AuxiliaryCoinbaseCaches {
+    fn for_params(&self, params: &MinerParams) -> CoinbaseCache {
+        let mut caches = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = caches.iter().position(|entry| entry.matches(params)) {
+            let entry = caches
+                .remove(index)
+                .expect("the matching recipient cache index is present");
+            let cache = entry.cache.clone();
+            caches.push_back(entry);
+            return cache;
+        }
+        if caches.len() == MAX_AUXILIARY_COINBASE_RECIPIENTS {
+            // An evicted cache can still be owned by an in-flight request. Its
+            // Arc remains valid, but it is never reused for another recipient.
+            caches.pop_front();
+        }
+        let cache = CoinbaseCache::default();
+        caches.push_back(AuxiliaryCoinbaseCache {
+            params: params.clone(),
+            cache: cache.clone(),
+        });
+        cache
+    }
 }
 
 /// Handler for the `getblocktemplate` RPC.
@@ -952,6 +1026,10 @@ where
     /// Caches the most recently built coinbase transaction, so short-polling miners don't re-run
     /// the shielded-coinbase proof on every request within a block.
     coinbase_cache: CoinbaseCache,
+
+    /// Recipient-isolated coinbase caches for caller-selected auxiliary payouts.
+    /// The configured payout's normal precompute/cache path remains separate.
+    auxiliary_coinbase_caches: AuxiliaryCoinbaseCaches,
 
     /// A block template for the current chain tip, kept up to date by the task spawned by
     /// `RpcImpl::spawn_block_template_updater()`, so `getblocktemplate` can answer without reading
@@ -989,6 +1067,7 @@ where
                 .unwrap_or(SubmitBlockChannel::default().sender()),
             duplicate_gossip_admission: Arc::new(Mutex::new(None)),
             coinbase_cache: CoinbaseCache::default(),
+            auxiliary_coinbase_caches: AuxiliaryCoinbaseCaches::default(),
             template_cache: Some(precompute::TemplateCache::default()),
         }
     }
@@ -1013,6 +1092,18 @@ where
         self.coinbase_cache = CoinbaseCache::default();
         // The precomputed template pays the previous miner address, and it's shared with the
         // handler this one was cloned from, so stop using it.
+        self.template_cache = None;
+    }
+
+    /// Selects a bounded recipient-isolated cache for `createauxblock` clones.
+    ///
+    /// A proof-complete coinbase can be reused only for exactly equal miner
+    /// parameters, height and fees. The configured template cannot be used for
+    /// an alternate recipient; all normal candidate validation still applies.
+    pub(crate) fn set_auxiliary_miner_params(&mut self, miner_params: MinerParams) {
+        let cache = self.auxiliary_coinbase_caches.for_params(&miner_params);
+        self.miner_params = Ok(Some(miner_params));
+        self.coinbase_cache = cache;
         self.template_cache = None;
     }
 

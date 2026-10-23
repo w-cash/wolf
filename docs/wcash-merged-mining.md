@@ -74,6 +74,16 @@ difficulty, and empty witness. Candidates are bounded to 16 entries and expire
 after ten minutes. A candidate remains exact and retryable across a shallow
 child reorg while its parent is retained in either committed chain.
 
+When a caller selects a payout different from the node's configured recipient,
+the handler retains a bounded set of four recipient-isolated coinbase caches.
+Repeated requests with exactly the same miner parameters, height and fees can
+reuse a proof-complete private coinbase across RPC clones. A recipient change
+never reuses another recipient's coinbase or configured block template. The
+existing height/fee limits, single-builder behavior, proposal verification and
+tip fences still apply. A cold entry, changed height or fees, or recipient-cache
+eviction can still require proving; ordinary configured-recipient prewarming
+does not promise a ready alternate-recipient proof.
+
 `createauxblock.coinbasevalue` is the miner's **net** payout including all fees:
 `subsidy - foundation + fees`. It excludes the compulsory transparent foundation
 output. During Mainnet heights 33000–621454, pool accounting must credit miners

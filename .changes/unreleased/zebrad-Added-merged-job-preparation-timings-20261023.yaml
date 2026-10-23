@@ -1,0 +1,4 @@
+project: zebrad
+kind: Added
+body: "The native merged-mining backend reports bounded post-result phase timings for slow or failed job preparation, using its existing nonblocking diagnostic queue without adding share-path logging or winner-submission dependencies."
+time: 2026-10-23T18:35:00.000000000Z
