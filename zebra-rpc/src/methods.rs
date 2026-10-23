@@ -3364,9 +3364,9 @@ where
         // Reuse the production template path. When the caller requests the
         // configured payout address, keep the shared coinbase cache: private
         // coinbase proving is expensive and the proof-complete transaction can
-        // be reused at the same height and fee total. A different caller
-        // address still gets an isolated cache so payout data cannot cross
-        // address boundaries.
+        // be reused at the same height and fee total. Different caller
+        // destinations use bounded, recipient-isolated caches shared across
+        // clones, so repeated pool requests do not rebuild the private proof.
         let mut candidate_rpc = self.clone();
         let uses_configured_payout = candidate_rpc
             .gbt
@@ -3375,7 +3375,7 @@ where
             .flatten()
             .is_some_and(|configured| configured.addr() == miner_params.addr());
         if !uses_configured_payout {
-            candidate_rpc.gbt.set_miner_params(miner_params);
+            candidate_rpc.gbt.set_auxiliary_miner_params(miner_params);
         }
         let template = candidate_rpc
             .get_block_template(None)

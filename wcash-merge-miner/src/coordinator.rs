@@ -59,9 +59,10 @@ use crate::{
     },
     pool_backend::JournalWinnerLifecycle,
     rpc::{RpcEndpoint, ZebraRpcClient, DEFAULT_RPC_TIMEOUT},
-    MinerError, NativeGenerationDescriptor, NativePreparedJob, NativeWcashPayoutVerification,
-    NativeZcashConfig, NativeZcashProvider, PoolBackendWinnerSnapshot, PoolBackendWinnerTransition,
-    ShareProcessor, ValidatedNativeShare, NATIVE_JOB_MAX_AGE_SECONDS,
+    MinerError, NativeGenerationDescriptor, NativePreparationTiming, NativePreparedJob,
+    NativeWcashPayoutVerification, NativeZcashConfig, NativeZcashProvider,
+    PoolBackendWinnerSnapshot, PoolBackendWinnerTransition, PreparationPhase, ShareProcessor,
+    ValidatedNativeShare, NATIVE_JOB_MAX_AGE_SECONDS,
 };
 
 /// Complete native-node configuration for one frozen dual-mining job.
@@ -509,6 +510,17 @@ impl NativeMiningSupervisor {
 
     /// Creates, proposal-validates, and durably activates one fresh generation.
     pub fn prepare_generation(&self) -> Result<NativeMiningCoordinator, MinerError> {
+        self.prepare_generation_timed(&mut NativePreparationTiming::new())
+    }
+
+    /// Prepares a generation while recording fixed, local phase durations.
+    ///
+    /// The pool caller finishes the timing record after durable actor activation.
+    /// Recording adds no RPC and never enters the independent winner workers.
+    pub fn prepare_generation_timed(
+        &self,
+        timing: &mut NativePreparationTiming,
+    ) -> Result<NativeMiningCoordinator, MinerError> {
         let _preparation = self
             .generation_preparation
             .lock()
@@ -523,6 +535,7 @@ impl NativeMiningSupervisor {
         // submitted by their own generation below, while older unresolved
         // entries move through bounded background maintenance. A stale
         // historical winner must never block every fresh job rotation.
+        timing.enter(PreparationPhase::NetworkIdentity);
         let wcash_identity =
             require_wcash_network_identity(&wcash_node, &config.expected_wcash_genesis_hash);
         let zcash_identity = zcash.require_network_identity(&expected_zcash_genesis_hash);
@@ -530,6 +543,7 @@ impl NativeMiningSupervisor {
             .initial_outbox_recovery_complete
             .load(Ordering::Acquire);
         if initial_outbox_recovery && wcash_identity.is_ok() {
+            timing.enter(PreparationPhase::Other);
             let pending = journal.all_pending()?;
             retry_pending_winners_with(
                 &wcash_node,
@@ -543,6 +557,7 @@ impl NativeMiningSupervisor {
             )?;
         }
         if initial_outbox_recovery && zcash_identity.is_ok() {
+            timing.enter(PreparationPhase::Other);
             let pending = journal.all_pending()?;
             retry_pending_winners_with(
                 &wcash_node,
@@ -558,16 +573,21 @@ impl NativeMiningSupervisor {
         // A transient failure after a prior `createauxblock` must be resolved
         // before another candidate is requested. This makes preparation
         // retries cache-capacity neutral even during a prolonged parent outage.
+        timing.enter(PreparationPhase::CandidateRetirement);
         self.retry_pending_candidate_retirement()?;
         zcash_identity?;
+        timing.enter(PreparationPhase::ObserverCatchup);
         zcash.relay_observer_blocks_to_work_nodes()?;
         self.initial_outbox_recovery_complete
             .store(true, Ordering::Release);
 
+        timing.enter(PreparationPhase::WcashCandidate);
         let child: ChildTemplate = wcash_node.call(
             "createauxblock",
             json!([config.wcash_payout_address.clone()]),
         )?;
+        timing.set_wcash_height(child.height);
+        timing.enter(PreparationPhase::WcashDecode);
         let child_hash = parse_display_hash(&child.hash, "createauxblock hash")?;
         parse_canonical_capability(&child.retire_token, "createauxblock retiretoken")?;
         let child_candidate_lease = ChildCandidateLease {
@@ -644,6 +664,7 @@ impl NativeMiningSupervisor {
                 "createauxblock metadata does not match its serialized candidate".to_string(),
             ));
         }
+        timing.enter(PreparationPhase::WcashPayout);
         let child_payout = validate_wcash_candidate_payout_with_authority(
             &child_candidate,
             &self.wcash_payout_address,
@@ -652,6 +673,7 @@ impl NativeMiningSupervisor {
             child.coinbase_value,
             child.height,
         )?;
+        timing.enter(PreparationPhase::WcashDecode);
         let child_coinbase_txid_le = child_candidate
             .transactions
             .first()
@@ -664,7 +686,7 @@ impl NativeMiningSupervisor {
             .0;
 
         let auxiliary_nonce = reserve_auxiliary_nonce(&self.next_auxiliary_nonce)?;
-        let job = zcash.prepare_job(child_hash, child_target, auxiliary_nonce)?;
+        let job = zcash.prepare_job_timed(child_hash, child_target, auxiliary_nonce, timing)?;
         let generation_descriptor = job.generation_descriptor(
             child_candidate.header.previous_block_hash.0,
             child_coinbase_txid_le,
@@ -679,6 +701,7 @@ impl NativeMiningSupervisor {
         let expected_child_height = child.height.checked_sub(1).ok_or_else(|| {
             MinerError::InvalidParentTemplate("child height must be positive".to_string())
         })?;
+        timing.enter(PreparationPhase::CurrentnessFences);
         let child_tip_height: u32 = wcash_node.call("getblockcount", json!([]))?;
         let child_tip: String = wcash_node.call("getbestblockhash", json!([]))?;
         if child_tip_height != expected_child_height
@@ -694,6 +717,7 @@ impl NativeMiningSupervisor {
             });
         }
         let child_candidate_bytes: Arc<[u8]> = child_candidate_bytes.into();
+        timing.enter(PreparationPhase::GenerationJournal);
         journal.activate_job(ActiveJournalJob {
             job_id: job.job().job_id().to_string(),
             child_hash_display: child.hash.clone(),
@@ -702,6 +726,7 @@ impl NativeMiningSupervisor {
             child_candidate_bytes: Arc::clone(&child_candidate_bytes),
         })?;
         // Parent workers use indices 0 and 1 in the current two-node layout.
+        timing.enter(PreparationPhase::Other);
         wcash_node.prewarm_next_coinbase(2, child.height, child.long_poll_id.clone());
         let candidate_created_at = Instant::now();
 
@@ -5540,7 +5565,11 @@ pub(crate) mod tests {
             vec![observer],
         ));
         let preparing = Arc::clone(&supervisor);
-        let catchup_worker = thread::spawn(move || preparing.prepare_generation());
+        let catchup_worker = thread::spawn(move || {
+            let mut timing = NativePreparationTiming::new();
+            let result = preparing.prepare_generation_timed(&mut timing);
+            (result, timing)
+        });
         let entered = entered_rx.recv_timeout(Duration::from_secs(2));
         if entered.is_err() {
             let _ = release_tx.send(());
@@ -5559,7 +5588,7 @@ pub(crate) mod tests {
         let received = delivery_rx.recv_timeout(Duration::from_secs(2));
         // Release every held request before checking the delivery assertion.
         release_tx.send(()).unwrap();
-        let catchup_result = catchup_worker.join().unwrap();
+        let (catchup_result, timing) = catchup_worker.join().unwrap();
         let (winner_result, snapshot) = winner_worker.join().unwrap();
         assert_eq!(
             received.expect("healthy template receives before catch-up is released"),
@@ -5569,6 +5598,22 @@ pub(crate) mod tests {
             catchup_result,
             Err(MinerError::ParentTipMismatch { .. })
         ));
+        let ((), preparation_reports) = crate::diagnostics::capture_preparation_timings(|| {
+            let error = match &catchup_result {
+                Err(error) => error,
+                Ok(_) => panic!("held catch-up must end with the competing-tip error"),
+            };
+            timing.finish_error(error);
+        });
+        assert_eq!(preparation_reports.len(), 1);
+        assert_eq!(
+            preparation_reports[0]["preparation"]["finished_phase"],
+            "observer_catchup"
+        );
+        assert_eq!(
+            preparation_reports[0]["preparation"]["error_class"],
+            "parent_tip_mismatch"
+        );
         assert!(matches!(
             winner_result.unwrap_err().miner_error(),
             MinerError::ParentTipMismatch { .. }

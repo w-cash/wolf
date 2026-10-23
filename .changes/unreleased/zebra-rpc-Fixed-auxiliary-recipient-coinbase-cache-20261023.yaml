@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: Fixed
+body: "Wcash createauxblock retains bounded recipient-isolated coinbase caches across caller-selected payout requests, avoiding repeated same-height private proving without sharing payouts or bypassing candidate validation."
+time: 2026-10-23T18:35:00.000000000Z

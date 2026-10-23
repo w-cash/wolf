@@ -48,8 +48,9 @@ use zebra_chain::{
 use crate::{
     diagnostics::{ZecRecipientRole, ZecRecipientTiming, ZecWinnerAttempt},
     rpc::{RpcEndpoint, ZebraRpcClient, DEFAULT_RPC_TIMEOUT},
-    MinerError, PreparedJob, SolvedAuxPow, EQUIHASH_SOLUTION_BYTES,
-    NATIVE_COINBASE_MATURITY_CONFIRMATIONS, NATIVE_JOB_MAX_AGE_MILLISECONDS,
+    MinerError, NativePreparationTiming, PreparationPhase, PreparedJob, SolvedAuxPow,
+    EQUIHASH_SOLUTION_BYTES, NATIVE_COINBASE_MATURITY_CONFIRMATIONS,
+    NATIVE_JOB_MAX_AGE_MILLISECONDS,
 };
 
 const HEADER_INPUT_BYTES: usize = 108;
@@ -506,7 +507,23 @@ impl NativeZcashProvider {
         child_target: Target,
         auxiliary_nonce: u32,
     ) -> Result<NativePreparedJob, MinerError> {
+        self.prepare_job_timed(
+            child_block_hash,
+            child_target,
+            auxiliary_nonce,
+            &mut NativePreparationTiming::new(),
+        )
+    }
+
+    pub(crate) fn prepare_job_timed(
+        &self,
+        child_block_hash: [u8; 32],
+        child_target: Target,
+        auxiliary_nonce: u32,
+        timing: &mut NativePreparationTiming,
+    ) -> Result<NativePreparedJob, MinerError> {
         let child_display = display_hex(child_block_hash);
+        timing.enter(PreparationPhase::ZcashTemplate);
         let template: BlockTemplateResponse = self.template_node.call(
             "getblocktemplate",
             json!([{
@@ -519,6 +536,8 @@ impl NativeZcashProvider {
             }]),
         )?;
 
+        timing.set_zcash_height(template.height);
+        timing.enter(PreparationPhase::ZcashDecode);
         let actual_parent_payout_commitment: [u8; 32] = parse_template_hex(
             template
                 .parent_payout_commitment
@@ -552,11 +571,14 @@ impl NativeZcashProvider {
         // Testnet liveness policy still validates the exact proposal on the
         // authoritative template node, and skips independent validators that
         // have not converged on that predecessor yet.
+        timing.enter(PreparationPhase::CurrentnessFences);
         self.require_tip(&self.template_node, &prepared)?;
         if self.allow_lagging_proposal_validators {
+            timing.enter(PreparationPhase::ZcashProposal);
             self.validate_parent_proposal(&self.template_node, &prepared)?;
         }
         for validator in &self.proposal_validators {
+            timing.enter(PreparationPhase::CurrentnessFences);
             if !self.proposal_validator_matches_or_lags(validator, &prepared)? {
                 continue;
             }
@@ -567,15 +589,18 @@ impl NativeZcashProvider {
             // Asking it to build a second shielded coinbase would duplicate the
             // expensive proof and delay the next ASIC job without adding a new
             // payout or consensus invariant.
+            timing.enter(PreparationPhase::ZcashProposal);
             self.validate_parent_proposal(validator, &prepared)?;
         }
 
         // Close the race where a tip changed while the proposal checks ran.
+        timing.enter(PreparationPhase::CurrentnessFences);
         self.assert_current(&prepared)?;
 
         // Keep one ordinary long poll open on each parent node. Zebra proves the
         // next height's shielded coinbase while it waits for a tip change, so a
         // winning share can rotate directly onto cached, proof-complete work.
+        timing.enter(PreparationPhase::Other);
         self.start_coinbase_prewarm(
             0,
             self.template_node.clone(),

@@ -19,8 +19,9 @@ use serde_json::json;
 use wcash_pool_protocol::{Hex32, MergedChain, WinnerDescriptor};
 
 use crate::{
-    pool_backend_journal::PoolBackendJournalError, MinerError, PoolBackendWinnerSnapshot,
-    PoolWinnerReconciliationError,
+    pool_backend_journal::PoolBackendJournalError,
+    preparation_timing::{PreparationPhase, PreparationReport},
+    MinerError, PoolBackendWinnerSnapshot, PoolWinnerReconciliationError,
 };
 
 const CAPACITY: usize = 128;
@@ -386,6 +387,7 @@ struct Event {
     io_kind: Option<&'static str>,
     queued_at: Instant,
     timing: Option<ZecTiming>,
+    preparation: Option<PreparationReport>,
     timing_metadata_dropped_total: u64,
 }
 
@@ -414,9 +416,27 @@ impl Event {
             io_kind: None,
             queued_at: Instant::now(),
             timing: None,
+            preparation: None,
             timing_metadata_dropped_total: 0,
         }
     }
+}
+
+/// Called once after a completed slow or failed preparation attempt.
+/// All formatting stays on the existing bounded, lossy writer thread.
+pub(crate) fn preparation_result(report: PreparationReport) {
+    record(preparation_event(report));
+}
+
+fn preparation_event(report: PreparationReport) -> Event {
+    let mut event = Event::new(
+        None,
+        "job_preparation_result",
+        report.result.error_class().unwrap_or(report.result.label()),
+    );
+    event.warning = report.result.error_class().is_some();
+    event.preparation = Some(report);
+    event
 }
 
 fn record(event: Event) {
@@ -690,6 +710,32 @@ pub(crate) fn capture_zec_timings<R>(run: impl FnOnce() -> R) -> (R, Vec<serde_j
     (result, values)
 }
 
+#[cfg(test)]
+pub(crate) fn capture_preparation_timings<R>(
+    run: impl FnOnce() -> R,
+) -> (R, Vec<serde_json::Value>) {
+    CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+    let result = run();
+    let events = CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
+    let mut output = Vec::new();
+    let mut reporter = Reporter::new(Instant::now());
+    for mut event in events
+        .into_iter()
+        .filter(|event| event.preparation.is_some())
+    {
+        event.noisy = false;
+        reporter
+            .record(&mut output, event, Instant::now(), 0)
+            .unwrap();
+    }
+    let values = output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    (result, values)
+}
+
 #[derive(Eq, PartialEq)]
 struct Key(
     Option<(&'static str, [u8; 32])>,
@@ -745,7 +791,12 @@ impl Reporter {
                 event.result,
                 event
                     .timing
-                    .and_then(|timing| timing.role.zip(timing.index)),
+                    .and_then(|timing| timing.role.zip(timing.index))
+                    .or_else(|| {
+                        event
+                            .preparation
+                            .map(|report| (report.finished_phase.name(), 0))
+                    }),
             );
             if let Some((_, previous, count)) = self
                 .recent
@@ -795,6 +846,31 @@ impl Reporter {
             "rpc_result":timing.rpc_result,
             "asserts_hardware_discovery_time":false
         }));
+        let preparation = event.preparation.map(|report| {
+            let phases: serde_json::Map<String, serde_json::Value> = PreparationPhase::ALL
+                .into_iter()
+                .map(|phase| {
+                    (
+                        phase.name().to_owned(),
+                        json!(report.phases_ms[phase.index()]),
+                    )
+                })
+                .collect();
+            json!({
+                "scope":"backend_preparation_through_activation",
+                "outcome":report.result.label(),
+                "elapsed_ms":report.elapsed_ms,
+                "phase_ms":phases,
+                "finished_phase":report.finished_phase.name(),
+                "error_class":report.result.error_class(),
+                "wcash_candidate_height":report.wcash_height,
+                "zcash_candidate_height":report.zcash_height,
+                "phase_accounting":"exclusive_caller_phases",
+                "slow_threshold_ms":1000,
+                "asserts_asic_notify_time":false,
+                "asserts_winner_submission_latency":false
+            })
+        });
         let value = json!({"component":"native_pool_backend","level":if event.warning {"WARN"} else {"INFO"},
             "stage":event.stage,"result":event.result,"winner":winner,"observation":observation,"confirmations":event.confirmations,
             "node_outcome_counts":event.counts.map(|counts| json!({
@@ -804,7 +880,7 @@ impl Reporter {
             "operation":event.operation,"os_error":event.os_error,"io_kind":event.io_kind,"suppressed_since_previous":suppressed,
             "suppressed_total":self.suppressed,"diagnostic_dropped_total":dropped,
             "timing_metadata_dropped_total":event.timing_metadata_dropped_total,
-            "diagnostic_queue_wait_ms":elapsed_ms(now,event.queued_at),"timing":timing,
+            "diagnostic_queue_wait_ms":elapsed_ms(now,event.queued_at),"timing":timing,"preparation":preparation,
             "asserts_independent_peer_receipt":false});
         write_record(writer, &value)
     }
@@ -850,6 +926,141 @@ fn write_record(writer: &mut impl Write, value: &serde_json::Value) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preparation_timing::{PreparationResult, PHASE_COUNT};
+
+    fn preparation_fixture() -> PreparationReport {
+        PreparationReport {
+            elapsed_ms: 3_000,
+            phases_ms: [0; PHASE_COUNT],
+            finished_phase: PreparationPhase::WcashCandidate,
+            wcash_height: Some(38_789),
+            zcash_height: None,
+            result: PreparationResult::Failed("rpc_error"),
+        }
+    }
+
+    #[test]
+    fn preparation_queue_saturation_and_disconnection_never_wait_for_sink_or_origin_lock() {
+        let (diagnostics, receiver) = Diagnostics::channel(1);
+        // Preparation reports never acquire the separate winner timing cache.
+        let _held = diagnostics.timing_origins.lock().unwrap();
+        let event = preparation_event(preparation_fixture());
+        let started = Instant::now();
+        for _ in 0..10_000 {
+            diagnostics.record(event);
+        }
+        assert_eq!(diagnostics.dropped.load(Ordering::Relaxed), 9_999);
+        assert!(receiver.try_recv().unwrap().preparation.is_some());
+        assert!(receiver.try_recv().is_err());
+        drop(receiver);
+        diagnostics.record(event);
+        assert_eq!(diagnostics.dropped.load(Ordering::Relaxed), 10_000);
+        assert_eq!(diagnostics.timing_dropped.load(Ordering::Relaxed), 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn preparation_retries_are_paced_by_phase_and_error_class_with_drop_visibility() {
+        let now = Instant::now();
+        let mut reporter = Reporter::new(now);
+        let mut output = Vec::new();
+        let report = preparation_fixture();
+        let event = preparation_event(report);
+        for _ in 0..100 {
+            reporter.record(&mut output, event, now, 0).unwrap();
+        }
+        let mut other_phase = report;
+        other_phase.finished_phase = PreparationPhase::ZcashProposal;
+        reporter
+            .record(&mut output, preparation_event(other_phase), now, 0)
+            .unwrap();
+        let mut other_error = report;
+        other_error.result = PreparationResult::Failed("parent_tip_mismatch");
+        reporter
+            .record(&mut output, preparation_event(other_error), now, 0)
+            .unwrap();
+        reporter
+            .record(&mut output, event, now + INTERVAL, 7)
+            .unwrap();
+        let rows = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(reporter.recent.len(), 3);
+        assert_eq!(rows[3]["suppressed_since_previous"], 99);
+        assert_eq!(rows[3]["diagnostic_dropped_total"], 7);
+        assert_eq!(
+            rows[3]["preparation"]["phase_accounting"],
+            "exclusive_caller_phases"
+        );
+        assert_eq!(rows[3]["preparation"]["wcash_candidate_height"], 38_789);
+        assert!(rows[3]["preparation"]["zcash_candidate_height"].is_null());
+    }
+
+    #[test]
+    fn preparation_finish_emits_only_fixed_public_metadata_after_result() {
+        let secret = "PRIVATE_ENDPOINT_PAYOUT_OR_RPC_BODY";
+        let ((), rows) = capture_preparation_timings(|| {
+            let mut timing = crate::NativePreparationTiming::new();
+            timing.set_heights(38_789, 3_528_090);
+            timing.enter(PreparationPhase::ZcashProposal);
+            timing.finish_error(&MinerError::ParentProposalRejected {
+                endpoint: secret.into(),
+                reason: secret.into(),
+            });
+            // Abandoned attempts and fast successful attempts emit no event.
+            let _abandoned = crate::NativePreparationTiming::new();
+            crate::NativePreparationTiming::new().finish_ok();
+        });
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].to_string().contains("PRIVATE_"));
+        assert_eq!(rows[0]["stage"], "job_preparation_result");
+        assert_eq!(rows[0]["result"], "proposal_rejected");
+        assert_eq!(rows[0]["level"], "WARN");
+        assert_eq!(rows[0]["preparation"]["outcome"], "failed");
+        assert_eq!(rows[0]["preparation"]["finished_phase"], "zcash_proposal");
+        assert_eq!(
+            rows[0]["preparation"]["phase_ms"]
+                .as_object()
+                .unwrap()
+                .len(),
+            PHASE_COUNT
+        );
+        assert_eq!(
+            rows[0]["preparation"]["asserts_winner_submission_latency"],
+            false
+        );
+        assert!(rows[0]["winner"].is_null());
+    }
+
+    #[test]
+    fn maximum_preparation_report_is_bounded_and_separate_from_sink_lag() {
+        let now = Instant::now();
+        let mut report = preparation_fixture();
+        report.elapsed_ms = u64::MAX;
+        report.phases_ms = [u64::MAX; PHASE_COUNT];
+        report.wcash_height = Some(u32::MAX);
+        report.zcash_height = Some(u32::MAX);
+        let mut event = preparation_event(report);
+        event.queued_at = now;
+        let mut output = Vec::new();
+        Reporter::new(now)
+            .record(
+                &mut output,
+                event,
+                now + Duration::from_millis(80),
+                u64::MAX,
+            )
+            .unwrap();
+        assert!(output.len() < 4096);
+        assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let row: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(row["preparation"]["elapsed_ms"], u64::MAX);
+        assert_eq!(row["diagnostic_queue_wait_ms"], 80);
+        assert!(row["timing"].is_null());
+    }
 
     fn timing_fixture(now: Instant) -> ZecWinnerAttempt {
         ZecWinnerAttempt {

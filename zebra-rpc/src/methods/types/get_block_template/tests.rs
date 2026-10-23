@@ -1,5 +1,7 @@
 //! Tests for types and functions for the `getblocktemplate` RPC.
 
+mod auxiliary_cache_tests;
+
 use anyhow::anyhow;
 use std::{
     iter,
