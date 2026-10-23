@@ -1,5 +1,6 @@
 //! Types and functions for the `getblocktemplate` RPC.
 
+mod auxiliary_precompute;
 pub mod constants;
 mod gossip_log;
 pub mod parameters;
@@ -735,6 +736,21 @@ pub(crate) struct CoinbaseCache(
     Arc<Mutex<HashMap<(block::Height, Amount<NonNegative>), Arc<CoinbaseCacheEntry>>>>,
 );
 
+#[derive(Clone)]
+pub(super) struct WeakCoinbaseCache(
+    std::sync::Weak<Mutex<HashMap<(block::Height, Amount<NonNegative>), Arc<CoinbaseCacheEntry>>>>,
+);
+
+impl WeakCoinbaseCache {
+    fn upgrade(&self) -> Option<CoinbaseCache> {
+        self.0.upgrade().map(CoinbaseCache)
+    }
+
+    fn ptr_eq(&self, cache: &CoinbaseCache) -> bool {
+        self.0.ptr_eq(&Arc::downgrade(&cache.0))
+    }
+}
+
 struct CoinbaseCacheEntry {
     state: Mutex<CoinbaseCacheState>,
     ready: Condvar,
@@ -763,7 +779,12 @@ impl CoinbaseCacheEntry {
 }
 
 impl CoinbaseCache {
+    fn downgrade(&self) -> WeakCoinbaseCache {
+        WeakCoinbaseCache(Arc::downgrade(&self.0))
+    }
+
     /// Returns the cached coinbase transaction if it was built for `height` and `fee`.
+    #[cfg(test)]
     fn get(
         &self,
         height: block::Height,
@@ -822,6 +843,20 @@ impl CoinbaseCache {
         fee: Amount<NonNegative>,
         build: impl FnOnce() -> TransactionTemplate<amount::NegativeOrZero>,
     ) -> TransactionTemplate<amount::NegativeOrZero> {
+        match self.try_get_or_build(height, fee, || Ok::<_, std::convert::Infallible>(build())) {
+            Ok(coinbase) => coinbase,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Shares proof work with fallible callers, including ZIP-317 sizing and prewarming.
+    /// Failed builders wake waiters without caching the error or changing its type.
+    pub(crate) fn try_get_or_build<E>(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+        build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, E>,
+    ) -> Result<TransactionTemplate<amount::NegativeOrZero>, E> {
         let (entry, is_builder) = {
             let mut map = self
                 .0
@@ -840,28 +875,7 @@ impl CoinbaseCache {
         };
 
         if is_builder {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
-                Ok(coinbase) => {
-                    let mut state = entry
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    *state = CoinbaseCacheState::Ready(coinbase.clone());
-                    entry.ready.notify_all();
-                    return coinbase;
-                }
-                Err(payload) => {
-                    let mut state = entry
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    *state = CoinbaseCacheState::Failed;
-                    entry.ready.notify_all();
-                    drop(state);
-                    self.remove_entry_if_same(height, fee, &entry);
-                    std::panic::resume_unwind(payload);
-                }
-            }
+            return self.build_entry(height, fee, &entry, build);
         }
 
         let mut state = entry
@@ -870,7 +884,7 @@ impl CoinbaseCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
             match &*state {
-                CoinbaseCacheState::Ready(coinbase) => return coinbase.clone(),
+                CoinbaseCacheState::Ready(coinbase) => return Ok(coinbase.clone()),
                 CoinbaseCacheState::Building => {
                     state = entry
                         .ready
@@ -880,9 +894,81 @@ impl CoinbaseCache {
                 CoinbaseCacheState::Failed => {
                     drop(state);
                     self.remove_entry_if_same(height, fee, &entry);
-                    return self.get_or_build(height, fee, build);
+                    return self.try_get_or_build(height, fee, build);
                 }
             }
+        }
+    }
+
+    /// Claims missing background work without evicting any foreground proof.
+    /// A stale lookahead request must not prune the current height after a reorg.
+    /// Existing builders and full caches are skipped; foreground callers still
+    /// join a background entry through `try_get_or_build`.
+    pub(crate) fn try_prewarm<E>(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+        build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, E>,
+    ) -> Result<Option<TransactionTemplate<amount::NegativeOrZero>>, E> {
+        let entry = {
+            let mut map = self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if map.contains_key(&(height, fee)) {
+                return Ok(None);
+            }
+            let fee_entries = map
+                .keys()
+                .filter(|(entry_height, _)| *entry_height == height)
+                .count();
+            if fee_entries >= MAX_COINBASE_FEE_ENTRIES_PER_HEIGHT {
+                return Ok(None);
+            }
+            if fee_entries == 0 {
+                let heights = map
+                    .keys()
+                    .map(|(height, _)| *height)
+                    .collect::<std::collections::HashSet<_>>();
+                if heights.len() >= 3 {
+                    return Ok(None);
+                }
+            }
+            let entry = Arc::new(CoinbaseCacheEntry::building());
+            map.insert((height, fee), Arc::clone(&entry));
+            entry
+        };
+        self.build_entry(height, fee, &entry, build).map(Some)
+    }
+
+    fn build_entry<E>(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+        entry: &Arc<CoinbaseCacheEntry>,
+        build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, E>,
+    ) -> Result<TransactionTemplate<amount::NegativeOrZero>, E> {
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
+        if let Ok(Ok(coinbase)) = &built {
+            let mut state = entry
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *state = CoinbaseCacheState::Ready(coinbase.clone());
+            entry.ready.notify_all();
+        } else {
+            let mut state = entry
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *state = CoinbaseCacheState::Failed;
+            entry.ready.notify_all();
+            drop(state);
+            self.remove_entry_if_same(height, fee, entry);
+        }
+        match built {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
         }
     }
 
@@ -909,12 +995,13 @@ impl CoinbaseCache {
 /// Bound both insertion paths so persistent recipient caches cannot grow with
 /// mempool fee churn. Preserve zero-fee work; an evicted builder/waiter keeps
 /// owning its entry Arc and is never redirected to another key's coinbase.
+const MAX_COINBASE_FEE_ENTRIES_PER_HEIGHT: usize = 4;
+
 fn bound_coinbase_fee_entries(
     map: &mut HashMap<(block::Height, Amount<NonNegative>), Arc<CoinbaseCacheEntry>>,
     height: block::Height,
     fee: Amount<NonNegative>,
 ) {
-    const MAX_FEE_ENTRIES_PER_HEIGHT: usize = 4;
     if map.contains_key(&(height, fee)) {
         return;
     }
@@ -922,7 +1009,7 @@ fn bound_coinbase_fee_entries(
         .keys()
         .filter(|(entry_height, _)| *entry_height == height)
         .count();
-    if entries >= MAX_FEE_ENTRIES_PER_HEIGHT {
+    if entries >= MAX_COINBASE_FEE_ENTRIES_PER_HEIGHT {
         let evict = map.keys().copied().find(|&(entry_height, entry_fee)| {
             entry_height == height && entry_fee != Amount::<NonNegative>::zero()
         });
@@ -1031,6 +1118,9 @@ where
     /// The configured payout's normal precompute/cache path remains separate.
     auxiliary_coinbase_caches: AuxiliaryCoinbaseCaches,
 
+    /// Optional, bounded next-height proof work for alternate auxiliary recipients.
+    auxiliary_precomputer: auxiliary_precompute::AuxiliaryPrecomputer,
+
     /// A block template for the current chain tip, kept up to date by the task spawned by
     /// `RpcImpl::spawn_block_template_updater()`, so `getblocktemplate` can answer without reading
     /// the state and the mempool.
@@ -1068,6 +1158,7 @@ where
             duplicate_gossip_admission: Arc::new(Mutex::new(None)),
             coinbase_cache: CoinbaseCache::default(),
             auxiliary_coinbase_caches: AuxiliaryCoinbaseCaches::default(),
+            auxiliary_precomputer: auxiliary_precompute::AuxiliaryPrecomputer::default(),
             template_cache: Some(precompute::TemplateCache::default()),
         }
     }
@@ -1110,6 +1201,24 @@ where
     /// Returns a handle to the coinbase transaction cache.
     pub(crate) fn coinbase_cache(&self) -> CoinbaseCache {
         self.coinbase_cache.clone()
+    }
+
+    /// Schedules optional next-height proof work only after an auxiliary candidate is published.
+    pub(crate) fn prewarm_auxiliary_coinbase(
+        &self,
+        network: &Network,
+        height: block::Height,
+        fees: Amount<NonNegative>,
+    ) {
+        if let Ok(Some(params)) = self.miner_params() {
+            self.auxiliary_precomputer.register(
+                network,
+                params,
+                self.coinbase_cache.clone(),
+                height,
+                fees,
+            );
+        }
     }
 
     /// Returns a handle to the precomputed block template, unless this handler's miner parameters

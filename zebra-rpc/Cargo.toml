@@ -77,6 +77,7 @@ strum_macros = { workspace = true }
 # RPC endpoint basic auth
 base64 = { workspace = true }
 rand = { workspace = true }
+rayon = { workspace = true }
 # Constant-time cookie comparison to prevent a timing oracle on RPC auth.
 subtle = { workspace = true }
 

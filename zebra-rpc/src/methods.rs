@@ -3611,6 +3611,15 @@ where
         }
         self.wcash_aux_blocks.publish(candidate_lease);
 
+        // The current candidate is already complete and published. Record only bounded optional
+        // next-height work for the caller-selected cache; this never builds or leases a candidate.
+        // Configured recipients retain their existing, separate precompute path.
+        if !uses_configured_payout {
+            candidate_rpc
+                .gbt
+                .prewarm_auxiliary_coinbase(&self.network, height, tx_fees);
+        }
+
         Ok(CreateAuxBlockResponse::new(
             (hash, RetireToken::new(candidate_lease.retire_token())),
             candidate_data,
