@@ -1,0 +1,9 @@
+project: zebra-rpc
+kind: Changed
+body: >-
+  Allow Wcash Mainnet mining work after genesis on a quiet chain when the sync
+  service reports close to tip and two distinct external full-node IPs have
+  responded recently. Recheck readiness before returning cached templates or
+  publishing createauxblock candidates, without treating timestamp-based height
+  estimates as observed missing blocks.
+time: 2026-10-23T00:00:00.000000000Z

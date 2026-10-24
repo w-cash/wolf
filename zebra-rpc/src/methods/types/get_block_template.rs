@@ -3,6 +3,8 @@
 mod auxiliary_precompute;
 pub mod constants;
 mod gossip_log;
+mod wcash_template_sync;
+pub(crate) use wcash_template_sync::check_synced_to_tip_for_template;
 pub mod parameters;
 pub(crate) mod precompute;
 pub mod proposal;
@@ -1471,10 +1473,9 @@ where
     }
 
     // A new Wcash mainnet has no existing peers or post-genesis blocks to prove
-    // that it is close to the tip. Permit exactly the first template after the
-    // locally verified genesis block. Once block 1 is committed, its current
-    // timestamp lets the normal stale-tip and sync-status checks protect every
-    // later template, including after restarts or network partitions.
+    // that it is close to the tip. Permit the first template after the locally
+    // verified genesis block. Post-genesis Wcash template admission uses the
+    // peer-aware wrapper; proposal callers retain the checks below.
     if network.is_wcash_mainnet() && latest_chain_tip.best_tip_height() == Some(block::Height(0)) {
         return Ok(());
     }

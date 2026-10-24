@@ -1111,9 +1111,22 @@ where
                 self.read_state.clone(),
                 self.latest_chain_tip.clone(),
                 self.gbt.sync_status(),
+                self.address_book.clone(),
             )
             .in_current_span(),
         ))
+    }
+
+    fn check_wcash_template_readiness(&self) -> Result<()> {
+        if !self.network.is_wcash_mainnet() {
+            return Ok(());
+        }
+        types::get_block_template::check_synced_to_tip_for_template(
+            &self.network,
+            self.latest_chain_tip.clone(),
+            self.gbt.sync_status(),
+            &self.address_book,
+        )
     }
 
     /// Returns the block template that [`Self::spawn_block_template_updater()`] keeps precomputed,
@@ -1192,6 +1205,7 @@ where
                         )?;
                 }
 
+                self.check_wcash_template_readiness()?;
                 return Ok(Some(template));
             }
 
@@ -1229,6 +1243,7 @@ where
                     let mut template = (*template).clone();
                     template.submit_old = Some(false);
 
+                    self.check_wcash_template_readiness()?;
                     return Ok(Some(template));
                 }
             }
@@ -2897,8 +2912,9 @@ where
         parameters: Option<GetBlockTemplateParameters>,
     ) -> Result<GetBlockTemplateResponse> {
         use types::get_block_template::{
-            check_parameters, check_synced_to_tip, fetch_chain_info, fetch_mempool_transactions,
-            validate_block_proposal, zip317::select_mempool_transactions,
+            check_parameters, check_synced_to_tip_for_template, fetch_chain_info,
+            fetch_mempool_transactions, validate_block_proposal,
+            zip317::select_mempool_transactions,
         };
 
         // Validate extensions before proposal dispatch so `wcashaux` can never
@@ -2947,7 +2963,12 @@ where
         //
         // Serve the template that the block template updater task keeps ready, as long as it
         // extends the current chain tip.
-        check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
+        check_synced_to_tip_for_template(
+            &self.network,
+            latest_chain_tip.clone(),
+            sync_status.clone(),
+            &self.address_book,
+        )?;
 
         if let Some(template) = self
             .precomputed_block_template(client_long_poll_id, wcash_aux)
@@ -2967,7 +2988,12 @@ where
             //
             // Optional TODO:
             // - add `async changed()` method to ChainSyncStatus (like `ChainTip`)
-            check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
+            check_synced_to_tip_for_template(
+                &self.network,
+                latest_chain_tip.clone(),
+                sync_status.clone(),
+                &self.address_book,
+            )?;
             // TODO: return an error if we have no peers, like `zcashd` does,
             //       and add a developer config that mines regardless of how many peers we have.
             // https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880
@@ -3193,6 +3219,7 @@ where
             "invalid wcashaux parent-template request",
         )?;
 
+        self.check_wcash_template_readiness()?;
         Ok(response.into())
     }
 
@@ -3582,6 +3609,7 @@ where
                 None,
             ));
         }
+        self.check_wcash_template_readiness()?;
         let candidate_lease = self
             .wcash_aux_blocks
             .insert(Arc::clone(&candidate))
