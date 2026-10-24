@@ -1,0 +1,4 @@
+project: zebrad
+kind: Changed
+body: "Discover Wcash Mainnet peers through node.wcash.net, node.wcash.io, and node.wcash.space on port 48233 when no peer override is configured; document DNS and public peer verification before release."
+time: 2026-10-23T17:52:31+01:00

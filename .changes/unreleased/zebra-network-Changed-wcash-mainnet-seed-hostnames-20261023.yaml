@@ -1,0 +1,4 @@
+project: zebra-network
+kind: Changed
+body: "Replace Wcash Mainnet bootstrap IPs and the former seed hostname with node.wcash.net, node.wcash.io, and node.wcash.space on port 48233; preserve explicit peer overrides and other network defaults."
+time: 2026-10-23T17:52:31+01:00
