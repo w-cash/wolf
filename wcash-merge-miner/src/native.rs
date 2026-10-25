@@ -722,7 +722,17 @@ impl NativeZcashProvider {
 
             // The exact response text is advisory; authoritative acceptance is
             // proved below by querying the block hash at this height.
-            let _ = node.call_value("submitblock", json!([raw_hex]))?;
+            let duplicate_admission_limited = match node.call_value("submitblock", json!([raw_hex])) {
+                // A P2P commit can race this relay. Only this known admission
+                // reply can defer to the authoritative canonical checks below.
+                Err(MinerError::RpcError {
+                    code: Some(-32603),
+                    message,
+                    ..
+                }) if message == "duplicate gossip admission limited; retry the same submission after one second" => true,
+                Err(error) => return Err(error),
+                Ok(_) => false,
+            };
             let mut accepted = false;
             for _ in 0..20 {
                 match node.call::<String>("getblockhash", json!([height])) {
@@ -736,6 +746,20 @@ impl NativeZcashProvider {
                     }
                     Err(MinerError::RpcError { code: Some(-1), .. }) => {
                         thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(MinerError::RpcError {
+                        code: Some(code),
+                        message,
+                        ..
+                    }) if duplicate_admission_limited
+                        && matches!(
+                            (code, message.as_str()),
+                            (-8, "Block not found")
+                                | (-32602, "Provided index is greater than the current tip")
+                        ) =>
+                    {
+                        let actual = native_chain_tip_on_node(node)?;
+                        return Err(parent_tip_mismatch(observer_tip, node, actual));
                     }
                     Err(error) => return Err(error),
                 }

@@ -160,6 +160,17 @@ An ahead work node or a deeper fork is not forced backward. The optimization
 does not remove ordinary block-rollover races or guarantee immediate convergence
 when the recipient legitimately prefers another branch.
 
+Forward catch-up applies the same authoritative canonical-height check when
+`submitblock` returns the specific duplicate-gossip admission throttle. A peer
+can commit the exact block between the initial tip read and the relay request;
+another announcement being rate-limited does not undo that commit. The backend
+continues only after the expected hash is canonical at each relayed height and
+the recipient reaches the sampled observer tip. An unconverged throttle remains
+a bounded preparation retry, including the node's exact missing-height replies
+after that throttle; other RPC errors keep their existing handling. Only this
+missing-height error path adds a recipient tip read. Healthy preparation and
+winner delivery gain no polling, delay, logging or synchronization.
+
 ## Independent report
 
 `scripts/zec-winner-tracking.py export --deployment UUID` reads the existing
