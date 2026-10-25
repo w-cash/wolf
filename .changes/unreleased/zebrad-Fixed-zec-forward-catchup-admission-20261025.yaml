@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Native merged-mining forward Zcash catch-up checks exact canonical convergence after a duplicate-gossip admission throttle instead of terminating the backend; unrelated RPC failures remain errors."
+time: 2026-10-25T10:36:30.000000000Z

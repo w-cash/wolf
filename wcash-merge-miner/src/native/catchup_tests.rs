@@ -20,6 +20,8 @@ struct FixtureState {
     retain_submission_unknown: bool,
     submission_reply: Value,
     submission_error: Option<Value>,
+    submission_canonical_override: Option<String>,
+    missing_height_error: Option<Value>,
     raw_override: Option<String>,
     tip_reads: usize,
     change_tip_on_read: Option<(usize, NativeChainTip)>,
@@ -53,6 +55,8 @@ impl FixtureState {
             retain_submission_unknown: false,
             submission_reply: Value::Null,
             submission_error: None,
+            submission_canonical_override: None,
+            missing_height_error: None,
             raw_override: None,
             tip_reads: 0,
             change_tip_on_read: None,
@@ -88,7 +92,11 @@ impl FixtureState {
                 .canonical
                 .get(&u32::try_from(params[0].as_u64().expect("height")).unwrap())
                 .map(|hash| json!(hash))
-                .ok_or_else(|| json!({"code": -1, "message": "height unavailable"})),
+                .ok_or_else(|| {
+                    self.missing_height_error
+                        .clone()
+                        .unwrap_or_else(|| json!({"code": -1, "message": "height unavailable"}))
+                }),
             "getblockstatus" => {
                 let hash = params[0].as_str().expect("exact block hash");
                 Ok(match self.membership.get(hash) {
@@ -141,7 +149,10 @@ impl FixtureState {
                 if self.accept_submission {
                     self.membership
                         .insert(hash.clone(), ParentCommittedMembership::BestChain);
-                    self.canonical.insert(1, hash);
+                    self.canonical.insert(
+                        1,
+                        self.submission_canonical_override.clone().unwrap_or(hash),
+                    );
                     self.tip = NativeChainTip {
                         block_hash_le: self.observed.hash().0,
                         height: 1,
@@ -351,6 +362,175 @@ fn catchup_lower_tip_still_receives_exact_public_block() {
     let state = node.state.lock().unwrap();
     assert_eq!(state.submissions(), 1);
     assert_eq!(state.tip, observer.state.lock().unwrap().tip);
+}
+
+fn duplicate_gossip_admission_error() -> Value {
+    json!({
+        "code": -32603,
+        "message": "duplicate gossip admission limited; retry the same submission after one second",
+    })
+}
+
+#[test]
+fn catchup_forward_duplicate_admission_error_after_commit_uses_canonical_convergence() {
+    let observer = observer_fixture();
+    let mut state = FixtureState::new(public_block(0), 0);
+    state.submission_error = Some(duplicate_gossip_admission_error());
+    let node = FixtureRpc::new(state);
+    let provider = fixture_provider();
+
+    relay(&provider, &observer, &node).unwrap();
+
+    let state = node.state.lock().unwrap();
+    let expected_tip = observer.state.lock().unwrap().tip;
+    assert_eq!(state.submissions(), 1);
+    assert_eq!(state.tip, expected_tip);
+    assert_eq!(state.canonical[&1], display_hex(expected_tip.block_hash_le));
+    assert!(state
+        .requests
+        .iter()
+        .any(|request| { request["method"] == "getblockhash" && request["params"][0] == 1 }));
+    assert_eq!(observer.state.lock().unwrap().raw_block_reads(), 1);
+    assert!(provider
+        .observed_parent_redelivery
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn catchup_forward_duplicate_admission_without_convergence_stays_retryable() {
+    for missing_height_error in [
+        None,
+        Some(json!({
+            "code": -32602,
+            "message": "Provided index is greater than the current tip",
+        })),
+        Some(json!({"code": -8, "message": "Block not found"})),
+    ] {
+        let observer = observer_fixture();
+        let mut state = FixtureState::new(public_block(0), 0);
+        state.accept_submission = false;
+        state.retain_submission_unknown = true;
+        state.submission_error = Some(duplicate_gossip_admission_error());
+        state.missing_height_error = missing_height_error;
+        let original_tip = state.tip;
+        let node = FixtureRpc::new(state);
+        let provider = fixture_provider();
+
+        assert!(matches!(
+            relay(&provider, &observer, &node),
+            Err(MinerError::ParentTipMismatch { .. })
+        ));
+
+        let state = node.state.lock().unwrap();
+        assert_eq!(state.submissions(), 1);
+        assert_eq!(state.tip, original_tip);
+        assert!(!state.canonical.contains_key(&1));
+        assert_eq!(observer.state.lock().unwrap().raw_block_reads(), 1);
+        assert!(provider
+            .observed_parent_redelivery
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[test]
+fn catchup_forward_duplicate_admission_does_not_hide_unrelated_height_lookup_errors() {
+    for code in [-32602, -8] {
+        let observer = observer_fixture();
+        let mut state = FixtureState::new(public_block(0), 0);
+        state.accept_submission = false;
+        state.retain_submission_unknown = true;
+        state.submission_error = Some(duplicate_gossip_admission_error());
+        state.missing_height_error = Some(json!({
+            "code": code, "message": "fixture unrelated height lookup failure",
+        }));
+        let node = FixtureRpc::new(state);
+        let provider = fixture_provider();
+
+        let error = relay(&provider, &observer, &node).unwrap_err();
+        assert!(matches!(
+            error,
+            MinerError::RpcError {
+                code: Some(actual_code),
+                message,
+                ..
+            } if actual_code == code && message == "fixture unrelated height lookup failure"
+        ));
+        assert_eq!(node.state.lock().unwrap().submissions(), 1);
+        assert!(provider
+            .observed_parent_redelivery
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[test]
+fn catchup_forward_duplicate_admission_never_overrides_a_different_canonical_hash() {
+    let observer = observer_fixture();
+    let mut state = FixtureState::new(public_block(0), 0);
+    state.submission_error = Some(duplicate_gossip_admission_error());
+    // Model different authoritative samples during a node-side chain change:
+    // matching final tip data must not override a conflicting height lookup.
+    let conflicting_hash = display_hex(competing_fixture_block(false).hash().0);
+    state.submission_canonical_override = Some(conflicting_hash.clone());
+    let node = FixtureRpc::new(state);
+    let provider = fixture_provider();
+
+    assert!(matches!(
+        relay(&provider, &observer, &node),
+        Err(MinerError::ParentTipMismatch { .. })
+    ));
+
+    let state = node.state.lock().unwrap();
+    assert_eq!(state.submissions(), 1);
+    assert_eq!(state.tip, observer.state.lock().unwrap().tip);
+    assert_eq!(state.canonical[&1], conflicting_hash);
+    assert!(provider
+        .observed_parent_redelivery
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn catchup_forward_unrelated_rpc_errors_stay_visible_despite_commit() {
+    for (code, message) in [
+        (-22, "fixture hard block rejection"),
+        (-32603, "fixture unrelated internal failure"),
+        (
+            -22,
+            "duplicate gossip admission limited; retry the same submission after one second",
+        ),
+    ] {
+        let observer = observer_fixture();
+        let mut state = FixtureState::new(public_block(0), 0);
+        state.submission_error = Some(json!({"code": code, "message": message}));
+        let node = FixtureRpc::new(state);
+        let provider = fixture_provider();
+
+        let error = relay(&provider, &observer, &node).unwrap_err();
+        assert!(matches!(
+            error,
+            MinerError::RpcError {
+                code: Some(actual_code),
+                message: actual_message,
+                ..
+            } if actual_code == code && actual_message == message
+        ));
+
+        let state = node.state.lock().unwrap();
+        assert_eq!(state.submissions(), 1);
+        assert_eq!(state.tip, observer.state.lock().unwrap().tip);
+        assert!(provider
+            .observed_parent_redelivery
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
 }
 
 #[test]
