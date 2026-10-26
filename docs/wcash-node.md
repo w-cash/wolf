@@ -127,22 +127,8 @@ The three `node.wcash.*` names extend the existing four entries. These entries
 are bootstrap configuration, not a guarantee of availability or
 independent operators. Do not substitute Zcash seeds or copy a Zcash peer cache.
 
-The node resolves these ordinary DNS hostnames through A/AAAA records; port
-`48233` comes from the peer entry. A dedicated DNS-seeder service or SRV record
-is not required. Select `network = "WcashMainnet"` and omit
-`initial_mainnet_peers` to use the built-in set. An explicit custom list or an
-explicit empty list remains authoritative. The bare Wcash build still defaults
-to Testnet; publishing DNS records does not change network selection.
-
-Before relying on the three new hostname entries, publish their DNS records,
-verify that their addresses accept public TCP connections on `48233`,
-and complete an external Wcash Mainnet handshake and canonical block retrieval.
-Use ordinary DNS records pointing to full nodes, rather than website redirects
-or an HTTP proxy. Publish an AAAA record only after verifying IPv6 P2P serving.
-For resilience, use independently hosted, synchronized nodes on different IPs.
-Multiple names pointing to one server remain a single server failure point.
-Existing builds need a peer-list override or an updated release to learn these
-new names; explicitly configured peer lists are not replaced during an upgrade.
+An explicit custom or empty `initial_mainnet_peers` list remains authoritative;
+the added defaults do not replace it.
 
 JSON-RPC is available only to local clients and requires a cookie. No indexer,
 lightwalletd gRPC, metrics, or health listener is enabled here. In particular,
