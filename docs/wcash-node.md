@@ -113,10 +113,22 @@ Budget disk space and investigate errors before removing any state.
 
 This configuration accepts P2P connections only on loopback, while still making
 outbound connections to Wcash peers. Omitting `initial_mainnet_peers` selects the
-built-in Wcash bootstrap set, currently `node.w.cash:48233` and three IP endpoints
-listed in [`zebra-network/src/config.rs`](../zebra-network/src/config.rs).
-Those entries are bootstrap configuration, not a guarantee of availability or
+built-in Wcash Mainnet bootstrap set:
+
+- `node.w.cash:48233`
+- `187.124.113.200:48233`
+- `2.24.93.205:48233`
+- `5.183.8.145:48233`
+- `node.wcash.net:48233`
+- `node.wcash.io:48233`
+- `node.wcash.space:48233`
+
+The three `node.wcash.*` names extend the existing four entries. These entries
+are bootstrap configuration, not a guarantee of availability or
 independent operators. Do not substitute Zcash seeds or copy a Zcash peer cache.
+
+An explicit custom or empty `initial_mainnet_peers` list remains authoritative;
+the added defaults do not replace it.
 
 JSON-RPC is available only to local clients and requires a cookie. No indexer,
 lightwalletd gRPC, metrics, or health listener is enabled here. In particular,

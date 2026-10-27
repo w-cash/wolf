@@ -1,0 +1,4 @@
+project: zebra-network
+kind: Changed
+body: "Add node.wcash.net, node.wcash.io, and node.wcash.space on port 48233 to the four existing Wcash Mainnet bootstrap peers; preserve explicit peer overrides and other network defaults."
+time: 2026-10-23T17:52:31+01:00
