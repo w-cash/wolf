@@ -1455,6 +1455,7 @@ where
 // - State and syncer checks
 
 /// Returns an error if Zebra is not synced to the consensus chain tip.
+/// Wcash Mainnet uses peer synchronization rather than tip age after genesis.
 /// Returns early with `Ok(())` if Proof-of-Work is disabled on the provided `network`.
 /// This error might be incorrect if the local clock is skewed.
 pub fn check_synced_to_tip<Tip, SyncStatus>(
@@ -1472,9 +1473,8 @@ where
 
     // A new Wcash mainnet has no existing peers or post-genesis blocks to prove
     // that it is close to the tip. Permit exactly the first template after the
-    // locally verified genesis block. Once block 1 is committed, its current
-    // timestamp lets the normal stale-tip and sync-status checks protect every
-    // later template, including after restarts or network partitions.
+    // locally verified genesis block. Later templates require a committed tip
+    // and completed peer synchronization.
     if network.is_wcash_mainnet() && latest_chain_tip.best_tip_height() == Some(block::Height(0)) {
         return Ok(());
     }
@@ -1485,8 +1485,14 @@ where
         .estimate_distance_to_network_chain_tip(network)
         .ok_or_misc_error("no chain tip available yet")?;
 
+    // A synchronized Wcash chain can remain quiet for hours. Treating its old
+    // timestamp as missing blocks stops the miners needed to advance it. Keep
+    // the committed-tip and peer-sync checks, and retain Zcash's age limit.
+    let wcash_mainnet = network.is_wcash_mainnet();
     if !sync_status.is_close_to_tip()
-        || estimated_distance_to_chain_tip > MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP
+        || (wcash_mainnet && latest_chain_tip.best_tip_height_and_hash().is_none())
+        || (!wcash_mainnet
+            && estimated_distance_to_chain_tip > MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP)
     {
         tracing::info!(
             ?estimated_distance_to_chain_tip,

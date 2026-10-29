@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: Fixed
+body: Allow Wcash Mainnet mining templates after a quiet-chain interval when a committed tip and completed peer synchronization are available, preserving Zcash's stale-tip limit.
+time: 2026-10-29T22:13:40.000000000Z
