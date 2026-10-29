@@ -114,8 +114,8 @@ async fn committed_duplicate_gossip_admission_is_global_and_retryable() {
 
 /// A clean Wcash network must be able to serve its first mining template after
 /// locally committing genesis, even before project-owned seed peers exist.
-/// Mainnet receives this exception only at height zero; its stale-tip protection
-/// is restored as soon as block one is committed.
+/// Mainnet receives this exception only at height zero; peer synchronization
+/// is required as soon as block one is committed.
 #[test]
 fn wcash_networks_allow_safe_genesis_mining_bootstrap() {
     assert!(check_synced_to_tip(
@@ -146,6 +146,53 @@ fn wcash_networks_allow_safe_genesis_mining_bootstrap() {
         MockSyncStatus::default(),
     )
     .is_err());
+}
+
+#[test]
+fn quiet_wcash_templates_require_a_committed_tip_and_peer_sync() {
+    let network = Network::new_wcash_mainnet_for_tests();
+    let (tip, sender) = MockChainTip::new();
+    sender.send_best_tip_height(Height(44_962));
+    sender.send_best_tip_hash(block::Hash([7; 32]));
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+
+    for distance in [0, 100, 101, 10_000] {
+        sender.send_estimated_distance_to_network_chain_tip(Some(distance));
+        assert!(check_synced_to_tip(&network, tip.clone(), sync.clone()).is_ok());
+    }
+
+    sync.set_is_close_to_tip(false);
+    for distance in [0, 101] {
+        sender.send_estimated_distance_to_network_chain_tip(Some(distance));
+        assert!(check_synced_to_tip(&network, tip.clone(), sync.clone()).is_err());
+    }
+
+    sync.set_is_close_to_tip(true);
+    assert!(check_synced_to_tip(&network, NoChainTip, sync.clone()).is_err());
+
+    let (incomplete_tip, incomplete_sender) = MockChainTip::new();
+    incomplete_sender.send_best_tip_height(Height(44_962));
+    incomplete_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    assert!(check_synced_to_tip(&network, incomplete_tip, sync).is_err());
+}
+
+#[test]
+fn zcash_template_sync_retains_clock_age_boundary() {
+    let (tip, sender) = MockChainTip::new();
+    sender.send_best_tip_height(Height(3_535_164));
+    sender.send_best_tip_hash(block::Hash([8; 32]));
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+
+    sender.send_estimated_distance_to_network_chain_tip(Some(100));
+    assert!(check_synced_to_tip(&Network::Mainnet, tip.clone(), sync.clone()).is_ok());
+    sender.send_estimated_distance_to_network_chain_tip(Some(101));
+    assert!(check_synced_to_tip(&Network::Mainnet, tip.clone(), sync.clone()).is_err());
+
+    sync.set_is_close_to_tip(false);
+    sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    assert!(check_synced_to_tip(&Network::Mainnet, tip, sync).is_err());
 }
 
 #[tokio::test]
