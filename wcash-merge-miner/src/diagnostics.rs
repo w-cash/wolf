@@ -130,6 +130,32 @@ pub(crate) fn note_zec_winner_committed(
     }
 }
 
+pub(crate) fn late_zcash_candidate(
+    job: &wcash_pool_protocol::JobDescriptor,
+    hash: &Hex32,
+    event_seq: u64,
+    result: &'static str,
+) {
+    let winner = Winner {
+        chain: "Zcash",
+        hash_le: *hash.as_bytes(),
+        height: job.zcash_height,
+        job: *job.job_id.as_bytes(),
+        // Zero explicitly identifies a failure before any durable receipt exists.
+        event_seq,
+    };
+    let mut event = Event::new(Some(winner), "late_zcash_winner_result", result);
+    event.warning = result != "durably_committed";
+    event.noisy = false;
+    record(event);
+}
+
+pub(crate) fn late_zcash_context_retired(reason: &'static str) {
+    let mut event = Event::new(None, "late_zcash_context_retired", reason);
+    event.warning = reason == "capacity";
+    record(event);
+}
+
 /// Same-process timings start after durability, never at hardware discovery.
 #[derive(Clone)]
 pub(crate) struct ZecWinnerAttempt {

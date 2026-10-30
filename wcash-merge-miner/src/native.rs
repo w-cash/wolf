@@ -1703,6 +1703,75 @@ pub struct NativePreparedJob {
     parent_reward_zatoshis: u64,
 }
 
+/// Detached, proposal-validated Zcash bytes; owns no RPC client or Wcash candidate lease.
+#[derive(Clone)]
+pub(crate) struct NativeZcashWinnerSnapshot {
+    header_input: [u8; HEADER_INPUT_BYTES],
+    target: Target,
+    parent_proposal: Block,
+    proposal_bytes: usize,
+}
+
+impl NativeZcashWinnerSnapshot {
+    #[cfg(test)]
+    pub(crate) fn from_verified_test_block(bytes: &[u8]) -> Self {
+        let parent_proposal: Block = bytes.zcash_deserialize_into().unwrap();
+        let expanded: zebra_chain::work::difficulty::U256 = parent_proposal
+            .header
+            .difficulty_threshold
+            .to_expanded()
+            .unwrap()
+            .into();
+        let target = Target::from_le_bytes(expanded.to_little_endian()).unwrap();
+        wcash_zcash_aux::ParentHeader::decode(&bytes[..1487])
+            .unwrap()
+            .validate_work(target)
+            .unwrap();
+        Self {
+            header_input: bytes[..108].try_into().unwrap(),
+            target,
+            parent_proposal,
+            proposal_bytes: bytes.len(),
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.proposal_bytes
+    }
+
+    pub(crate) fn validate_winner(
+        &self,
+        time: [u8; 4],
+        nonce: &[u8; 32],
+        solution: &[u8; EQUIHASH_SOLUTION_BYTES],
+        share_target: Target,
+    ) -> Result<Vec<u8>, MinerError> {
+        if self.header_input[100..104] != time {
+            return Err(MinerError::SubmittedTimeMismatch);
+        }
+        let mut bytes = self.header_input.to_vec();
+        bytes.extend_from_slice(nonce);
+        bytes.extend_from_slice(&[0xfd, 0x40, 0x05]);
+        bytes.extend_from_slice(solution);
+        let header = wcash_zcash_aux::ParentHeader::decode(&bytes)?;
+        header.check_target(share_target)?;
+        // This is real Zcash-target Equihash validation, independent of Wcash.
+        header.validate_work(self.target)?;
+        let mut block = self.parent_proposal.clone();
+        let mut solved = block.header.as_ref().clone();
+        solved.nonce = (*nonce).into();
+        solved.solution = Solution::Common(*solution);
+        block.header = Arc::new(solved);
+        let bytes = block.zcash_serialize_to_vec()?;
+        if bytes.len() != self.proposal_bytes {
+            return Err(MinerError::InvalidParentTemplate(
+                "late Zcash winner changed its frozen proposal size".to_string(),
+            ));
+        }
+        Ok(bytes)
+    }
+}
+
 /// Strength of the Wcash coinbase-recipient check performed for one generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeWcashPayoutVerification {
@@ -1891,6 +1960,15 @@ impl NativeGenerationDescriptor {
 }
 
 impl NativePreparedJob {
+    pub(crate) fn zcash_winner_snapshot(&self) -> NativeZcashWinnerSnapshot {
+        NativeZcashWinnerSnapshot {
+            header_input: *self.job.parent_header_input(),
+            target: self.parent_target,
+            parent_proposal: self.parent_proposal.clone(),
+            proposal_bytes: self.proposal_bytes.len(),
+        }
+    }
+
     fn from_template(
         child_block_hash: [u8; 32],
         child_target: Target,

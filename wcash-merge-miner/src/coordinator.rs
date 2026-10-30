@@ -246,6 +246,7 @@ pub struct NativeMiningCoordinator {
     child_candidate_lease: ChildCandidateLease,
     candidate_created_at: Instant,
     freshness: Mutex<JobFreshness>,
+    pool_zcash_current: AtomicBool,
     outbox_retry: Arc<OutboxRetryState>,
     journal: Arc<ShareJournal>,
 }
@@ -745,6 +746,7 @@ impl NativeMiningSupervisor {
                 last_checked: Instant::now(),
                 replacement_requested: false,
             }),
+            pool_zcash_current: AtomicBool::new(true),
             outbox_retry: Arc::clone(&self.outbox_retry),
             journal,
         };
@@ -817,6 +819,10 @@ impl Drop for CandidatePreparationGuard<'_> {
 }
 
 impl NativeMiningCoordinator {
+    pub(crate) fn pool_zcash_current(&self) -> bool {
+        self.pool_zcash_current.load(Ordering::Acquire)
+    }
+
     /// Opens a one-shot supervisor and prepares one proposal-gated generation.
     pub fn prepare(
         config: CoordinatorConfig,
@@ -1002,7 +1008,7 @@ impl NativeMiningCoordinator {
         thread::scope(|scope| {
             let child = scope.spawn(|| self.check_child_tip());
             let parent = scope.spawn(|| self.zcash.assert_current(&self.job));
-            (
+            let results = (
                 child.join().unwrap_or_else(|_| {
                     Err(MinerError::InvalidParentTemplate(
                         "child tip-check worker panicked".to_string(),
@@ -1013,7 +1019,10 @@ impl NativeMiningCoordinator {
                         "parent tip-check worker panicked".to_string(),
                     ))
                 }),
-            )
+            );
+            self.pool_zcash_current
+                .store(results.1.is_ok(), Ordering::Release);
+            results
         })
     }
 

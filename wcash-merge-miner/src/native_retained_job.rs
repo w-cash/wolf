@@ -2,7 +2,10 @@
 
 use std::{
     fmt,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use wcash_pool_protocol::{Hex32, JobDescriptor, TargetLe};
@@ -13,7 +16,7 @@ use crate::{
     pool_backend::{job_descriptor_from_native, PoolBackendAdapterError},
     pool_backend_actor::{
         PoolBackendRetainedJob, PoolBackendShareRequest, PoolBackendShareValidationError,
-        PoolBackendValidatedShare,
+        PoolBackendValidatedShare, PoolBackendZcashWinnerSnapshot,
     },
     MinerError, EQUIHASH_SOLUTION_BYTES,
 };
@@ -35,16 +38,19 @@ pub struct NativePoolBackendRetainedJob {
     coordinator: NativeMiningCoordinator,
     descriptor: JobDescriptor,
     admission_healthy: AtomicBool,
+    zcash_winner_snapshot: Arc<crate::native::NativeZcashWinnerSnapshot>,
 }
 
 impl NativePoolBackendRetainedJob {
     /// Binds one exact coordinator to its backend descriptor.
     pub fn new(coordinator: NativeMiningCoordinator) -> Result<Self, PoolBackendAdapterError> {
         let descriptor = job_descriptor_from_native(coordinator.generation_descriptor())?;
+        let zcash_winner_snapshot = Arc::new(coordinator.job().zcash_winner_snapshot());
         Ok(Self {
             coordinator,
             descriptor,
             admission_healthy: AtomicBool::new(true),
+            zcash_winner_snapshot,
         })
     }
 
@@ -92,6 +98,10 @@ impl fmt::Debug for NativePoolBackendRetainedJob {
 }
 
 impl PoolBackendRetainedJob for NativePoolBackendRetainedJob {
+    fn zcash_winner_snapshot(&self) -> Option<Arc<dyn PoolBackendZcashWinnerSnapshot>> {
+        Some(self.zcash_winner_snapshot.clone())
+    }
+
     fn descriptor(&self) -> JobDescriptor {
         self.descriptor.clone()
     }
@@ -121,6 +131,10 @@ impl PoolBackendRetainedJob for NativePoolBackendRetainedJob {
         self.admission_healthy.load(Ordering::Acquire)
     }
 
+    fn is_zcash_current(&self) -> bool {
+        self.coordinator.pool_zcash_current()
+    }
+
     fn validate_share(
         &self,
         share: PoolBackendShareRequest<'_>,
@@ -132,6 +146,27 @@ impl PoolBackendRetainedJob for NativePoolBackendRetainedJob {
             share.solution().as_bytes(),
             share.target_le(),
         )
+    }
+}
+
+impl PoolBackendZcashWinnerSnapshot for crate::native::NativeZcashWinnerSnapshot {
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes()
+    }
+
+    fn validate_zcash_winner(
+        &self,
+        share: PoolBackendShareRequest<'_>,
+    ) -> Result<Vec<u8>, PoolBackendShareValidationError> {
+        let target = Target::from_le_bytes(*share.target_le().as_bytes())
+            .map_err(|error| map_native_validation_error(error.into()))?;
+        self.validate_winner(
+            *share.time().as_bytes(),
+            share.nonce().as_bytes(),
+            share.solution().as_bytes(),
+            target,
+        )
+        .map_err(map_native_validation_error)
     }
 }
 
