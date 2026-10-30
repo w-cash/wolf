@@ -978,7 +978,7 @@ fn enqueue_closed_pool_backend_generation(
     job_id: Hex32,
     retained: Arc<NativePoolBackendRetainedJob>,
 ) -> Result<(), Box<dyn Error>> {
-    match actor.close_job(&job_id) {
+    match actor.release_ordinary_job(&job_id) {
         Ok(_) | Err(PoolBackendActorError::JobNotRetained) => {}
         Err(error) => return Err(error.into()),
     }
@@ -1007,6 +1007,7 @@ fn retire_running_pool_backend_generations(
             generation.retained,
         )?;
     }
+    actor.close_zcash_winner_snapshots()?;
     Ok(())
 }
 
@@ -1016,6 +1017,7 @@ fn retire_active_pool_backend_generation(
     retained: Arc<NativePoolBackendRetainedJob>,
 ) -> Result<GenerationRetirement, Box<dyn Error>> {
     actor.invalidate_job(job_id, JobInvalidationReason::Age, Duration::ZERO)?;
+    actor.close_zcash_winner_snapshots()?;
     let mut retained = Arc::try_unwrap(retained).map_err(|_| {
         MinerError::InvalidRequest(
             "private backend retained a native generation after durable closure".to_string(),

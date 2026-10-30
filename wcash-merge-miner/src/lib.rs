@@ -69,7 +69,7 @@ pub use pool_backend_actor::{
     PoolBackendRetainedJob, PoolBackendShareRequest, PoolBackendShareValidationError,
     PoolBackendValidatedShare, PoolBackendWinnerAuditScheduler, PoolBackendWinnerKey,
     PoolBackendWinnerScheduler, PoolBackendWinnerSnapshot, PoolBackendWinnerTransition,
-    PoolBackendWinnerWork,
+    PoolBackendWinnerWork, PoolBackendZcashWinnerSnapshot,
 };
 pub use pool_backend_workers::{
     is_retryable_winner_reconciliation_error, PoolBackendWinnerWorkers,

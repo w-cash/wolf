@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Retain bounded detached Zcash proposal snapshots after ordinary merged-mining job expiry, verify and journal exact late Zcash winners without Wcash finalization or RPC, and preserve existing ordinary admission, journal format, and independent winner delivery. Requires the matching pool frontend."
+time: 2026-10-30T08:00:00.000000000Z

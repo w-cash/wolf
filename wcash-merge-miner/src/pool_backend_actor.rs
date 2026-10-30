@@ -46,6 +46,21 @@ const MAX_CONSECUTIVE_FIRST_ATTEMPTS: u8 = 8;
 
 const MAX_RECENT_JOBS: usize = 2;
 const MAX_SUPERSEDED_GRACE: Duration = Duration::from_secs(60);
+const ZCASH_WINNER_RECOVERY_TAIL: Duration = Duration::from_secs(60);
+const MAX_ZCASH_WINNER_SNAPSHOTS: usize = 32;
+const MAX_ZCASH_WINNER_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Detached local validation of exact Zcash winners, without Wcash or network I/O.
+pub trait PoolBackendZcashWinnerSnapshot: Send + Sync {
+    /// Serialized parent-block bytes charged to the bounded retention budget.
+    fn retained_bytes(&self) -> usize;
+
+    /// Validates immutable time, real Equihash and the original Zcash network target.
+    fn validate_zcash_winner(
+        &self,
+        share: PoolBackendShareRequest<'_>,
+    ) -> Result<Vec<u8>, PoolBackendShareValidationError>;
+}
 
 /// A retained exact generation capable of independently validating miner work.
 ///
@@ -55,6 +70,11 @@ const MAX_SUPERSEDED_GRACE: Duration = Duration::from_secs(60);
 /// met that chain's network target. The journal validates and binds those exact
 /// blocks again before acknowledging the share.
 pub trait PoolBackendRetainedJob: Send + Sync {
+    /// Returns a detached Zcash-only verifier; it must own no coordinator or Wcash lease.
+    fn zcash_winner_snapshot(&self) -> Option<Arc<dyn PoolBackendZcashWinnerSnapshot>> {
+        None
+    }
+
     /// Returns the exact proposal-validated descriptor retained by this job.
     fn descriptor(&self) -> JobDescriptor;
 
@@ -75,6 +95,11 @@ pub trait PoolBackendRetainedJob: Send + Sync {
 
     /// Returns whether this retained generation can presently validate work.
     fn is_healthy(&self) -> bool;
+
+    /// Last chain-specific Zcash currentness observation; must be a nonblocking local read.
+    fn is_zcash_current(&self) -> bool {
+        false
+    }
 
     /// Performs exact consensus validation and independently classifies both
     /// network targets.
@@ -798,6 +823,16 @@ struct LiveJob {
     validator: Arc<dyn PoolBackendRetainedJob>,
     deadline: Duration,
     phase: DurableJobPhase,
+    zcash_snapshot: Option<Arc<dyn PoolBackendZcashWinnerSnapshot>>,
+    zcash_deadline: Duration,
+}
+
+struct RetainedZcashWinner {
+    descriptor: JobDescriptor,
+    validator: Arc<dyn PoolBackendZcashWinnerSnapshot>,
+    deadline: Duration,
+    activation_seq: u64,
+    bytes: usize,
 }
 
 trait ActorClock: Send + Sync {
@@ -834,6 +869,8 @@ struct ActorState {
     current: Option<Hex32>,
     /// Oldest to newest. Snapshot responses reverse this order.
     recent: VecDeque<Hex32>,
+    zcash_winner_snapshots: HashMap<Hex32, RetainedZcashWinner>,
+    zcash_snapshot_bytes: usize,
 }
 
 /// Single serialized authority for durable pool jobs and accepted shares.
@@ -892,6 +929,8 @@ impl PoolBackendActor {
             live_jobs: HashMap::new(),
             current: None,
             recent: VecDeque::new(),
+            zcash_winner_snapshots: HashMap::new(),
+            zcash_snapshot_bytes: 0,
         };
         close_abandoned_jobs(&mut state)?;
 
@@ -995,6 +1034,21 @@ impl PoolBackendActor {
         let deadline = now
             .checked_add(Duration::from_millis(u64::from(descriptor.max_age_ms)))
             .ok_or(PoolBackendActorError::DeadlineOverflow)?;
+        let zcash_deadline = deadline
+            .checked_add(ZCASH_WINNER_RECOVERY_TAIL)
+            .ok_or(PoolBackendActorError::DeadlineOverflow)?;
+        let zcash_snapshot = validator.zcash_winner_snapshot();
+        let obsolete_snapshots: Vec<_> = state
+            .zcash_winner_snapshots
+            .iter()
+            .filter(|(_, snapshot)| {
+                snapshot.descriptor.zcash_previous_hash_le != descriptor.zcash_previous_hash_le
+            })
+            .map(|(job_id, _)| job_id.clone())
+            .collect();
+        for job_id in obsolete_snapshots {
+            close_zcash_snapshot(&mut state, &job_id, "parent_changed")?;
+        }
         let tip_change = changed_tip_reason(&state, &descriptor);
 
         state
@@ -1018,7 +1072,7 @@ impl PoolBackendActor {
                     .front()
                     .cloned()
                     .ok_or(PoolBackendActorError::RecentJobCapacity)?;
-                close_retained_job(&mut state, &oldest)?;
+                release_ordinary_job(&mut state, &oldest, now)?;
             }
             state
                 .recent
@@ -1048,9 +1102,12 @@ impl PoolBackendActor {
                 validator,
                 deadline,
                 phase: DurableJobPhase::Active,
+                zcash_snapshot,
+                zcash_deadline,
             },
         );
         state.current = Some(job_id);
+        prune_zcash_snapshots(&mut state, now)?;
         Ok(event)
     }
 
@@ -1102,15 +1159,20 @@ impl PoolBackendActor {
                     return Err(PoolBackendActorError::InvalidSupersededGrace);
                 }
                 let invalidated = invalidate_immediately(&mut state, job_id, reason)?;
-                let closed = close_retained_job(&mut state, job_id)?;
-                Ok(vec![invalidated, closed])
+                let mut events = vec![invalidated];
+                if let Some(closed) = release_ordinary_job(&mut state, job_id, now)? {
+                    events.push(closed);
+                }
+                Ok(events)
             }
         }
     }
 
-    /// Durably closes an already-invalidated retained job and releases its
-    /// validation resource.
-    pub fn close_job(&self, job_id: &Hex32) -> Result<BackendEvent, PoolBackendActorError> {
+    /// Releases ordinary validation while preserving a bounded detached Zcash context.
+    pub fn release_ordinary_job(
+        &self,
+        job_id: &Hex32,
+    ) -> Result<Option<BackendEvent>, PoolBackendActorError> {
         let mut state = self.lock_state()?;
         expire_jobs(&mut state, self.clock.now())?;
         let phase = state
@@ -1121,7 +1183,32 @@ impl PoolBackendActor {
         if phase != DurableJobPhase::Invalidated {
             return Err(PoolBackendActorError::InvalidJobPhase);
         }
+        release_ordinary_job(&mut state, job_id, self.clock.now())
+    }
+
+    /// Durably closes an invalidated job, including any detached recovery context.
+    pub fn close_job(&self, job_id: &Hex32) -> Result<BackendEvent, PoolBackendActorError> {
+        let mut state = self.lock_state()?;
+        expire_jobs(&mut state, self.clock.now())?;
+        let phase = state
+            .durable_jobs
+            .get(job_id)
+            .ok_or(PoolBackendActorError::JobNotRetained)?
+            .phase;
+        if phase != DurableJobPhase::Invalidated {
+            return Err(PoolBackendActorError::InvalidJobPhase);
+        }
         close_retained_job(&mut state, job_id)
+    }
+
+    /// Drops detached recovery contexts on shutdown without entering Wcash retirement.
+    pub fn close_zcash_winner_snapshots(&self) -> Result<(), PoolBackendActorError> {
+        let mut state = self.lock_state()?;
+        let jobs: Vec<_> = state.zcash_winner_snapshots.keys().cloned().collect();
+        for job_id in jobs {
+            close_zcash_snapshot(&mut state, &job_id, "shutdown")?;
+        }
+        Ok(())
     }
 
     /// Returns the next retained winner in durable journal order while cloning
@@ -1328,8 +1415,12 @@ impl PoolBackendActor {
             .lock()
             .map_err(|_| unhealthy_backend("backend actor requires restart"))?;
         let now = self.clock.now();
-        expire_jobs(&mut state, now)
-            .map_err(|_| unhealthy_backend("job lifecycle persistence failed"))?;
+        // Admission checks its own deadlines. Never put unrelated expiry
+        // journal writes ahead of a submitted proof or a winning-block commit.
+        if !matches!(&request, BackendRequest::SubmitShare { .. }) {
+            expire_jobs(&mut state, now)
+                .map_err(|_| unhealthy_backend("job lifecycle persistence failed"))?;
+        }
 
         match request {
             BackendRequest::Hello {
@@ -1491,18 +1582,61 @@ impl PoolBackendActor {
             return live_response(&state.journal, cursor, response);
         }
 
-        let retained = state.live_jobs.get(&job_id).ok_or_else(stale_job)?;
-        let advertised = match retained.phase {
-            DurableJobPhase::Active => state.current.as_ref() == Some(&job_id),
-            DurableJobPhase::Invalidated => state.recent.contains(&job_id),
-            DurableJobPhase::Closed => false,
+        let ordinary = state.live_jobs.get(&job_id).filter(|retained| {
+            let advertised = match retained.phase {
+                DurableJobPhase::Active => state.current.as_ref() == Some(&job_id),
+                DurableJobPhase::Invalidated => state.recent.contains(&job_id),
+                DurableJobPhase::Closed => false,
+            };
+            advertised && acceptable_job(retained, now).is_some()
+        });
+        let (descriptor, snapshot) = match ordinary {
+            Some(retained) => (retained.descriptor.clone(), None),
+            None => {
+                // Borrow an already detached context, or the same pure Zcash
+                // snapshot still attached to an expired ordinary generation.
+                // Submission never transfers, evicts, or closes generations.
+                let (descriptor, validator) = state
+                    .zcash_winner_snapshots
+                    .get(&job_id)
+                    .filter(|retained| {
+                        now < retained.deadline
+                            && retained.bytes > 0
+                            && retained.bytes <= MAX_ZCASH_WINNER_SNAPSHOT_BYTES
+                    })
+                    .map(|retained| (&retained.descriptor, &retained.validator))
+                    .or_else(|| {
+                        let live = state.live_jobs.get(&job_id)?;
+                        if live.phase == DurableJobPhase::Closed || now >= live.zcash_deadline {
+                            return None;
+                        }
+                        let snapshot = live.zcash_snapshot.as_ref()?;
+                        let bytes = snapshot.retained_bytes();
+                        (bytes > 0 && bytes <= MAX_ZCASH_WINNER_SNAPSHOT_BYTES)
+                            .then_some((&live.descriptor, snapshot))
+                    })
+                    .ok_or_else(stale_job)?;
+                let active = state
+                    .current
+                    .as_ref()
+                    .and_then(|id| state.live_jobs.get(id))
+                    .filter(|active| {
+                        acceptable_job(active, now).is_some()
+                            && active.validator.is_healthy()
+                            && active.validator.is_zcash_current()
+                    })
+                    .ok_or_else(stale_job)?;
+                if descriptor.zcash_previous_hash_le != active.descriptor.zcash_previous_hash_le
+                    || descriptor.zcash_height != active.descriptor.zcash_height
+                {
+                    return Err(stale_job());
+                }
+                (descriptor.clone(), Some(Arc::clone(validator)))
+            }
         };
-        if !advertised || acceptable_job(retained, now).is_none() {
-            return Err(stale_job());
-        }
         state
             .target_policy
-            .validate_for_job(&retained.descriptor, &target_le)
+            .validate_for_job(&descriptor, &target_le)
             .map_err(|_| {
                 PoolBackendHandlerError::new(
                     BackendErrorCode::TargetOutOfRange,
@@ -1510,23 +1644,47 @@ impl PoolBackendActor {
                     false,
                 )
             })?;
-        if retained.descriptor.header_input.as_bytes()[100..104] != time.as_bytes()[..] {
+        if descriptor.header_input.as_bytes()[100..104] != time.as_bytes()[..] {
             return Err(stale_job());
         }
 
-        let validated = retained
-            .validator
-            .validate_share(PoolBackendShareRequest {
-                time: &time,
-                nonce: &nonce,
-                solution: &solution,
-                target_le: &target_le,
-            })
-            .map_err(PoolBackendShareValidationError::handler_error)?;
         let parent_hash_le =
-            canonical_parent_header_hash_le(&retained.descriptor.header_input, &nonce, &solution);
+            canonical_parent_header_hash_le(&descriptor.header_input, &nonce, &solution);
+        let request = PoolBackendShareRequest {
+            time: &time,
+            nonce: &nonce,
+            solution: &solution,
+            target_le: &target_le,
+        };
+        let recovered = snapshot.is_some();
+        let validated = if let Some(snapshot) = snapshot {
+            if !wcash_zcash_aux::Target::from_le_bytes(*descriptor.zcash_target_le.as_bytes())
+                .map_err(|_| unhealthy_backend("retained Zcash target is invalid"))?
+                .is_met_by_le_hash(*parent_hash_le.as_bytes())
+            {
+                return Err(stale_job());
+            }
+            match snapshot.validate_zcash_winner(request) {
+                Ok(block) => PoolBackendValidatedShare::with_winners(None, Some(block)),
+                Err(error) => {
+                    crate::diagnostics::late_zcash_candidate(
+                        &descriptor,
+                        &parent_hash_le,
+                        0,
+                        "validation_failed",
+                    );
+                    return Err(error.handler_error());
+                }
+            }
+        } else {
+            ordinary
+                .expect("ordinary admission retained its validator")
+                .validator
+                .validate_share(request)
+                .map_err(PoolBackendShareValidationError::handler_error)?
+        };
         let winners = winner_descriptors(
-            &retained.descriptor,
+            &descriptor,
             &parent_hash_le,
             validated.wcash_block.is_some(),
             validated.zcash_block.is_some(),
@@ -1545,13 +1703,23 @@ impl PoolBackendActor {
             .append_share_committed(
                 job_id,
                 share_id.clone(),
-                parent_hash_le,
+                parent_hash_le.clone(),
                 winners,
                 identity.clone(),
                 target_le.clone(),
                 winner_blocks,
             )
-            .map_err(journal_handler_error)?;
+            .map_err(|error| {
+                if recovered {
+                    crate::diagnostics::late_zcash_candidate(
+                        &descriptor,
+                        &parent_hash_le,
+                        0,
+                        "persistence_failed",
+                    );
+                }
+                journal_handler_error(error)
+            })?;
         let wake_winner_worker = !commit.replayed && !commit.receipt.winners.is_empty();
         if !commit.replayed {
             for winner in &commit.receipt.winners {
@@ -1575,6 +1743,14 @@ impl PoolBackendActor {
         if wake_winner_worker {
             self.wake_winner_worker()
                 .map_err(|_| unhealthy_backend("winner reconciliation wakeup is unavailable"))?;
+        }
+        if recovered && !commit.replayed {
+            crate::diagnostics::late_zcash_candidate(
+                &descriptor,
+                &commit.receipt.parent_hash_le,
+                commit.receipt.event_seq,
+                "durably_committed",
+            );
         }
         let response = BackendMessage::ShareCommitted {
             version: BACKEND_PROTOCOL_VERSION,
@@ -2047,6 +2223,9 @@ fn close_retained_job(
         job_id: job_id.clone(),
     })?;
     state.live_jobs.remove(job_id);
+    if let Some(snapshot) = state.zcash_winner_snapshots.remove(job_id) {
+        state.zcash_snapshot_bytes = state.zcash_snapshot_bytes.saturating_sub(snapshot.bytes);
+    }
     state.recent.retain(|recent| recent != job_id);
     if state.current.as_ref() == Some(job_id) {
         state.current = None;
@@ -2059,6 +2238,114 @@ fn close_retained_job(
     Ok(event)
 }
 
+fn close_zcash_snapshot(
+    state: &mut ActorState,
+    job_id: &Hex32,
+    reason: &'static str,
+) -> Result<(), PoolBackendActorError> {
+    close_retained_job(state, job_id)?;
+    crate::diagnostics::late_zcash_context_retired(reason);
+    Ok(())
+}
+
+fn release_ordinary_job(
+    state: &mut ActorState,
+    job_id: &Hex32,
+    now: Duration,
+) -> Result<Option<BackendEvent>, PoolBackendActorError> {
+    let live = state
+        .live_jobs
+        .get(job_id)
+        .ok_or(PoolBackendActorError::JobNotRetained)?;
+    let snapshot = live
+        .zcash_snapshot
+        .as_ref()
+        .filter(|snapshot| {
+            now < live.zcash_deadline
+                && snapshot.retained_bytes() > 0
+                && snapshot.retained_bytes() <= MAX_ZCASH_WINNER_SNAPSHOT_BYTES
+        })
+        .cloned();
+    let Some(snapshot) = snapshot else {
+        return close_retained_job(state, job_id).map(Some);
+    };
+    if live.phase != DurableJobPhase::Invalidated {
+        return Err(PoolBackendActorError::InvalidJobPhase);
+    }
+    let bytes = snapshot.retained_bytes();
+    state
+        .zcash_winner_snapshots
+        .try_reserve(1)
+        .map_err(PoolBackendActorError::Allocation)?;
+    while state.zcash_winner_snapshots.len() >= MAX_ZCASH_WINNER_SNAPSHOTS
+        || state.zcash_snapshot_bytes.saturating_add(bytes) > MAX_ZCASH_WINNER_SNAPSHOT_BYTES
+    {
+        let oldest = state
+            .zcash_winner_snapshots
+            .iter()
+            .min_by_key(|(_, snapshot)| snapshot.activation_seq)
+            .map(|(job_id, _)| job_id.clone())
+            .ok_or(PoolBackendActorError::JobNotRetained)?;
+        close_zcash_snapshot(state, &oldest, "capacity")?;
+    }
+    let live = state
+        .live_jobs
+        .remove(job_id)
+        .ok_or(PoolBackendActorError::JobNotRetained)?;
+    state.zcash_snapshot_bytes = state
+        .zcash_snapshot_bytes
+        .checked_add(bytes)
+        .ok_or(PoolBackendActorError::DeadlineOverflow)?;
+    state.zcash_winner_snapshots.insert(
+        job_id.clone(),
+        RetainedZcashWinner {
+            descriptor: live.descriptor,
+            validator: snapshot,
+            deadline: live.zcash_deadline,
+            activation_seq: state.durable_jobs[job_id].activation_seq,
+            bytes,
+        },
+    );
+    state.recent.retain(|recent| recent != job_id);
+    if state.current.as_ref() == Some(job_id) {
+        state.current = None;
+    }
+    // Drop the live coordinator here. Only detached Zcash bytes remain, so the
+    // existing two-second Wcash retirement worker regains unique ownership.
+    Ok(None)
+}
+
+fn prune_zcash_snapshots(
+    state: &mut ActorState,
+    now: Duration,
+) -> Result<(), PoolBackendActorError> {
+    let parent = state
+        .current
+        .as_ref()
+        .and_then(|job_id| state.live_jobs.get(job_id))
+        .map(|job| job.descriptor.zcash_previous_hash_le.clone());
+    let obsolete: Vec<_> = state
+        .zcash_winner_snapshots
+        .iter()
+        .filter_map(|(job_id, snapshot)| {
+            if now >= snapshot.deadline {
+                Some((job_id.clone(), "expired"))
+            } else if parent
+                .as_ref()
+                .is_some_and(|parent| parent != &snapshot.descriptor.zcash_previous_hash_le)
+            {
+                Some((job_id.clone(), "parent_changed"))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (job_id, reason) in obsolete {
+        close_zcash_snapshot(state, &job_id, reason)?;
+    }
+    Ok(())
+}
+
 fn expire_jobs(state: &mut ActorState, now: Duration) -> Result<(), PoolBackendActorError> {
     if let Some(job_id) = state.current.clone() {
         let deadline = state
@@ -2068,7 +2355,7 @@ fn expire_jobs(state: &mut ActorState, now: Duration) -> Result<(), PoolBackendA
             .ok_or(PoolBackendActorError::JobNotRetained)?;
         if remaining_milliseconds(deadline, now).is_none() {
             invalidate_immediately(state, &job_id, JobInvalidationReason::Age)?;
-            close_retained_job(state, &job_id)?;
+            release_ordinary_job(state, &job_id, now)?;
         }
     }
 
@@ -2087,8 +2374,9 @@ fn expire_jobs(state: &mut ActorState, now: Duration) -> Result<(), PoolBackendA
         }
     }
     for job_id in expired_recent {
-        close_retained_job(state, &job_id)?;
+        release_ordinary_job(state, &job_id, now)?;
     }
+    prune_zcash_snapshots(state, now)?;
     Ok(())
 }
 
@@ -2265,6 +2553,7 @@ pub(crate) mod tests {
         wcash_payout_commitment: Hex32,
         zcash_payout_commitment: Hex32,
         healthy: AtomicBool,
+        zcash_current: AtomicBool,
         remaining_lifetime: Mutex<Option<Duration>>,
         validated: Mutex<PoolBackendValidatedShare>,
         validations: AtomicUsize,
@@ -2278,6 +2567,7 @@ pub(crate) mod tests {
                 wcash_payout_commitment: Hex32::new([0x33; 32]),
                 zcash_payout_commitment: Hex32::new([0x44; 32]),
                 healthy: AtomicBool::new(true),
+                zcash_current: AtomicBool::new(true),
                 remaining_lifetime: Mutex::new(remaining_lifetime),
                 validated: Mutex::new(PoolBackendValidatedShare::ordinary()),
                 validations: AtomicUsize::new(0),
@@ -2327,6 +2617,10 @@ pub(crate) mod tests {
 
         fn is_healthy(&self) -> bool {
             self.healthy.load(Ordering::Acquire)
+        }
+
+        fn is_zcash_current(&self) -> bool {
+            self.zcash_current.load(Ordering::Acquire)
         }
 
         fn validate_share(

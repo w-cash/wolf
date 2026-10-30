@@ -309,10 +309,11 @@ sync, block validation or per-share event. Continue independent observation:
 even a completed peer request is not evidence of a remote chain's adoption.
 
 The native pool backend emits JSON diagnostics with
-`component="native_pool_backend"`. `winner_durable` follows successful journal
-fsync; an identical receipt replay emits no new discovery event.
-`winner_submission_attempt` and `winner_submission_result` identify actual
-submission calls. `winner_lifecycle_persisted` follows a successful durable CAS
+`component="native_pool_backend"`. Durable `share_committed` receipts and their
+retained exact block bytes are the authoritative discovery record; identical
+receipt replay creates no second winner. `winner_recipient_result` and
+`winner_submission_result` report completed submission calls.
+`winner_lifecycle_persisted` follows a successful durable CAS
 transition, with its new event sequence and confirmation depth when available.
 Stale CAS results and observation passes that make no transition stay silent.
 `winner_reconciliation`, `winner_persistence_failure` and `journal_failure`
@@ -330,6 +331,43 @@ suppression and queue loss when output is available. A stalled or failed sink
 can still lose diagnostics: the preserved authoritative journal and independent
 exact-hash observation remain the recovery evidence. No new diagnostics run
 for ordinary shares, and no diagnostic adds an fsync or validation pass.
+
+### Late Zcash winners from a retired pool job
+
+Ordinary admission still uses the original 45-second native lease and two-second
+supersession grace. The native backend separately keeps detached Zcash proposal
+snapshots until the original native deadline plus 60 seconds, capped at 32
+snapshots and 64 MiB of serialized parent-block bytes. They contain no Wcash
+candidate lease, coordinator, RPC client, or retirement-worker ownership.
+Expiry, a known Zcash predecessor change, capacity eviction, or shutdown removes
+the snapshots; their lifetimes never restart on retirement or reconnect.
+Share submission checks these absolute deadlines without running lifecycle
+cleanup; maintenance closes expired contexts outside the submitted-proof path.
+
+A coordinated pool frontend may forward a solution only for an exact job and
+target previously assigned to that miner. After ordinary expiry the backend
+requires a newer ordinary-admissible active job on the same Zcash predecessor
+and a positive last-known chain-specific Zcash currentness sample. That sample
+comes from existing monitoring; no RPC or blocking freshness lock is added to
+submission. It can race a network tip change, so subsequent full node consensus
+remains authoritative.
+
+Only hashes meeting the original Zcash network target enter the detached real
+Equihash verifier and exact Zcash block serialization. Ordinary stale shares are
+rejected. Recovery neither constructs nor submits a stale Wcash block. A valid
+late winner uses the existing atomic receipt, exact-byte journal, accounting,
+and independent Zcash delivery worker. The generation remains invalidated until
+its recovery snapshot is retired, then receives `generation_closed`; journal
+format and the six required protocol capabilities are unchanged. Deploy the
+matching pool frontend and backend together.
+
+`late_zcash_winner_result` reports verification/storage failure or a successful
+durable recovery after the winner worker has been woken. It uses the existing
+bounded diagnostic writer. `late_zcash_context_retired` reports retirement or
+capacity eviction. Uncommitted snapshots are deliberately volatile: restart
+closes abandoned generations, while already committed winners retain normal
+durable recovery. These bounds do not guarantee delivery of every late hardware
+solution or independent network receipt.
 
 The included ZIP-301 listener validates Equihash and both targets locally,
 requires authorization, assigns per-session nonce prefixes, rejects malformed,
