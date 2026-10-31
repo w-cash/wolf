@@ -305,7 +305,11 @@ impl ZebraRpcClient {
                 }
             });
         if let Err(error) = spawn_result {
-            eprintln!("could not start coinbase prewarm worker {worker_index}: {error}");
+            if crate::diagnostics::native_backend_mode() {
+                crate::diagnostics::native_backend_prewarm_failure(&error);
+            } else {
+                eprintln!("could not start coinbase prewarm worker {worker_index}: {error}");
+            }
         }
     }
 

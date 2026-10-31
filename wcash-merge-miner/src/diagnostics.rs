@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     io::{self, Write},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
         Arc, Mutex, OnceLock,
     },
@@ -30,12 +30,161 @@ const INTERVAL: Duration = Duration::from_secs(30);
 const NOISY_BURST: u64 = 32;
 const TIMING_ORIGINS: usize = 128;
 static DIAGNOSTICS: OnceLock<Diagnostics> = OnceLock::new();
+static NATIVE_BACKEND_MODE: AtomicBool = AtomicBool::new(false);
 static STARTUP: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 thread_local! {
     static CAPTURE: std::cell::RefCell<Option<Vec<Event>>> = const { std::cell::RefCell::new(None) };
     static TIMING_CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<Event>>>>> = const { std::cell::RefCell::new(None) };
+    static TEST_SINK: std::cell::RefCell<Option<Arc<Diagnostics>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runtime notices for the persistent native backend, independent of console I/O.
+pub enum NativeBackendRuntimeEvent<'a> {
+    /// An authoritative job was activated; this is not an ASIC-notification receipt.
+    JobActivated(&'a wcash_pool_protocol::JobDescriptor),
+    /// Shutdown cleanup completed.
+    Stopped,
+    /// A nonfatal listener connection ended with a fixed protocol reason.
+    ConnectionClosed(&'static str),
+    /// Preparation failed and the existing retry policy selected a delay.
+    PreparationRetry(&'a MinerError, Duration),
+    /// Candidate retirement failed and the existing retry policy selected a delay.
+    CandidateRetirementRetry(&'a MinerError, Duration),
+    /// Cleanup also failed after an authoritative activation failure.
+    ActivationRetirementFailed(&'a MinerError),
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeMetadata {
+    Activated {
+        job: [u8; 32],
+        wcash_height: u32,
+        zcash_height: u32,
+        max_age_ms: u64,
+    },
+    Retry {
+        delay_ms: u64,
+    },
+    Outbox {
+        chain: &'static str,
+        hash_be: [u8; 32],
+        job: [u8; 32],
+        height: u32,
+    },
+}
+
+/// Records fixed public metadata without waiting for diagnostic capacity or I/O.
+pub fn record_native_backend_runtime(event: NativeBackendRuntimeEvent<'_>) {
+    record(runtime_event(event));
+}
+
+fn runtime_event(event: NativeBackendRuntimeEvent<'_>) -> Event {
+    match event {
+        NativeBackendRuntimeEvent::JobActivated(job) => {
+            let mut event = Event::new(None, "backend_job_activated", "activated");
+            event.noisy = false;
+            event.runtime = Some(RuntimeMetadata::Activated {
+                job: *job.job_id.as_bytes(),
+                wcash_height: job.wcash_height,
+                zcash_height: job.zcash_height,
+                max_age_ms: u64::from(job.max_age_ms),
+            });
+            event
+        }
+        NativeBackendRuntimeEvent::Stopped => Event::new(None, "backend_runtime", "stopped"),
+        NativeBackendRuntimeEvent::ConnectionClosed(reason) => {
+            let result = match reason {
+                "incomplete request frame" => "incomplete_request_frame",
+                "invalid request frame length" => "invalid_request_frame_length",
+                "invalid request frame" => "invalid_request_frame",
+                "request deadline expired" => "request_deadline_expired",
+                "response deadline expired" => "response_deadline_expired",
+                "response peer closed" => "response_peer_closed",
+                "request peer disconnected" => "request_peer_disconnected",
+                "response peer disconnected" => "response_peer_disconnected",
+                _ => "connection_closed",
+            };
+            runtime_warning_event("backend_connection_closed", result)
+        }
+        NativeBackendRuntimeEvent::PreparationRetry(error, delay) => {
+            runtime_retry_event("backend_preparation_retry", error, delay)
+        }
+        NativeBackendRuntimeEvent::CandidateRetirementRetry(error, delay) => {
+            runtime_retry_event("backend_candidate_retirement_retry", error, delay)
+        }
+        NativeBackendRuntimeEvent::ActivationRetirementFailed(error) => runtime_warning_event(
+            "backend_activation_retirement_failed",
+            crate::preparation_timing::preparation_error_class(error),
+        ),
+    }
+}
+
+fn runtime_warning_event(stage: &'static str, result: &'static str) -> Event {
+    let mut event = Event::new(None, stage, result);
+    event.warning = true;
+    event
+}
+
+fn runtime_retry_event(stage: &'static str, error: &MinerError, delay: Duration) -> Event {
+    let mut event = runtime_warning_event(
+        stage,
+        crate::preparation_timing::preparation_error_class(error),
+    );
+    event.runtime = Some(RuntimeMetadata::Retry {
+        delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+    });
+    event
+}
+
+pub(crate) fn native_backend_mode() -> bool {
+    NATIVE_BACKEND_MODE.load(Ordering::Acquire)
+}
+
+pub(crate) fn native_backend_warning(stage: &'static str, error: Option<&MinerError>) {
+    record(runtime_warning_event(
+        stage,
+        error.map_or(
+            "state_unavailable",
+            crate::preparation_timing::preparation_error_class,
+        ),
+    ));
+}
+
+pub(crate) fn native_backend_prewarm_failure(error: &io::Error) {
+    let mut event = runtime_warning_event("backend_prewarm_worker", "spawn_failed");
+    event.os_error = error.raw_os_error();
+    event.io_kind = Some(io_kind(error.kind()));
+    record(event);
+}
+
+pub(crate) fn native_backend_outbox(
+    chain: &'static str,
+    hash: &str,
+    job: &str,
+    height: u32,
+    result: &'static str,
+    confirmations: Option<u32>,
+) {
+    let mut event = runtime_warning_event("native_outbox_observation", result);
+    let mut hash_be = [0; 32];
+    let mut job_id = [0; 32];
+    if hex::decode_to_slice(hash, &mut hash_be).is_ok()
+        && hex::decode_to_slice(job, &mut job_id).is_ok()
+    {
+        event.runtime = Some(RuntimeMetadata::Outbox {
+            chain,
+            hash_be,
+            job: job_id,
+            height,
+        });
+    } else {
+        event.result = "invalid_public_metadata";
+    }
+    event.warning = result != "observed";
+    event.confirmations = confirmations;
+    record(event);
 }
 
 struct Diagnostics {
@@ -414,6 +563,7 @@ struct Event {
     queued_at: Instant,
     timing: Option<ZecTiming>,
     preparation: Option<PreparationReport>,
+    runtime: Option<RuntimeMetadata>,
     timing_metadata_dropped_total: u64,
 }
 
@@ -443,6 +593,7 @@ impl Event {
             queued_at: Instant::now(),
             timing: None,
             preparation: None,
+            runtime: None,
             timing_metadata_dropped_total: 0,
         }
     }
@@ -467,6 +618,17 @@ fn preparation_event(report: PreparationReport) -> Event {
 
 fn record(event: Event) {
     #[cfg(test)]
+    if TEST_SINK.with(|sink| {
+        if let Some(sink) = sink.borrow().as_ref() {
+            sink.record(event);
+            true
+        } else {
+            false
+        }
+    }) {
+        return;
+    }
+    #[cfg(test)]
     if CAPTURE.with(|capture| {
         if let Some(events) = capture.borrow_mut().as_mut() {
             events.push(event);
@@ -487,6 +649,8 @@ fn record(event: Event) {
 /// Diagnostic failures are deliberately independent of journal durability. No
 /// other command enables this writer, and shutdown never waits for a slow sink.
 pub fn start_native_backend_diagnostics() -> io::Result<()> {
+    // Select the no-console-fallback policy even if descriptor/thread setup fails.
+    NATIVE_BACKEND_MODE.store(true, Ordering::Release);
     let _startup = STARTUP
         .lock()
         .map_err(|_| io::Error::other("diagnostic startup unavailable"))?;
@@ -499,44 +663,51 @@ pub fn start_native_backend_diagnostics() -> io::Result<()> {
     let timing_dropped = Arc::clone(&diagnostics.timing_dropped);
     thread::Builder::new()
         .name("wcash-diagnostics".into())
-        .spawn(move || {
-            let mut reporter = Reporter::new(Instant::now());
-            loop {
-                match receiver.recv_timeout(Duration::from_secs(1)) {
-                    Ok(event) => {
-                        if reporter
-                            .record(
-                                &mut writer,
-                                event,
-                                Instant::now(),
-                                dropped.load(Ordering::Relaxed),
-                            )
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
+        .spawn(move || run_writer(&mut writer, receiver, &dropped, &timing_dropped))?;
+    let _ = DIAGNOSTICS.set(diagnostics);
+    let mut started = Event::new(None, "diagnostics_started", "bounded_lossy_writer");
+    started.noisy = false;
+    record(started);
+    Ok(())
+}
+
+fn run_writer(
+    writer: &mut impl Write,
+    receiver: Receiver<Event>,
+    dropped: &AtomicU64,
+    timing_dropped: &AtomicU64,
+) {
+    let mut reporter = Reporter::new(Instant::now());
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(event) => {
                 if reporter
-                    .summary(
-                        &mut writer,
+                    .record(
+                        writer,
+                        event,
                         Instant::now(),
                         dropped.load(Ordering::Relaxed),
-                        timing_dropped.load(Ordering::Relaxed),
                     )
                     .is_err()
                 {
                     break;
                 }
             }
-        })?;
-    let _ = DIAGNOSTICS.set(diagnostics);
-    let mut started = Event::new(None, "diagnostics_started", "bounded_lossy_writer");
-    started.noisy = false;
-    record(started);
-    Ok(())
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if reporter
+            .summary(
+                writer,
+                Instant::now(),
+                dropped.load(Ordering::Relaxed),
+                timing_dropped.load(Ordering::Relaxed),
+            )
+            .is_err()
+        {
+            break;
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -812,7 +983,13 @@ impl Reporter {
                 event
                     .winner
                     .map(|w| (w.chain, w.hash_le))
-                    .or_else(|| event.observation.map(|o| ("Zcash", o.hash_be))),
+                    .or_else(|| event.observation.map(|o| ("Zcash", o.hash_be)))
+                    .or(match event.runtime {
+                        Some(RuntimeMetadata::Outbox { chain, hash_be, .. }) => {
+                            Some((chain, hash_be))
+                        }
+                        _ => None,
+                    }),
                 event.stage,
                 event.result,
                 event
@@ -897,6 +1074,28 @@ impl Reporter {
                 "asserts_winner_submission_latency":false
             })
         });
+        let runtime = event.runtime.map(|metadata| match metadata {
+            RuntimeMetadata::Activated {
+                job,
+                wcash_height,
+                zcash_height,
+                max_age_ms,
+            } => json!({
+                "job_id":hex::encode(job), "wcash_height":wcash_height,
+                "zcash_height":zcash_height, "max_age_ms":max_age_ms,
+                "asserts_asic_notify_time":false
+            }),
+            RuntimeMetadata::Retry { delay_ms } => json!({"retry_delay_ms":delay_ms}),
+            RuntimeMetadata::Outbox {
+                chain,
+                hash_be,
+                job,
+                height,
+            } => json!({
+                "source":"native_share_journal", "chain":chain,
+                "hash":hex::encode(hash_be), "job_id":hex::encode(job), "height":height
+            }),
+        });
         let value = json!({"component":"native_pool_backend","level":if event.warning {"WARN"} else {"INFO"},
             "stage":event.stage,"result":event.result,"winner":winner,"observation":observation,"confirmations":event.confirmations,
             "node_outcome_counts":event.counts.map(|counts| json!({
@@ -906,7 +1105,7 @@ impl Reporter {
             "operation":event.operation,"os_error":event.os_error,"io_kind":event.io_kind,"suppressed_since_previous":suppressed,
             "suppressed_total":self.suppressed,"diagnostic_dropped_total":dropped,
             "timing_metadata_dropped_total":event.timing_metadata_dropped_total,
-            "diagnostic_queue_wait_ms":elapsed_ms(now,event.queued_at),"timing":timing,"preparation":preparation,
+            "diagnostic_queue_wait_ms":elapsed_ms(now,event.queued_at),"timing":timing,"preparation":preparation,"runtime":runtime,
             "asserts_independent_peer_receipt":false});
         write_record(writer, &value)
     }
@@ -953,6 +1152,214 @@ fn write_record(writer: &mut impl Write, value: &serde_json::Value) -> io::Resul
 mod tests {
     use super::*;
     use crate::preparation_timing::{PreparationResult, PHASE_COUNT};
+
+    fn with_sink<R>(sink: Arc<Diagnostics>, run: impl FnOnce() -> R) -> R {
+        struct Restore(Option<Arc<Diagnostics>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_SINK.with(|sink| *sink.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(TEST_SINK.with(|current| current.replace(Some(sink))));
+        run()
+    }
+
+    fn runtime_job() -> wcash_pool_protocol::JobDescriptor {
+        use wcash_pool_protocol::{Hex108, TargetLe};
+        wcash_pool_protocol::JobDescriptor {
+            job_id: Hex32::new([1; 32]),
+            wcash_candidate_hash_le: Hex32::new([2; 32]),
+            header_input: Hex108::new([3; 108]),
+            wcash_previous_hash_le: Hex32::new([4; 32]),
+            zcash_previous_hash_le: Hex32::new([5; 32]),
+            wcash_coinbase_txid_le: Hex32::new([6; 32]),
+            zcash_coinbase_txid_le: Hex32::new([7; 32]),
+            wcash_target_le: TargetLe::new([0xfe; 32]),
+            zcash_target_le: TargetLe::new([0xfd; 32]),
+            wcash_height: 46_000,
+            zcash_height: 3_537_000,
+            wcash_reward_zat: 1,
+            zcash_reward_zat: 1,
+            wcash_maturity_confirmations: 100,
+            zcash_maturity_confirmations: 100,
+            max_age_ms: 45_000,
+        }
+    }
+
+    #[test]
+    fn runtime_recording_continues_after_production_writer_breaks() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (sink, receiver) = Diagnostics::channel(1);
+        let sink = Arc::new(sink);
+        let dropped = Arc::clone(&sink.dropped);
+        let timing_dropped = Arc::clone(&sink.timing_dropped);
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            run_writer(&mut Broken, receiver, &dropped, &timing_dropped);
+            done_tx.send(()).unwrap();
+        });
+        with_sink(Arc::clone(&sink), || {
+            record_native_backend_runtime(NativeBackendRuntimeEvent::JobActivated(&runtime_job()));
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            for _ in 0..100 {
+                record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
+            }
+        });
+        writer.join().unwrap();
+        assert_eq!(sink.dropped.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn runtime_producers_finish_while_production_writer_is_blocked() {
+        struct Release(Option<mpsc::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        struct Blocked {
+            entered: Option<mpsc::Sender<()>>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Write for Blocked {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).unwrap();
+                    self.release
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "test gate was not released")
+                        })?;
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (sink, receiver) = Diagnostics::channel(1);
+        let sink = Arc::new(sink);
+        let dropped = Arc::clone(&sink.dropped);
+        let timing_dropped = Arc::clone(&sink.timing_dropped);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release = Release(Some(release_tx));
+        let (writer_done_tx, writer_done_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let mut blocked = Blocked {
+                entered: Some(entered_tx),
+                release: release_rx,
+            };
+            run_writer(&mut blocked, receiver, &dropped, &timing_dropped);
+            writer_done_tx.send(()).unwrap();
+        });
+        with_sink(Arc::clone(&sink), || {
+            record_native_backend_runtime(NativeBackendRuntimeEvent::JobActivated(&runtime_job()));
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let producer_sink = Arc::clone(&sink);
+        let (producer_done_tx, producer_done_rx) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            with_sink(producer_sink, || {
+                for _ in 0..100 {
+                    record_native_backend_runtime(NativeBackendRuntimeEvent::JobActivated(
+                        &runtime_job(),
+                    ));
+                    record_native_backend_runtime(NativeBackendRuntimeEvent::ConnectionClosed(
+                        "request deadline expired",
+                    ));
+                }
+            });
+            producer_done_tx.send(()).unwrap();
+        });
+        let completed_while_blocked = producer_done_rx.recv_timeout(Duration::from_secs(5));
+        // Always release owned work before asserting or joining.
+        drop(release);
+        let producer_finished = completed_while_blocked.is_ok()
+            || producer_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .is_ok();
+        if producer_finished {
+            producer.join().unwrap();
+        }
+        let dropped = sink.dropped.load(Ordering::Relaxed);
+        drop(sink);
+        let writer_finished = writer_done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        if writer_finished {
+            writer.join().unwrap();
+        }
+        assert!(completed_while_blocked.is_ok());
+        assert!(producer_finished);
+        assert!(writer_finished);
+        assert_eq!(dropped, 199);
+    }
+
+    #[test]
+    fn runtime_metadata_is_public_bounded_and_error_classes_are_redacted() {
+        let secret = "PRIVATE_ENDPOINT_PATH_OR_RETIREMENT_TOKEN";
+        let error = MinerError::RpcProtocol(secret.into());
+        let (sink, receiver) = Diagnostics::channel(16);
+        with_sink(Arc::new(sink), || {
+            record_native_backend_runtime(NativeBackendRuntimeEvent::JobActivated(&runtime_job()));
+            record_native_backend_runtime(NativeBackendRuntimeEvent::PreparationRetry(
+                &error,
+                Duration::from_millis(250),
+            ));
+            record_native_backend_runtime(NativeBackendRuntimeEvent::ConnectionClosed(secret));
+            record_native_backend_runtime(NativeBackendRuntimeEvent::ActivationRetirementFailed(
+                &error,
+            ));
+            record_native_backend_runtime(NativeBackendRuntimeEvent::CandidateRetirementRetry(
+                &error,
+                Duration::from_secs(1),
+            ));
+            native_backend_prewarm_failure(&io::Error::other(secret));
+            native_backend_outbox(
+                "zcash",
+                &"00".repeat(32),
+                &"01".repeat(32),
+                42,
+                "observed",
+                Some(3),
+            );
+            record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
+        });
+        let mut output = Vec::new();
+        let mut reporter = Reporter::new(Instant::now());
+        for event in receiver.try_iter() {
+            reporter
+                .record(&mut output, event, Instant::now(), 0)
+                .unwrap();
+        }
+        assert!(!String::from_utf8_lossy(&output).contains(secret));
+        let rows = output
+            .split(|b| *b == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| {
+                assert!(row.len() < 4096);
+                serde_json::from_slice::<serde_json::Value>(row).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[0]["runtime"]["job_id"], "01".repeat(32));
+        assert_eq!(rows[0]["runtime"]["asserts_asic_notify_time"], false);
+        assert_eq!(rows[1]["result"], "rpc_response");
+        assert_eq!(rows[1]["runtime"]["retry_delay_ms"], 250);
+        assert_eq!(rows[2]["result"], "connection_closed");
+        assert_eq!(rows[6]["runtime"]["source"], "native_share_journal");
+        assert_eq!(rows[6]["confirmations"], 3);
+        assert!(rows.iter().all(|row| row["winner"].is_null()));
+    }
 
     fn preparation_fixture() -> PreparationReport {
         PreparationReport {

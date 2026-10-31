@@ -249,7 +249,7 @@ fn milliseconds(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn preparation_error_class(error: &MinerError) -> &'static str {
+pub(crate) fn preparation_error_class(error: &MinerError) -> &'static str {
     match error {
         MinerError::ParentTipMismatch { .. } => "parent_tip_mismatch",
         MinerError::ChildTipMismatch { .. } => "child_tip_mismatch",

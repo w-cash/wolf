@@ -28,6 +28,21 @@ Diagnostics follow the result or failure of a submission. A stalled diagnostic
 sink may lose text records but cannot hold a share or a block submission.
 Exact discovery records remain durable even if optional diagnostics cannot start.
 
+The persistent `native-pool-backend` command also routes activation, retry,
+connection-close and retirement notices through that bounded writer. Console
+errors, a full diagnostic queue or a stalled sink do not trigger listener
+shutdown or candidate retirement. Shared preparation and legacy native-outbox
+warnings use this policy even if diagnostic startup fails. Other CLI commands
+retain their existing stdout results and stderr warnings.
+
+Activation notices now use `stage=backend_job_activated` on the diagnostic
+stream, with public job ID, both heights and lease duration under `runtime`;
+they no longer produce pretty JSON on stdout. This notice follows authoritative
+activation and does not prove ASIC notification. Native-outbox notices carry
+`runtime.source=native_share_journal`, separate from pool winner receipts.
+Repeated warnings are paced and queue drops are counted; diagnostics remain
+lossy evidence, while the authoritative journals keep their durability contract.
+
 Pool delivery dispatches writable recipients concurrently. Each recipient checks
 its own network identity and current predecessor before submitting the retained
 bytes; an unavailable observer or another writable node cannot veto healthy

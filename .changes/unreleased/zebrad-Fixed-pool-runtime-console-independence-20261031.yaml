@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Keep persistent native pool backend activation and runtime warnings on bounded nonblocking diagnostics so console failures cannot stop listeners or retire active mining work, while preserving journal durability and one-shot CLI results."
+time: 2026-10-31T21:00:00.000000000Z
