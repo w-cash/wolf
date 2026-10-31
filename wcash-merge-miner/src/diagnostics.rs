@@ -140,15 +140,11 @@ impl RuntimeFailure {
             | MinerError::ChildTipMismatch {
                 expected, actual, ..
             } => {
-                if expected.len() == 64 && actual.len() == 64 {
-                    let mut expected_hash = [0; 32];
-                    let mut actual_hash = [0; 32];
-                    if hex::decode_to_slice(expected, &mut expected_hash).is_ok()
-                        && hex::decode_to_slice(actual, &mut actual_hash).is_ok()
-                    {
-                        metadata.expected_tip_hash = Some(expected_hash);
-                        metadata.actual_tip_hash = Some(actual_hash);
-                    }
+                if let (Some(expected), Some(actual)) =
+                    (runtime_tip_hash(expected), runtime_tip_hash(actual))
+                {
+                    metadata.expected_tip_hash = Some(expected);
+                    metadata.actual_tip_hash = Some(actual);
                 }
             }
             MinerError::RpcHttpStatus(status) => metadata.rpc_http_status = Some(status.as_u16()),
@@ -157,6 +153,29 @@ impl RuntimeFailure {
         }
         metadata
     }
+}
+
+fn runtime_tip_hash(value: &str) -> Option<[u8; 32]> {
+    const HEIGHT_PREFIX: &str = " at height ";
+    const MAX_BYTES: usize = 64 + HEIGHT_PREFIX.len() + 10;
+    if !(64..=MAX_BYTES).contains(&value.len()) {
+        return None;
+    }
+    let hash = value.get(..64)?;
+    let suffix = value.get(64..)?;
+    if !suffix.is_empty() {
+        let height = suffix.strip_prefix(HEIGHT_PREFIX)?;
+        if height.is_empty()
+            || (height.len() > 1 && height.starts_with('0'))
+            || !height.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        height.parse::<u32>().ok()?;
+    }
+    let mut decoded = [0; 32];
+    hex::decode_to_slice(hash, &mut decoded).ok()?;
+    Some(decoded)
 }
 
 /// Records fixed public metadata without waiting for diagnostic capacity or I/O.
@@ -1376,17 +1395,54 @@ mod tests {
     }
 
     #[test]
+    fn runtime_tip_hash_accepts_only_known_bounded_public_tip_forms() {
+        let hash = "AB".repeat(32);
+        assert_eq!(runtime_tip_hash(&hash), Some([0xab; 32]));
+        for height in [0, 46_515, 3_537_502, u32::MAX] {
+            assert_eq!(
+                runtime_tip_hash(&format!("{hash} at height {height}")),
+                Some([0xab; 32])
+            );
+        }
+        for suffix in [
+            " at height ",
+            " at height -1",
+            " at height +1",
+            " at height 01",
+            " at height 4294967296",
+            " at height 10000000000",
+            " at height 1 ",
+            " at height 1\n",
+            " at height ١",
+            " AT HEIGHT 1",
+            " at height 1 PRIVATE_ENDPOINT_TOKEN",
+            " (relay gap exceeds bound)",
+        ] {
+            assert_eq!(runtime_tip_hash(&format!("{hash}{suffix}")), None);
+        }
+        for malformed in [
+            "ff".repeat(31),
+            "Z".repeat(64),
+            format!("prefix {hash}"),
+            format!("{}é", "f".repeat(63)),
+            "PRIVATE_ENDPOINT_RESPONSE_OR_RETIREMENT_TOKEN".repeat(100),
+        ] {
+            assert_eq!(runtime_tip_hash(&malformed), None);
+        }
+    }
+
+    #[test]
     fn runtime_failure_context_keeps_fixed_public_fields_and_rejects_raw_strings() {
         let secret = "PRIVATE_ENDPOINT_RESPONSE_OR_RETIREMENT_TOKEN";
         let errors = [
             MinerError::ParentTipMismatch {
-                expected: "AB".repeat(32),
-                actual: "cd".repeat(32),
+                expected: format!("{} at height 3537502", "AB".repeat(32)),
+                actual: format!("{} at height 3537503", "cd".repeat(32)),
                 endpoint: secret.into(),
             },
             MinerError::ChildTipMismatch {
-                expected: "ef".repeat(32),
-                actual: "01".repeat(32),
+                expected: format!("{} at height 46515", "ef".repeat(32)),
+                actual: format!("{} at height 46516", "01".repeat(32)),
                 endpoint: secret.into(),
             },
             MinerError::ParentTipMismatch {

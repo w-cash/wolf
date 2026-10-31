@@ -1,4 +1,4 @@
 project: zebrad
 kind: Fixed
-body: "Keep persistent native pool backend activation and runtime warnings on bounded nonblocking diagnostics so console failures cannot stop listeners or retire active mining work. A cached routine-notice filter skips disabled events before construction while retaining failures and winner tracking, with fixed public failure context, unchanged journal durability and one-shot CLI results."
+body: "Keep persistent native pool backend activation and runtime warnings on bounded nonblocking diagnostics so console failures cannot stop listeners or retire active mining work. A cached routine-notice filter skips disabled events before construction while retaining failures and winner tracking, with bounded public tip-height and failure context, unchanged journal durability and one-shot CLI results."
 time: 2026-10-31T21:00:00.000000000Z

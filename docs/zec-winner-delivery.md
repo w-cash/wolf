@@ -56,8 +56,11 @@ There is no per-record environment lookup or logging-framework dependency.
 Runtime failure records retain only safe typed context: a validated pair of
 expected/actual tip hashes in conventional display order, numeric HTTP status or
 JSON-RPC error code, retry delay, and the prewarm worker index where available.
-Malformed hashes are omitted as a pair. Raw endpoint labels, error messages and
-response text are not copied; endpoint roles are not inferred from labels.
+Mismatch hashes accept bare 64-digit hexadecimal or the exact `HASH at height N`
+form used by current tip checks, with a canonical decimal `u32` height and at
+most 85 bytes per input. Other forms are omitted as a pair. Raw endpoint labels,
+error messages and response text are not copied; endpoint roles are not inferred
+from labels.
 The background writer formats these fields. Optional text can still be lost if
 the writer cannot start, fails or stalls, and counters cannot report through a
 failed sink. Before deployment, log consumers must accept the new runtime stages
