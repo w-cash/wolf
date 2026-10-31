@@ -1,12 +1,6 @@
 //! Pool-backend retention for one exact native merged-mining generation.
 
-use std::{
-    fmt,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-};
+use std::{fmt, sync::Arc};
 
 use wcash_pool_protocol::{Hex32, JobDescriptor, TargetLe};
 use wcash_zcash_aux::{AuxPowError, Target};
@@ -37,21 +31,49 @@ use crate::{
 pub struct NativePoolBackendRetainedJob {
     coordinator: NativeMiningCoordinator,
     descriptor: JobDescriptor,
-    admission_healthy: AtomicBool,
+    currentness: crate::pool_backend_supervision::NativePoolCurrentnessProbe,
     zcash_winner_snapshot: Arc<crate::native::NativeZcashWinnerSnapshot>,
 }
 
 impl NativePoolBackendRetainedJob {
     /// Binds one exact coordinator to its backend descriptor.
     pub fn new(coordinator: NativeMiningCoordinator) -> Result<Self, PoolBackendAdapterError> {
-        let descriptor = job_descriptor_from_native(coordinator.generation_descriptor())?;
+        Self::new_recoverable(coordinator).map_err(|(_, error)| error)
+    }
+
+    /// Constructs the adapter without dropping candidate ownership on failure.
+    pub fn new_recoverable(
+        coordinator: NativeMiningCoordinator,
+    ) -> Result<Self, (Box<NativeMiningCoordinator>, PoolBackendAdapterError)> {
+        let descriptor = match job_descriptor_from_native(coordinator.generation_descriptor()) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Err((Box::new(coordinator), error)),
+        };
         let zcash_winner_snapshot = Arc::new(coordinator.job().zcash_winner_snapshot());
+        let currentness = coordinator.pool_currentness_probe();
         Ok(Self {
             coordinator,
             descriptor,
-            admission_healthy: AtomicBool::new(true),
+            currentness,
             zcash_winner_snapshot,
         })
+    }
+
+    /// Returns a detached probe for independent bounded chain workers.
+    pub fn currentness_probe(
+        &self,
+    ) -> &crate::pool_backend_supervision::NativePoolCurrentnessProbe {
+        &self.currentness
+    }
+
+    /// Returns cached replacement demand without RPC or the coordinator mutex.
+    pub fn replacement_requested(&self) -> bool {
+        self.currentness.replacement_requested()
+    }
+
+    /// Permanently closes cached admission before retirement is queued.
+    pub fn close_currentness(&self) {
+        self.currentness.close();
     }
 
     /// Refreshes chain currentness and returns whether a replacement should
@@ -63,15 +85,16 @@ impl NativePoolBackendRetainedJob {
     pub fn refresh_currentness(&self) -> bool {
         match self.coordinator.refresh_pool_currentness() {
             Ok(PoolGenerationCurrentness::Current) => {
-                self.admission_healthy.store(true, Ordering::Release);
+                self.currentness.record_legacy_currentness(true, true);
                 false
             }
             Ok(PoolGenerationCurrentness::OneChainUnavailable) => {
-                self.admission_healthy.store(true, Ordering::Release);
+                let zcash = self.coordinator.pool_zcash_current();
+                self.currentness.record_legacy_currentness(!zcash, zcash);
                 true
             }
             Err(_) => {
-                self.admission_healthy.store(false, Ordering::Release);
+                self.currentness.close();
                 true
             }
         }
@@ -83,6 +106,7 @@ impl NativePoolBackendRetainedJob {
     /// `Arc::get_mut` or `Arc::try_unwrap`. Both operations fail while the actor
     /// or an admitted validation retains another owner.
     pub fn retire_generation(&mut self) -> Result<GenerationRetirement, MinerError> {
+        self.currentness.close();
         self.coordinator.retire_generation()
     }
 }
@@ -128,11 +152,11 @@ impl PoolBackendRetainedJob for NativePoolBackendRetainedJob {
     }
 
     fn is_healthy(&self) -> bool {
-        self.admission_healthy.load(Ordering::Acquire)
+        self.currentness.is_healthy()
     }
 
     fn is_zcash_current(&self) -> bool {
-        self.coordinator.pool_zcash_current()
+        self.currentness.is_zcash_current()
     }
 
     fn validate_share(
@@ -211,14 +235,11 @@ impl NativeValidationBackend for NativeMiningCoordinator {
 
 impl NativeValidationBackend for NativePoolBackendRetainedJob {
     fn assert_current(&self) -> Result<(), MinerError> {
-        self.admission_healthy
-            .load(Ordering::Acquire)
-            .then_some(())
-            .ok_or_else(|| {
-                MinerError::StaleNativeJob(
-                    "neither merge-mined chain remains available for this job".to_string(),
-                )
-            })
+        self.currentness.is_healthy().then_some(()).ok_or_else(|| {
+            MinerError::StaleNativeJob(
+                "neither merge-mined chain remains available for this job".to_string(),
+            )
+        })
     }
 
     fn validate_and_materialize(

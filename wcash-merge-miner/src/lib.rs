@@ -28,6 +28,7 @@ mod pool_backend_connection;
 mod pool_backend_identity;
 mod pool_backend_journal;
 mod pool_backend_listener;
+pub mod pool_backend_supervision;
 mod pool_backend_transport;
 mod pool_backend_workers;
 mod preparation_timing;

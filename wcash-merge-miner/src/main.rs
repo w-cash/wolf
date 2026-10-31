@@ -8,8 +8,8 @@ use std::{
     path::PathBuf,
     process,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime},
@@ -24,6 +24,7 @@ use wcash_merge_miner::{
         PoolBackendJournal, PoolBackendJournalError, PoolBackendListener,
         PoolBackendListenerConfig, PoolShareTargetPolicy,
     },
+    pool_backend_supervision::{NativePoolCurrentnessWorkers, PoolBackendControlWorker},
     protocol::serve_loopback,
     record_native_backend_runtime,
     rpc::RpcEndpoint,
@@ -55,7 +56,11 @@ const TIP_RACE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const WCASH_AUX_TIP_CHANGED_ERROR_CODE: i64 = -32_001;
 const POOL_BACKEND_MONITOR_INTERVAL: Duration = Duration::from_millis(50);
 const POOL_BACKEND_SUPERSEDED_GRACE: Duration = Duration::from_secs(2);
-const POOL_BACKEND_RETIREMENT_QUEUE: usize = 4;
+// Every in-flight/prepared/active/draining/retiring generation owns one slot.
+// A queue with this capacity cannot overflow while a sender owns another slot.
+const POOL_BACKEND_CANDIDATE_LIMIT: usize = 6;
+const POOL_BACKEND_RETIREMENT_QUEUE: usize = POOL_BACKEND_CANDIDATE_LIMIT;
+const POOL_BACKEND_RETIREMENT_OWNERSHIP_TIMEOUT: Duration = Duration::from_secs(5);
 
 const WCASH_RPC_USERNAME: &str = "WCASH_RPC_USERNAME";
 const WCASH_RPC_PASSWORD: &str = "WCASH_RPC_PASSWORD";
@@ -334,88 +339,202 @@ struct PoolBackendAuthorityFacts {
     zcash_payout_commitment: Hex32,
 }
 
-enum PoolBackendGenerationControl {
-    Rotate,
-    Shutdown,
-    ServiceFailure(String),
-}
-
 struct PoolBackendListenerWorkers {
     listener: Arc<PoolBackendListener>,
     threads: Vec<thread::JoinHandle<()>>,
 }
 
+struct PoolBackendCandidateSlot(Arc<AtomicUsize>);
+
+impl PoolBackendCandidateSlot {
+    fn acquire(slots: &Arc<AtomicUsize>) -> Option<Self> {
+        slots
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < POOL_BACKEND_CANDIDATE_LIMIT).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(slots)))
+    }
+}
+
+impl Drop for PoolBackendCandidateSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct PoolBackendCandidate {
+    retained: Arc<NativePoolBackendRetainedJob>,
+    _slot: PoolBackendCandidateSlot,
+}
+
 struct ActivePoolBackendGeneration {
     job_id: Hex32,
-    retained: Arc<NativePoolBackendRetainedJob>,
+    candidate: PoolBackendCandidate,
     rotation_deadline: Instant,
 }
 
 struct DrainingPoolBackendGeneration {
     job_id: Hex32,
-    retained: Arc<NativePoolBackendRetainedJob>,
+    candidate: PoolBackendCandidate,
     close_at: Instant,
 }
 
+struct PoolBackendPreparationRequest {
+    id: u64,
+    requested_at: Instant,
+    slot: PoolBackendCandidateSlot,
+}
+
+struct PoolBackendPreparationResult {
+    id: u64,
+    requested_at: Instant,
+    completed_at: Instant,
+    timing: NativePreparationTiming,
+    result: Result<PoolBackendCandidate, MinerError>,
+}
+
 struct PoolBackendRetirementWorker {
-    sender: Option<mpsc::SyncSender<Arc<NativePoolBackendRetainedJob>>>,
+    sender: Option<mpsc::SyncSender<PoolBackendCandidate>>,
     thread: Option<thread::JoinHandle<()>>,
+    stranded: Arc<Mutex<Vec<PoolBackendCandidate>>>,
+    failure: mpsc::Sender<String>,
 }
 
 impl PoolBackendRetirementWorker {
     fn spawn(failure: mpsc::Sender<String>) -> Result<Self, io::Error> {
-        let (sender, receiver) = mpsc::sync_channel(POOL_BACKEND_RETIREMENT_QUEUE);
+        let (sender, receiver) =
+            mpsc::sync_channel::<PoolBackendCandidate>(POOL_BACKEND_RETIREMENT_QUEUE);
+        let worker_failure = failure.clone();
         let thread = thread::Builder::new()
             .name("wcash-candidate-retirement".to_string())
             .spawn(move || {
-                while let Ok(retained) = receiver.recv() {
-                    let mut retained = match Arc::try_unwrap(retained) {
-                        Ok(retained) => retained,
-                        Err(_) => {
-                            let _ = failure.send(
-                                "closed native generation retained unexpected validation ownership"
-                                    .to_string(),
-                            );
-                            break;
-                        }
-                    };
-                    if let Err(error) = retire_pool_backend_generation(&mut retained) {
-                        let _ = failure.send(format!(
-                            "closed native generation candidate retirement failed: {error}"
-                        ));
-                        break;
-                    }
+                while let Ok(candidate) = receiver.recv() {
+                    retire_owned_pool_backend_candidate(candidate, &worker_failure);
                 }
             })?;
         Ok(Self {
             sender: Some(sender),
             thread: Some(thread),
+            stranded: Arc::new(Mutex::new(Vec::new())),
+            failure,
         })
     }
 
-    fn enqueue(&self, retained: Arc<NativePoolBackendRetainedJob>) -> Result<(), MinerError> {
-        let sender = self.sender.as_ref().ok_or_else(|| {
-            MinerError::InvalidRequest("candidate retirement worker is stopped".to_string())
-        })?;
-        sender.try_send(retained).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => MinerError::InvalidRequest(
-                "candidate retirement queue is full; refusing unbounded generation overlap"
-                    .to_string(),
-            ),
-            mpsc::TrySendError::Disconnected(_) => MinerError::InvalidRequest(
-                "candidate retirement worker stopped unexpectedly".to_string(),
-            ),
-        })
+    fn enqueue(&self, candidate: PoolBackendCandidate) -> Result<(), MinerError> {
+        enqueue_pool_backend_retirement(self.sender.as_ref(), &self.stranded, candidate)
     }
 
     fn request_shutdown(&mut self) -> Result<(), io::Error> {
         self.sender.take();
-        if let Some(worker) = self.thread.take() {
-            worker.join().map_err(|_| {
-                io::Error::other("candidate retirement worker panicked during shutdown")
-            })?;
+        let joined = self.thread.take().map(|worker| worker.join()).transpose();
+        // A disconnected receiver must not drop a returned candidate on the
+        // controller. After all actor/validator owners stop, drain the bounded
+        // fallback on a cleanup thread, never by issuing RPC on the controller.
+        let has_stranded = !self
+            .stranded
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty();
+        if has_stranded {
+            let stranded = Arc::clone(&self.stranded);
+            let failure = self.failure.clone();
+            // Move only an Arc into the spawn closure. If thread creation
+            // fails, the original store still owns every candidate lease.
+            thread::Builder::new()
+                .name("wcash-retirement-recovery".to_string())
+                .spawn(move || loop {
+                    let candidate = stranded
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .pop();
+                    let Some(candidate) = candidate else {
+                        break;
+                    };
+                    retire_owned_pool_backend_candidate(candidate, &failure);
+                })?
+                .join()
+                .map_err(|_| io::Error::other("candidate recovery worker panicked"))?;
         }
+        joined.map_err(|_| {
+            io::Error::other("candidate retirement worker panicked during shutdown")
+        })?;
         Ok(())
+    }
+}
+
+fn enqueue_pool_backend_retirement(
+    sender: Option<&mpsc::SyncSender<PoolBackendCandidate>>,
+    stranded: &Mutex<Vec<PoolBackendCandidate>>,
+    candidate: PoolBackendCandidate,
+) -> Result<(), MinerError> {
+    candidate.retained.close_currentness();
+    enqueue_owned_pool_backend_cleanup(sender, stranded, candidate)
+}
+
+fn enqueue_owned_pool_backend_cleanup<T>(
+    sender: Option<&mpsc::SyncSender<T>>,
+    stranded: &Mutex<Vec<T>>,
+    candidate: T,
+) -> Result<(), MinerError> {
+    let (candidate, reason) = match sender {
+        Some(sender) => match sender.try_send(candidate) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Full(candidate)) => {
+                (candidate, "candidate retirement queue is full")
+            }
+            Err(mpsc::TrySendError::Disconnected(candidate)) => (
+                candidate,
+                "candidate retirement worker stopped unexpectedly",
+            ),
+        },
+        None => (candidate, "candidate retirement worker is stopped"),
+    };
+    // Candidate slots bound this emergency ownership store as well as the
+    // ordinary channel. No failed enqueue discards the returned lease owner.
+    stranded
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(candidate);
+    Err(MinerError::InvalidRequest(reason.to_string()))
+}
+
+fn retire_owned_pool_backend_candidate(
+    candidate: PoolBackendCandidate,
+    failure: &mpsc::Sender<String>,
+) {
+    let PoolBackendCandidate { retained, _slot } = candidate;
+    let mut retained = wait_for_pool_backend_unique_owner(
+        retained,
+        failure,
+        POOL_BACKEND_RETIREMENT_OWNERSHIP_TIMEOUT,
+    );
+    if let Err(error) = retire_pool_backend_generation(&mut retained) {
+        let _ = failure.send(format!(
+            "closed native generation candidate retirement failed: {error}"
+        ));
+    }
+}
+
+fn wait_for_pool_backend_unique_owner<T>(
+    mut owner: Arc<T>,
+    failure: &mpsc::Sender<String>,
+    report_after: Duration,
+) -> T {
+    let started = Instant::now();
+    let mut reported = false;
+    loop {
+        match Arc::try_unwrap(owner) {
+            Ok(owner) => return owner,
+            Err(retained) => owner = retained,
+        }
+        if !reported && started.elapsed() >= report_after {
+            reported = true;
+            let _ = failure.send("closed native generation retained validation ownership beyond the bounded handoff; stopping backend before candidate slots exhaust".to_string());
+        }
+        // Keep exact ownership after reporting. Common shutdown releases
+        // listener/actor owners before joining this lane; no lease is dropped.
+        thread::sleep(POOL_BACKEND_MONITOR_INTERVAL);
     }
 }
 
@@ -468,11 +587,18 @@ impl PoolBackendListenerWorkers {
         Ok(workers)
     }
 
-    fn request_shutdown(&self) -> Result<(), Box<dyn Error>> {
+    fn request_shutdown(&mut self) -> Result<(), Box<dyn Error>> {
         if self.threads.is_empty() {
             return Ok(());
         }
         self.listener.request_shutdown(self.threads.len())?;
+        let mut panicked = false;
+        for worker in self.threads.drain(..) {
+            panicked |= worker.join().is_err();
+        }
+        if panicked {
+            return Err(io::Error::other("pool listener worker panicked during shutdown").into());
+        }
         Ok(())
     }
 }
@@ -630,282 +756,335 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
         Arc::clone(&shutdown),
         listener_failure_tx.clone(),
     )?;
-    let listeners = PoolBackendListenerWorkers::spawn(
+    let mut listeners = PoolBackendListenerWorkers::spawn(
         listener,
         Arc::clone(&actor),
         runtime.listener_workers,
         listener_failure_tx.clone(),
     )?;
     let mut retirement_worker = PoolBackendRetirementWorker::spawn(listener_failure_tx.clone())?;
+    let retirement_sender = retirement_worker
+        .sender
+        .as_ref()
+        .expect("new retirement worker")
+        .clone();
+    let abandoned_candidates = Arc::clone(&retirement_worker.stranded);
+    let preparation_supervisor = Arc::clone(&supervisor);
+    let abandoned_failure = listener_failure_tx.clone();
+    let mut preparation_worker = PoolBackendControlWorker::spawn(
+        "wcash-job-preparation",
+        move |request: PoolBackendPreparationRequest| {
+            let mut timing = NativePreparationTiming::new();
+            let result = preparation_supervisor
+                .prepare_generation_timed(&mut timing)
+                .and_then(|coordinator| {
+                    match NativePoolBackendRetainedJob::new_recoverable(coordinator) {
+                        Ok(retained) => Ok(PoolBackendCandidate {
+                            retained: Arc::new(retained),
+                            _slot: request.slot,
+                        }),
+                        Err((mut coordinator, error)) => {
+                            // Descriptor failure is exceptional; preserve and retire
+                            // the lease here, never by dropping it on the controller.
+                            let retirement =
+                                retire_pool_backend_candidate(|| coordinator.retire_generation());
+                            retirement?;
+                            Err(MinerError::InvalidRequest(error.to_string()))
+                        }
+                    }
+                });
+            PoolBackendPreparationResult {
+                id: request.id,
+                requested_at: request.requested_at,
+                completed_at: Instant::now(),
+                timing,
+                result,
+            }
+        },
+        move |result: PoolBackendPreparationResult| {
+            if let Ok(candidate) = result.result {
+                if let Err(error) = enqueue_pool_backend_retirement(
+                    Some(&retirement_sender),
+                    &abandoned_candidates,
+                    candidate,
+                ) {
+                    let _ = abandoned_failure.send(error.to_string());
+                }
+            }
+        },
+    )?;
+    let mut currentness_workers = NativePoolCurrentnessWorkers::spawn()?;
     drop(listener_failure_tx);
 
+    let slots = Arc::new(AtomicUsize::new(0));
     let mut preparation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
+    let mut next_preparation = Instant::now();
+    let mut request_id = 0u64;
+    let mut expected_preparation: Option<(u64, Instant)> = None;
     let mut active: Option<ActivePoolBackendGeneration> = None;
     let mut draining = Vec::new();
-    loop {
-        reap_draining_pool_backend_generations(actor.as_ref(), &retirement_worker, &mut draining)?;
-        if shutdown.load(Ordering::Acquire) {
-            listeners.request_shutdown()?;
-            retire_running_pool_backend_generations(
-                actor.as_ref(),
-                &retirement_worker,
-                active.take(),
-                &mut draining,
-            )?;
-            winner_worker.request_shutdown()?;
-            retirement_worker.request_shutdown()?;
-            record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
-            return Ok(());
-        }
-        match listener_failure_rx.try_recv() {
-            Ok(error) => {
-                listeners.request_shutdown()?;
-                retire_running_pool_backend_generations(
-                    actor.as_ref(),
-                    &retirement_worker,
-                    active.take(),
-                    &mut draining,
-                )?;
-                winner_worker.request_shutdown()?;
-                retirement_worker.request_shutdown()?;
-                return Err(MinerError::InvalidRequest(format!(
-                    "private pool backend service stopped: {error}"
-                ))
-                .into());
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                listeners.request_shutdown()?;
-                retire_running_pool_backend_generations(
-                    actor.as_ref(),
-                    &retirement_worker,
-                    active.take(),
-                    &mut draining,
-                )?;
-                winner_worker.request_shutdown()?;
-                retirement_worker.request_shutdown()?;
-                return Err(MinerError::InvalidRequest(
-                    "every private backend service worker stopped".to_string(),
-                )
-                .into());
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-        let mut preparation_timing = NativePreparationTiming::new();
-        let coordinator = match supervisor.prepare_generation_timed(&mut preparation_timing) {
-            Ok(coordinator) => {
-                preparation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
-                coordinator
-            }
-            Err(error) if is_retryable_native_preparation_error(&error) => {
-                preparation_timing.finish_error(&error);
-                let retry_delay = native_preparation_retry_delay(&error, preparation_backoff);
-                record_native_backend_runtime(NativeBackendRuntimeEvent::PreparationRetry(
-                    &error,
-                    retry_delay,
-                ));
-                match wait_for_pool_backend_retry(
-                    retry_delay,
-                    shutdown.as_ref(),
-                    &listener_failure_rx,
-                ) {
-                    PoolBackendGenerationControl::Rotate => {}
-                    PoolBackendGenerationControl::Shutdown => {
-                        listeners.request_shutdown()?;
-                        retire_running_pool_backend_generations(
-                            actor.as_ref(),
-                            &retirement_worker,
-                            active.take(),
-                            &mut draining,
-                        )?;
-                        winner_worker.request_shutdown()?;
-                        retirement_worker.request_shutdown()?;
-                        record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
-                        return Ok(());
-                    }
-                    PoolBackendGenerationControl::ServiceFailure(error) => {
-                        listeners.request_shutdown()?;
-                        retire_running_pool_backend_generations(
-                            actor.as_ref(),
-                            &retirement_worker,
-                            active.take(),
-                            &mut draining,
-                        )?;
-                        winner_worker.request_shutdown()?;
-                        retirement_worker.request_shutdown()?;
-                        return Err(MinerError::InvalidRequest(format!(
-                            "private pool backend service stopped: {error}"
-                        ))
-                        .into());
-                    }
-                }
-                preparation_backoff = next_native_preparation_backoff(&error, preparation_backoff);
-                continue;
-            }
-            Err(error) => {
-                preparation_timing.finish_error(&error);
-                return Err(error.into());
-            }
-        };
-        preparation_timing.enter(PreparationPhase::Activation);
-        let retained = match NativePoolBackendRetainedJob::new(coordinator) {
-            Ok(retained) => Arc::new(retained),
-            Err(error) => {
-                preparation_timing.finish_activation_failed();
-                return Err(error.into());
-            }
-        };
-        let descriptor = retained.descriptor();
-        let job_id = descriptor.job_id.clone();
-        let superseded_grace = if active.is_some() {
-            POOL_BACKEND_SUPERSEDED_GRACE
-        } else {
-            Duration::ZERO
-        };
-        if let Err(error) = actor.activate_job(retained.clone(), superseded_grace) {
-            preparation_timing.finish_activation_failed();
-            let mut retained = Arc::try_unwrap(retained).map_err(|_| {
-                MinerError::InvalidRequest(
-                    "private backend retained a generation after failed activation".to_string(),
-                )
-            })?;
-            if let Err(retirement) = retire_pool_backend_generation(&mut retained) {
-                record_native_backend_runtime(
-                    NativeBackendRuntimeEvent::ActivationRetirementFailed(&retirement),
-                );
-            }
-            return Err(error.into());
-        }
-        preparation_timing.finish_ok();
-        record_native_backend_runtime(NativeBackendRuntimeEvent::JobActivated(&descriptor));
+    let mut unpublished: Option<PoolBackendCandidate> = None;
 
-        if let Some(previous) = active.take() {
-            let shares_a_tip = pool_backend_generations_share_any_tip(
-                &previous.retained.descriptor(),
-                &descriptor,
-            );
-            if shares_a_tip {
-                let close_after = previous
-                    .retained
-                    .remaining_lifetime()
-                    .unwrap_or_default()
-                    .min(POOL_BACKEND_SUPERSEDED_GRACE);
-                let close_at = Instant::now().checked_add(close_after).ok_or_else(|| {
-                    MinerError::InvalidRequest(
-                        "superseded backend generation deadline overflow".to_string(),
-                    )
-                })?;
-                draining.push(DrainingPoolBackendGeneration {
-                    job_id: previous.job_id,
-                    retained: previous.retained,
-                    close_at,
-                });
-            } else {
-                enqueue_closed_pool_backend_generation(
-                    actor.as_ref(),
-                    &retirement_worker,
-                    previous.job_id,
-                    previous.retained,
-                )?;
-            }
-        }
-
-        // Rotate before the native 45-second admission lease expires, leaving
-        // margin for node health RPCs and a share already inside validation.
-        let rotation_deadline = Instant::now()
-            .checked_add(Duration::from_secs(
-                NATIVE_JOB_MAX_AGE_SECONDS.saturating_sub(15),
-            ))
-            .ok_or_else(|| {
-                MinerError::InvalidRequest("native backend rotation deadline overflow".to_string())
-            })?;
-        active = Some(ActivePoolBackendGeneration {
-            job_id,
-            retained,
-            rotation_deadline,
-        });
-        let control = loop {
+    // All runtime errors leave ownership in these outer slots for the common
+    // listener-first shutdown path. No preparation/currentness RPC joins this loop.
+    let runtime_result: Result<(), Box<dyn Error>> = (|| {
+        loop {
             reap_draining_pool_backend_generations(
                 actor.as_ref(),
                 &retirement_worker,
                 &mut draining,
             )?;
             if shutdown.load(Ordering::Acquire) {
-                break PoolBackendGenerationControl::Shutdown;
+                return Ok(());
             }
-            match listener_failure_rx.recv_timeout(POOL_BACKEND_MONITOR_INTERVAL) {
-                Ok(error) => break PoolBackendGenerationControl::ServiceFailure(error),
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    break PoolBackendGenerationControl::ServiceFailure(
+            match listener_failure_rx.try_recv() {
+                Ok(error) => {
+                    return Err(MinerError::InvalidRequest(format!(
+                        "private pool backend service stopped: {error}"
+                    ))
+                    .into())
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(MinerError::InvalidRequest(
                         "every private backend service worker stopped".to_string(),
                     )
+                    .into())
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+
+            currentness_workers.tick(
+                active
+                    .as_ref()
+                    .map(|current| current.candidate.retained.currentness_probe()),
+            )?;
+            if let Some(result) = preparation_worker.poll()? {
+                let expected = expected_preparation.take();
+                let valid_request = pool_backend_preparation_response_matches(
+                    expected,
+                    result.id,
+                    result.requested_at,
+                    result.completed_at,
+                    Instant::now(),
+                );
+                match result.result {
+                    Ok(candidate) => {
+                        unpublished = Some(candidate);
+                        if !pool_backend_preparation_can_activate(
+                            valid_request,
+                            shutdown.load(Ordering::Acquire),
+                            unpublished
+                                .as_ref()
+                                .expect("owned prepared candidate")
+                                .retained
+                                .remaining_lifetime(),
+                        ) {
+                            result.timing.finish_activation_failed();
+                            retirement_worker
+                                .enqueue(unpublished.take().expect("owned prepared candidate"))?;
+                            next_preparation = Instant::now();
+                            continue;
+                        }
+                        let candidate = unpublished.as_ref().expect("owned prepared candidate");
+                        let descriptor = candidate.retained.descriptor();
+                        let job_id = descriptor.job_id.clone();
+                        let grace = if active.is_some() {
+                            POOL_BACKEND_SUPERSEDED_GRACE
+                        } else {
+                            Duration::ZERO
+                        };
+                        let mut timing = result.timing;
+                        timing.enter(PreparationPhase::Activation);
+                        if let Err(error) = actor.activate_job(candidate.retained.clone(), grace) {
+                            timing.finish_activation_failed();
+                            return Err(error.into());
+                        }
+                        timing.finish_ok();
+                        record_native_backend_runtime(NativeBackendRuntimeEvent::JobActivated(
+                            &descriptor,
+                        ));
+                        preparation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
+                        let replacement = ActivePoolBackendGeneration {
+                            job_id,
+                            candidate: unpublished.take().expect("activated prepared candidate"),
+                            rotation_deadline: Instant::now()
+                                + Duration::from_secs(
+                                    NATIVE_JOB_MAX_AGE_SECONDS.saturating_sub(15),
+                                ),
+                        };
+                        if let Some(previous) =
+                            replace_owned_pool_backend_generation(&mut active, replacement)
+                        {
+                            if pool_backend_generations_share_any_tip(
+                                &previous.candidate.retained.descriptor(),
+                                &descriptor,
+                            ) {
+                                let close_after = previous
+                                    .candidate
+                                    .retained
+                                    .remaining_lifetime()
+                                    .unwrap_or_default()
+                                    .min(POOL_BACKEND_SUPERSEDED_GRACE);
+                                draining.push(DrainingPoolBackendGeneration {
+                                    job_id: previous.job_id,
+                                    candidate: previous.candidate,
+                                    close_at: Instant::now() + close_after,
+                                });
+                            } else {
+                                enqueue_closed_pool_backend_generation(
+                                    actor.as_ref(),
+                                    &retirement_worker,
+                                    previous.job_id,
+                                    previous.candidate,
+                                )?;
+                            }
+                        }
+                        currentness_workers.generation_changed();
+                    }
+                    Err(error) => {
+                        result.timing.finish_error(&error);
+                        if !valid_request || !is_retryable_native_preparation_error(&error) {
+                            return Err(error.into());
+                        }
+                        let delay = native_preparation_retry_delay(&error, preparation_backoff);
+                        record_native_backend_runtime(NativeBackendRuntimeEvent::PreparationRetry(
+                            &error, delay,
+                        ));
+                        next_preparation = Instant::now() + delay;
+                        preparation_backoff =
+                            next_native_preparation_backoff(&error, preparation_backoff);
+                    }
+                }
+            }
+
+            // Expiry and draining are supervised even during preparation/backoff.
+            // A late positive probe cannot reopen this generation after closure.
+            if active
+                .as_ref()
+                .is_some_and(|current| current.candidate.retained.remaining_lifetime().is_none())
+            {
+                let current = active.take().expect("expired active generation");
+                match actor.invalidate_job(
+                    &current.job_id,
+                    JobInvalidationReason::Age,
+                    Duration::ZERO,
+                ) {
+                    Ok(_) | Err(PoolBackendActorError::JobNotRetained) => {}
+                    Err(error) => {
+                        active = Some(current);
+                        return Err(error.into());
+                    }
+                }
+                retirement_worker.enqueue(current.candidate)?;
+            }
+            let replacement_needed = active.as_ref().is_none_or(|current| {
+                Instant::now() >= current.rotation_deadline
+                    || current.candidate.retained.replacement_requested()
+            });
+            if replacement_needed
+                && !preparation_worker.is_busy()
+                && Instant::now() >= next_preparation
+            {
+                if let Some(slot) = PoolBackendCandidateSlot::acquire(&slots) {
+                    request_id = request_id.checked_add(1).ok_or_else(|| {
+                        MinerError::InvalidRequest(
+                            "preparation request identity exhausted".to_string(),
+                        )
+                    })?;
+                    let requested_at = Instant::now();
+                    preparation_worker.request(PoolBackendPreparationRequest {
+                        id: request_id,
+                        requested_at,
+                        slot,
+                    })?;
+                    expected_preparation = Some((request_id, requested_at));
+                }
+            }
+            // Both active and retry/backoff modes use this same bounded tick.
+            match listener_failure_rx.recv_timeout(POOL_BACKEND_MONITOR_INTERVAL) {
+                Ok(error) => {
+                    return Err(MinerError::InvalidRequest(format!(
+                        "private pool backend service stopped: {error}"
+                    ))
+                    .into())
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(MinerError::InvalidRequest(
+                        "every private backend service worker stopped".to_string(),
+                    )
+                    .into())
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            let current = active.as_ref().ok_or_else(|| {
-                MinerError::InvalidRequest("private backend lost its active generation".to_string())
-            })?;
-            if Instant::now() >= current.rotation_deadline || current.retained.refresh_currentness()
-            {
-                break PoolBackendGenerationControl::Rotate;
-            }
-        };
-
-        if !matches!(control, PoolBackendGenerationControl::Rotate) {
-            listeners.request_shutdown()?;
-            retire_running_pool_backend_generations(
-                actor.as_ref(),
-                &retirement_worker,
-                active.take(),
-                &mut draining,
-            )?;
         }
+    })();
 
-        match control {
-            PoolBackendGenerationControl::Rotate => {}
-            PoolBackendGenerationControl::Shutdown => {
-                winner_worker.request_shutdown()?;
-                retirement_worker.request_shutdown()?;
-                record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
-                return Ok(());
-            }
-            PoolBackendGenerationControl::ServiceFailure(error) => {
-                winner_worker.request_shutdown()?;
-                retirement_worker.request_shutdown()?;
-                return Err(MinerError::InvalidRequest(format!(
-                    "private pool backend service stopped: {error}"
-                ))
-                .into());
-            }
-        }
-    }
+    // Stop ingress before waiting for any already-bounded control RPC. Dropping
+    // the preparation result receiver hands unpublished leases back to its owner.
+    let listener_shutdown = listeners.request_shutdown();
+    let preparation_shutdown = preparation_worker.request_shutdown();
+    let currentness_shutdown = currentness_workers.request_shutdown();
+    let unpublished_retirement = unpublished
+        .take()
+        .map(|candidate| {
+            let id = candidate.retained.descriptor().job_id;
+            let _ = actor.invalidate_job(&id, JobInvalidationReason::Age, Duration::ZERO);
+            retirement_worker.enqueue(candidate)
+        })
+        .transpose();
+    let running_retirement = retire_running_pool_backend_generations(
+        actor.as_ref(),
+        &retirement_worker,
+        active.take(),
+        &mut draining,
+    );
+    let winner_shutdown = winner_worker.request_shutdown();
+    // Also release actor ownership when a hard journal error prevented normal
+    // invalidation. The retirement lane alone waits for unique ownership.
+    drop(actor);
+    let retirement_shutdown = retirement_worker.request_shutdown();
+    listener_shutdown?;
+    preparation_shutdown?;
+    currentness_shutdown?;
+    unpublished_retirement?;
+    running_retirement?;
+    winner_shutdown?;
+    retirement_shutdown?;
+    runtime_result?;
+    record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
+    Ok(())
 }
 
-fn wait_for_pool_backend_retry(
-    duration: Duration,
-    shutdown: &AtomicBool,
-    failures: &mpsc::Receiver<String>,
-) -> PoolBackendGenerationControl {
-    let Some(deadline) = Instant::now().checked_add(duration) else {
-        return PoolBackendGenerationControl::Rotate;
-    };
-    loop {
-        if shutdown.load(Ordering::Acquire) {
-            return PoolBackendGenerationControl::Shutdown;
-        }
-        match failures.try_recv() {
-            Ok(error) => return PoolBackendGenerationControl::ServiceFailure(error),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return PoolBackendGenerationControl::ServiceFailure(
-                    "every private backend service worker stopped".to_string(),
-                )
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return PoolBackendGenerationControl::Rotate;
-        };
-        thread::sleep(remaining.min(Duration::from_millis(100)));
-    }
+fn replace_owned_pool_backend_generation<T>(active: &mut Option<T>, replacement: T) -> Option<T> {
+    active.replace(replacement)
+}
+
+fn enqueue_after_pool_backend_close<C, E>(
+    close: Result<(), E>,
+    candidate: C,
+    enqueue: impl FnOnce(C) -> Result<(), E>,
+) -> Result<(), E> {
+    let retirement = enqueue(candidate);
+    close?;
+    retirement
+}
+
+fn pool_backend_preparation_response_matches(
+    expected: Option<(u64, Instant)>,
+    id: u64,
+    requested_at: Instant,
+    completed_at: Instant,
+    now: Instant,
+) -> bool {
+    expected == Some((id, requested_at)) && requested_at <= completed_at && completed_at <= now
+}
+
+fn pool_backend_preparation_can_activate(
+    response_matches: bool,
+    stopped: bool,
+    remaining: Option<Duration>,
+) -> bool {
+    response_matches && !stopped && remaining.is_some_and(|remaining| !remaining.is_zero())
 }
 
 fn pool_backend_generations_share_any_tip(
@@ -946,7 +1125,7 @@ fn reap_draining_pool_backend_generations(
             actor,
             retirement_worker,
             generation.job_id,
-            generation.retained,
+            generation.candidate,
         )?;
     }
     Ok(())
@@ -956,14 +1135,15 @@ fn enqueue_closed_pool_backend_generation(
     actor: &PoolBackendActor,
     retirement_worker: &PoolBackendRetirementWorker,
     job_id: Hex32,
-    retained: Arc<NativePoolBackendRetainedJob>,
+    candidate: PoolBackendCandidate,
 ) -> Result<(), Box<dyn Error>> {
-    match actor.release_ordinary_job(&job_id) {
-        Ok(_) | Err(PoolBackendActorError::JobNotRetained) => {}
-        Err(error) => return Err(error.into()),
-    }
-    retirement_worker.enqueue(retained)?;
-    Ok(())
+    let release: Result<(), Box<dyn Error>> = match actor.release_ordinary_job(&job_id) {
+        Ok(_) | Err(PoolBackendActorError::JobNotRetained) => Ok(()),
+        Err(error) => Err(error.into()),
+    };
+    enqueue_after_pool_backend_close(release, candidate, |candidate| {
+        retirement_worker.enqueue(candidate).map_err(Into::into)
+    })
 }
 
 fn retire_running_pool_backend_generations(
@@ -972,27 +1152,43 @@ fn retire_running_pool_backend_generations(
     active: Option<ActivePoolBackendGeneration>,
     draining: &mut Vec<DrainingPoolBackendGeneration>,
 ) -> Result<(), Box<dyn Error>> {
+    let mut first_error: Option<Box<dyn Error>> = None;
     if let Some(active) = active {
-        match actor.invalidate_job(&active.job_id, JobInvalidationReason::Age, Duration::ZERO) {
-            Ok(_) | Err(PoolBackendActorError::JobNotRetained) => {}
-            Err(error) => return Err(error.into()),
+        if let Err(error) =
+            actor.invalidate_job(&active.job_id, JobInvalidationReason::Age, Duration::ZERO)
+        {
+            if !matches!(error, PoolBackendActorError::JobNotRetained) {
+                first_error = Some(error.into());
+            }
         }
-        retirement_worker.enqueue(active.retained)?;
+        if let Err(error) = retirement_worker.enqueue(active.candidate) {
+            first_error.get_or_insert_with(|| error.into());
+        }
     }
     for generation in draining.drain(..) {
-        enqueue_closed_pool_backend_generation(
+        if let Err(error) = enqueue_closed_pool_backend_generation(
             actor,
             retirement_worker,
             generation.job_id,
-            generation.retained,
-        )?;
+            generation.candidate,
+        ) {
+            first_error.get_or_insert(error);
+        }
     }
-    actor.close_zcash_winner_snapshots()?;
-    Ok(())
+    if let Err(error) = actor.close_zcash_winner_snapshots() {
+        first_error.get_or_insert_with(|| error.into());
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn retire_pool_backend_generation(
     retained: &mut NativePoolBackendRetainedJob,
+) -> Result<GenerationRetirement, MinerError> {
+    retire_pool_backend_candidate(|| retained.retire_generation())
+}
+
+fn retire_pool_backend_candidate(
+    mut retire: impl FnMut() -> Result<GenerationRetirement, MinerError>,
 ) -> Result<GenerationRetirement, MinerError> {
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(30))
@@ -1001,7 +1197,7 @@ fn retire_pool_backend_generation(
         })?;
     let mut backoff = Duration::from_secs(1);
     loop {
-        match retained.retire_generation() {
+        match retire() {
             Ok(retirement) => return Ok(retirement),
             Err(error) if is_retryable_native_preparation_error(&error) => {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -2719,31 +2915,201 @@ mod tests {
         assert_eq!(result, GenerationRetirement::RetainedForWcashWinner);
     }
 
+    struct CandidateOwnershipFixture {
+        id: u64,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for CandidateOwnershipFixture {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     #[test]
-    fn pool_backend_retry_wait_wakes_for_shutdown_and_worker_failure() {
-        let shutdown = AtomicBool::new(true);
-        let (_failure_sender, failures) = mpsc::channel();
-        assert!(matches!(
-            wait_for_pool_backend_retry(Duration::from_secs(1), &shutdown, &failures),
-            PoolBackendGenerationControl::Shutdown
-        ));
+    fn pool_backend_activated_owner_survives_old_close_failure_and_shutdown_enqueues_every_owner() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let lease = |id| CandidateOwnershipFixture {
+            id,
+            drops: Arc::clone(&drops),
+        };
+        let mut active = Some(lease(1));
+        let previous = replace_owned_pool_backend_generation(&mut active, lease(2)).unwrap();
+        assert_eq!(active.as_ref().unwrap().id, 2);
+        let (retirement, queued) = mpsc::sync_channel(2);
+        let close = enqueue_after_pool_backend_close::<_, &'static str>(
+            Err("journal close failed"),
+            previous,
+            |candidate| {
+                retirement
+                    .try_send(candidate)
+                    .map_err(|_| "queue failure")?;
+                Ok(())
+            },
+        );
+        assert_eq!(close, Err("journal close failed"));
+        assert_eq!(
+            drops.load(Ordering::Acquire),
+            0,
+            "old owner reached cleanup despite close error"
+        );
+        assert_eq!(
+            active.as_ref().unwrap().id,
+            2,
+            "activated replacement remains owned after prior close error"
+        );
+        let close = enqueue_after_pool_backend_close::<_, &'static str>(
+            Err("expiry close failed"),
+            active.take().unwrap(),
+            |candidate| {
+                retirement
+                    .try_send(candidate)
+                    .map_err(|_| "queue failure")?;
+                Ok(())
+            },
+        );
+        assert_eq!(close, Err("expiry close failed"));
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        let old = queued.recv().unwrap();
+        let replacement = queued.recv().unwrap();
+        assert_eq!((old.id, replacement.id), (1, 2));
+        drop(old);
+        drop(replacement);
+        assert_eq!(
+            drops.load(Ordering::Acquire),
+            2,
+            "each exact owner retires once"
+        );
+    }
 
-        let shutdown = AtomicBool::new(false);
-        let (failure_sender, failures) = mpsc::channel();
-        failure_sender
-            .send("durable winner journal failed".to_string())
-            .expect("failure channel remains open");
-        assert!(matches!(
-            wait_for_pool_backend_retry(Duration::from_secs(1), &shutdown, &failures),
-            PoolBackendGenerationControl::ServiceFailure(error)
-                if error == "durable winner journal failed"
-        ));
+    #[test]
+    fn pool_backend_cleanup_queue_full_and_disconnected_keep_exact_owners() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let lease = |id| CandidateOwnershipFixture {
+            id,
+            drops: Arc::clone(&drops),
+        };
+        let fallback = Mutex::new(Vec::new());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        enqueue_owned_pool_backend_cleanup(Some(&sender), &fallback, lease(1)).unwrap();
+        assert!(enqueue_owned_pool_backend_cleanup(Some(&sender), &fallback, lease(2)).is_err());
+        assert_eq!(fallback.lock().unwrap()[0].id, 2);
+        let queued = receiver.recv().unwrap();
+        drop(receiver);
+        assert!(enqueue_owned_pool_backend_cleanup(Some(&sender), &fallback, lease(3)).is_err());
+        assert!(enqueue_owned_pool_backend_cleanup(None, &fallback, lease(4)).is_err());
+        assert_eq!(
+            drops.load(Ordering::Acquire),
+            0,
+            "failed sends never drop a candidate owner"
+        );
+        let saved = std::mem::take(&mut *fallback.lock().unwrap());
+        assert_eq!(
+            saved.iter().map(|owner| owner.id).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+        drop(queued);
+        drop(saved);
+        assert_eq!(drops.load(Ordering::Acquire), 4);
+    }
 
-        let (_failure_sender, failures) = mpsc::channel();
-        assert!(matches!(
-            wait_for_pool_backend_retry(Duration::ZERO, &shutdown, &failures),
-            PoolBackendGenerationControl::Rotate
+    #[test]
+    fn pool_backend_retirement_reports_held_owner_once_without_discarding_it() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let retained = Arc::new(CandidateOwnershipFixture {
+            id: 7,
+            drops: Arc::clone(&drops),
+        });
+        let admitted_validator = Arc::clone(&retained);
+        let (failure, failures) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            wait_for_pool_backend_unique_owner(retained, &failure, Duration::ZERO)
+        });
+        let reported = failures.recv_timeout(Duration::from_secs(1));
+        // Always release the barrier before assertions or a join, including a
+        // failed report, so this test cannot strand a background owner.
+        drop(admitted_validator);
+        let retired = worker.join().unwrap();
+        assert!(reported.is_ok());
+        assert!(
+            failures.try_recv().is_err(),
+            "one bounded ownership warning only"
+        );
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        assert_eq!(retired.id, 7);
+        drop(retired);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn pool_backend_preparation_handoff_checks_exact_request_time_and_original_lease() {
+        let requested = Instant::now();
+        let completed = requested + Duration::from_secs(1);
+        let now = completed + Duration::from_millis(50);
+        let expected = Some((3, requested));
+        assert!(pool_backend_preparation_response_matches(
+            expected, 3, requested, completed, now
         ));
+        assert!(!pool_backend_preparation_response_matches(
+            expected, 4, requested, completed, now
+        ));
+        assert!(!pool_backend_preparation_response_matches(
+            expected, 3, completed, completed, now
+        ));
+        assert!(!pool_backend_preparation_response_matches(
+            expected,
+            3,
+            requested,
+            requested - Duration::from_millis(1),
+            now
+        ));
+        assert!(!pool_backend_preparation_response_matches(
+            expected,
+            3,
+            requested,
+            now + Duration::from_millis(1),
+            now
+        ));
+        assert!(!pool_backend_preparation_response_matches(
+            None, 3, requested, completed, now
+        ));
+        assert!(pool_backend_preparation_can_activate(
+            true,
+            false,
+            Some(Duration::from_secs(1))
+        ));
+        assert!(!pool_backend_preparation_can_activate(
+            false,
+            false,
+            Some(Duration::from_secs(1))
+        ));
+        assert!(!pool_backend_preparation_can_activate(
+            true,
+            true,
+            Some(Duration::from_secs(1))
+        ));
+        assert!(!pool_backend_preparation_can_activate(
+            true,
+            false,
+            Some(Duration::ZERO)
+        ));
+        assert!(!pool_backend_preparation_can_activate(true, false, None));
+    }
+
+    #[test]
+    fn pool_backend_candidate_slots_bound_inflight_ready_active_and_retirement_owners() {
+        let budget = Arc::new(AtomicUsize::new(0));
+        let mut owners = (0..POOL_BACKEND_CANDIDATE_LIMIT)
+            .map(|_| PoolBackendCandidateSlot::acquire(&budget).unwrap())
+            .collect::<Vec<_>>();
+        assert!(PoolBackendCandidateSlot::acquire(&budget).is_none());
+        assert_eq!(budget.load(Ordering::Acquire), POOL_BACKEND_CANDIDATE_LIMIT);
+        owners.pop();
+        let replacement = PoolBackendCandidateSlot::acquire(&budget).unwrap();
+        assert!(PoolBackendCandidateSlot::acquire(&budget).is_none());
+        drop(replacement);
+        drop(owners);
+        assert_eq!(budget.load(Ordering::Acquire), 0);
     }
 
     #[test]

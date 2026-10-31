@@ -1,0 +1,4 @@
+project: wcash-merge-miner
+kind: Fixed
+body: "Keep pool-backend expiry and control supervision responsive during bounded job preparation, with independent per-chain currentness probes and bounded owned candidate retirement."
+time: 2026-10-31T12:00:00.000000000Z
