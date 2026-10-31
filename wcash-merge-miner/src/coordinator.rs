@@ -430,17 +430,33 @@ impl NativeMiningSupervisor {
 
     fn retire_failed_preparation(&self, lease: ChildCandidateLease) {
         if let Err(error) = retire_child_candidate(&self.wcash_node, &lease) {
-            eprintln!(
-                "failed to retire an unpublished native child generation: {error}; no new candidate will be requested until retirement is retried"
-            );
+            if crate::diagnostics::native_backend_mode() {
+                crate::diagnostics::native_backend_warning(
+                    "backend_unpublished_candidate_retirement",
+                    Some(&error),
+                );
+            } else {
+                eprintln!(
+                    "failed to retire an unpublished native child generation: {error}; no new candidate will be requested until retirement is retried"
+                );
+            }
             match self.pending_candidate_retirement.lock() {
                 Ok(mut pending) => {
                     debug_assert!(pending.is_none());
                     *pending = Some(lease);
                 }
-                Err(_) => eprintln!(
-                    "pending candidate retirement mutex is poisoned; stop this supervisor before issuing more work"
-                ),
+                Err(_) => {
+                    if crate::diagnostics::native_backend_mode() {
+                        crate::diagnostics::native_backend_warning(
+                            "backend_retirement_state_unavailable",
+                            None,
+                        );
+                    } else {
+                        eprintln!(
+                            "pending candidate retirement mutex is poisoned; stop this supervisor before issuing more work"
+                        );
+                    }
+                }
             }
         }
     }
@@ -2221,7 +2237,9 @@ fn retry_pending_winners_with(
                     journal.mark_status(winner, WinnerStatus::Observed)?;
                     if confirmations >= WINNER_RETENTION_CONFIRMATIONS {
                         journal.mark_status(winner, WinnerStatus::Matured)?;
-                    } else if !winner.observed_on_best_chain {
+                    } else if !winner.observed_on_best_chain
+                        && !native_backend_outbox_notice(winner, "observed", Some(confirmations))
+                    {
                         eprintln!(
                             "{} winner {} at height {} is on the best chain with {confirmations} confirmation(s); retaining exact bytes until {}",
                             winner.key.chain.as_str(),
@@ -2233,28 +2251,34 @@ fn retry_pending_winners_with(
                 }
                 WinnerObservation::Absent if winner.observed_on_best_chain => {
                     journal.mark_status(winner, WinnerStatus::Orphaned)?;
-                    eprintln!(
+                    if !native_backend_outbox_notice(winner, "orphaned", None) {
+                        eprintln!(
                         "{} winner {} at height {} left the observed best chain; exact bytes remain queued for replay",
                         winner.key.chain.as_str(),
                         winner.block_hash_display,
                         winner.height,
                     );
+                    }
                 }
                 WinnerObservation::ConflictingWitness => {
                     journal.mark_status(winner, WinnerStatus::Conflicting)?;
-                    eprintln!(
+                    if !native_backend_outbox_notice(winner, "conflicting_witness", None) {
+                        eprintln!(
                         "wcash winner {} at height {} conflicts with a different AuxPoW witness for the same block ID; exact bytes remain queued and operator intervention is required",
                         winner.block_hash_display,
                         winner.height,
                     );
+                    }
                 }
                 WinnerObservation::Absent | WinnerObservation::Unavailable => {
-                    eprintln!(
+                    if !native_backend_outbox_notice(winner, "pending", None) {
+                        eprintln!(
                         "{} winner {} at height {} is not yet confirmed; exact bytes remain in the durable outbox",
                         winner.key.chain.as_str(),
                         winner.block_hash_display,
                         winner.height,
                     );
+                    }
                 }
             }
         }
@@ -3267,6 +3291,25 @@ impl ShareJournal {
     fn lock_state(&self) -> Result<MutexGuard<'_, JournalState>, MinerError> {
         self.state.lock().map_err(|_| journal_mutex_error())
     }
+}
+
+fn native_backend_outbox_notice(
+    winner: &PendingWinner,
+    result: &'static str,
+    confirmations: Option<u32>,
+) -> bool {
+    if !crate::diagnostics::native_backend_mode() {
+        return false;
+    }
+    crate::diagnostics::native_backend_outbox(
+        winner.key.chain.as_str(),
+        &winner.block_hash_display,
+        &winner.job_id,
+        winner.height,
+        result,
+        confirmations,
+    );
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
