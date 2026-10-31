@@ -31,13 +31,60 @@ const NOISY_BURST: u64 = 32;
 const TIMING_ORIGINS: usize = 128;
 static DIAGNOSTICS: OnceLock<Diagnostics> = OnceLock::new();
 static NATIVE_BACKEND_MODE: AtomicBool = AtomicBool::new(false);
+static RUNTIME_INFO_ENABLED: AtomicBool = AtomicBool::new(true);
+static RUNTIME_LOG_CONFIG: OnceLock<RuntimeLogConfig> = OnceLock::new();
 static STARTUP: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Copy)]
+struct RuntimeLogConfig {
+    include_info: bool,
+    invalid_value: bool,
+}
+
+fn parse_runtime_log_level(value: Option<&str>) -> Option<bool> {
+    match value {
+        None => Some(true),
+        Some(value) if value.eq_ignore_ascii_case("info") => Some(true),
+        Some(value) if value.eq_ignore_ascii_case("warn") => Some(false),
+        Some(_) => None,
+    }
+}
+
+fn runtime_log_config() -> RuntimeLogConfig {
+    let value = std::env::var("WCASH_POOL_RUNTIME_LOG_LEVEL");
+    match value.as_ref() {
+        Ok(value) => runtime_log_config_for(Some(value)),
+        Err(std::env::VarError::NotPresent) => runtime_log_config_for(None),
+        Err(std::env::VarError::NotUnicode(_)) => RuntimeLogConfig {
+            include_info: true,
+            invalid_value: true,
+        },
+    }
+}
+
+fn runtime_log_config_for(value: Option<&str>) -> RuntimeLogConfig {
+    let include_info = parse_runtime_log_level(value);
+    RuntimeLogConfig {
+        include_info: include_info.unwrap_or(true),
+        invalid_value: include_info.is_none(),
+    }
+}
+
+fn runtime_info_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_RUNTIME_INFO.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    RUNTIME_INFO_ENABLED.load(Ordering::Relaxed)
+}
 
 #[cfg(test)]
 thread_local! {
     static CAPTURE: std::cell::RefCell<Option<Vec<Event>>> = const { std::cell::RefCell::new(None) };
     static TIMING_CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<Event>>>>> = const { std::cell::RefCell::new(None) };
     static TEST_SINK: std::cell::RefCell<Option<Arc<Diagnostics>>> = const { std::cell::RefCell::new(None) };
+    static TEST_RUNTIME_INFO: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static RUNTIME_EVENT_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Runtime notices for the persistent native backend, independent of console I/O.
@@ -64,9 +111,7 @@ enum RuntimeMetadata {
         zcash_height: u32,
         max_age_ms: u64,
     },
-    Retry {
-        delay_ms: u64,
-    },
+    Failure(RuntimeFailure),
     Outbox {
         chain: &'static str,
         hash_be: [u8; 32],
@@ -75,12 +120,60 @@ enum RuntimeMetadata {
     },
 }
 
+#[derive(Clone, Copy, Default)]
+struct RuntimeFailure {
+    retry_delay_ms: Option<u64>,
+    expected_tip_hash: Option<[u8; 32]>,
+    actual_tip_hash: Option<[u8; 32]>,
+    rpc_http_status: Option<u16>,
+    rpc_error_code: Option<i64>,
+    worker_index: Option<usize>,
+}
+
+impl RuntimeFailure {
+    fn from_error(error: &MinerError) -> Self {
+        let mut metadata = Self::default();
+        match error {
+            MinerError::ParentTipMismatch {
+                expected, actual, ..
+            }
+            | MinerError::ChildTipMismatch {
+                expected, actual, ..
+            } => {
+                if expected.len() == 64 && actual.len() == 64 {
+                    let mut expected_hash = [0; 32];
+                    let mut actual_hash = [0; 32];
+                    if hex::decode_to_slice(expected, &mut expected_hash).is_ok()
+                        && hex::decode_to_slice(actual, &mut actual_hash).is_ok()
+                    {
+                        metadata.expected_tip_hash = Some(expected_hash);
+                        metadata.actual_tip_hash = Some(actual_hash);
+                    }
+                }
+            }
+            MinerError::RpcHttpStatus(status) => metadata.rpc_http_status = Some(status.as_u16()),
+            MinerError::RpcError { code, .. } => metadata.rpc_error_code = *code,
+            _ => {}
+        }
+        metadata
+    }
+}
+
 /// Records fixed public metadata without waiting for diagnostic capacity or I/O.
 pub fn record_native_backend_runtime(event: NativeBackendRuntimeEvent<'_>) {
+    if matches!(
+        &event,
+        NativeBackendRuntimeEvent::JobActivated(_) | NativeBackendRuntimeEvent::Stopped
+    ) && !runtime_info_enabled()
+    {
+        return;
+    }
     record(runtime_event(event));
 }
 
 fn runtime_event(event: NativeBackendRuntimeEvent<'_>) -> Event {
+    #[cfg(test)]
+    RUNTIME_EVENT_BUILDS.with(|builds| builds.set(builds.get().saturating_add(1)));
     match event {
         NativeBackendRuntimeEvent::JobActivated(job) => {
             let mut event = Event::new(None, "backend_job_activated", "activated");
@@ -114,10 +207,9 @@ fn runtime_event(event: NativeBackendRuntimeEvent<'_>) -> Event {
         NativeBackendRuntimeEvent::CandidateRetirementRetry(error, delay) => {
             runtime_retry_event("backend_candidate_retirement_retry", error, delay)
         }
-        NativeBackendRuntimeEvent::ActivationRetirementFailed(error) => runtime_warning_event(
-            "backend_activation_retirement_failed",
-            crate::preparation_timing::preparation_error_class(error),
-        ),
+        NativeBackendRuntimeEvent::ActivationRetirementFailed(error) => {
+            runtime_error_event("backend_activation_retirement_failed", error)
+        }
     }
 }
 
@@ -128,13 +220,23 @@ fn runtime_warning_event(stage: &'static str, result: &'static str) -> Event {
 }
 
 fn runtime_retry_event(stage: &'static str, error: &MinerError, delay: Duration) -> Event {
+    let mut event = runtime_error_event(stage, error);
+    if let Some(RuntimeMetadata::Failure(metadata)) = event.runtime.as_mut() {
+        metadata.retry_delay_ms = Some(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+    }
+    event
+}
+
+fn runtime_error_event(stage: &'static str, error: &MinerError) -> Event {
     let mut event = runtime_warning_event(
         stage,
         crate::preparation_timing::preparation_error_class(error),
     );
-    event.runtime = Some(RuntimeMetadata::Retry {
-        delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-    });
+    event.runtime = Some(RuntimeMetadata::Failure(RuntimeFailure::from_error(error)));
+    if let MinerError::Io(error) = error {
+        event.os_error = error.raw_os_error();
+        event.io_kind = Some(io_kind(error.kind()));
+    }
     event
 }
 
@@ -143,19 +245,20 @@ pub(crate) fn native_backend_mode() -> bool {
 }
 
 pub(crate) fn native_backend_warning(stage: &'static str, error: Option<&MinerError>) {
-    record(runtime_warning_event(
-        stage,
-        error.map_or(
-            "state_unavailable",
-            crate::preparation_timing::preparation_error_class,
-        ),
-    ));
+    record(match error {
+        Some(error) => runtime_error_event(stage, error),
+        None => runtime_warning_event(stage, "state_unavailable"),
+    });
 }
 
-pub(crate) fn native_backend_prewarm_failure(error: &io::Error) {
+pub(crate) fn native_backend_prewarm_failure(worker_index: usize, error: &io::Error) {
     let mut event = runtime_warning_event("backend_prewarm_worker", "spawn_failed");
     event.os_error = error.raw_os_error();
     event.io_kind = Some(io_kind(error.kind()));
+    event.runtime = Some(RuntimeMetadata::Failure(RuntimeFailure {
+        worker_index: Some(worker_index),
+        ..RuntimeFailure::default()
+    }));
     record(event);
 }
 
@@ -170,7 +273,9 @@ pub(crate) fn native_backend_outbox(
     let mut event = runtime_warning_event("native_outbox_observation", result);
     let mut hash_be = [0; 32];
     let mut job_id = [0; 32];
-    if hex::decode_to_slice(hash, &mut hash_be).is_ok()
+    if hash.len() == 64
+        && job.len() == 64
+        && hex::decode_to_slice(hash, &mut hash_be).is_ok()
         && hex::decode_to_slice(job, &mut job_id).is_ok()
     {
         event.runtime = Some(RuntimeMetadata::Outbox {
@@ -182,7 +287,7 @@ pub(crate) fn native_backend_outbox(
     } else {
         event.result = "invalid_public_metadata";
     }
-    event.warning = result != "observed";
+    event.warning = event.result != "observed";
     event.confirmations = confirmations;
     record(event);
 }
@@ -657,6 +762,8 @@ pub fn start_native_backend_diagnostics() -> io::Result<()> {
     if DIAGNOSTICS.get().is_some() {
         return Ok(());
     }
+    let config = RUNTIME_LOG_CONFIG.get_or_init(runtime_log_config);
+    RUNTIME_INFO_ENABLED.store(config.include_info, Ordering::Relaxed);
     let mut writer = diagnostic_writer()?;
     let (diagnostics, receiver) = Diagnostics::channel(CAPACITY);
     let dropped = Arc::clone(&diagnostics.dropped);
@@ -668,6 +775,12 @@ pub fn start_native_backend_diagnostics() -> io::Result<()> {
     let mut started = Event::new(None, "diagnostics_started", "bounded_lossy_writer");
     started.noisy = false;
     record(started);
+    if config.invalid_value {
+        record(runtime_warning_event(
+            "backend_runtime_log_config",
+            "invalid_level_default_info",
+        ));
+    }
     Ok(())
 }
 
@@ -1085,7 +1198,14 @@ impl Reporter {
                 "zcash_height":zcash_height, "max_age_ms":max_age_ms,
                 "asserts_asic_notify_time":false
             }),
-            RuntimeMetadata::Retry { delay_ms } => json!({"retry_delay_ms":delay_ms}),
+            RuntimeMetadata::Failure(metadata) => json!({
+                "retry_delay_ms":metadata.retry_delay_ms,
+                "expected_tip_hash":metadata.expected_tip_hash.map(hex::encode),
+                "actual_tip_hash":metadata.actual_tip_hash.map(hex::encode),
+                "rpc_http_status":metadata.rpc_http_status,
+                "rpc_error_code":metadata.rpc_error_code,
+                "worker_index":metadata.worker_index
+            }),
             RuntimeMetadata::Outbox {
                 chain,
                 hash_be,
@@ -1164,6 +1284,17 @@ mod tests {
         run()
     }
 
+    fn with_runtime_info<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+        struct Restore(Option<bool>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_RUNTIME_INFO.with(|current| current.set(self.0));
+            }
+        }
+        let _restore = Restore(TEST_RUNTIME_INFO.with(|current| current.replace(Some(enabled))));
+        run()
+    }
+
     fn runtime_job() -> wcash_pool_protocol::JobDescriptor {
         use wcash_pool_protocol::{Hex108, TargetLe};
         wcash_pool_protocol::JobDescriptor {
@@ -1184,6 +1315,130 @@ mod tests {
             zcash_maturity_confirmations: 100,
             max_age_ms: 45_000,
         }
+    }
+
+    #[test]
+    fn runtime_log_level_accepts_only_info_or_warn_without_silencing_failures() {
+        assert_eq!(parse_runtime_log_level(None), Some(true));
+        assert_eq!(parse_runtime_log_level(Some("info")), Some(true));
+        assert_eq!(parse_runtime_log_level(Some("INFO")), Some(true));
+        assert_eq!(parse_runtime_log_level(Some("warn")), Some(false));
+        assert_eq!(parse_runtime_log_level(Some("WaRn")), Some(false));
+        for invalid in ["", "off", "error", " info", "warn ", "PRIVATE_CONFIG"] {
+            assert_eq!(parse_runtime_log_level(Some(invalid)), None);
+            let config = runtime_log_config_for(Some(invalid));
+            assert!(config.include_info);
+            assert!(config.invalid_value);
+        }
+        assert!(!runtime_log_config_for(None).invalid_value);
+        assert!(!runtime_log_config_for(Some("warn")).include_info);
+    }
+
+    #[test]
+    fn runtime_info_gate_precedes_construction_and_keeps_failures_and_winners() {
+        let (sink, receiver) = Diagnostics::channel(8);
+        let sink = Arc::new(sink);
+        with_runtime_info(false, || {
+            with_sink(Arc::clone(&sink), || {
+                let before = RUNTIME_EVENT_BUILDS.with(std::cell::Cell::get);
+                record_native_backend_runtime(NativeBackendRuntimeEvent::JobActivated(
+                    &runtime_job(),
+                ));
+                record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
+                assert_eq!(RUNTIME_EVENT_BUILDS.with(std::cell::Cell::get), before);
+                assert!(receiver.try_recv().is_err());
+                assert_eq!(sink.dropped.load(Ordering::Relaxed), 0);
+
+                record_native_backend_runtime(NativeBackendRuntimeEvent::PreparationRetry(
+                    &MinerError::RpcProtocol("PRIVATE_ERROR".into()),
+                    Duration::from_millis(250),
+                ));
+                native_backend_outbox(
+                    "zcash",
+                    &"00".repeat(32),
+                    &"01".repeat(32),
+                    42,
+                    "observed",
+                    Some(3),
+                );
+                timing_fixture(Instant::now()).completed("best_chain_admitted", None);
+                assert_eq!(RUNTIME_EVENT_BUILDS.with(std::cell::Cell::get), before + 1);
+            });
+        });
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].stage, "backend_preparation_retry");
+        assert!(events[0].warning);
+        assert_eq!(events[1].stage, "native_outbox_observation");
+        assert!(!events[1].warning);
+        assert_eq!(events[2].stage, "winner_submission_result");
+        assert!(!events[2].warning);
+    }
+
+    #[test]
+    fn runtime_failure_context_keeps_fixed_public_fields_and_rejects_raw_strings() {
+        let secret = "PRIVATE_ENDPOINT_RESPONSE_OR_RETIREMENT_TOKEN";
+        let errors = [
+            MinerError::ParentTipMismatch {
+                expected: "AB".repeat(32),
+                actual: "cd".repeat(32),
+                endpoint: secret.into(),
+            },
+            MinerError::ChildTipMismatch {
+                expected: "ef".repeat(32),
+                actual: "01".repeat(32),
+                endpoint: secret.into(),
+            },
+            MinerError::ParentTipMismatch {
+                expected: "ff".repeat(32),
+                actual: secret.repeat(100),
+                endpoint: secret.into(),
+            },
+            MinerError::ParentTipMismatch {
+                expected: "Z".repeat(64),
+                actual: "ff".repeat(32),
+                endpoint: secret.into(),
+            },
+            MinerError::RpcHttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            MinerError::RpcError {
+                endpoint: secret.into(),
+                code: Some(-28),
+                message: secret.into(),
+            },
+        ];
+        let (sink, receiver) = Diagnostics::channel(16);
+        with_sink(Arc::new(sink), || {
+            for error in &errors {
+                record_native_backend_runtime(NativeBackendRuntimeEvent::PreparationRetry(
+                    error,
+                    Duration::from_millis(250),
+                ));
+            }
+            native_backend_prewarm_failure(1, &io::Error::other(secret));
+        });
+        let mut rows = Vec::new();
+        for event in receiver.try_iter() {
+            let mut output = Vec::new();
+            Reporter::new(Instant::now())
+                .record(&mut output, event, Instant::now(), 0)
+                .unwrap();
+            assert!(output.len() < 4096);
+            assert!(!String::from_utf8_lossy(&output).contains(secret));
+            rows.push(serde_json::from_slice::<serde_json::Value>(&output).unwrap());
+        }
+        assert_eq!(rows.len(), 7);
+        assert_eq!(rows[0]["runtime"]["expected_tip_hash"], "ab".repeat(32));
+        assert_eq!(rows[0]["runtime"]["actual_tip_hash"], "cd".repeat(32));
+        assert_eq!(rows[1]["runtime"]["expected_tip_hash"], "ef".repeat(32));
+        assert_eq!(rows[1]["runtime"]["actual_tip_hash"], "01".repeat(32));
+        for row in &rows[2..4] {
+            assert!(row["runtime"]["expected_tip_hash"].is_null());
+            assert!(row["runtime"]["actual_tip_hash"].is_null());
+        }
+        assert_eq!(rows[4]["runtime"]["rpc_http_status"], 503);
+        assert_eq!(rows[5]["runtime"]["rpc_error_code"], -28);
+        assert_eq!(rows[6]["runtime"]["worker_index"], 1);
+        assert!(rows.iter().all(|row| row["winner"].is_null()));
     }
 
     #[test]
@@ -1323,7 +1578,7 @@ mod tests {
                 &error,
                 Duration::from_secs(1),
             ));
-            native_backend_prewarm_failure(&io::Error::other(secret));
+            native_backend_prewarm_failure(0, &io::Error::other(secret));
             native_backend_outbox(
                 "zcash",
                 &"00".repeat(32),
@@ -1333,6 +1588,7 @@ mod tests {
                 Some(3),
             );
             record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
+            native_backend_outbox("zcash", secret, secret, 42, "observed", None);
         });
         let mut output = Vec::new();
         let mut reporter = Reporter::new(Instant::now());
@@ -1350,7 +1606,7 @@ mod tests {
                 serde_json::from_slice::<serde_json::Value>(row).unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(rows.len(), 8);
+        assert_eq!(rows.len(), 9);
         assert_eq!(rows[0]["runtime"]["job_id"], "01".repeat(32));
         assert_eq!(rows[0]["runtime"]["asserts_asic_notify_time"], false);
         assert_eq!(rows[1]["result"], "rpc_response");
@@ -1358,6 +1614,8 @@ mod tests {
         assert_eq!(rows[2]["result"], "connection_closed");
         assert_eq!(rows[6]["runtime"]["source"], "native_share_journal");
         assert_eq!(rows[6]["confirmations"], 3);
+        assert_eq!(rows[8]["result"], "invalid_public_metadata");
+        assert_eq!(rows[8]["level"], "WARN");
         assert!(rows.iter().all(|row| row["winner"].is_null()));
     }
 

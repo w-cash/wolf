@@ -43,6 +43,27 @@ activation and does not prove ASIC notification. Native-outbox notices carry
 Repeated warnings are paced and queue drops are counted; diagnostics remain
 lossy evidence, while the authoritative journals keep their durability contract.
 
+`WCASH_POOL_RUNTIME_LOG_LEVEL=info|warn` controls routine activation and stopped
+notices only. It is read once when diagnostics initialize, with `info` as the
+default; the values are ASCII case-insensitive. `warn` skips these notices with
+a cached branch before event construction, clock reads, copying or queue access.
+Failures, winner discovery, delivery results and lifecycle/outbox records remain
+enabled at either setting, including successful winner observations labelled
+`INFO`. An invalid or non-Unicode value selects `info` and, when the writer is
+available, emits a fixed `backend_runtime_log_config` warning without the value.
+There is no per-record environment lookup or logging-framework dependency.
+
+Runtime failure records retain only safe typed context: a validated pair of
+expected/actual tip hashes in conventional display order, numeric HTTP status or
+JSON-RPC error code, retry delay, and the prewarm worker index where available.
+Malformed hashes are omitted as a pair. Raw endpoint labels, error messages and
+response text are not copied; endpoint roles are not inferred from labels.
+The background writer formats these fields. Optional text can still be lost if
+the writer cannot start, fails or stalls, and counters cannot report through a
+failed sink. Before deployment, log consumers must accept the new runtime stages
+and metadata alongside historical stdout reports. Durable backend protocol and
+journal records retain their existing schema.
+
 Pool delivery dispatches writable recipients concurrently. Each recipient checks
 its own network identity and current predecessor before submitting the retained
 bytes; an unavailable observer or another writable node cannot veto healthy
