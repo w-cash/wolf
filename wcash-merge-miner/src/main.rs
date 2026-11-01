@@ -5,7 +5,7 @@ use std::{
     error::Error,
     io::{self, Write},
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -25,16 +25,17 @@ use wcash_merge_miner::{
         PoolBackendListenerConfig, PoolShareTargetPolicy,
     },
     protocol::serve_loopback,
+    record_native_backend_runtime,
     rpc::RpcEndpoint,
     zip301::{
         DEFAULT_ZIP301_AUTHENTICATION_LIMIT, DEFAULT_ZIP301_CLIENT_LIMIT,
         DEFAULT_ZIP301_VALIDATION_LIMIT,
     },
-    CoordinatorConfig, GenerationRetirement, JobConfig, MinerError, NativeMiningCoordinator,
-    NativeMiningSupervisor, NativePoolBackendRetainedJob, NativePreparationTiming,
-    NativeZcashConfig, NativeZcashNetwork, PoolBackendActor, PoolBackendActorError,
-    PoolBackendRetainedJob, PoolBackendWinnerWorkers, PreparationPhase, PreparedJob,
-    ShareProcessor, WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config,
+    CoordinatorConfig, GenerationRetirement, JobConfig, MinerError, NativeBackendRuntimeEvent,
+    NativeMiningCoordinator, NativeMiningSupervisor, NativePoolBackendRetainedJob,
+    NativePreparationTiming, NativeZcashConfig, NativeZcashNetwork, PoolBackendActor,
+    PoolBackendActorError, PoolBackendRetainedJob, PoolBackendWinnerWorkers, PreparationPhase,
+    PreparedJob, ShareProcessor, WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config,
     Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
 };
 use wcash_pool_protocol::{Hex32, JobInvalidationReason, TargetBe, TargetLe};
@@ -448,7 +449,9 @@ impl PoolBackendListenerWorkers {
                     match listener.serve_one(actor.as_ref()) {
                         Ok(PoolBackendConnectionOutcome::Closed { reason }) => {
                             if listener.is_accepting() {
-                                eprintln!("private pool backend connection closed: {reason}");
+                                record_native_backend_runtime(
+                                    NativeBackendRuntimeEvent::ConnectionClosed(reason),
+                                );
                             }
                         }
                         Ok(_) => {}
@@ -463,10 +466,6 @@ impl PoolBackendListenerWorkers {
             workers.threads.push(thread);
         }
         Ok(workers)
-    }
-
-    fn socket_path(&self) -> &Path {
-        self.listener.socket_path()
     }
 
     fn request_shutdown(&self) -> Result<(), Box<dyn Error>> {
@@ -655,10 +654,8 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
             )?;
             winner_worker.request_shutdown()?;
             retirement_worker.request_shutdown()?;
-            return print_json(&json!({
-                "command": "native-pool-backend",
-                "result": "stopped",
-            }));
+            record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
+            return Ok(());
         }
         match listener_failure_rx.try_recv() {
             Ok(error) => {
@@ -702,10 +699,10 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
             Err(error) if is_retryable_native_preparation_error(&error) => {
                 preparation_timing.finish_error(&error);
                 let retry_delay = native_preparation_retry_delay(&error, preparation_backoff);
-                eprintln!(
-                    "transient native backend preparation failure: {error}; retrying in {} millisecond(s)",
-                    retry_delay.as_millis()
-                );
+                record_native_backend_runtime(NativeBackendRuntimeEvent::PreparationRetry(
+                    &error,
+                    retry_delay,
+                ));
                 match wait_for_pool_backend_retry(
                     retry_delay,
                     shutdown.as_ref(),
@@ -722,10 +719,8 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                         )?;
                         winner_worker.request_shutdown()?;
                         retirement_worker.request_shutdown()?;
-                        return print_json(&json!({
-                            "command": "native-pool-backend",
-                            "result": "stopped",
-                        }));
+                        record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
+                        return Ok(());
                     }
                     PoolBackendGenerationControl::ServiceFailure(error) => {
                         listeners.request_shutdown()?;
@@ -774,27 +769,14 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                 )
             })?;
             if let Err(retirement) = retire_pool_backend_generation(&mut retained) {
-                eprintln!(
-                    "backend activation also failed to retire its child candidate: {retirement}"
+                record_native_backend_runtime(
+                    NativeBackendRuntimeEvent::ActivationRetirementFailed(&retirement),
                 );
             }
             return Err(error.into());
         }
         preparation_timing.finish_ok();
-        let activation_output = print_json(&json!({
-            "command": "native-pool-backend",
-            "result": "job_activated",
-            "job_id": job_id,
-            "wcash_height": descriptor.wcash_height,
-            "zcash_height": descriptor.zcash_height,
-            "max_age_ms": descriptor.max_age_ms,
-            "socket": listeners.socket_path(),
-        }));
-        if let Err(error) = activation_output {
-            listeners.request_shutdown()?;
-            retire_active_pool_backend_generation(actor.as_ref(), &job_id, retained)?;
-            return Err(error);
-        }
+        record_native_backend_runtime(NativeBackendRuntimeEvent::JobActivated(&descriptor));
 
         if let Some(previous) = active.take() {
             let shares_a_tip = pool_backend_generations_share_any_tip(
@@ -883,10 +865,8 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
             PoolBackendGenerationControl::Shutdown => {
                 winner_worker.request_shutdown()?;
                 retirement_worker.request_shutdown()?;
-                return print_json(&json!({
-                    "command": "native-pool-backend",
-                    "result": "stopped",
-                }));
+                record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
+                return Ok(());
             }
             PoolBackendGenerationControl::ServiceFailure(error) => {
                 winner_worker.request_shutdown()?;
@@ -1011,21 +991,6 @@ fn retire_running_pool_backend_generations(
     Ok(())
 }
 
-fn retire_active_pool_backend_generation(
-    actor: &PoolBackendActor,
-    job_id: &Hex32,
-    retained: Arc<NativePoolBackendRetainedJob>,
-) -> Result<GenerationRetirement, Box<dyn Error>> {
-    actor.invalidate_job(job_id, JobInvalidationReason::Age, Duration::ZERO)?;
-    actor.close_zcash_winner_snapshots()?;
-    let mut retained = Arc::try_unwrap(retained).map_err(|_| {
-        MinerError::InvalidRequest(
-            "private backend retained a native generation after durable closure".to_string(),
-        )
-    })?;
-    Ok(retire_pool_backend_generation(&mut retained)?)
-}
-
 fn retire_pool_backend_generation(
     retained: &mut NativePoolBackendRetainedJob,
 ) -> Result<GenerationRetirement, MinerError> {
@@ -1042,10 +1007,10 @@ fn retire_pool_backend_generation(
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                     return Err(error);
                 };
-                eprintln!(
-                    "transient native backend candidate-retirement failure: {error}; retrying in {} second(s)",
-                    backoff.min(remaining).as_secs()
-                );
+                record_native_backend_runtime(NativeBackendRuntimeEvent::CandidateRetirementRetry(
+                    &error,
+                    backoff.min(remaining),
+                ));
                 thread::sleep(backoff.min(remaining));
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }

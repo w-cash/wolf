@@ -53,8 +53,9 @@ pub use coordinator::{
     WcashIncomingViewingKey, WinnerOutboxStatus,
 };
 pub use diagnostics::{
-    record_native_winner_persistence_failure, record_native_winner_reconciliation,
-    start_native_backend_diagnostics,
+    record_native_backend_runtime, record_native_winner_persistence_failure,
+    record_native_winner_reconciliation, start_native_backend_diagnostics,
+    NativeBackendRuntimeEvent,
 };
 pub use error::MinerError;
 pub use job::{JobConfig, PreparedJob, SolvedAuxPow, EQUIHASH_SOLUTION_BYTES};
