@@ -975,30 +975,22 @@ impl NativeZcashProvider {
         validator: &ZebraRpcClient,
         prepared: &NativePreparedJob,
     ) -> Result<bool, MinerError> {
-        let expected_height = prepared.parent_height().checked_sub(1).ok_or_else(|| {
-            MinerError::InvalidParentTemplate("parent height must be positive".to_string())
-        })?;
+        self.proposal_validator_matches_or_lags_tip(validator, prepared.predecessor_tip()?)
+    }
+
+    fn proposal_validator_matches_or_lags_tip(
+        &self,
+        validator: &ZebraRpcClient,
+        expected: NativeChainTip,
+    ) -> Result<bool, MinerError> {
         let actual = native_chain_tip_on_node(validator)?;
-        if actual.height == expected_height
-            && actual.block_hash_le == prepared.parent_proposal.header.previous_block_hash.0
-        {
+        if actual == expected {
             return Ok(true);
         }
-        if self.allow_lagging_proposal_validators && actual.height <= expected_height {
+        if self.allow_lagging_proposal_validators && actual.height <= expected.height {
             return Ok(false);
         }
-        Err(MinerError::ParentTipMismatch {
-            expected: format!(
-                "{} at height {expected_height}",
-                prepared.parent_tip_display()
-            ),
-            endpoint: validator.label().to_string(),
-            actual: format!(
-                "{} at height {}",
-                display_hex(actual.block_hash_le),
-                actual.height
-            ),
-        })
+        Err(parent_tip_mismatch(expected, validator, actual))
     }
 
     fn start_coinbase_prewarm(
@@ -1489,16 +1481,21 @@ impl NativeZcashProvider {
 
     /// Requires every configured parent node to remain on the exact job tip.
     pub fn assert_current(&self, job: &NativePreparedJob) -> Result<(), MinerError> {
+        self.assert_tip_current(job.predecessor_tip()?)
+    }
+
+    /// Checks an immutable predecessor without retaining a prepared block or lease.
+    pub(crate) fn assert_tip_current(&self, expected: NativeChainTip) -> Result<(), MinerError> {
         if self.allow_lagging_proposal_validators {
-            self.require_tip(&self.template_node, job)?;
+            self.require_expected_tip(&self.template_node, expected)?;
             for validator in &self.proposal_validators {
-                self.proposal_validator_matches_or_lags(validator, job)?;
+                self.proposal_validator_matches_or_lags_tip(validator, expected)?;
             }
             for broadcaster in &self.broadcast_nodes {
-                self.require_tip(broadcaster, job)?;
+                self.require_expected_tip(broadcaster, expected)?;
             }
             for observer in &self.observer_nodes {
-                self.require_tip(observer, job)?;
+                self.require_expected_tip(observer, expected)?;
             }
             return Ok(());
         }
@@ -1515,7 +1512,7 @@ impl NativeZcashProvider {
         let checks = thread::scope(|scope| {
             nodes
                 .into_iter()
-                .map(|node| scope.spawn(move || self.require_tip(node, job)))
+                .map(|node| scope.spawn(move || self.require_expected_tip(node, expected)))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|handle| {
@@ -1535,21 +1532,17 @@ impl NativeZcashProvider {
         node: &ZebraRpcClient,
         job: &NativePreparedJob,
     ) -> Result<(), MinerError> {
-        let tip_height = job.parent_height().checked_sub(1).ok_or_else(|| {
-            MinerError::InvalidParentTemplate("parent height must be positive".to_string())
-        })?;
+        self.require_expected_tip(node, job.predecessor_tip()?)
+    }
+
+    fn require_expected_tip(
+        &self,
+        node: &ZebraRpcClient,
+        expected: NativeChainTip,
+    ) -> Result<(), MinerError> {
         let actual = native_chain_tip_on_node(node)?;
-        let expected_hash = job.parent_proposal.header.previous_block_hash.0;
-        if actual.height != tip_height || actual.block_hash_le != expected_hash {
-            return Err(MinerError::ParentTipMismatch {
-                expected: format!("{} at height {tip_height}", job.parent_tip_display()),
-                endpoint: node.label().to_string(),
-                actual: format!(
-                    "{} at height {}",
-                    display_hex(actual.block_hash_le),
-                    actual.height
-                ),
-            });
+        if actual != expected {
+            return Err(parent_tip_mismatch(expected, node, actual));
         }
         Ok(())
     }
@@ -2221,6 +2214,15 @@ impl NativePreparedJob {
     /// Returns the Zcash network target authenticated by the parent template.
     pub const fn parent_target(&self) -> Target {
         self.parent_target
+    }
+
+    pub(crate) fn predecessor_tip(&self) -> Result<NativeChainTip, MinerError> {
+        Ok(NativeChainTip {
+            block_hash_le: self.parent_proposal.header.previous_block_hash.0,
+            height: self.parent_height.checked_sub(1).ok_or_else(|| {
+                MinerError::InvalidParentTemplate("parent height must be positive".to_string())
+            })?,
+        })
     }
 
     /// Returns the parent predecessor hash in conventional display order.

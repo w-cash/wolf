@@ -839,6 +839,26 @@ impl NativeMiningCoordinator {
         self.pool_zcash_current.load(Ordering::Acquire)
     }
 
+    pub(crate) fn pool_currentness_probe(
+        &self,
+    ) -> crate::pool_backend_supervision::NativePoolCurrentnessProbe {
+        // Both heights and predecessors were checked by dual-chain preparation;
+        // this detached view owns no prepared block, coordinator or child lease.
+        crate::pool_backend_supervision::NativePoolCurrentnessProbe::new(
+            self.wcash_node.clone(),
+            self.zcash.clone(),
+            crate::native::NativeChainTip {
+                block_hash_le: self.generation_descriptor.wcash_previous_hash_le(),
+                height: self.child_height.saturating_sub(1),
+            },
+            crate::native::NativeChainTip {
+                block_hash_le: self.generation_descriptor.zcash_previous_hash_le(),
+                height: self.job.parent_height().saturating_sub(1),
+            },
+            self.candidate_created_at,
+        )
+    }
+
     /// Opens a one-shot supervisor and prepares one proposal-gated generation.
     pub fn prepare(
         config: CoordinatorConfig,
@@ -5482,6 +5502,8 @@ pub(crate) mod tests {
                         .tips
                         .pop_front()
                         .unwrap_or_else(|| fixture.tip.clone())),
+                    "getblockcount" => Ok(fixture.tip["blocks"].clone()),
+                    "getbestblockhash" => Ok(fixture.tip["bestblockhash"].clone()),
                     "getblockheader" => Ok(fixture
                         .headers
                         .pop_front()
@@ -5561,6 +5583,129 @@ pub(crate) mod tests {
             directory.join("native-share-journal.jsonl"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn detached_zec_rpc_probes_continue_while_wec_is_held_and_ignore_closed_generations() {
+        use crate::pool_backend_supervision::{
+            NativePoolCurrentnessProbe, NativePoolCurrentnessWorkers,
+        };
+        let directory = tempdir().unwrap();
+        let block = mainnet_block_one();
+        let hash = display_hash(block.hash().0);
+        let tip = json!({"blocks": 1, "bestblockhash": hash});
+        let samples = Arc::new(AtomicUsize::new(0));
+        let counted_samples = Arc::clone(&samples);
+        let mut template_fixture = PoolRpcFixture::new(tip.clone(), &hash, 1);
+        template_fixture.tips = [
+            tip.clone(),
+            json!({"blocks": 2, "bestblockhash": "77".repeat(32)}),
+        ]
+        .into();
+        let (template, template_server) =
+            spawn_pool_rpc_with_hook(template_fixture, move |request| {
+                if request["method"] == "getblockchaininfo" {
+                    counted_samples.fetch_add(1, Ordering::AcqRel);
+                }
+            });
+        let (validator, validator_server) =
+            spawn_pool_rpc(PoolRpcFixture::new(tip.clone(), &hash, 1));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut release_rx = Some(release_rx);
+        let mut child_fixture = PoolRpcFixture::new(tip, &hash, 1);
+        child_fixture.genesis = Network::new_wcash_regtest().genesis_hash().to_string();
+        let (child, child_server) = spawn_pool_rpc_with_hook(child_fixture, move |request| {
+            if request["method"] == "getblockcount" {
+                if let Some(release_rx) = release_rx.take() {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release held WEC tip RPC");
+                }
+            }
+        });
+        let supervisor =
+            test_pool_supervisor(directory.path(), child, template, validator, vec![], vec![]);
+        let expected = crate::native::NativeChainTip {
+            block_hash_le: block.hash().0,
+            height: 1,
+        };
+        let probe = NativePoolCurrentnessProbe::new(
+            supervisor.wcash_node.clone(),
+            supervisor.zcash.clone(),
+            expected,
+            expected,
+            Instant::now(),
+        );
+        let mut workers = NativePoolCurrentnessWorkers::spawn().unwrap();
+        workers.tick(Some(&probe)).unwrap();
+        let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+        if entered.is_err() {
+            let _ = release_tx.send(());
+            workers.request_shutdown().unwrap();
+            panic!("WEC probe did not enter barrier");
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (samples.load(Ordering::Acquire) < 2 || probe.is_zcash_current())
+            && Instant::now() < deadline
+        {
+            workers.tick(Some(&probe)).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        let independent_samples = samples.load(Ordering::Acquire);
+        let zec_parent_change_published = !probe.is_zcash_current();
+        // Frequent controller ticks must not create additional stable-generation
+        // RPCs before the 250ms completion-paced interval has elapsed.
+        for _ in 0..30 {
+            workers.tick(Some(&probe)).unwrap();
+            thread::yield_now();
+        }
+        let paced_samples = samples.load(Ordering::Acquire);
+        probe.close();
+        let replacement = NativePoolCurrentnessProbe::new(
+            supervisor.wcash_node.clone(),
+            supervisor.zcash.clone(),
+            expected,
+            expected,
+            Instant::now(),
+        );
+        workers.generation_changed();
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            workers.tick(Some(&replacement)).unwrap();
+            if !workers.wcash_is_busy_for_test() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        workers.request_shutdown().unwrap();
+        assert!(
+            independent_samples >= 2,
+            "ZEC RPC sampling advanced while WEC RPC was held"
+        );
+        assert!(
+            zec_parent_change_published,
+            "a new ZEC mismatch publishes before the held WEC response"
+        );
+        assert_eq!(
+            paced_samples, independent_samples,
+            "controller ticks do not amplify stable probe rate"
+        );
+        assert!(
+            !probe.is_healthy(),
+            "late WEC response cannot reopen the closed old generation"
+        );
+        assert!(!probe.is_zcash_current());
+        assert!(
+            replacement.is_zcash_current(),
+            "old generation writes cannot change replacement state"
+        );
+        assert!(replacement.is_healthy());
+        template_server.finish();
+        validator_server.finish();
+        child_server.finish();
     }
 
     #[test]

@@ -332,6 +332,47 @@ can still lose diagnostics: the preserved authoritative journal and independent
 exact-hash observation remain the recovery evidence. No new diagnostics run
 for ordinary shares, and no diagnostic adds an fsync or validation pass.
 
+### Pool-backend job supervision
+
+The native pool backend prepares a replacement on one managed worker. Its
+50ms control loop keeps supervising active-generation expiry, draining jobs,
+worker failures, and shutdown during preparation and retry backoff. Two separate
+managed lanes check Wcash and Zcash currentness at the existing 250ms interval;
+a blocked Wcash check does not hold up the next Zcash sample. Per-node Zcash
+quorum checks retain the existing parallel RPC behavior and explicit Testnet
+lag policy. No new freshness RPC, mutex, log or disk sync enters share validation
+or Zcash winner delivery.
+
+Each probe owns cloned RPC clients, exact predecessor identities and a separate
+atomic state bound to that generation's original monotonic 45-second lease.
+It owns no coordinator, prepared block or Wcash candidate lease. Per-chain
+completion timestamps and currentness bits update independently. Closed and
+expired generations cannot be reopened by a delayed response. A still-current
+chain remains usable while replacement restores dual coverage; if neither
+cached chain is available, this generation closes permanently, preserving the
+previous fail-closed policy. Initial positive
+samples come from the existing final dual-chain preparation checks. A sample
+remains last-known evidence and may race a later network tip change.
+
+Only one preparation and one probe per chain can be in flight. Results use a
+rendezvous handoff, so shutdown returns an unconsumed prepared candidate to its
+worker for retirement. Activation checks the exact request identity, ordering
+of its monotonic timestamps and remaining original lease. Six candidate slots
+bound preparing, ready, active, draining and retiring generations together. A
+stalled retirement lane stops new preparation when those slots are exhausted;
+it cannot create an unbounded node candidate cache. Candidate cleanup stays on
+an owned retirement lane, including controller/actor error paths. Listeners and
+admitted validators stop before bounded control RPCs are joined; actor ownership
+is released before retirement is joined. Failure to enqueue retains ownership
+in the same bounded cleanup budget until shutdown recovery.
+
+This changes supervision responsiveness, not the time required to construct a
+valid dual-chain job. Observer catch-up, coinbase proof generation, final exact
+predecessor checks and proposal validation remain required. It does not claim
+zero stale work, zero propagation delay, or guaranteed public acceptance of the
+next winner. The exact-byte winner journal, independent per-chain delivery,
+retry rules, payout authority and detached late-Zcash rescue remain unchanged.
+
 ### Late Zcash winners from a retired pool job
 
 Ordinary admission still uses the original 45-second native lease and two-second
