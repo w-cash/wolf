@@ -13,12 +13,13 @@ use zebra_chain::{
 };
 use zebra_node_services::mempool::TransactionDependencies;
 
+use super::super::response_deserialize::SeqOrMap;
 use super::zec::Zec;
 
 /// Response to a `getrawmempool` RPC request.
 ///
 /// See the notes for the [`Rpc::get_raw_mempool` method].
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(untagged)]
 pub enum GetRawMempoolResponse {
     /// The transaction IDs, as hex strings (verbose=0)
@@ -26,6 +27,20 @@ pub enum GetRawMempoolResponse {
     /// A map of transaction IDs to mempool transaction details objects
     /// (verbose=1)
     Verbose(HashMap<String, MempoolObject>),
+}
+
+impl<'de> serde::Deserialize<'de> for GetRawMempoolResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match <SeqOrMap<Vec<String>, HashMap<String, MempoolObject>> as serde::Deserialize>::deserialize(
+            deserializer,
+        )? {
+            SeqOrMap::Seq(tx_ids) => Ok(Self::TxIds(tx_ids)),
+            SeqOrMap::Map(transactions) => Ok(Self::Verbose(transactions)),
+        }
+    }
 }
 
 /// A mempool transaction details object as returned by `getrawmempool` in
