@@ -20,13 +20,13 @@ pub enum PreparationPhase {
     NetworkIdentity,
     /// Retirement of an unpublished child candidate from a prior attempt.
     CandidateRetirement,
-    /// Catch-up of work nodes against the public-chain observer.
+    /// Caller time catching up work nodes, overlapping child preparation when possible.
     ObserverCatchup,
-    /// The Wcash candidate RPC, including its node-side construction/checks.
+    /// Remaining wait for Wcash preparation after catchup, or the serial candidate RPC.
     WcashCandidate,
-    /// Local Wcash candidate decoding and metadata checks.
+    /// Local Wcash decoding in the serial fallback; parallel work is included above.
     WcashDecode,
-    /// Local Wcash payout-authority and value checks.
+    /// Wcash payout checks in the serial fallback; parallel work is included above.
     WcashPayout,
     /// The Zcash template RPC and its node-side work.
     ZcashTemplate,

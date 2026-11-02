@@ -27,7 +27,7 @@ use wcash_merge_miner::{
     pool_backend_supervision::{NativePoolCurrentnessWorkers, PoolBackendControlWorker},
     protocol::serve_loopback,
     record_native_backend_runtime,
-    rpc::RpcEndpoint,
+    rpc::{RpcEndpoint, WCASH_AUX_TIP_CHANGED_ERROR_CODE},
     zip301::{
         DEFAULT_ZIP301_AUTHENTICATION_LIMIT, DEFAULT_ZIP301_CLIENT_LIMIT,
         DEFAULT_ZIP301_VALIDATION_LIMIT,
@@ -52,8 +52,6 @@ const DEFAULT_SHARE_JOURNAL: &str = ".wcash-share-journal-v2.jsonl";
 const INITIAL_NATIVE_PREPARATION_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_NATIVE_PREPARATION_BACKOFF: Duration = Duration::from_secs(60);
 const TIP_RACE_RETRY_DELAY: Duration = Duration::from_millis(250);
-/// Stable `createauxblock` server error for an ordinary Wcash best-tip race.
-const WCASH_AUX_TIP_CHANGED_ERROR_CODE: i64 = -32_001;
 const POOL_BACKEND_MONITOR_INTERVAL: Duration = Duration::from_millis(50);
 const POOL_BACKEND_SUPERSEDED_GRACE: Duration = Duration::from_secs(2);
 // Every in-flight/prepared/active/draining/retiring generation owns one slot.
@@ -1666,19 +1664,7 @@ fn retire_native_generation(
 /// configuration, and malformed RPC responses must stop the supervisor instead
 /// of being hidden behind an unbounded retry loop.
 fn is_retryable_native_preparation_error(error: &MinerError) -> bool {
-    match error {
-        MinerError::RpcTransport(error) => is_retryable_rpc_transport(error),
-        MinerError::RpcHttpStatus(status) => is_retryable_http_status(*status),
-        MinerError::RpcError {
-            code: Some(-9 | -10 | -28 | WCASH_AUX_TIP_CHANGED_ERROR_CODE),
-            ..
-        } => true,
-        MinerError::Io(error) => is_retryable_io_kind(error.kind()),
-        MinerError::ParentTipMismatch { .. }
-        | MinerError::ChildTipMismatch { .. }
-        | MinerError::StaleNativeJob(_) => true,
-        _ => false,
-    }
+    error.is_retryable_preparation()
 }
 
 fn native_preparation_retry_delay(error: &MinerError, backoff: Duration) -> Duration {
@@ -1705,49 +1691,6 @@ fn next_native_preparation_backoff(error: &MinerError, backoff: Duration) -> Dur
         } => INITIAL_NATIVE_PREPARATION_BACKOFF,
         _ => (backoff * 2).min(MAX_NATIVE_PREPARATION_BACKOFF),
     }
-}
-
-fn is_retryable_rpc_transport(error: &reqwest::Error) -> bool {
-    if error.is_timeout() {
-        return true;
-    }
-
-    // A generic request/build/TLS error can be permanent or security-sensitive.
-    // Retry a non-timeout transport failure only when its source chain exposes
-    // an I/O kind which is explicitly classified as transient below.
-    let mut source = error.source();
-    while let Some(cause) = source {
-        if cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|error| is_retryable_io_kind(error.kind()))
-        {
-            return true;
-        }
-        source = cause.source();
-    }
-
-    false
-}
-
-const fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
-}
-
-const fn is_retryable_io_kind(kind: io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::HostUnreachable
-            | io::ErrorKind::NetworkUnreachable
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::NetworkDown
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::WouldBlock
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::Interrupted
-    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
