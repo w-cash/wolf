@@ -821,6 +821,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     let mut next_preparation = Instant::now();
     let mut request_id = 0u64;
     let mut expected_preparation: Option<(u64, Instant)> = None;
+    let mut next_currentness_observation = Instant::now();
     let mut active: Option<ActivePoolBackendGeneration> = None;
     let mut draining = Vec::new();
     let mut unpublished: Option<PoolBackendCandidate> = None;
@@ -858,6 +859,20 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                     .as_ref()
                     .map(|current| current.candidate.retained.currentness_probe()),
             )?;
+            // Cached evidence only: no RPC, disk I/O or diagnostic capacity wait.
+            if Instant::now() >= next_currentness_observation {
+                next_currentness_observation = Instant::now() + Duration::from_secs(5);
+                if let Some(current) = active.as_ref() {
+                    record_native_backend_runtime(NativeBackendRuntimeEvent::Currentness(
+                        &current.job_id,
+                        current
+                            .candidate
+                            .retained
+                            .currentness_probe()
+                            .observation_snapshot(),
+                    ));
+                }
+            }
             if let Some(result) = preparation_worker.poll()? {
                 let expected = expected_preparation.take();
                 let valid_request = pool_backend_preparation_response_matches(
@@ -899,10 +914,14 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                             timing.finish_activation_failed();
                             return Err(error.into());
                         }
+                        let preparation_attempt_id = timing.attempt_id();
                         timing.finish_ok();
-                        record_native_backend_runtime(NativeBackendRuntimeEvent::JobActivated(
-                            &descriptor,
-                        ));
+                        record_native_backend_runtime(
+                            NativeBackendRuntimeEvent::PreparationActivated(
+                                &descriptor,
+                                preparation_attempt_id,
+                            ),
+                        );
                         preparation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
                         let replacement = ActivePoolBackendGeneration {
                             job_id,
@@ -942,14 +961,19 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                         currentness_workers.generation_changed();
                     }
                     Err(error) => {
+                        let preparation_attempt_id = result.timing.attempt_id();
                         result.timing.finish_error(&error);
                         if !valid_request || !is_retryable_native_preparation_error(&error) {
                             return Err(error.into());
                         }
                         let delay = native_preparation_retry_delay(&error, preparation_backoff);
-                        record_native_backend_runtime(NativeBackendRuntimeEvent::PreparationRetry(
-                            &error, delay,
-                        ));
+                        record_native_backend_runtime(
+                            NativeBackendRuntimeEvent::PreparationRetryForAttempt(
+                                &error,
+                                delay,
+                                preparation_attempt_id,
+                            ),
+                        );
                         next_preparation = Instant::now() + delay;
                         preparation_backoff =
                             next_native_preparation_backoff(&error, preparation_backoff);

@@ -25,14 +25,112 @@ const WCASH_CURRENT: u8 = 1;
 const ZCASH_CURRENT: u8 = 2;
 const CLOSED: u8 = 4;
 const BOTH_CURRENT: u8 = WCASH_CURRENT | ZCASH_CURRENT;
+const OBSERVATION_RESULT_BITS: u32 = 2;
+const OBSERVATION_RESULT_MASK: u64 = (1 << OBSERVATION_RESULT_BITS) - 1;
+
+/// The result of one last completed chain probe, not a current admission verdict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeCurrentnessObservationResult {
+    /// No completed probe is available, or its completion cannot be ordered.
+    Unknown,
+    /// The probe found its exact expected chain tip at completion.
+    Current,
+    /// The probe proved that its expected chain tip differs from the node tip.
+    TipMismatch,
+    /// The probe failed without establishing a different tip.
+    ProbeFailed,
+}
+
+impl NativeCurrentnessObservationResult {
+    /// A fixed, public diagnostic label without endpoint or error text.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Current => "current",
+            Self::TipMismatch => "tip_mismatch",
+            Self::ProbeFailed => "probe_failed",
+        }
+    }
+
+    const fn tag(self) -> u64 {
+        match self {
+            Self::Unknown => 0,
+            Self::Current => 1,
+            Self::TipMismatch => 2,
+            Self::ProbeFailed => 3,
+        }
+    }
+
+    fn from_result(result: &Result<(), MinerError>) -> Self {
+        match result {
+            Ok(()) => Self::Current,
+            Err(MinerError::ChildTipMismatch { .. } | MinerError::ParentTipMismatch { .. }) => {
+                Self::TipMismatch
+            }
+            Err(_) => Self::ProbeFailed,
+        }
+    }
+}
+
+/// An independently sampled chain result and the age of that exact result.
+///
+/// An old positive result is not evidence that the parent remains current. A
+/// missing sample is unknown even when initial admission permits both chains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeChainCurrentnessObservation {
+    /// Last published result; this does not gate share or winner admission.
+    /// Equal completion microseconds conservatively prefer a failure/mismatch.
+    pub result: NativeCurrentnessObservationResult,
+    /// Monotonic age of the same result, or `None` when there is no usable sample.
+    pub sample_age_ms: Option<u64>,
+}
+
+/// Lease/closure status sampled after the independent chain observations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeGenerationObservationStatus {
+    /// The original generation lease has not expired or been closed.
+    Active,
+    /// Cached admission has been permanently closed.
+    Closed,
+    /// The original generation lease has expired.
+    Expired,
+}
+
+impl NativeGenerationObservationStatus {
+    /// A fixed, public diagnostic label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Closed => "closed",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+/// A bounded diagnostic view of one generation's last-known probe observations.
+///
+/// Chain samples are independent, not an atomic dual-chain observation or a
+/// measurement of physical miner work. The view does not change admission,
+/// extend the lease, prove ASIC notification, or issue a new network request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativePoolCurrentnessObservation {
+    /// Elapsed monotonic time since this exact generation was created.
+    pub generation_age_ms: u64,
+    /// Explicit terminal status, separate from any historical positive sample.
+    pub status: NativeGenerationObservationStatus,
+    /// Last completed Wcash probe and its own sample age.
+    pub wcash: NativeChainCurrentnessObservation,
+    /// Last completed Zcash probe and its own sample age.
+    pub zcash: NativeChainCurrentnessObservation,
+}
 
 struct CurrentnessState {
     created_at: Instant,
     bits: AtomicU8,
-    // Monotonic completion timestamps relative to this exact generation.
-    // Separate atomics mean WEC completion can never hold up a ZEC sample.
-    wcash_sample_micros: AtomicU64,
-    zcash_sample_micros: AtomicU64,
+    // Each atomic publishes one complete result/timestamp pair relative to this
+    // generation. Independent chains never wait for the other chain's sample.
+    wcash_observation: AtomicU64,
+    zcash_observation: AtomicU64,
 }
 
 impl CurrentnessState {
@@ -40,8 +138,8 @@ impl CurrentnessState {
         Self {
             created_at,
             bits: AtomicU8::new(BOTH_CURRENT),
-            wcash_sample_micros: AtomicU64::new(0),
-            zcash_sample_micros: AtomicU64::new(0),
+            wcash_observation: AtomicU64::new(0),
+            zcash_observation: AtomicU64::new(0),
         }
     }
 
@@ -58,13 +156,49 @@ impl CurrentnessState {
     }
 
     fn record(&self, chain: u8, current: bool) {
+        // The legacy boolean result does not establish why a check failed.
+        self.record_observation(
+            chain,
+            current,
+            if current {
+                NativeCurrentnessObservationResult::Current
+            } else {
+                NativeCurrentnessObservationResult::ProbeFailed
+            },
+        );
+    }
+
+    fn record_result(&self, chain: u8, result: &Result<(), MinerError>) {
+        self.record_observation(
+            chain,
+            result.is_ok(),
+            NativeCurrentnessObservationResult::from_result(result),
+        );
+    }
+
+    fn record_observation(
+        &self,
+        chain: u8,
+        current: bool,
+        observation: NativeCurrentnessObservationResult,
+    ) {
         let elapsed = self.created_at.elapsed();
+        self.record_observation_at(chain, current, observation, elapsed);
+    }
+
+    fn record_observation_at(
+        &self,
+        chain: u8,
+        current: bool,
+        observation: NativeCurrentnessObservationResult,
+        elapsed: Duration,
+    ) {
         if elapsed >= Duration::from_secs(NATIVE_JOB_MAX_AGE_SECONDS) {
             return;
         }
         // The CLOSED bit and current bits share one atomic. A response racing
         // closure cannot clear CLOSED or reopen this generation.
-        let _ = self
+        let published = self
             .bits
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bits| {
                 if bits & CLOSED != 0 {
@@ -79,16 +213,77 @@ impl CurrentnessState {
                     updated
                 })
             });
-        let completed = u64::try_from(elapsed.as_micros())
-            .unwrap_or(u64::MAX)
-            .max(1);
-        let timestamp = if chain == WCASH_CURRENT {
-            &self.wcash_sample_micros
+        if published.is_err() {
+            return;
+        }
+        // A completion is accepted only within the 45-second lease, so shifting
+        // its microsecond timestamp cannot overflow this fixed-size field.
+        let completed = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let sample = (completed << OBSERVATION_RESULT_BITS) | observation.tag();
+        let destination = if chain == WCASH_CURRENT {
+            &self.wcash_observation
         } else {
-            &self.zcash_sample_micros
+            &self.zcash_observation
         };
-        timestamp.store(completed, Ordering::Release);
+        // Keep the newest completion even if an older publisher was delayed.
+        // Completion time dominates the packed value; equal-microsecond ties
+        // conservatively prefer failed/mismatched over positive observations.
+        destination.fetch_max(sample, Ordering::Release);
     }
+
+    fn observation_snapshot(&self) -> NativePoolCurrentnessObservation {
+        let wcash = self.wcash_observation.load(Ordering::Acquire);
+        let zcash = self.zcash_observation.load(Ordering::Acquire);
+        // Read time after samples so a concurrent newer completion cannot be
+        // described as a future sample with a fabricated zero age.
+        self.observation_snapshot_at(wcash, zcash, self.created_at.elapsed())
+    }
+
+    fn observation_snapshot_at(
+        &self,
+        wcash: u64,
+        zcash: u64,
+        elapsed: Duration,
+    ) -> NativePoolCurrentnessObservation {
+        let status = if elapsed >= Duration::from_secs(NATIVE_JOB_MAX_AGE_SECONDS) {
+            NativeGenerationObservationStatus::Expired
+        } else if self.bits.load(Ordering::Acquire) & CLOSED != 0 {
+            NativeGenerationObservationStatus::Closed
+        } else {
+            NativeGenerationObservationStatus::Active
+        };
+        NativePoolCurrentnessObservation {
+            generation_age_ms: milliseconds(elapsed),
+            status,
+            wcash: decode_observation(wcash, elapsed),
+            zcash: decode_observation(zcash, elapsed),
+        }
+    }
+}
+
+fn decode_observation(sample: u64, elapsed: Duration) -> NativeChainCurrentnessObservation {
+    let unknown = NativeChainCurrentnessObservation {
+        result: NativeCurrentnessObservationResult::Unknown,
+        sample_age_ms: None,
+    };
+    let result = match sample & OBSERVATION_RESULT_MASK {
+        1 => NativeCurrentnessObservationResult::Current,
+        2 => NativeCurrentnessObservationResult::TipMismatch,
+        3 => NativeCurrentnessObservationResult::ProbeFailed,
+        _ => return unknown,
+    };
+    let completed = Duration::from_micros(sample >> OBSERVATION_RESULT_BITS);
+    let Some(age) = elapsed.checked_sub(completed) else {
+        return unknown;
+    };
+    NativeChainCurrentnessObservation {
+        result,
+        sample_age_ms: Some(milliseconds(age)),
+    }
+}
+
+fn milliseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// An immutable probe bound to one exact generation and its original 45s lease.
@@ -121,7 +316,7 @@ impl NativePoolCurrentnessProbe {
     /// Checks only WEC. Call from its own bounded worker, never share ingress.
     pub fn check_wcash(&self) {
         let result = self.check_wcash_tip();
-        self.state.record(WCASH_CURRENT, result.is_ok());
+        self.state.record_result(WCASH_CURRENT, &result);
     }
 
     fn check_wcash_tip(&self) -> Result<(), MinerError> {
@@ -148,7 +343,16 @@ impl NativePoolCurrentnessProbe {
     /// Checks the existing ZEC quorum policy independently of WEC completion.
     pub fn check_zcash(&self) {
         let result = self.zcash.assert_tip_current(self.zcash_tip);
-        self.state.record(ZCASH_CURRENT, result.is_ok());
+        self.state.record_result(ZCASH_CURRENT, &result);
+    }
+
+    /// Reads cached diagnostic observations without RPC, locks or formatting.
+    ///
+    /// Call from control/diagnostics code, not ordinary share admission. Results
+    /// include their ages and never assert a freshness threshold or physical
+    /// useful work. The two chain samples are independently timed.
+    pub fn observation_snapshot(&self) -> NativePoolCurrentnessObservation {
+        self.state.observation_snapshot()
     }
 
     /// Cached admission only; no RPC, mutex, formatting, or logging.
@@ -369,7 +573,7 @@ mod tests {
             CurrentnessState::new(Instant::now() - Duration::from_secs(NATIVE_JOB_MAX_AGE_SECONDS));
         state.record(ZCASH_CURRENT, true);
         assert_eq!(state.live_bits(), 0);
-        assert_eq!(state.zcash_sample_micros.load(Ordering::Acquire), 0);
+        assert_eq!(state.zcash_observation.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -377,7 +581,7 @@ mod tests {
         let state = CurrentnessState::new(Instant::now());
         state.record(WCASH_CURRENT, false);
         assert_eq!(state.live_bits(), ZCASH_CURRENT);
-        assert!(state.wcash_sample_micros.load(Ordering::Acquire) > 0);
+        assert!(state.wcash_observation.load(Ordering::Acquire) > 0);
         state.record(ZCASH_CURRENT, false);
         assert_eq!(state.live_bits(), 0);
         state.record(WCASH_CURRENT, true);
@@ -389,6 +593,319 @@ mod tests {
         state.bits.fetch_or(CLOSED, Ordering::AcqRel);
         state.record(ZCASH_CURRENT, true);
         assert_eq!(state.live_bits(), 0);
+    }
+
+    #[test]
+    fn initial_observations_are_unknown_without_changing_initial_admission() {
+        let state = CurrentnessState::new(Instant::now());
+        assert_eq!(state.live_bits(), BOTH_CURRENT);
+        let snapshot = state.observation_snapshot();
+        assert_eq!(snapshot.status, NativeGenerationObservationStatus::Active);
+        for chain in [snapshot.wcash, snapshot.zcash] {
+            assert_eq!(chain.result, NativeCurrentnessObservationResult::Unknown);
+            assert_eq!(chain.sample_age_ms, None);
+        }
+    }
+
+    #[test]
+    fn observation_samples_retain_independent_results_and_exact_ages() {
+        let state = CurrentnessState::new(Instant::now());
+        state.record_observation_at(
+            WCASH_CURRENT,
+            false,
+            NativeCurrentnessObservationResult::TipMismatch,
+            Duration::from_millis(2),
+        );
+        assert_eq!(state.live_bits(), ZCASH_CURRENT);
+        let wcash = state.wcash_observation.load(Ordering::Acquire);
+        let snapshot = state.observation_snapshot_at(wcash, 0, Duration::from_millis(7));
+        assert_eq!(
+            snapshot.wcash,
+            NativeChainCurrentnessObservation {
+                result: NativeCurrentnessObservationResult::TipMismatch,
+                sample_age_ms: Some(5),
+            }
+        );
+        assert_eq!(
+            snapshot.zcash.result,
+            NativeCurrentnessObservationResult::Unknown
+        );
+
+        state.record_observation_at(
+            ZCASH_CURRENT,
+            true,
+            NativeCurrentnessObservationResult::Current,
+            Duration::from_millis(4),
+        );
+        let snapshot = state.observation_snapshot_at(
+            state.wcash_observation.load(Ordering::Acquire),
+            state.zcash_observation.load(Ordering::Acquire),
+            Duration::from_millis(9),
+        );
+        assert_eq!(snapshot.wcash.sample_age_ms, Some(7));
+        assert_eq!(snapshot.zcash.sample_age_ms, Some(5));
+        assert_eq!(
+            snapshot.zcash.result,
+            NativeCurrentnessObservationResult::Current
+        );
+        assert_eq!(state.live_bits(), ZCASH_CURRENT);
+        assert_eq!(snapshot.status, NativeGenerationObservationStatus::Active);
+    }
+
+    #[test]
+    fn wcash_only_observation_preserves_the_other_chains_failed_sample() {
+        let state = CurrentnessState::new(Instant::now());
+        state.record_observation_at(
+            WCASH_CURRENT,
+            true,
+            NativeCurrentnessObservationResult::Current,
+            Duration::ZERO,
+        );
+        state.record_observation_at(
+            ZCASH_CURRENT,
+            false,
+            NativeCurrentnessObservationResult::ProbeFailed,
+            Duration::from_millis(1),
+        );
+        let snapshot = state.observation_snapshot_at(
+            state.wcash_observation.load(Ordering::Acquire),
+            state.zcash_observation.load(Ordering::Acquire),
+            Duration::from_millis(8),
+        );
+        assert_eq!(state.live_bits(), WCASH_CURRENT);
+        assert_eq!(
+            snapshot.wcash.result,
+            NativeCurrentnessObservationResult::Current
+        );
+        assert_eq!(snapshot.wcash.sample_age_ms, Some(8));
+        assert_eq!(
+            snapshot.zcash.result,
+            NativeCurrentnessObservationResult::ProbeFailed
+        );
+        assert_eq!(snapshot.zcash.sample_age_ms, Some(7));
+        assert_eq!(snapshot.status.label(), "active");
+    }
+
+    #[test]
+    fn only_proven_tip_errors_are_observed_as_mismatch() {
+        let secret = "PRIVATE_ENDPOINT_OR_ERROR";
+        for error in [
+            MinerError::ChildTipMismatch {
+                expected: secret.into(),
+                endpoint: secret.into(),
+                actual: secret.into(),
+            },
+            MinerError::ParentTipMismatch {
+                expected: secret.into(),
+                endpoint: secret.into(),
+                actual: secret.into(),
+            },
+        ] {
+            assert_eq!(
+                NativeCurrentnessObservationResult::from_result(&Err(error)),
+                NativeCurrentnessObservationResult::TipMismatch
+            );
+        }
+        for error in [
+            MinerError::RpcProtocol(secret.into()),
+            MinerError::RpcError {
+                endpoint: secret.into(),
+                code: Some(-32001),
+                message: secret.into(),
+            },
+        ] {
+            let state = CurrentnessState::new(Instant::now());
+            state.record_result(WCASH_CURRENT, &Err(error));
+            let snapshot = state.observation_snapshot();
+            assert_eq!(
+                snapshot.wcash.result,
+                NativeCurrentnessObservationResult::ProbeFailed
+            );
+            assert_eq!(state.live_bits(), ZCASH_CURRENT);
+            assert!(!snapshot.wcash.result.label().contains(secret));
+        }
+        assert_eq!(
+            NativeCurrentnessObservationResult::from_result(&Ok(())),
+            NativeCurrentnessObservationResult::Current
+        );
+    }
+
+    #[test]
+    fn closed_and_expired_snapshots_never_report_live_admission() {
+        let state = CurrentnessState::new(Instant::now());
+        state.record_observation_at(
+            ZCASH_CURRENT,
+            true,
+            NativeCurrentnessObservationResult::Current,
+            Duration::from_millis(3),
+        );
+        state.bits.fetch_or(CLOSED, Ordering::AcqRel);
+        state.record(ZCASH_CURRENT, true);
+        let zcash = state.zcash_observation.load(Ordering::Acquire);
+        let closed = state.observation_snapshot_at(0, zcash, Duration::from_millis(5));
+        assert_eq!(closed.status, NativeGenerationObservationStatus::Closed);
+        assert_eq!(
+            closed.zcash.result,
+            NativeCurrentnessObservationResult::Current
+        );
+        assert_eq!(closed.zcash.sample_age_ms, Some(2));
+        assert_eq!(state.live_bits(), 0);
+
+        let expired = state.observation_snapshot_at(
+            0,
+            zcash,
+            Duration::from_secs(NATIVE_JOB_MAX_AGE_SECONDS),
+        );
+        assert_eq!(expired.status, NativeGenerationObservationStatus::Expired);
+        assert_eq!(
+            expired.generation_age_ms,
+            NATIVE_JOB_MAX_AGE_SECONDS * 1_000
+        );
+        assert_eq!(
+            expired.zcash.sample_age_ms,
+            Some(NATIVE_JOB_MAX_AGE_SECONDS * 1_000 - 3)
+        );
+        assert_eq!(
+            decode_observation(zcash, Duration::ZERO).sample_age_ms,
+            None
+        );
+        assert_eq!(
+            decode_observation(zcash, Duration::ZERO).result,
+            NativeCurrentnessObservationResult::Unknown
+        );
+    }
+
+    #[test]
+    fn concurrent_publication_never_tears_a_result_and_its_completion_time() {
+        let state = Arc::new(CurrentnessState::new(Instant::now()));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let state = Arc::clone(&state);
+            let gate = Arc::clone(&gate);
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                gate.wait();
+                for _ in 0..10_000 {
+                    state.record_observation_at(
+                        WCASH_CURRENT,
+                        true,
+                        NativeCurrentnessObservationResult::Current,
+                        Duration::from_millis(1),
+                    );
+                    state.record_observation_at(
+                        WCASH_CURRENT,
+                        false,
+                        NativeCurrentnessObservationResult::TipMismatch,
+                        Duration::from_millis(2),
+                    );
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+        gate.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let sample = state.wcash_observation.load(Ordering::Acquire);
+            let observation = decode_observation(sample, Duration::from_millis(3));
+            match observation.result {
+                NativeCurrentnessObservationResult::Unknown => {
+                    assert_eq!(observation.sample_age_ms, None);
+                }
+                NativeCurrentnessObservationResult::Current => {
+                    assert_eq!(observation.sample_age_ms, Some(2));
+                }
+                NativeCurrentnessObservationResult::TipMismatch => {
+                    assert_eq!(observation.sample_age_ms, Some(1));
+                }
+                NativeCurrentnessObservationResult::ProbeFailed => {
+                    panic!("the fixture publishes no probe failures");
+                }
+            }
+            if done.load(Ordering::Acquire) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        writer.join().unwrap();
+        assert_eq!(state.live_bits(), ZCASH_CURRENT);
+    }
+
+    #[test]
+    fn delayed_publication_cannot_replace_a_newer_observation() {
+        let state = CurrentnessState::new(Instant::now());
+        state.record_observation_at(
+            WCASH_CURRENT,
+            false,
+            NativeCurrentnessObservationResult::ProbeFailed,
+            Duration::from_millis(4),
+        );
+        state.record_observation_at(
+            WCASH_CURRENT,
+            true,
+            NativeCurrentnessObservationResult::Current,
+            Duration::from_millis(2),
+        );
+        let observation = decode_observation(
+            state.wcash_observation.load(Ordering::Acquire),
+            Duration::from_millis(9),
+        );
+        assert_eq!(
+            observation.result,
+            NativeCurrentnessObservationResult::ProbeFailed
+        );
+        assert_eq!(observation.sample_age_ms, Some(5));
+        // Observation publication is independent of the unchanged admission
+        // update; it does not restore or override any admission bit.
+        assert_eq!(state.live_bits(), BOTH_CURRENT);
+
+        state.record_observation_at(
+            WCASH_CURRENT,
+            true,
+            NativeCurrentnessObservationResult::Current,
+            Duration::from_millis(4),
+        );
+        assert_eq!(
+            decode_observation(
+                state.wcash_observation.load(Ordering::Acquire),
+                Duration::from_millis(9)
+            ),
+            observation,
+            "equal-time positive publication cannot hide a failure"
+        );
+    }
+
+    #[test]
+    fn held_wcash_observation_never_blocks_a_zcash_sample_or_snapshot() {
+        let state = Arc::new(CurrentnessState::new(Instant::now()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let wcash = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                state.record(WCASH_CURRENT, true);
+            })
+        };
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        state.record_result(ZCASH_CURRENT, &Ok(()));
+        let snapshot = state.observation_snapshot();
+        // Always release and join owned work before asserting observations.
+        release_tx.send(()).unwrap();
+        wcash.join().unwrap();
+        assert_eq!(
+            snapshot.wcash.result,
+            NativeCurrentnessObservationResult::Unknown
+        );
+        assert_eq!(snapshot.wcash.sample_age_ms, None);
+        assert_eq!(
+            snapshot.zcash.result,
+            NativeCurrentnessObservationResult::Current
+        );
+        assert!(snapshot.zcash.sample_age_ms.is_some());
+        assert_eq!(state.live_bits(), BOTH_CURRENT);
     }
 
     #[test]

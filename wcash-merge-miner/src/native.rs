@@ -48,6 +48,7 @@ use zebra_chain::{
 use crate::{
     diagnostics::{ZecRecipientRole, ZecRecipientTiming, ZecWinnerAttempt},
     rpc::{RpcEndpoint, ZebraRpcClient, DEFAULT_RPC_TIMEOUT},
+    rpc_evidence::{PreparationRpcContext, RpcRole},
     MinerError, NativePreparationTiming, PreparationPhase, PreparedJob, SolvedAuxPow,
     EQUIHASH_SOLUTION_BYTES, NATIVE_COINBASE_MATURITY_CONFIRMATIONS,
     NATIVE_JOB_MAX_AGE_MILLISECONDS,
@@ -433,6 +434,41 @@ struct BlockchainInfoTip {
 }
 
 impl NativeZcashProvider {
+    /// Attributes only temporary preparation clients by their configured role.
+    pub(crate) fn with_preparation_context(&self, context: PreparationRpcContext) -> Self {
+        let mut provider = self.clone();
+        provider.template_node =
+            provider
+                .template_node
+                .with_preparation_context(RpcRole::Template, 0, context.clone());
+        for (role, nodes) in [
+            (RpcRole::Validator, &mut provider.proposal_validators),
+            (RpcRole::Broadcaster, &mut provider.broadcast_nodes),
+            (RpcRole::Observer, &mut provider.observer_nodes),
+        ] {
+            for (index, node) in nodes.iter_mut().enumerate() {
+                *node = node.with_preparation_context(role, index, context.clone());
+            }
+        }
+        provider
+    }
+
+    /// Clears preparation origin before retained live or background operation.
+    pub(crate) fn without_preparation_context(&self) -> Self {
+        let mut provider = self.clone();
+        provider.template_node = provider.template_node.without_preparation_context();
+        for nodes in [
+            &mut provider.proposal_validators,
+            &mut provider.broadcast_nodes,
+            &mut provider.observer_nodes,
+        ] {
+            for node in nodes.iter_mut() {
+                *node = node.without_preparation_context();
+            }
+        }
+        provider
+    }
+
     /// Connects the configured native parent-node set.
     pub fn new(config: NativeZcashConfig) -> Result<Self, MinerError> {
         let expected_genesis_hash = config.expected_genesis_hash.clone();
@@ -3967,6 +4003,66 @@ pub(crate) mod tests {
         assert!(
             NativeZcashProvider::connect(bypass_attempt).is_err(),
             "the provider must revalidate configs even when an in-crate caller bypasses new()"
+        );
+    }
+
+    #[test]
+    fn preparation_client_roles_are_explicit_and_do_not_escape_into_live_provider() {
+        let endpoint =
+            |port| RpcEndpoint::new(format!("http://127.0.0.1:{port}/"), None, None).unwrap();
+        let network = NativeZcashNetwork::Regtest;
+        let config = NativeZcashConfig::new(
+            endpoint(18000),
+            vec![endpoint(18001), endpoint(18002)],
+            network,
+            network.consensus_parameters().genesis_hash().to_string(),
+            "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV".parse().unwrap(),
+        )
+        .unwrap()
+        .with_broadcast_nodes(vec![endpoint(18003)])
+        .unwrap()
+        .with_observer_nodes(vec![endpoint(18004)])
+        .unwrap();
+        let original = NativeZcashProvider::connect(config).unwrap();
+        let context = PreparationRpcContext::new();
+        let attributed = original.with_preparation_context(context.clone());
+        assert_eq!(
+            attributed.template_node.preparation_attribution_for_test(),
+            Some((context.attempt_id(), RpcRole::Template, Some(0)))
+        );
+        for (role, nodes) in [
+            (RpcRole::Validator, &attributed.proposal_validators),
+            (RpcRole::Broadcaster, &attributed.broadcast_nodes),
+            (RpcRole::Observer, &attributed.observer_nodes),
+        ] {
+            for (index, node) in nodes.iter().enumerate() {
+                assert_eq!(
+                    node.preparation_attribution_for_test(),
+                    Some((
+                        context.attempt_id(),
+                        role,
+                        Some(u16::try_from(index).unwrap())
+                    ))
+                );
+            }
+        }
+        let cleared = attributed.without_preparation_context();
+        for provider in [&original, &cleared] {
+            assert!(provider
+                .template_node
+                .preparation_attribution_for_test()
+                .is_none());
+            assert!(provider
+                .proposal_validators
+                .iter()
+                .chain(provider.broadcast_nodes.iter())
+                .chain(provider.observer_nodes.iter())
+                .all(|node| node.preparation_attribution_for_test().is_none()));
+        }
+        assert_eq!(
+            attributed.template_node.preparation_attribution_for_test(),
+            Some((context.attempt_id(), RpcRole::Template, Some(0))),
+            "clearing a clone must not change its origin provider"
         );
     }
 

@@ -4,7 +4,15 @@
 //! RPC payloads or wall-clock timestamps and never participates in share or
 //! winner admission. Only slow or failed completed attempts reach diagnostics.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use crate::{
+    preparation_stats::{global_counters, PreparationCounters},
+    rpc_evidence::PreparationRpcContext,
+};
 
 use crate::MinerError;
 
@@ -98,9 +106,13 @@ impl PreparationPhase {
 
 /// One explicit preparation attempt, ending only after success or failure.
 ///
-/// This is a fixed-size stack value with no writer, RPC, shared mutex or cache.
-/// Dropping it emits nothing; the owner must finish the attempt after its result.
+/// This fixed-size owner shares only atomic counters and a preparation context.
+/// It has no writer, RPC, shared mutex or blocking telemetry operation.
+/// Dropping it only counts abandonment; the owner must finish an actual result.
 pub struct NativePreparationTiming {
+    counters: Arc<PreparationCounters>,
+    finished: bool,
+    rpc_context: PreparationRpcContext,
     started: Instant,
     phase_started: Instant,
     phase: PreparationPhase,
@@ -122,7 +134,15 @@ impl NativePreparationTiming {
     }
 
     fn at(now: Instant) -> Self {
+        Self::with_counters_at(now, global_counters())
+    }
+
+    fn with_counters_at(now: Instant, counters: Arc<PreparationCounters>) -> Self {
+        counters.started();
         Self {
+            counters,
+            finished: false,
+            rpc_context: PreparationRpcContext::new(),
             started: now,
             phase_started: now,
             phase: PreparationPhase::Other,
@@ -143,7 +163,22 @@ impl NativePreparationTiming {
     fn enter_at(&mut self, phase: PreparationPhase, now: Instant) {
         self.close_phase(now);
         self.phase = phase;
+        self.rpc_context.enter(phase);
         self.phase_started = now;
+    }
+
+    pub(crate) fn rpc_context(&self) -> PreparationRpcContext {
+        self.rpc_context.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_counters(counters: Arc<PreparationCounters>) -> Self {
+        Self::with_counters_at(Instant::now(), counters)
+    }
+
+    /// Process-local attempt identity; zero means telemetry identity exhausted.
+    pub fn attempt_id(&self) -> u64 {
+        self.rpc_context.attempt_id()
     }
 
     /// Adds the public Wcash candidate height once known.
@@ -162,7 +197,7 @@ impl NativePreparationTiming {
         self.set_zcash_height(zcash);
     }
 
-    /// Finishes a successfully activated attempt; fast success emits nothing.
+    /// Finishes an activated attempt; fast success counts without console output.
     pub fn finish_ok(self) {
         self.finish(PreparationResult::Activated);
     }
@@ -198,17 +233,30 @@ impl NativePreparationTiming {
     ) -> Option<PreparationReport> {
         self.close_phase(finished);
         let elapsed = finished.saturating_duration_since(self.started);
+        let elapsed_ms = milliseconds(elapsed);
+        let phases_ms = self.phases.map(milliseconds);
+        self.counters.completed(result, elapsed_ms, phases_ms);
+        self.finished = true;
         if matches!(result, PreparationResult::Activated) && elapsed < SLOW_PREPARATION {
             return None;
         }
         Some(PreparationReport {
-            elapsed_ms: milliseconds(elapsed),
-            phases_ms: self.phases.map(milliseconds),
+            attempt_id: self.rpc_context.attempt_id(),
+            elapsed_ms,
+            phases_ms,
             finished_phase: self.phase,
             wcash_height: self.wcash_height,
             zcash_height: self.zcash_height,
             result,
         })
+    }
+}
+
+impl Drop for NativePreparationTiming {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.counters.abandoned();
+        }
     }
 }
 
@@ -237,6 +285,7 @@ impl PreparationResult {
 /// Only fixed public metadata crosses the existing bounded diagnostic channel.
 #[derive(Clone, Copy)]
 pub(crate) struct PreparationReport {
+    pub(crate) attempt_id: u64,
     pub(crate) elapsed_ms: u64,
     pub(crate) phases_ms: [u64; PHASE_COUNT],
     pub(crate) finished_phase: PreparationPhase,
@@ -270,6 +319,36 @@ pub(crate) fn preparation_error_class(error: &MinerError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_finished_attempt_counts_before_filter_and_abandoned_is_separate() {
+        let now = Instant::now();
+        let c = Arc::new(PreparationCounters::default());
+        let fast = NativePreparationTiming::with_counters_at(now, Arc::clone(&c));
+        assert!(fast.report_at(PreparationResult::Activated, now).is_none());
+        let mut failure = NativePreparationTiming::with_counters_at(now, Arc::clone(&c));
+        failure.enter_at(PreparationPhase::WcashCandidate, now);
+        assert!(failure
+            .report_at(
+                PreparationResult::Failed("rpc_error"),
+                now + Duration::from_millis(75)
+            )
+            .is_some());
+        let activation = NativePreparationTiming::with_counters_at(now, Arc::clone(&c));
+        activation.finish_activation_failed();
+        drop(NativePreparationTiming::with_counters_at(
+            now,
+            Arc::clone(&c),
+        ));
+        let s = c.snapshot();
+        assert_eq!(s.started, 4);
+        assert_eq!(s.completed, 3);
+        assert_eq!(s.activated, 1);
+        assert_eq!(s.failed, 2);
+        assert_eq!(s.abandoned, 1);
+        assert_eq!(s.elapsed_buckets.iter().sum::<u64>(), 3);
+        assert_eq!(s.phase_sum_ms[PreparationPhase::WcashCandidate.index()], 75);
+    }
 
     #[test]
     fn exclusive_repeated_phases_account_for_the_complete_attempt() {

@@ -22,7 +22,10 @@ use reqwest::{
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
-use crate::MinerError;
+use crate::{
+    rpc_evidence::{PreparationRpcContext, PreparationRpcFailure, RpcMethod, RpcRole},
+    MinerError,
+};
 
 /// Maximum accepted JSON-RPC response size, including a hex-encoded 2 MB block template.
 pub const MAX_RPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -137,6 +140,14 @@ pub struct ZebraRpcClient {
     client: Client,
     next_id: Arc<AtomicU64>,
     active_coinbase_prewarms: Arc<Mutex<HashSet<u32>>>,
+    preparation_context: Option<PreparationAttribution>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparationAttribution {
+    role: RpcRole,
+    index: Option<u16>,
+    context: PreparationRpcContext,
 }
 
 struct CoinbasePrewarmReservation {
@@ -178,6 +189,7 @@ impl ZebraRpcClient {
             client,
             next_id: Arc::new(AtomicU64::new(1)),
             active_coinbase_prewarms: Arc::new(Mutex::new(HashSet::new())),
+            preparation_context: None,
         })
     }
 
@@ -186,24 +198,110 @@ impl ZebraRpcClient {
         self.endpoint.label()
     }
 
+    /// Adds only fixed preparation metadata to a temporary shared-client clone.
+    pub(crate) fn with_preparation_context(
+        &self,
+        role: RpcRole,
+        index: usize,
+        context: PreparationRpcContext,
+    ) -> Self {
+        let mut client = self.clone();
+        let index = u16::try_from(index).ok();
+        client.preparation_context = Some(PreparationAttribution {
+            role: if index.is_some() {
+                role
+            } else {
+                RpcRole::Unspecified
+            },
+            index,
+            context,
+        });
+        client
+    }
+
+    /// Removes attempt attribution before a client enters long-lived work.
+    pub(crate) fn without_preparation_context(&self) -> Self {
+        let mut client = self.clone();
+        client.preparation_context = None;
+        client
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preparation_attribution_for_test(&self) -> Option<(u64, RpcRole, Option<u16>)> {
+        self.preparation_context.as_ref().map(|attribution| {
+            (
+                attribution.context.attempt_id(),
+                attribution.role,
+                attribution.index,
+            )
+        })
+    }
+
     /// Calls one JSON-RPC method and decodes its result.
     pub fn call<T: DeserializeOwned>(
         &self,
         method: &'static str,
         params: Value,
     ) -> Result<T, MinerError> {
-        let result = self.call_value(method, params)?;
-        serde_json::from_value(result).map_err(|error| {
-            MinerError::RpcProtocol(format!(
-                "{} returned an invalid {method} result: {error}",
-                self.label()
-            ))
+        self.request(method, params, |result| {
+            serde_json::from_value(result).map_err(|error| {
+                MinerError::RpcProtocol(format!(
+                    "{} returned an invalid {method} result: {error}",
+                    self.label()
+                ))
+            })
         })
     }
 
     /// Calls one JSON-RPC method while preserving a JSON `null` result.
     pub fn call_value(&self, method: &'static str, params: Value) -> Result<Value, MinerError> {
+        self.request(method, params, Ok)
+    }
+
+    fn request<T>(
+        &self,
+        method: &'static str,
+        params: Value,
+        decode: impl FnOnce(Value) -> Result<T, MinerError>,
+    ) -> Result<T, MinerError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // Ordinary RPC clients retain their prior path: no diagnostic clock,
+        // phase read, event construction or queue access without an origin.
+        let attribution = self
+            .preparation_context
+            .as_ref()
+            .filter(|attribution| attribution.context.attempt_id() != 0);
+        let started =
+            attribution.map(|attribution| (Instant::now(), attribution.context.snapshot_phase()));
+        let result = self.request_value(method, params, id).and_then(decode);
+        if let (Err(error), Some(attribution), Some((started, phase))) =
+            (&result, attribution, started)
+        {
+            attribution.context.record_failure(
+                PreparationRpcFailure {
+                    attempt_id: attribution.context.attempt_id(),
+                    phase,
+                    role: attribution.role,
+                    recipient_index: attribution.index,
+                    method: RpcMethod::from_name(method),
+                    request_id: id,
+                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    error_class: "rpc_failure",
+                    rpc_error_code: None,
+                    rpc_http_status: None,
+                }
+                .with_error(error),
+            );
+        }
+        result
+    }
+
+    fn request_value(
+        &self,
+        method: &'static str,
+        params: Value,
+        id: u64,
+    ) -> Result<Value, MinerError> {
         let request = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -414,6 +512,243 @@ fn is_loopback_host(url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{preparation_timing::PreparationPhase, rpc_evidence::RpcRole};
+    use std::{io::Write, net::TcpListener};
+
+    fn evidence_rpc_fixture(
+        status: u16,
+        response: Value,
+    ) -> (ZebraRpcClient, thread::JoinHandle<Value>) {
+        evidence_rpc_fixture_with_gate(status, response, None)
+    }
+
+    fn evidence_rpc_fixture_with_gate(
+        status: u16,
+        mut response: Value,
+        gate: Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    ) -> (ZebraRpcClient, thread::JoinHandle<Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let (header_end, body_len) = loop {
+                let mut bytes = [0; 1_024];
+                let read = stream.read(&mut bytes).unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&bytes[..read]);
+                assert!(request.len() <= 65_536);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break (end + 4, length);
+                    }
+                }
+            };
+            let request: Value =
+                serde_json::from_slice(&request[header_end..header_end + body_len]).unwrap();
+            if let Some((entered, released)) = gate {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+            response["id"] = request["id"].clone();
+            let body = serde_json::to_vec(&response).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+            request
+        });
+        let endpoint = RpcEndpoint::new(format!("http://{address}/"), None, None).unwrap();
+        (
+            ZebraRpcClient::new(endpoint, Duration::from_secs(3)).unwrap(),
+            server,
+        )
+    }
+
+    #[test]
+    fn preparation_rpc_errors_keep_exact_variants_and_safe_source_attribution() {
+        for (role, method, phase) in [
+            (
+                RpcRole::Wcash,
+                "createauxblock",
+                PreparationPhase::WcashCandidate,
+            ),
+            (
+                RpcRole::Template,
+                "getblocktemplate",
+                PreparationPhase::ZcashTemplate,
+            ),
+            (
+                RpcRole::Validator,
+                "getblocktemplate",
+                PreparationPhase::ZcashProposal,
+            ),
+        ] {
+            let (client, server) = evidence_rpc_fixture(
+                500,
+                json!({"jsonrpc":"2.0","result":null,"error":{"code":-32001,"message":"PRIVATE_RPC_BODY"}}),
+            );
+            let (context, reports) = PreparationRpcContext::new().with_failure_capture();
+            context.enter(phase);
+            let client = client.with_preparation_context(role, 2, context.clone());
+            let (error, events) =
+                crate::diagnostics::capture(|| client.call_value(method, json!([])).unwrap_err());
+            assert!(
+                matches!(error, MinerError::RpcError { code: Some(-32001), ref message, .. } if message == "PRIVATE_RPC_BODY")
+            );
+            assert_eq!(server.join().unwrap()["method"], method);
+            assert_eq!(events.len(), 1, "a failed request emits at most one record");
+            let reports = reports.lock().unwrap();
+            assert_eq!(reports.len(), 1);
+            let report = reports[0];
+            assert_eq!(report.attempt_id, context.attempt_id());
+            assert_eq!(report.phase, phase);
+            assert_eq!(report.role, role);
+            assert_eq!(report.recipient_index, Some(2));
+            assert_eq!(report.method, RpcMethod::from_name(method));
+            assert_eq!(report.request_id, 1);
+            assert_eq!(report.error_class, "rpc_error");
+            assert_eq!(report.rpc_error_code, Some(-32001));
+            assert_eq!(report.rpc_http_status, None);
+            let debug = format!("{report:?}");
+            assert!(!debug.contains("PRIVATE_RPC_BODY"));
+            assert!(!debug.contains("127.0.0.1"));
+        }
+    }
+
+    #[test]
+    fn typed_result_failure_is_reported_once_after_decode() {
+        let (client, server) = evidence_rpc_fixture(
+            200,
+            json!({"jsonrpc":"2.0","result":"PRIVATE_RESULT","error":null}),
+        );
+        let (context, reports) = PreparationRpcContext::new().with_failure_capture();
+        let client = client.with_preparation_context(RpcRole::Wcash, 0, context);
+        let (result, events) =
+            crate::diagnostics::capture(|| client.call::<u32>("getblockcount", json!([])));
+        assert!(matches!(result, Err(MinerError::RpcProtocol(_))));
+        server.join().unwrap();
+        assert_eq!(events.len(), 1);
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].error_class, "rpc_response");
+        assert!(!format!("{:?}", reports[0]).contains("PRIVATE_RESULT"));
+    }
+
+    #[test]
+    fn unattributed_and_cleared_clients_do_not_emit_preparation_records() {
+        for clear in [false, true] {
+            let (client, server) =
+                evidence_rpc_fixture(401, json!({"jsonrpc":"2.0","result":true,"error":null}));
+            let (context, reports) = PreparationRpcContext::new().with_failure_capture();
+            let client = if clear {
+                client
+                    .with_preparation_context(RpcRole::Template, 0, context)
+                    .without_preparation_context()
+            } else {
+                client
+            };
+            let (result, events) =
+                crate::diagnostics::capture(|| client.call_value("getblockcount", json!([])));
+            assert!(matches!(
+                result,
+                Err(MinerError::RpcHttpStatus(reqwest::StatusCode::UNAUTHORIZED))
+            ));
+            server.join().unwrap();
+            assert!(events.is_empty());
+            assert!(reports.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn parallel_rpc_clones_retain_their_explicit_origin() {
+        let mut fixtures = Vec::new();
+        let (context, reports) = PreparationRpcContext::new().with_failure_capture();
+        context.enter(PreparationPhase::CurrentnessFences);
+        for index in 0..3 {
+            let (client, server) = evidence_rpc_fixture(
+                200,
+                json!({"jsonrpc":"2.0","result":null,"error":{"code":-32001,"message":"PRIVATE_PARALLEL_BODY"}}),
+            );
+            fixtures.push((
+                client.with_preparation_context(RpcRole::Validator, index, context.clone()),
+                server,
+            ));
+        }
+        thread::scope(|scope| {
+            let requests: Vec<_> = fixtures
+                .iter()
+                .map(|(client, _)| scope.spawn(|| client.call_value("getbestblockhash", json!([]))))
+                .collect();
+            for request in requests {
+                assert!(matches!(
+                    request.join().unwrap(),
+                    Err(MinerError::RpcError {
+                        code: Some(-32001),
+                        ..
+                    })
+                ));
+            }
+        });
+        for (_, server) in fixtures {
+            server.join().unwrap();
+        }
+        let mut reports = reports.lock().unwrap().clone();
+        reports.sort_by_key(|report| report.recipient_index);
+        assert_eq!(reports.len(), 3);
+        for (index, report) in reports.into_iter().enumerate() {
+            assert_eq!(report.attempt_id, context.attempt_id());
+            assert_eq!(report.phase, PreparationPhase::CurrentnessFences);
+            assert_eq!(report.recipient_index, Some(u16::try_from(index).unwrap()));
+        }
+    }
+
+    #[test]
+    fn preparation_phase_is_snapshotted_before_the_request() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let (client, server) = evidence_rpc_fixture_with_gate(
+            200,
+            json!({"jsonrpc":"2.0","result":null,"error":{"code":-1,"message":"error"}}),
+            Some((entered_tx, release_rx)),
+        );
+        let (context, reports) = PreparationRpcContext::new().with_failure_capture();
+        context.enter(PreparationPhase::ZcashProposal);
+        let client =
+            client.with_preparation_context(RpcRole::Validator, usize::MAX, context.clone());
+        let request = thread::spawn(move || client.call_value("PRIVATE_UNKNOWN_METHOD", json!([])));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        context.enter(PreparationPhase::Activation);
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            request.join().unwrap(),
+            Err(MinerError::RpcError { code: Some(-1), .. })
+        ));
+        server.join().unwrap();
+        let report = reports.lock().unwrap()[0];
+        assert_eq!(report.phase, PreparationPhase::ZcashProposal);
+        assert_eq!(report.method, RpcMethod::Other);
+        assert_eq!(report.recipient_index, None);
+        assert_eq!(report.role, RpcRole::Unspecified);
+    }
 
     #[test]
     fn endpoint_policy_never_exposes_credentials() {

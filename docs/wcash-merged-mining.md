@@ -332,6 +332,51 @@ can still lose diagnostics: the preserved authoritative journal and independent
 exact-hash observation remain the recovery evidence. No new diagnostics run
 for ordinary shares, and no diagnostic adds an fsync or validation pass.
 
+### Preparation and currentness evidence
+
+Failed RPCs through temporary preparation clients carry a process-local
+`attempt_id`, fixed recipient role and index, allowlisted RPC method, request
+ID, entry phase, elapsed time, and
+available numeric error code or HTTP status. The original RPC error and retry
+policy are preserved. The same attempt ID joins a completed preparation,
+selected retry, and successful activation. Correlation is scoped to the journal
+invocation and process: IDs reset on restart, and exhausted IDs are unknown.
+RPC elapsed time includes decoding, not just network time. These are lossy
+failure diagnostics, including startup recovery calls made during preparation;
+they are not durable submission receipts. Repeated method/phase failures remain
+bounded by the existing suppression cache and burst limit.
+
+Attribution travels only with temporary preparation client clones, including
+parallel checks. Live winner, currentness, and prewarm clients do not retain an
+old preparation origin. Endpoint URLs, credentials, RPC bodies, payout data,
+and arbitrary error strings are excluded from the new metadata.
+
+`diagnostic_output_summary` includes fixed-size `preparation_statistics` when
+counters change, at most once per 30 seconds. All explicitly completed timings,
+including fast successes omitted from individual logs, enter one exclusive
+latency bucket and the phase sums. Dropped timing owners count as `abandoned`,
+not activated or failed, with no destructor I/O. The in-process
+`preparation_statistics()` API reads the same cached counters without RPC or
+formatting. Fields are independently sampled atomics, not an atomic accounting
+snapshot or durable history. Counters saturate and reset on process restart.
+No counter can prove visibility through a stalled or failed sink: absent an
+independently healthy cached observation path, coverage is unknown until recovery.
+
+The controller samples `generation_currentness_observation` at most once per
+five seconds. It reads cached, packed result/time pairs independently for each
+chain. Results distinguish `unknown`, `current`, `tip_mismatch`, and `probe_failed`,
+with each sample's own age and explicit closed/expired generation status.
+Initial unsampled observations are unknown even though preparation's final
+checks permit initial admission. Equal-microsecond observations conservatively
+prefer a failure or mismatch. No diagnostic snapshot probes a node or changes
+admission. A last-known positive sample can race a later tip change; these
+records do not establish ASIC notification or physically useful hash work.
+
+This evidence does not extend the protocol or journal schema. Durable per-share
+arrival/commit eligibility and miner notification receipts require a separately
+versioned Pool/Wolf change. Historical missing observations remain unknown;
+accepted work alone must not be relabeled as current-parent Zcash work.
+
 ### Pool-backend job supervision
 
 The native pool backend prepares a replacement on one managed worker. Its
