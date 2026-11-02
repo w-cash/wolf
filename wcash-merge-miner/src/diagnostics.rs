@@ -21,7 +21,8 @@ use wcash_pool_protocol::{Hex32, MergedChain, WinnerDescriptor};
 use crate::{
     pool_backend_journal::PoolBackendJournalError,
     preparation_timing::{PreparationPhase, PreparationReport},
-    MinerError, PoolBackendWinnerSnapshot, PoolWinnerReconciliationError,
+    MinerError, PoolBackendWinnerSnapshot, PoolBackendZcashWorkStats,
+    PoolWinnerReconciliationError,
 };
 
 const CAPACITY: usize = 128;
@@ -89,6 +90,8 @@ thread_local! {
 
 /// Runtime notices for the persistent native backend, independent of console I/O.
 pub enum NativeBackendRuntimeEvent<'a> {
+    /// Cumulative accepted work classified by cached Zcash predecessor evidence.
+    ZcashWorkObservation(PoolBackendZcashWorkStats),
     /// An authoritative job was activated; this is not an ASIC-notification receipt.
     JobActivated(&'a wcash_pool_protocol::JobDescriptor),
     /// Shutdown cleanup completed.
@@ -105,6 +108,11 @@ pub enum NativeBackendRuntimeEvent<'a> {
 
 #[derive(Clone, Copy)]
 enum RuntimeMetadata {
+    ZcashWork(PoolBackendZcashWorkStats),
+    RecoverySampleExpired {
+        elapsed_ms: u64,
+        maximum_age_ms: u64,
+    },
     Activated {
         job: [u8; 32],
         wcash_height: u32,
@@ -182,7 +190,9 @@ fn runtime_tip_hash(value: &str) -> Option<[u8; 32]> {
 pub fn record_native_backend_runtime(event: NativeBackendRuntimeEvent<'_>) {
     if matches!(
         &event,
-        NativeBackendRuntimeEvent::JobActivated(_) | NativeBackendRuntimeEvent::Stopped
+        NativeBackendRuntimeEvent::JobActivated(_)
+            | NativeBackendRuntimeEvent::Stopped
+            | NativeBackendRuntimeEvent::ZcashWorkObservation(_)
     ) && !runtime_info_enabled()
     {
         return;
@@ -194,6 +204,12 @@ fn runtime_event(event: NativeBackendRuntimeEvent<'_>) -> Event {
     #[cfg(test)]
     RUNTIME_EVENT_BUILDS.with(|builds| builds.set(builds.get().saturating_add(1)));
     match event {
+        NativeBackendRuntimeEvent::ZcashWorkObservation(stats) => {
+            let mut event = Event::new(None, "zcash_work_observation", "cumulative");
+            event.noisy = false;
+            event.runtime = Some(RuntimeMetadata::ZcashWork(stats));
+            event
+        }
         NativeBackendRuntimeEvent::JobActivated(job) => {
             let mut event = Event::new(None, "backend_job_activated", "activated");
             event.noisy = false;
@@ -268,6 +284,15 @@ pub(crate) fn native_backend_warning(stage: &'static str, error: Option<&MinerEr
         Some(error) => runtime_error_event(stage, error),
         None => runtime_warning_event(stage, "state_unavailable"),
     });
+}
+
+pub(crate) fn native_zcash_recovery_sample_expired(elapsed: Duration, maximum: Duration) {
+    let mut event = runtime_warning_event("zcash_recovery_observation_expired", "slow_positive");
+    event.runtime = Some(RuntimeMetadata::RecoverySampleExpired {
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        maximum_age_ms: u64::try_from(maximum.as_millis()).unwrap_or(u64::MAX),
+    });
+    record(event);
 }
 
 pub(crate) fn native_backend_prewarm_failure(worker_index: usize, error: &io::Error) {
@@ -1207,6 +1232,34 @@ impl Reporter {
             })
         });
         let runtime = event.runtime.map(|metadata| match metadata {
+            RuntimeMetadata::RecoverySampleExpired {
+                elapsed_ms,
+                maximum_age_ms,
+            } => json!({
+                "elapsed_ms":elapsed_ms,
+                "maximum_age_ms":maximum_age_ms,
+                "authorizes_recovery":false
+            }),
+            RuntimeMetadata::ZcashWork(stats) => {
+                let work = stats.target_work_le.map(|bytes| {
+                    zebra_chain::work::difficulty::U256::from_little_endian(&bytes)
+                        .to_string()
+                });
+                json!({
+                    "scope":"process_cumulative_new_durable_shares",
+                    "first_event_seq":stats.first_event_seq,
+                    "last_event_seq":stats.last_event_seq,
+                    "shares":{"current":stats.shares[0],"stale":stats.shares[1],"unknown":stats.shares[2]},
+                    "target_work":{"current":work[0],"stale":work[1],"unknown":work[2]},
+                    "target_work_formula":"floor(2^256/(assigned_share_target+1))",
+                    "observation":"authenticated_cached_predecessor_near_backend_admission",
+                    "maximum_sample_age_ms":1000,
+                    "overflowed":stats.overflowed,
+                    "replays_included":false,
+                    "asserts_hardware_solve_time":false,
+                    "asserts_canonical_reward_eligibility":false
+                })
+            }
             RuntimeMetadata::Activated {
                 job,
                 wcash_height,
@@ -1337,6 +1390,43 @@ mod tests {
     }
 
     #[test]
+    fn zcash_work_observation_preserves_exact_units_and_scope_on_the_wire() {
+        let now = Instant::now();
+        let mut stats = PoolBackendZcashWorkStats {
+            shares: [3, 2, 1],
+            first_event_seq: 11,
+            last_event_seq: 28,
+            ..Default::default()
+        };
+        stats.target_work_le[0][0] = 1;
+        stats.target_work_le[0][8] = 1;
+        let event = runtime_event(NativeBackendRuntimeEvent::ZcashWorkObservation(stats));
+        let mut output = Vec::new();
+        Reporter::new(now)
+            .record(&mut output, event, now, 0)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["stage"], "zcash_work_observation");
+        assert_eq!(
+            value["runtime"]["target_work"]["current"],
+            "18446744073709551617"
+        );
+        assert_eq!(
+            value["runtime"]["shares"],
+            json!({"current":3,"stale":2,"unknown":1})
+        );
+        assert_eq!(value["runtime"]["first_event_seq"], 11);
+        assert_eq!(value["runtime"]["last_event_seq"], 28);
+        assert_eq!(value["runtime"]["replays_included"], false);
+        assert_eq!(
+            value["runtime"]["asserts_canonical_reward_eligibility"],
+            false
+        );
+        assert_eq!(value["runtime"]["asserts_hardware_solve_time"], false);
+        assert_eq!(value["runtime"]["maximum_sample_age_ms"], 1000);
+    }
+
+    #[test]
     fn runtime_log_level_accepts_only_info_or_warn_without_silencing_failures() {
         assert_eq!(parse_runtime_log_level(None), Some(true));
         assert_eq!(parse_runtime_log_level(Some("info")), Some(true));
@@ -1364,6 +1454,9 @@ mod tests {
                     &runtime_job(),
                 ));
                 record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
+                record_native_backend_runtime(NativeBackendRuntimeEvent::ZcashWorkObservation(
+                    PoolBackendZcashWorkStats::default(),
+                ));
                 assert_eq!(RUNTIME_EVENT_BUILDS.with(std::cell::Cell::get), before);
                 assert!(receiver.try_recv().is_err());
                 assert_eq!(sink.dropped.load(Ordering::Relaxed), 0);

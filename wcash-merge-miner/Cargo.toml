@@ -30,7 +30,7 @@ sha2 = "0.10"
 signal-hook = "0.3"
 thiserror = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
-wcash-pool-protocol = { git = "https://github.com/w-cash/pool.git", rev = "da1b625e45c312fbbd61383799850c8d599a82f9" }
+wcash-pool-protocol = { git = "https://github.com/w-cash/pool.git", rev = "2925597d1af8b7b9c7edfc67c0d822a15ffd01f3" }
 wcash-zcash-aux = { path = "../wcash-zcash-aux" }
 zcash_address.workspace = true
 zcash_note_encryption.workspace = true

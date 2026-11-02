@@ -241,6 +241,20 @@ impl fmt::Debug for NativeZcashConfig {
 }
 
 impl NativeZcashConfig {
+    pub(crate) fn recovery_observation_provider(
+        &self,
+    ) -> Result<(NativeZcashProvider, [u8; 32]), MinerError> {
+        let mut config = self.clone();
+        // Only the independent metadata lane uses this shorter deadline.
+        config.rpc_timeout = Duration::from_secs(1);
+        let genesis = config
+            .expected_parent_network
+            .consensus_parameters()
+            .genesis_hash()
+            .0;
+        Ok((NativeZcashProvider::connect(config)?, genesis))
+    }
+
     /// Creates a configuration that fails closed without a proposal validator.
     pub fn new(
         template_node: RpcEndpoint,
@@ -433,6 +447,10 @@ struct BlockchainInfoTip {
 }
 
 impl NativeZcashProvider {
+    pub(crate) fn uses_lagging_validator_policy(&self) -> bool {
+        self.allow_lagging_proposal_validators
+    }
+
     /// Connects the configured native parent-node set.
     pub fn new(config: NativeZcashConfig) -> Result<Self, MinerError> {
         let expected_genesis_hash = config.expected_genesis_hash.clone();
@@ -1402,8 +1420,59 @@ impl NativeZcashProvider {
         })
     }
 
-    /// Returns one exact tip only when every pinned parent node reports the
-    /// same atomic blockchain snapshot.
+    /// Authenticates every configured role and requires an exact shared tip.
+    /// Recovery is strict even for Testnet callers opting into lagging validators.
+    pub(crate) fn recovery_chain_tip(&self) -> Result<NativeChainTip, MinerError> {
+        let genesis = self.expected_parent_network.genesis_hash().to_string();
+        let mut nodes = Vec::with_capacity(
+            1 + self.proposal_validators.len()
+                + self.broadcast_nodes.len()
+                + self.observer_nodes.len(),
+        );
+        nodes.push((&self.template_node, true));
+        nodes.extend(self.proposal_validators.iter().map(|node| (node, true)));
+        nodes.extend(self.broadcast_nodes.iter().map(|node| (node, false)));
+        nodes.extend(self.observer_nodes.iter().map(|node| (node, false)));
+        let tips = thread::scope(|scope| {
+            nodes
+                .iter()
+                .copied()
+                .map(|(node, work_node)| {
+                    let genesis = &genesis;
+                    scope.spawn(move || {
+                        if work_node {
+                            self.require_node_genesis(node, genesis)?;
+                        } else {
+                            self.require_standard_node_genesis(node, genesis)?;
+                        }
+                        native_chain_tip_on_node(node)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|worker| {
+                    worker.join().unwrap_or_else(|_| {
+                        Err(MinerError::RpcProtocol(
+                            "Zcash recovery identity/tip worker panicked".to_string(),
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        let expected = tips.first().copied().ok_or_else(|| {
+            MinerError::RpcProtocol("no configured Zcash recovery node".to_string())
+        })?;
+        if let Some(((node, _), actual)) = nodes
+            .iter()
+            .zip(&tips)
+            .find(|(_, actual)| **actual != expected)
+        {
+            return Err(parent_tip_mismatch(expected, node, *actual));
+        }
+        Ok(expected)
+    }
+
+    /// Returns the shared work-node/observer tip used by existing accounting reads.
     pub(crate) fn consistent_chain_tip(&self) -> Result<NativeChainTip, MinerError> {
         let mut nodes =
             Vec::with_capacity(self.proposal_validators.len() + self.observer_nodes.len() + 1);
@@ -4516,5 +4585,8 @@ pub(crate) mod tests {
             .is_err(),
             "a reachable HTTP failure must prevent maturity"
         );
+    }
+    mod recovery_authority {
+        include!("native/recovery_authority_tests.rs");
     }
 }

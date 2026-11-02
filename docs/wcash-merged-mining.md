@@ -386,12 +386,40 @@ Share submission checks these absolute deadlines without running lifecycle
 cleanup; maintenance closes expired contexts outside the submitted-proof path.
 
 A coordinated pool frontend may forward a solution only for an exact job and
-target previously assigned to that miner. After ordinary expiry the backend
-requires a newer ordinary-admissible active job on the same Zcash predecessor
-and a positive last-known chain-specific Zcash currentness sample. That sample
-comes from existing monitoring; no RPC or blocking freshness lock is added to
-submission. It can race a network tip change, so subsequent full node consensus
-remains authoritative.
+target previously assigned to that miner. Production pool mode binds a separate
+Zcash recovery authority to the backend journal's genesis. The existing Zcash
+currentness worker refreshes that process-global authority during preparation,
+backoff and periods without an ordinary job. It authenticates genesis on every
+configured node, the canonical-genesis status capability on work nodes, and the
+exact predecessor hash and height across template, validator, broadcaster and
+observer roles. Recovery is strict even for the Testnet-only ordinary policy
+that allows lagging validators. That opt-in keeps its separate ordinary currentness
+check; Mainnet reuses one Zcash quorum sample for both purposes. Metadata requests
+have their own one-second
+per-request timeout and cannot hold the actor or Wcash worker.
+
+After ordinary expiry, only hashes meeting the original Zcash target consult
+this authority. A positive sample must be younger than one second from request
+start, not completion or controller polling; failed, future, slow, contended and
+closed samples never authorize a receipt. A matching fresh parent authorizes
+only the original detached proposal's real Equihash validation. A known parent
+change rejects the candidate. Temporary unknown evidence returns nonfatal
+`recovery_deferred`; it does not credit work or create a winner receipt. Library
+actors without an explicitly bound independent authority retain the legacy
+requirement for an ordinarily admissible active replacement.
+
+Backend-v2 live health adds optional `recovery_only`, mutually exclusive with
+ordinary `healthy`. It permits only bounded original-assignment Zcash candidate
+forwarding while ordinary admission stays paused, including a bounded retry
+while parent evidence is temporarily unknown. The exact original recovery
+deadline is unchanged. Read-only/non-subscribed health omits this field, so the
+isolated payout worker's existing binary is preserved. The new frontend keeps
+authentication, synchronized stream, assignment, time, nonce and target fences;
+its explicit recovery path never advertises an ordinary job. Old frontends
+reject the new true field under strict decoding. Upgrade and roll back the
+matching backend and pool clients together; the version constant, six required
+capabilities, journal and accounting formats are unchanged. Cached evidence can
+race a later tip change, so full node consensus remains authoritative.
 
 Only hashes meeting the original Zcash network target enter the detached real
 Equihash verifier and exact Zcash block serialization. Ordinary stale shares are
@@ -409,6 +437,29 @@ capacity eviction. Uncommitted snapshots are deliberately volatile: restart
 closes abandoned generations, while already committed winners retain normal
 durable recovery. These bounds do not guarantee delivery of every late hardware
 solution or independent network receipt.
+
+### Observed Zcash-current accepted work
+
+The backend counts newly durable shares and exact target-derived work in three
+categories: a fresh authenticated predecessor match (`current`), a fresh known
+mismatch (`stale`), and absent/expired/failed/contended evidence (`unknown`). Work
+uses the same integer `floor(2^256 / (assigned_share_target + 1))` weighting as
+pool accounting, without changing any receipt, payout weight or stored record.
+Duplicate receipt replays and rejected/deferred candidates do not add work.
+Counters are process-local and saturate explicitly rather than wrap.
+
+Every 15 seconds the controller may copy one nonblocking counter snapshot to
+the existing bounded diagnostic queue as `zcash_work_observation`. Decimal work
+strings, counts, first/last share event sequences and saturation status are
+formatted only by the diagnostic writer. Ordinary shares add no log message,
+RPC or journal write. At runtime log level `warn`, the info event is rejected
+before metadata construction. Lost diagnostic lines can be bridged by a later
+cumulative snapshot within the same process; restart resets the counters.
+
+These are last-observed parent categories near backend admission, not an ASIC
+solve/notify clock or proof that every `current` unit earned canonical Zcash
+opportunity. Never relabel all merged accepted work, unknown work, or these
+observations as guaranteed reward-producing Zcash work.
 
 The included ZIP-301 listener validates Equihash and both targets locally,
 requires authorization, assigns per-session nonce prefixes, rejects malformed,

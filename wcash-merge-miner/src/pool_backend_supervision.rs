@@ -18,6 +18,7 @@ use serde_json::json;
 use crate::{
     native::{NativeChainTip, NativeZcashProvider},
     rpc::ZebraRpcClient,
+    zcash_recovery::{NativePoolZcashRecoveryAuthority, PoolBackendZcashWorkObservation},
     MinerError, NATIVE_JOB_MAX_AGE_SECONDS,
 };
 
@@ -181,7 +182,8 @@ impl NativePoolCurrentnessProbe {
 /// The controller calls `tick` during preparation and backoff as well as idle time.
 pub struct NativePoolCurrentnessWorkers {
     wcash: PoolBackendControlWorker<NativePoolCurrentnessProbe, ()>,
-    zcash: PoolBackendControlWorker<NativePoolCurrentnessProbe, ()>,
+    zcash: PoolBackendControlWorker<Option<NativePoolCurrentnessProbe>, ()>,
+    recovery_authority: Option<NativePoolZcashRecoveryAuthority>,
     next_wcash: Instant,
     next_zcash: Instant,
 }
@@ -189,6 +191,22 @@ pub struct NativePoolCurrentnessWorkers {
 impl NativePoolCurrentnessWorkers {
     /// Starts exactly two lanes; no per-controller-tick thread creation.
     pub fn spawn() -> Result<Self, io::Error> {
+        Self::spawn_inner(None)
+    }
+
+    /// Reuses the ZEC lane for authenticated recovery evidence even without a live job.
+    /// Mainnet reuses the same quorum poll. Opt-in lagging Testnet keeps its
+    /// separate ordinary-admission policy; recovery remains strict.
+    pub fn spawn_with_zcash_recovery_authority(
+        authority: NativePoolZcashRecoveryAuthority,
+    ) -> Result<Self, io::Error> {
+        Self::spawn_inner(Some(authority))
+    }
+
+    fn spawn_inner(
+        recovery_authority: Option<NativePoolZcashRecoveryAuthority>,
+    ) -> Result<Self, io::Error> {
+        let refreshing = recovery_authority.clone();
         Ok(Self {
             wcash: PoolBackendControlWorker::spawn(
                 "wcash-currentness",
@@ -197,9 +215,27 @@ impl NativePoolCurrentnessWorkers {
             )?,
             zcash: PoolBackendControlWorker::spawn(
                 "zcash-currentness",
-                |probe: NativePoolCurrentnessProbe| probe.check_zcash(),
+                move |probe: Option<NativePoolCurrentnessProbe>| {
+                    if let Some(authority) = refreshing.as_ref() {
+                        authority.refresh();
+                        if let Some(probe) = probe {
+                            if probe.zcash.uses_lagging_validator_policy() {
+                                probe.check_zcash();
+                            } else {
+                                probe.state.record(
+                                    ZCASH_CURRENT,
+                                    authority.observe_tip(probe.zcash_tip)
+                                        == PoolBackendZcashWorkObservation::Current,
+                                );
+                            }
+                        }
+                    } else if let Some(probe) = probe {
+                        probe.check_zcash();
+                    }
+                },
                 |_| {},
             )?,
+            recovery_authority,
             next_wcash: Instant::now(),
             next_zcash: Instant::now(),
         })
@@ -218,9 +254,12 @@ impl NativePoolCurrentnessWorkers {
             if !self.wcash.is_busy() && Instant::now() >= self.next_wcash {
                 self.wcash.request(probe.clone())?;
             }
-            if !self.zcash.is_busy() && Instant::now() >= self.next_zcash {
-                self.zcash.request(probe.clone())?;
-            }
+        }
+        if (probe.is_some() || self.recovery_authority.is_some())
+            && !self.zcash.is_busy()
+            && Instant::now() >= self.next_zcash
+        {
+            self.zcash.request(probe.cloned())?;
         }
         Ok(())
     }
@@ -238,6 +277,9 @@ impl NativePoolCurrentnessWorkers {
 
     /// Joins both bounded RPC lanes after listeners have stopped.
     pub fn request_shutdown(&mut self) -> Result<(), io::Error> {
+        if let Some(authority) = self.recovery_authority.as_ref() {
+            authority.close();
+        }
         let wcash = self.wcash.request_shutdown();
         let zcash = self.zcash.request_shutdown();
         wcash?;

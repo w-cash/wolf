@@ -34,6 +34,10 @@ use crate::{
         PoolBackendAuthority, PoolBackendHandlerError, PoolBackendListenerError,
         PoolBackendRequestContext, PoolBackendRequestHandler,
     },
+    zcash_recovery::{
+        PoolBackendZcashRecoveryAuthority, PoolBackendZcashWorkObservation,
+        PoolBackendZcashWorkStats,
+    },
 };
 
 // Historical winner observation must never compete with live share validation
@@ -710,6 +714,9 @@ impl PoolBackendShareValidationError {
 /// Failure to construct or durably mutate the backend actor.
 #[derive(Debug, Error)]
 pub enum PoolBackendActorError {
+    /// Independent recovery evidence must belong to this exact parent network.
+    #[error("Zcash recovery authority genesis does not match the backend journal")]
+    RecoveryAuthorityMismatch,
     /// The authoritative journal could not be read or durably updated.
     #[error("pool backend journal operation failed: {0}")]
     Journal(#[from] PoolBackendJournalError),
@@ -871,6 +878,7 @@ struct ActorState {
     recent: VecDeque<Hex32>,
     zcash_winner_snapshots: HashMap<Hex32, RetainedZcashWinner>,
     zcash_snapshot_bytes: usize,
+    zcash_work: PoolBackendZcashWorkStats,
 }
 
 /// Single serialized authority for durable pool jobs and accepted shares.
@@ -880,6 +888,7 @@ pub struct PoolBackendActor {
     clock: Arc<dyn ActorClock>,
     state: Mutex<ActorState>,
     winner_worker: Mutex<Option<Vec<thread::Thread>>>,
+    zcash_recovery_authority: Option<Arc<dyn PoolBackendZcashRecoveryAuthority>>,
 }
 
 impl PoolBackendActor {
@@ -931,6 +940,7 @@ impl PoolBackendActor {
             recent: VecDeque::new(),
             zcash_winner_snapshots: HashMap::new(),
             zcash_snapshot_bytes: 0,
+            zcash_work: PoolBackendZcashWorkStats::default(),
         };
         close_abandoned_jobs(&mut state)?;
 
@@ -940,7 +950,27 @@ impl PoolBackendActor {
             clock,
             state: Mutex::new(state),
             winner_worker: Mutex::new(None),
+            zcash_recovery_authority: None,
         })
+    }
+
+    /// Binds independent parent evidence before this actor is shared with listeners.
+    /// Generic callers without this opt-in retain the original active-job policy.
+    pub fn with_zcash_recovery_authority(
+        mut self,
+        authority: Arc<dyn PoolBackendZcashRecoveryAuthority>,
+    ) -> Result<Self, PoolBackendActorError> {
+        if authority.expected_genesis() != self.authority_fields.zcash_genesis {
+            return Err(PoolBackendActorError::RecoveryAuthorityMismatch);
+        }
+        self.zcash_recovery_authority = Some(authority);
+        Ok(self)
+    }
+
+    /// Copies process-cumulative observational counters without waiting for ingress.
+    /// These counters are not a second accounting ledger or ASIC timing evidence.
+    pub fn try_zcash_work_observation(&self) -> Option<PoolBackendZcashWorkStats> {
+        self.state.try_lock().ok().map(|state| state.zcash_work)
     }
 
     /// Registers one compatibility reconciliation worker for durable wakeups.
@@ -1616,20 +1646,22 @@ impl PoolBackendActor {
                             .then_some((&live.descriptor, snapshot))
                     })
                     .ok_or_else(stale_job)?;
-                let active = state
-                    .current
-                    .as_ref()
-                    .and_then(|id| state.live_jobs.get(id))
-                    .filter(|active| {
-                        acceptable_job(active, now).is_some()
-                            && active.validator.is_healthy()
-                            && active.validator.is_zcash_current()
-                    })
-                    .ok_or_else(stale_job)?;
-                if descriptor.zcash_previous_hash_le != active.descriptor.zcash_previous_hash_le
-                    || descriptor.zcash_height != active.descriptor.zcash_height
-                {
-                    return Err(stale_job());
+                if self.zcash_recovery_authority.is_none() {
+                    let active = state
+                        .current
+                        .as_ref()
+                        .and_then(|id| state.live_jobs.get(id))
+                        .filter(|active| {
+                            acceptable_job(active, now).is_some()
+                                && active.validator.is_healthy()
+                                && active.validator.is_zcash_current()
+                        })
+                        .ok_or_else(stale_job)?;
+                    if descriptor.zcash_previous_hash_le != active.descriptor.zcash_previous_hash_le
+                        || descriptor.zcash_height != active.descriptor.zcash_height
+                    {
+                        return Err(stale_job());
+                    }
                 }
                 (descriptor.clone(), Some(Arc::clone(validator)))
             }
@@ -1657,12 +1689,37 @@ impl PoolBackendActor {
             target_le: &target_le,
         };
         let recovered = snapshot.is_some();
+        let mut work_observation = PoolBackendZcashWorkObservation::Unknown;
         let validated = if let Some(snapshot) = snapshot {
             if !wcash_zcash_aux::Target::from_le_bytes(*descriptor.zcash_target_le.as_bytes())
                 .map_err(|_| unhealthy_backend("retained Zcash target is invalid"))?
                 .is_met_by_le_hash(*parent_hash_le.as_bytes())
             {
                 return Err(stale_job());
+            }
+            if let Some(authority) = self.zcash_recovery_authority.as_ref() {
+                work_observation = authority.observe(&descriptor);
+                match work_observation {
+                    PoolBackendZcashWorkObservation::Current => {}
+                    PoolBackendZcashWorkObservation::Stale => {
+                        crate::diagnostics::late_zcash_candidate(
+                            &descriptor,
+                            &parent_hash_le,
+                            0,
+                            "parent_changed",
+                        );
+                        return Err(stale_job());
+                    }
+                    PoolBackendZcashWorkObservation::Unknown => {
+                        crate::diagnostics::late_zcash_candidate(
+                            &descriptor,
+                            &parent_hash_le,
+                            0,
+                            "authority_deferred",
+                        );
+                        return Err(recovery_deferred());
+                    }
+                }
             }
             match snapshot.validate_zcash_winner(request) {
                 Ok(block) => PoolBackendValidatedShare::with_winners(None, Some(block)),
@@ -1677,6 +1734,9 @@ impl PoolBackendActor {
                 }
             }
         } else {
+            if let Some(authority) = self.zcash_recovery_authority.as_ref() {
+                work_observation = authority.observe(&descriptor);
+            }
             ordinary
                 .expect("ordinary admission retained its validator")
                 .validator
@@ -1721,6 +1781,11 @@ impl PoolBackendActor {
                 journal_handler_error(error)
             })?;
         let wake_winner_worker = !commit.replayed && !commit.receipt.winners.is_empty();
+        if !commit.replayed {
+            state
+                .zcash_work
+                .record(work_observation, &target_le, commit.receipt.event_seq);
+        }
         if !commit.replayed {
             for winner in &commit.receipt.winners {
                 if winner.chain == MergedChain::Zcash {
@@ -1817,11 +1882,39 @@ impl PoolBackendActor {
         // generation rejects its own ordinary shares, but must not pause a
         // healthy replacement and strand every miner on the superseded job.
         let healthy = current_healthy;
+        let recovery_only = !healthy
+            && after_live_event_seq.is_some()
+            && self
+                .zcash_recovery_authority
+                .as_ref()
+                .is_some_and(|authority| {
+                    if !authority.is_open() {
+                        return false;
+                    }
+                    let possible = |descriptor: &JobDescriptor| {
+                        authority.observe(descriptor) != PoolBackendZcashWorkObservation::Stale
+                    };
+                    state.zcash_winner_snapshots.values().any(|snapshot| {
+                        now < snapshot.deadline
+                            && snapshot.bytes > 0
+                            && snapshot.bytes <= MAX_ZCASH_WINNER_SNAPSHOT_BYTES
+                            && possible(&snapshot.descriptor)
+                    }) || state.live_jobs.values().any(|job| {
+                        job.phase != DurableJobPhase::Closed
+                            && now < job.zcash_deadline
+                            && job.zcash_snapshot.as_ref().is_some_and(|snapshot| {
+                                let bytes = snapshot.retained_bytes();
+                                bytes > 0 && bytes <= MAX_ZCASH_WINNER_SNAPSHOT_BYTES
+                            })
+                            && possible(&job.descriptor)
+                    })
+                });
         let response = BackendMessage::HealthStatus {
             version: BACKEND_PROTOCOL_VERSION,
             id,
             event_seq,
             healthy,
+            recovery_only,
             pending_wcash: winner_summary.pending_wcash,
             quarantined_wcash: winner_summary.quarantined_wcash,
             pending_zcash: winner_summary.pending_zcash,
@@ -2462,6 +2555,14 @@ fn invalid_request() -> PoolBackendHandlerError {
 
 fn stale_job() -> PoolBackendHandlerError {
     PoolBackendHandlerError::new(BackendErrorCode::StaleJob, "job is not acceptable", false)
+}
+
+fn recovery_deferred() -> PoolBackendHandlerError {
+    PoolBackendHandlerError::new(
+        BackendErrorCode::RecoveryDeferred,
+        "Zcash recovery authority is temporarily unavailable",
+        false,
+    )
 }
 
 fn attribution_conflict() -> PoolBackendHandlerError {
@@ -5173,4 +5274,7 @@ pub(crate) mod tests {
         ));
     }
     include!("pool_backend_actor/independent_submission_tests.rs");
+    mod late_authority {
+        include!("pool_backend_actor/late_authority_tests.rs");
+    }
 }
