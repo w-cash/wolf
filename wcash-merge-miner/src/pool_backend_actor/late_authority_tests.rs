@@ -321,7 +321,9 @@ fn recovery_health_is_explicit_cursor_bound_and_never_ordinary_healthy() {
     authority.set(2);
     assert_eq!(health(&fixture.actor, Some(0))["recovery_only"], true);
     authority.set(1);
-    assert!(health(&fixture.actor, Some(0)).get("recovery_only").is_none());
+    assert!(health(&fixture.actor, Some(0))
+        .get("recovery_only")
+        .is_none());
 }
 
 #[test]
@@ -533,7 +535,11 @@ impl PoolBackendZcashWinnerSnapshot for UnreachableSnapshot {
 
 #[test]
 fn real_wec_only_proof_is_not_admitted_through_zec_recovery() {
-    use zebra_chain::work::difficulty::CompactDifficulty;
+    use sha2::Digest as _;
+    use zebra_chain::{
+        serialization::ZcashSerialize, transaction::Transaction, transparent::Input,
+        work::difficulty::CompactDifficulty,
+    };
     let directory = private_temp_dir();
     let clock = Arc::new(TestClock::new());
     let authority = Arc::new(Authority::new());
@@ -544,13 +550,31 @@ fn real_wec_only_proof_is_not_admitted_through_zec_recovery() {
     )
     .with_zcash_recovery_authority(authority.clone())
     .unwrap();
-    let bytes =
-        hex::decode(include_str!("../vectors/wcash-valid-auxpow-block-nonzero-prev.txt").trim())
-            .unwrap();
+    // Preserve the public block's actual header, targets, proof and chain
+    // metadata. Authority/genesis/payout configuration is still modeled here;
+    // this actor regression is not a current Mainnet admission or payout test.
+    let bytes = hex::decode(include_str!("../vectors/wcash-mainnet-000048509-wec-only.txt").trim())
+        .unwrap();
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&bytes)),
+        "28079d3d286480baedc4dffd230a184fd730b04ea4879eb1b0275877f49ceacd"
+    );
     let child: Block = bytes.as_slice().zcash_deserialize_into().unwrap();
+    assert_eq!(child.zcash_serialize_to_vec().unwrap(), bytes);
+    assert_eq!(
+        child.hash().to_string(),
+        "3c36883dd11261485149b5943b3d388a46a6263bf4395a6045c8a803f0c899aa"
+    );
+    assert_eq!(child.coinbase_height().unwrap().0, 48_509);
     let proof =
         wcash_zcash_aux::AuxPowProof::decode(child.header.solution.as_wcash().unwrap().as_bytes())
             .unwrap();
+    let parent_coinbase: Transaction = proof.coinbase_bytes().zcash_deserialize_into().unwrap();
+    let parent_height = match parent_coinbase.inputs().as_slice() {
+        [Input::Coinbase { height, .. }] => height.0,
+        _ => panic!("captured proof must contain one canonical parent coinbase input"),
+    };
+    assert_eq!(parent_height, 3_539_592);
     let child_target: U256 = child
         .header
         .difficulty_threshold
@@ -562,6 +586,7 @@ fn real_wec_only_proof_is_not_admitted_through_zec_recovery() {
     proof
         .validate(child.hash().0, child_target)
         .expect("captured proof is valid WEC AuxPoW");
+    assert_eq!(proof.parent_header().advertised_n_bits(), 0x1c00_8620);
     let bits = CompactDifficulty::from_bytes_in_display_order(
         &proof.parent_header().advertised_n_bits().to_be_bytes(),
     )
@@ -579,9 +604,16 @@ fn real_wec_only_proof_is_not_admitted_through_zec_recovery() {
     descriptor.header_input = Hex108::new(header[..108].try_into().unwrap());
     descriptor.wcash_candidate_hash_le = Hex32::new(child.hash().0);
     descriptor.wcash_previous_hash_le = Hex32::new(child.header.previous_block_hash.0);
+    descriptor.wcash_coinbase_txid_le = Hex32::new(child.transactions[0].hash().0);
+    descriptor.wcash_height = child.coinbase_height().unwrap().0;
     descriptor.wcash_target_le = TargetLe::new(child_target.to_le_bytes());
     descriptor.zcash_previous_hash_le = Hex32::new(header[4..36].try_into().unwrap());
+    descriptor.zcash_coinbase_txid_le = Hex32::new(parent_coinbase.hash().0);
+    descriptor.zcash_height = parent_height;
     descriptor.zcash_target_le = TargetLe::new(parent_target.to_le_bytes());
+    descriptor
+        .validate()
+        .expect("exact captured proof metadata forms a strict protocol job");
     authority.bind(&descriptor);
     let request = BackendRequest::SubmitShare {
         version: BACKEND_PROTOCOL_VERSION,

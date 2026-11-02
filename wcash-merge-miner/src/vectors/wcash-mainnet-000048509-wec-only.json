@@ -1,0 +1,44 @@
+{
+  "at": "2026-11-02T19:05:28.643454+00:00",
+  "source": "existing Wcash Mainnet node read-only raw canonical block RPC",
+  "read_only_methods": [
+    "getblockhash",
+    "getblockchaininfo",
+    "getblock"
+  ],
+  "genesis": "5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48",
+  "height": 48509,
+  "block_hash": "3c36883dd11261485149b5943b3d388a46a6263bf4395a6045c8a803f0c899aa",
+  "tip_height_at_selection": 48511,
+  "stable_canonical_fence": true,
+  "raw_block_sha256": "28079d3d286480baedc4dffd230a184fd730b04ea4879eb1b0275877f49ceacd",
+  "raw_block_bytes": 29913,
+  "classification": {
+    "at": "2026-11-02T19:07:47.633822+00:00",
+    "classification": "WEC-only against both original encoded targets",
+    "raw_bytes": 29913,
+    "raw_sha256": "28079d3d286480baedc4dffd230a184fd730b04ea4879eb1b0275877f49ceacd",
+    "text_sha256": "07140b3f938abba539601546bdd4f66806b489c6ab4e6ad2fafec25fd271479d",
+    "child_hash_display": "3c36883dd11261485149b5943b3d388a46a6263bf4395a6045c8a803f0c899aa",
+    "child_height": 48509,
+    "child_compact_target": "1d0e8947",
+    "child_target_le": "000000000000000000000000000000000000000000000000000047890e000000",
+    "parent_height_from_coinbase_bip34": 3539592,
+    "parent_compact_target": "1c008620",
+    "parent_target_le": "0000000000000000000000000000000000000000000000000020860000000000",
+    "parent_hash_le": "efc88a105922f8671be8f4905ba292f25497ad3e3f68db01182d25bb01000000",
+    "parent_hash_display": "00000001bb252d1801db683f3ead9754f292a25b90f4e81b67f82259108ac8ef",
+    "parent_header_sha256": "9bd2c05c00be9205c7823eab0ca5924d9689c3dd74acc5eb06af05adfd00789f",
+    "parent_previous_hash_le": "3fea79f3d226ea33cafb19fbb624a9b0a389996f9b931e301e3c180000000000",
+    "parent_time": 1793645708,
+    "meets_child": true,
+    "meets_parent": false,
+    "framing": "AuxPoW version2; exact1880-byte witness; original1487-byte parent header; original child140-byte fixed header; no byte/target mutation",
+    "validation_limit": "Offline Python hash/framing/target/BIP34 classification only. Real Rust Equihash/commitment validation remains mandatory in the corrected regression test; no test pass claimed yet."
+  },
+  "custody": {
+    "capture_record_sha256": "98b6f7dfc1988d86553cde32be2fd4e44d6a2de6f5d65b15e28e386ad99c093e",
+    "vector_text_sha256": "07140b3f938abba539601546bdd4f66806b489c6ab4e6ad2fafec25fd271479d"
+  },
+  "scope": "Public historical mainnet WEC block observed canonical at collection. Actor clock/authority/genesis/payout configuration remain modeled test fixtures; this does not authorize current mining, a ZEC block, payout, or contextual chain admission. No solver/test block/wallet/accounting state was created."
+}
