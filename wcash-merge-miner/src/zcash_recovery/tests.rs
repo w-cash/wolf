@@ -6,10 +6,11 @@ use zebra_chain::parameters::Network;
 use super::*;
 
 fn authority() -> NativePoolZcashRecoveryAuthority {
-    let endpoint = crate::rpc::RpcEndpoint::new("http://127.0.0.1:1/", None, None).unwrap();
+    let template = crate::rpc::RpcEndpoint::new("http://127.0.0.1:1/", None, None).unwrap();
+    let validator = crate::rpc::RpcEndpoint::new("http://127.0.0.1:2/", None, None).unwrap();
     let config = NativeZcashConfig::new(
-        endpoint.clone(),
-        vec![endpoint],
+        template,
+        vec![validator],
         crate::NativeZcashNetwork::Regtest,
         Network::new_regtest(Default::default())
             .genesis_hash()
