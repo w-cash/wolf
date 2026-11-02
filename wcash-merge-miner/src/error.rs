@@ -1,6 +1,6 @@
 //! Error types for local job construction and share validation.
 
-use std::io;
+use std::{error::Error as _, io};
 
 use thiserror::Error;
 
@@ -215,4 +215,71 @@ pub enum MinerError {
     /// The live parent template failed a local invariant before reaching miners.
     #[error("invalid parent template: {0}")]
     InvalidParentTemplate(String),
+}
+
+impl MinerError {
+    /// Whether preparation can safely retry without an operator or software correction.
+    ///
+    /// This is the same exhaustive policy used by the command-line supervisor.
+    /// Malformed responses/templates, proposal rejection, identity/payout mismatch,
+    /// journal failure and configuration errors remain fatal. Parallel preparation
+    /// uses this policy to avoid hiding a fatal result behind a transient sibling.
+    pub fn is_retryable_preparation(&self) -> bool {
+        match self {
+            MinerError::RpcTransport(error) => is_retryable_rpc_transport(error),
+            MinerError::RpcHttpStatus(status) => is_retryable_http_status(*status),
+            MinerError::RpcError {
+                code: Some(-9 | -10 | -28 | crate::rpc::WCASH_AUX_TIP_CHANGED_ERROR_CODE),
+                ..
+            } => true,
+            MinerError::Io(error) => is_retryable_io_kind(error.kind()),
+            MinerError::ParentTipMismatch { .. }
+            | MinerError::ChildTipMismatch { .. }
+            | MinerError::StaleNativeJob(_) => true,
+            _ => false,
+        }
+    }
+}
+
+fn is_retryable_rpc_transport(error: &reqwest::Error) -> bool {
+    if error.is_timeout() {
+        return true;
+    }
+
+    // A generic request/build/TLS error can be permanent or security-sensitive.
+    // Retry a non-timeout transport failure only when its source chain exposes
+    // an I/O kind which is explicitly classified as transient below.
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| is_retryable_io_kind(error.kind()))
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+
+    false
+}
+
+const fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+const fn is_retryable_io_kind(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+    )
 }

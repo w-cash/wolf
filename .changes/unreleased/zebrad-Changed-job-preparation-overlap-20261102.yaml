@@ -1,0 +1,4 @@
+project: zebrad
+kind: Changed
+body: "Overlap guarded Wcash candidate preparation with Zcash observer catchup while retaining exact validation, retirement ownership, retry safety and active generation leases."
+time: 2026-11-02T16:00:00.000000000Z

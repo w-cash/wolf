@@ -31,6 +31,9 @@ const MAX_RPC_RESPONSE_BYTES_U64: u64 = 8 * 1024 * 1024;
 /// Default deadline for a single parent-node RPC call.
 pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Stable Wcash best-tip race returned by `createauxblock`.
+pub const WCASH_AUX_TIP_CHANGED_ERROR_CODE: i64 = -32_001;
+
 /// One authenticated parent-node endpoint.
 ///
 /// Plain HTTP is accepted only for a loopback host. Remote endpoints must use

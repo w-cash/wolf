@@ -332,6 +332,41 @@ can still lose diagnostics: the preserved authoritative journal and independent
 exact-hash observation remain the recovery evidence. No new diagnostics run
 for ordinary shares, and no diagnostic adds an fsync or validation pass.
 
+### Parallel native job preparation
+
+After both network identities and pending candidate retirement are checked,
+the supervisor can prepare and validate one Wcash candidate while the calling
+thread catches Zcash work nodes up to the observer. The final Zcash template
+still commits to that exact child hash and waits for both operations to finish.
+All existing payout, proposal, predecessor and durable activation checks remain.
+This overlaps independent waits; it does not remove the child-template dependency,
+change the proof cache, or establish a hashrate or reward increase.
+
+There is at most one scoped child worker per serialized preparation. If that
+worker cannot start, the original catchup-then-child order is used. The worker
+owns the exact candidate retirement guard before decoding and payout validation;
+failure or an observer unwind retains cleanup ownership. An ambiguous RPC timeout
+does not establish a known candidate lease or successful retirement. If both
+operations fail, the same retry policy used by the supervisor gives a fatal
+error precedence over a transient sibling, with observer-first ties.
+
+An overlapped child's request-start age is checked after the join and again
+before generation journal activation, with a 45-second preparation budget.
+An expired result is retired and retried. This is a preparation acceptance fence,
+not realtime cancellation of a stalled RPC or fsync. The existing active
+45-second generation lease and its start point remain unchanged.
+
+Preparation timings remain exclusive caller intervals with the same phase names.
+`observer_catchup` includes time during which the child worker also runs;
+`wcash_candidate` is the remaining child-preparation wait after catchup.
+Separate `wcash_decode` and `wcash_payout` intervals are recorded in the serial
+fallback only. Zero in those fields does not mean the parallel validation did
+no work. `finished_phase` identifies the last caller interval, including the
+child join after an observer failure; `error_class` still identifies the selected
+failure. The same RPC methods are used, but a parallel child can require
+creation and retirement even when catchup fails. No new ordinary-share logging,
+journal format or accounting change is introduced by this overlap.
+
 ### Pool-backend job supervision
 
 The native pool backend prepares a replacement on one managed worker. Its
