@@ -338,8 +338,9 @@ Failed RPCs through temporary preparation clients carry a process-local
 `attempt_id`, fixed recipient role and index, allowlisted RPC method, request
 ID, entry phase, elapsed time, and
 available numeric error code or HTTP status. The original RPC error and retry
-policy are preserved. The same attempt ID joins a completed preparation,
-selected retry, and successful activation. Correlation is scoped to the journal
+policy are preserved. The attempt ID correlates emitted preparation and RPC
+records with a selected retry after failure or activation after success. A
+subsequent preparation attempt has a new ID. Correlation is scoped to the journal
 invocation and process: IDs reset on restart, and exhausted IDs are unknown.
 RPC elapsed time includes decoding, not just network time. These are lossy
 failure diagnostics, including startup recovery calls made during preparation;
