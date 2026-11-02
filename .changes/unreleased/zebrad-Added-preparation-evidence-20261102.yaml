@@ -1,0 +1,4 @@
+project: zebrad
+kind: Added
+body: "Add bounded preparation RPC attribution, complete process-local preparation timing counters, and independently sampled generation currentness diagnostics without changing mining admission or journal and frontend compatibility."
+time: 2026-11-02T12:00:00.000000000Z

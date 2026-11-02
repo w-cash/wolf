@@ -31,9 +31,11 @@ mod pool_backend_listener;
 pub mod pool_backend_supervision;
 mod pool_backend_transport;
 mod pool_backend_workers;
+mod preparation_stats;
 mod preparation_timing;
 pub mod protocol;
 pub mod rpc;
+mod rpc_evidence;
 pub mod zip301;
 pub mod zip301_client;
 
@@ -75,6 +77,9 @@ pub use pool_backend_actor::{
 };
 pub use pool_backend_workers::{
     is_retryable_winner_reconciliation_error, PoolBackendWinnerWorkers,
+};
+pub use preparation_stats::{
+    preparation_statistics, PreparationStatistics, PREPARATION_LATENCY_BOUNDS_MS,
 };
 pub use preparation_timing::{NativePreparationTiming, PreparationPhase};
 pub use zip301::{serve_zip301_loopback, ShareProcessor, Zip301Config, Zip301LoopbackListener};

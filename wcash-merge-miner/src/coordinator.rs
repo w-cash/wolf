@@ -543,8 +543,12 @@ impl NativeMiningSupervisor {
             .lock()
             .map_err(|_| coordinator_mutex_error("native generation preparation"))?;
         let config = &self.config;
-        let wcash_node = self.wcash_node.clone();
-        let zcash = self.zcash.clone();
+        let wcash_node = self.wcash_node.with_preparation_context(
+            crate::rpc_evidence::RpcRole::Wcash,
+            0,
+            timing.rpc_context(),
+        );
+        let zcash = self.zcash.with_preparation_context(timing.rpc_context());
         let journal = Arc::clone(&self.journal);
         let expected_zcash_genesis_hash = config.zcash.expected_genesis_hash().to_string();
 
@@ -748,8 +752,10 @@ impl NativeMiningSupervisor {
         let candidate_created_at = Instant::now();
 
         let coordinator = NativeMiningCoordinator {
-            wcash_node,
-            zcash,
+            // Only this attempt owns preparation attribution. Live winner/probe
+            // clients must never inherit a previous attempt identity.
+            wcash_node: wcash_node.without_preparation_context(),
+            zcash: zcash.without_preparation_context(),
             job,
             generation_descriptor,
             child_candidate_bytes,

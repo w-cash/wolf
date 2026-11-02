@@ -20,7 +20,15 @@ use wcash_pool_protocol::{Hex32, MergedChain, WinnerDescriptor};
 
 use crate::{
     pool_backend_journal::PoolBackendJournalError,
+    pool_backend_supervision::{
+        NativeCurrentnessObservationResult, NativeGenerationObservationStatus,
+        NativePoolCurrentnessObservation,
+    },
+    preparation_stats::{
+        preparation_statistics, PreparationStatistics, PREPARATION_LATENCY_BOUNDS_MS,
+    },
     preparation_timing::{PreparationPhase, PreparationReport},
+    rpc_evidence::PreparationRpcFailure,
     MinerError, PoolBackendWinnerSnapshot, PoolWinnerReconciliationError,
 };
 
@@ -91,12 +99,18 @@ thread_local! {
 pub enum NativeBackendRuntimeEvent<'a> {
     /// An authoritative job was activated; this is not an ASIC-notification receipt.
     JobActivated(&'a wcash_pool_protocol::JobDescriptor),
+    /// Authoritative activation linked to a process-local preparation timing owner.
+    PreparationActivated(&'a wcash_pool_protocol::JobDescriptor, u64),
     /// Shutdown cleanup completed.
     Stopped,
+    /// Independently sampled cached probe observations, never durable share work.
+    Currentness(&'a Hex32, NativePoolCurrentnessObservation),
     /// A nonfatal listener connection ended with a fixed protocol reason.
     ConnectionClosed(&'static str),
     /// Preparation failed and the existing retry policy selected a delay.
     PreparationRetry(&'a MinerError, Duration),
+    /// Retry selection bound to a process-local preparation attempt.
+    PreparationRetryForAttempt(&'a MinerError, Duration, u64),
     /// Candidate retirement failed and the existing retry policy selected a delay.
     CandidateRetirementRetry(&'a MinerError, Duration),
     /// Cleanup also failed after an authoritative activation failure.
@@ -110,8 +124,13 @@ enum RuntimeMetadata {
         wcash_height: u32,
         zcash_height: u32,
         max_age_ms: u64,
+        preparation_attempt_id: Option<u64>,
     },
     Failure(RuntimeFailure),
+    Currentness {
+        job: [u8; 32],
+        observation: NativePoolCurrentnessObservation,
+    },
     Outbox {
         chain: &'static str,
         hash_be: [u8; 32],
@@ -122,6 +141,7 @@ enum RuntimeMetadata {
 
 #[derive(Clone, Copy, Default)]
 struct RuntimeFailure {
+    preparation_attempt_id: Option<u64>,
     retry_delay_ms: Option<u64>,
     expected_tip_hash: Option<[u8; 32]>,
     actual_tip_hash: Option<[u8; 32]>,
@@ -182,18 +202,72 @@ fn runtime_tip_hash(value: &str) -> Option<[u8; 32]> {
 pub fn record_native_backend_runtime(event: NativeBackendRuntimeEvent<'_>) {
     if matches!(
         &event,
-        NativeBackendRuntimeEvent::JobActivated(_) | NativeBackendRuntimeEvent::Stopped
+        NativeBackendRuntimeEvent::JobActivated(_)
+            | NativeBackendRuntimeEvent::PreparationActivated(_, _)
+            | NativeBackendRuntimeEvent::Stopped
     ) && !runtime_info_enabled()
     {
         return;
     }
+    if let NativeBackendRuntimeEvent::Currentness(_, observation) = &event {
+        if !currentness_is_degraded(*observation) && !runtime_info_enabled() {
+            return;
+        }
+    }
     record(runtime_event(event));
+}
+
+fn observation_result_key(result: NativeCurrentnessObservationResult) -> usize {
+    match result {
+        NativeCurrentnessObservationResult::Unknown => 0,
+        NativeCurrentnessObservationResult::Current => 1,
+        NativeCurrentnessObservationResult::TipMismatch => 2,
+        NativeCurrentnessObservationResult::ProbeFailed => 3,
+    }
+}
+
+fn currentness_is_degraded(observation: NativePoolCurrentnessObservation) -> bool {
+    observation.status != NativeGenerationObservationStatus::Active
+        || [observation.wcash.result, observation.zcash.result]
+            .into_iter()
+            .any(|r| {
+                matches!(
+                    r,
+                    NativeCurrentnessObservationResult::TipMismatch
+                        | NativeCurrentnessObservationResult::ProbeFailed
+                )
+            })
 }
 
 fn runtime_event(event: NativeBackendRuntimeEvent<'_>) -> Event {
     #[cfg(test)]
     RUNTIME_EVENT_BUILDS.with(|builds| builds.set(builds.get().saturating_add(1)));
     match event {
+        NativeBackendRuntimeEvent::Currentness(job, observation) => {
+            let mut event = Event::new(
+                None,
+                "generation_currentness_observation",
+                observation.status.label(),
+            );
+            event.warning = currentness_is_degraded(observation);
+            event.runtime = Some(RuntimeMetadata::Currentness {
+                job: *job.as_bytes(),
+                observation,
+            });
+            event
+        }
+        NativeBackendRuntimeEvent::PreparationActivated(job, attempt_id) => {
+            let mut event = runtime_event(NativeBackendRuntimeEvent::JobActivated(job));
+            if let Some(RuntimeMetadata::Activated {
+                preparation_attempt_id,
+                ..
+            }) = &mut event.runtime
+            {
+                *preparation_attempt_id =
+                    std::num::NonZeroU64::new(attempt_id).map(std::num::NonZeroU64::get);
+            }
+            event
+        }
         NativeBackendRuntimeEvent::JobActivated(job) => {
             let mut event = Event::new(None, "backend_job_activated", "activated");
             event.noisy = false;
@@ -202,6 +276,7 @@ fn runtime_event(event: NativeBackendRuntimeEvent<'_>) -> Event {
                 wcash_height: job.wcash_height,
                 zcash_height: job.zcash_height,
                 max_age_ms: u64::from(job.max_age_ms),
+                preparation_attempt_id: None,
             });
             event
         }
@@ -219,6 +294,15 @@ fn runtime_event(event: NativeBackendRuntimeEvent<'_>) -> Event {
                 _ => "connection_closed",
             };
             runtime_warning_event("backend_connection_closed", result)
+        }
+        NativeBackendRuntimeEvent::PreparationRetryForAttempt(error, delay, attempt_id) => {
+            let mut event =
+                runtime_event(NativeBackendRuntimeEvent::PreparationRetry(error, delay));
+            if let Some(RuntimeMetadata::Failure(ref mut failure)) = event.runtime {
+                failure.preparation_attempt_id =
+                    std::num::NonZeroU64::new(attempt_id).map(std::num::NonZeroU64::get);
+            }
+            event
         }
         NativeBackendRuntimeEvent::PreparationRetry(error, delay) => {
             runtime_retry_event("backend_preparation_retry", error, delay)
@@ -687,6 +771,7 @@ struct Event {
     queued_at: Instant,
     timing: Option<ZecTiming>,
     preparation: Option<PreparationReport>,
+    preparation_rpc: Option<PreparationRpcFailure>,
     runtime: Option<RuntimeMetadata>,
     timing_metadata_dropped_total: u64,
 }
@@ -717,6 +802,7 @@ impl Event {
             queued_at: Instant::now(),
             timing: None,
             preparation: None,
+            preparation_rpc: None,
             runtime: None,
             timing_metadata_dropped_total: 0,
         }
@@ -727,6 +813,13 @@ impl Event {
 /// All formatting stays on the existing bounded, lossy writer thread.
 pub(crate) fn preparation_result(report: PreparationReport) {
     record(preparation_event(report));
+}
+
+pub(crate) fn preparation_rpc_failure(report: PreparationRpcFailure) {
+    let mut event = Event::new(None, "preparation_rpc_failure", report.error_class);
+    event.warning = true;
+    event.preparation_rpc = Some(report);
+    record(event);
 }
 
 fn preparation_event(report: PreparationReport) -> Event {
@@ -1071,6 +1164,7 @@ struct Key(
     &'static str,
     &'static str,
     Option<(&'static str, usize)>,
+    Option<(&'static str, &'static str)>,
 );
 
 struct Reporter {
@@ -1081,6 +1175,7 @@ struct Reporter {
     reported_suppressed: u64,
     reported_dropped: u64,
     reported_timing_dropped: u64,
+    reported_preparation: PreparationStatistics,
     last_summary: Instant,
 }
 
@@ -1094,6 +1189,7 @@ impl Reporter {
             reported_suppressed: 0,
             reported_dropped: 0,
             reported_timing_dropped: 0,
+            reported_preparation: PreparationStatistics::default(),
             last_summary: now,
         }
     }
@@ -1131,7 +1227,25 @@ impl Reporter {
                         event
                             .preparation
                             .map(|report| (report.finished_phase.name(), 0))
+                    })
+                    .or_else(|| {
+                        event.preparation_rpc.map(|r| {
+                            (
+                                r.role.name(),
+                                usize::from(r.recipient_index.unwrap_or(u16::MAX)),
+                            )
+                        })
+                    })
+                    .or_else(|| match event.runtime {
+                        Some(RuntimeMetadata::Currentness { observation: o, .. }) => Some((
+                            o.wcash.result.label(),
+                            observation_result_key(o.zcash.result),
+                        )),
+                        _ => None,
                     }),
+                event
+                    .preparation_rpc
+                    .map(|r| (r.method.name(), r.phase.name())),
             );
             if let Some((_, previous, count)) = self
                 .recent
@@ -1193,6 +1307,7 @@ impl Reporter {
                 .collect();
             json!({
                 "scope":"backend_preparation_through_activation",
+                "attempt_id":std::num::NonZeroU64::new(report.attempt_id).map(std::num::NonZeroU64::get),
                 "outcome":report.result.label(),
                 "elapsed_ms":report.elapsed_ms,
                 "phase_ms":phases,
@@ -1206,19 +1321,34 @@ impl Reporter {
                 "asserts_winner_submission_latency":false
             })
         });
+        let preparation_rpc = event.preparation_rpc.map(|r| json!({
+            "attempt_id":std::num::NonZeroU64::new(r.attempt_id).map(std::num::NonZeroU64::get),
+            "phase":r.phase.name(), "recipient_role":r.role.name(), "recipient_index":r.recipient_index,
+            "method":r.method.name(), "request_id":r.request_id, "elapsed_ms":r.elapsed_ms,
+            "error_class":r.error_class,"rpc_error_code":r.rpc_error_code,"rpc_http_status":r.rpc_http_status,
+            "scope":"preparation_rpc_failure_only","durable_receipt":false
+        }));
         let runtime = event.runtime.map(|metadata| match metadata {
+            RuntimeMetadata::Currentness { job, observation:o } => json!({
+                "job_id":hex::encode(job),"generation_age_ms":o.generation_age_ms,"status":o.status.label(),
+                "wcash":{"result":o.wcash.result.label(),"sample_age_ms":o.wcash.sample_age_ms},
+                "zcash":{"result":o.zcash.result.label(),"sample_age_ms":o.zcash.sample_age_ms},
+                "scope":"independent_last_completed_probe_observations",
+                "atomic_both_chain_snapshot":false,"asserts_asic_work_eligibility":false,"durable_share_receipt":false
+            }),
             RuntimeMetadata::Activated {
                 job,
                 wcash_height,
                 zcash_height,
                 max_age_ms,
+                preparation_attempt_id,
             } => json!({
                 "job_id":hex::encode(job), "wcash_height":wcash_height,
-                "zcash_height":zcash_height, "max_age_ms":max_age_ms,
+                "zcash_height":zcash_height, "max_age_ms":max_age_ms,"preparation_attempt_id":preparation_attempt_id,
                 "asserts_asic_notify_time":false
             }),
             RuntimeMetadata::Failure(metadata) => json!({
-                "retry_delay_ms":metadata.retry_delay_ms,
+                "retry_delay_ms":metadata.retry_delay_ms,"preparation_attempt_id":metadata.preparation_attempt_id,
                 "expected_tip_hash":metadata.expected_tip_hash.map(hex::encode),
                 "actual_tip_hash":metadata.actual_tip_hash.map(hex::encode),
                 "rpc_http_status":metadata.rpc_http_status,
@@ -1244,7 +1374,7 @@ impl Reporter {
             "operation":event.operation,"os_error":event.os_error,"io_kind":event.io_kind,"suppressed_since_previous":suppressed,
             "suppressed_total":self.suppressed,"diagnostic_dropped_total":dropped,
             "timing_metadata_dropped_total":event.timing_metadata_dropped_total,
-            "diagnostic_queue_wait_ms":elapsed_ms(now,event.queued_at),"timing":timing,"preparation":preparation,"runtime":runtime,
+            "diagnostic_queue_wait_ms":elapsed_ms(now,event.queued_at),"timing":timing,"preparation":preparation,"preparation_rpc":preparation_rpc,"runtime":runtime,
             "asserts_independent_peer_receipt":false});
         write_record(writer, &value)
     }
@@ -1260,20 +1390,32 @@ impl Reporter {
             return Ok(());
         }
         self.last_summary = now;
+        let preparation = preparation_statistics();
         if self.reported_suppressed == self.suppressed
             && self.reported_dropped == dropped
             && self.reported_timing_dropped == timing_dropped
+            && self.reported_preparation == preparation
         {
             return Ok(());
         }
         self.reported_suppressed = self.suppressed;
         self.reported_dropped = dropped;
         self.reported_timing_dropped = timing_dropped;
+        self.reported_preparation = preparation;
         write_record(
             writer,
             &json!({"component":"native_pool_backend","level":"WARN",
             "stage":"diagnostic_output_summary","suppressed_total":self.suppressed,"diagnostic_dropped_total":dropped,
-            "timing_metadata_dropped_total":timing_dropped}),
+            "timing_metadata_dropped_total":timing_dropped,
+            "preparation_statistics":{
+                "scope":"process_local_nonatomic_fields","process_id":std::process::id(),"join_scope":"journal_invocation_and_process_id","started":preparation.started,"completed":preparation.completed,
+                "activated":preparation.activated,"failed":preparation.failed,"abandoned":preparation.abandoned,
+                "latency_exclusive_bounds_ms":PREPARATION_LATENCY_BOUNDS_MS,
+                "elapsed_buckets":preparation.elapsed_buckets,"elapsed_sum_ms":preparation.elapsed_sum_ms,
+                "elapsed_max_ms":preparation.elapsed_max_ms,"phase_sum_ms":preparation.phase_sum_ms,
+                "phase_order":PreparationPhase::ALL.map(PreparationPhase::name),
+                "resets_on_process_restart":true,"durable":false,"coverage_if_sink_unavailable":"unknown"
+            }}),
         )
     }
 }
@@ -1677,6 +1819,7 @@ mod tests {
 
     fn preparation_fixture() -> PreparationReport {
         PreparationReport {
+            attempt_id: 1,
             elapsed_ms: 3_000,
             phases_ms: [0; PHASE_COUNT],
             finished_phase: PreparationPhase::WcashCandidate,
@@ -1684,6 +1827,185 @@ mod tests {
             zcash_height: None,
             result: PreparationResult::Failed("rpc_error"),
         }
+    }
+
+    #[test]
+    fn preparation_retry_and_activation_share_origin_without_changing_error_metadata() {
+        let job = runtime_job();
+        let error = MinerError::RpcError {
+            endpoint: "PRIVATE_ENDPOINT".into(),
+            code: Some(-32001),
+            message: "PRIVATE_ERROR_BODY".into(),
+        };
+        let (sink, receiver) = Diagnostics::channel(8);
+        with_sink(Arc::new(sink), || {
+            with_runtime_info(true, || {
+                record_native_backend_runtime(
+                    NativeBackendRuntimeEvent::PreparationRetryForAttempt(
+                        &error,
+                        Duration::from_millis(250),
+                        42,
+                    ),
+                );
+                record_native_backend_runtime(NativeBackendRuntimeEvent::PreparationActivated(
+                    &job, 42,
+                ));
+                record_native_backend_runtime(NativeBackendRuntimeEvent::PreparationActivated(
+                    &job, 0,
+                ));
+            })
+        });
+        let mut output = Vec::new();
+        let mut reporter = Reporter::new(Instant::now());
+        for event in receiver.try_iter() {
+            reporter
+                .record(&mut output, event, Instant::now(), 0)
+                .unwrap();
+        }
+        let rows: Vec<serde_json::Value> = output
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["runtime"]["preparation_attempt_id"], 42);
+        assert_eq!(rows[1]["runtime"]["preparation_attempt_id"], 42);
+        assert!(rows[2]["runtime"]["preparation_attempt_id"].is_null());
+        assert_eq!(rows[0]["runtime"]["rpc_error_code"], -32001);
+        assert_eq!(rows[0]["runtime"]["retry_delay_ms"], 250);
+        assert!(!String::from_utf8_lossy(&output).contains("PRIVATE_"));
+    }
+
+    fn currentness_fixture() -> NativePoolCurrentnessObservation {
+        use crate::pool_backend_supervision::NativeChainCurrentnessObservation;
+        NativePoolCurrentnessObservation {
+            generation_age_ms: 15,
+            status: NativeGenerationObservationStatus::Active,
+            wcash: NativeChainCurrentnessObservation {
+                result: NativeCurrentnessObservationResult::Unknown,
+                sample_age_ms: None,
+            },
+            zcash: NativeChainCurrentnessObservation {
+                result: NativeCurrentnessObservationResult::Unknown,
+                sample_age_ms: None,
+            },
+        }
+    }
+
+    #[test]
+    fn unknown_currentness_is_not_a_share_claim_and_warn_gate_is_before_build() {
+        let (sink, receiver) = Diagnostics::channel(8);
+        let sink = Arc::new(sink);
+        let job = runtime_job();
+        let unknown = currentness_fixture();
+        let before = RUNTIME_EVENT_BUILDS.with(std::cell::Cell::get);
+        with_sink(Arc::clone(&sink), || {
+            with_runtime_info(false, || {
+                record_native_backend_runtime(NativeBackendRuntimeEvent::Currentness(
+                    &job.job_id,
+                    unknown,
+                ));
+                record_native_backend_runtime(NativeBackendRuntimeEvent::PreparationActivated(
+                    &job, 42,
+                ));
+            })
+        });
+        assert_eq!(RUNTIME_EVENT_BUILDS.with(std::cell::Cell::get), before);
+        assert!(receiver.try_recv().is_err());
+        with_sink(sink, || {
+            with_runtime_info(false, || {
+                let mut failed = unknown;
+                failed.wcash.result = NativeCurrentnessObservationResult::ProbeFailed;
+                failed.wcash.sample_age_ms = Some(12);
+                record_native_backend_runtime(NativeBackendRuntimeEvent::Currentness(
+                    &job.job_id,
+                    failed,
+                ));
+            })
+        });
+        let event = receiver.try_recv().unwrap();
+        assert!(event.warning);
+        let mut output = Vec::new();
+        Reporter::new(Instant::now())
+            .record(&mut output, event, Instant::now(), 0)
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(row["runtime"]["wcash"]["result"], "probe_failed");
+        assert_eq!(row["runtime"]["wcash"]["sample_age_ms"], 12);
+        assert_eq!(row["runtime"]["zcash"]["result"], "unknown");
+        assert!(row["runtime"]["zcash"]["sample_age_ms"].is_null());
+        assert_eq!(row["runtime"]["atomic_both_chain_snapshot"], false);
+        assert_eq!(row["runtime"]["durable_share_receipt"], false);
+        assert!(output.len() < 4096);
+    }
+
+    #[test]
+    fn full_sink_never_loses_finished_counters_or_conflates_abandonment() {
+        use crate::preparation_stats::PreparationCounters;
+        let c = Arc::new(PreparationCounters::default());
+        let (sink, receiver) = Diagnostics::channel(1);
+        let sink = Arc::new(sink);
+        with_sink(Arc::clone(&sink), || {
+            for _ in 0..100 {
+                crate::NativePreparationTiming::with_test_counters(Arc::clone(&c))
+                    .finish_error(&MinerError::RpcProtocol("PRIVATE".into()));
+                crate::NativePreparationTiming::with_test_counters(Arc::clone(&c)).finish_ok();
+            }
+            drop(crate::NativePreparationTiming::with_test_counters(
+                Arc::clone(&c),
+            ));
+        });
+        let snapshot = c.snapshot();
+        assert_eq!(snapshot.started, 201);
+        assert_eq!(snapshot.completed, 200);
+        assert_eq!(snapshot.failed, 100);
+        assert_eq!(snapshot.activated, 100);
+        assert_eq!(snapshot.abandoned, 1);
+        assert_eq!(snapshot.elapsed_buckets.iter().sum::<u64>(), 200);
+        assert_eq!(sink.dropped.load(Ordering::Relaxed), 99);
+        assert!(receiver.try_recv().unwrap().preparation.is_some());
+    }
+
+    #[test]
+    fn rpc_attribution_is_bounded_and_distinct_methods_are_not_silently_merged() {
+        use crate::rpc_evidence::{RpcMethod, RpcRole};
+        let now = Instant::now();
+        let (sink, receiver) = Diagnostics::channel(8);
+        with_sink(Arc::new(sink), || {
+            for method in [RpcMethod::CreateAuxBlock, RpcMethod::GetBlockCount] {
+                preparation_rpc_failure(PreparationRpcFailure {
+                    attempt_id: 42,
+                    phase: PreparationPhase::WcashCandidate,
+                    role: RpcRole::Wcash,
+                    recipient_index: Some(u16::MAX),
+                    method,
+                    request_id: u64::MAX,
+                    elapsed_ms: u64::MAX,
+                    error_class: "rpc_error",
+                    rpc_error_code: Some(-32001),
+                    rpc_http_status: None,
+                });
+            }
+        });
+        let mut output = Vec::new();
+        let mut reporter = Reporter::new(now);
+        for event in receiver.try_iter() {
+            reporter.record(&mut output, event, now, 0).unwrap();
+        }
+        let rows: Vec<serde_json::Value> = output
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                assert!(l.len() < 4096);
+                serde_json::from_slice(l).unwrap()
+            })
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["preparation_rpc"]["attempt_id"], 42);
+        assert_eq!(rows[0]["preparation_rpc"]["method"], "createauxblock");
+        assert_eq!(rows[1]["preparation_rpc"]["method"], "getblockcount");
+        assert_eq!(rows[0]["preparation_rpc"]["rpc_error_code"], -32001);
+        assert_eq!(rows[0]["preparation_rpc"]["durable_receipt"], false);
     }
 
     #[test]
