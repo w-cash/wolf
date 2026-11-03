@@ -1,0 +1,4 @@
+project: zebrad
+kind: breaking
+body: "Recover exact late Zcash winners independently of ordinary job availability, add explicit paired pool recovery permission and observed Zcash-current work counters. Requires matching upgraded pool clients; financial records and read-only payout health remain unchanged."
+time: 2026-11-02T18:00:00.000000000Z

@@ -34,6 +34,7 @@ mod pool_backend_workers;
 mod preparation_timing;
 pub mod protocol;
 pub mod rpc;
+pub mod zcash_recovery;
 pub mod zip301;
 pub mod zip301_client;
 
@@ -77,5 +78,9 @@ pub use pool_backend_workers::{
     is_retryable_winner_reconciliation_error, PoolBackendWinnerWorkers,
 };
 pub use preparation_timing::{NativePreparationTiming, PreparationPhase};
+pub use zcash_recovery::{
+    NativePoolZcashRecoveryAuthority, PoolBackendZcashRecoveryAuthority,
+    PoolBackendZcashWorkObservation, PoolBackendZcashWorkStats,
+};
 pub use zip301::{serve_zip301_loopback, ShareProcessor, Zip301Config, Zip301LoopbackListener};
 pub use zip301_client::{mine_zip301_once, Zip301AcceptedShare, Zip301ClientConfig};

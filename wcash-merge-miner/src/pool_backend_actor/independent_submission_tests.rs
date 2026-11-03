@@ -158,6 +158,32 @@ pub(crate) mod independent_submission {
         }
     }
 
+    /// Reuses the real captured proof for optional late-authority actor tests.
+    pub(super) fn late_authority_fixture(
+        clock: Arc<TestClock>,
+        authority: Option<Arc<dyn crate::zcash_recovery::PoolBackendZcashRecoveryAuthority>>,
+    ) -> (
+        IndependentWinnerFixture,
+        JobDescriptor,
+        BackendRequest,
+        Arc<dyn PoolBackendRetainedJob>,
+    ) {
+        let mut fixture = IndependentWinnerFixture::with_clock(false, clock);
+        if let Some(authority) = authority {
+            let actor = match Arc::try_unwrap(fixture.actor) {
+                Ok(actor) => actor,
+                Err(_) => panic!("new fixture actor has exactly one owner"),
+            };
+            fixture.actor = Arc::new(
+                actor
+                    .with_zcash_recovery_authority(authority)
+                    .expect("fixture authority has the approved genesis"),
+            );
+        }
+        let (descriptor, request, retained) = verified_dual_submission(&fixture);
+        (fixture, descriptor, request, retained)
+    }
+
     struct ProofCheckingRetainedJob {
         metadata: TestRetainedJob,
         wcash_bytes: Vec<u8>,

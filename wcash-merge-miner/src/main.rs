@@ -34,10 +34,11 @@ use wcash_merge_miner::{
     },
     CoordinatorConfig, GenerationRetirement, JobConfig, MinerError, NativeBackendRuntimeEvent,
     NativeMiningCoordinator, NativeMiningSupervisor, NativePoolBackendRetainedJob,
-    NativePreparationTiming, NativeZcashConfig, NativeZcashNetwork, PoolBackendActor,
-    PoolBackendActorError, PoolBackendRetainedJob, PoolBackendWinnerWorkers, PreparationPhase,
-    PreparedJob, ShareProcessor, WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config,
-    Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
+    NativePoolZcashRecoveryAuthority, NativePreparationTiming, NativeZcashConfig,
+    NativeZcashNetwork, PoolBackendActor, PoolBackendActorError, PoolBackendRetainedJob,
+    PoolBackendWinnerWorkers, PreparationPhase, PreparedJob, ShareProcessor,
+    WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config, Zip301LoopbackListener,
+    NATIVE_JOB_MAX_AGE_SECONDS,
 };
 use wcash_pool_protocol::{Hex32, JobInvalidationReason, TargetBe, TargetLe};
 use wcash_zcash_aux::{Target, WCASH_AUXILIARY_CHAIN_ID};
@@ -739,7 +740,11 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
         facts.zcash_payout_commitment,
         WCASH_AUXILIARY_CHAIN_ID,
     )?;
-    let actor = Arc::new(PoolBackendActor::new(journal, runtime.target_policy)?);
+    let recovery_authority = NativePoolZcashRecoveryAuthority::new(&configured.config.zcash)?;
+    let actor = Arc::new(
+        PoolBackendActor::new(journal, runtime.target_policy)?
+            .with_zcash_recovery_authority(Arc::new(recovery_authority.clone()))?,
+    );
     let share_journal = share_journal_path()?;
     let supervisor = Arc::new(NativeMiningSupervisor::open(
         configured.config,
@@ -813,7 +818,10 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
             }
         },
     )?;
-    let mut currentness_workers = NativePoolCurrentnessWorkers::spawn()?;
+    let mut currentness_workers =
+        NativePoolCurrentnessWorkers::spawn_with_zcash_recovery_authority(
+            recovery_authority.clone(),
+        )?;
     drop(listener_failure_tx);
 
     let slots = Arc::new(AtomicUsize::new(0));
@@ -824,6 +832,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     let mut active: Option<ActivePoolBackendGeneration> = None;
     let mut draining = Vec::new();
     let mut unpublished: Option<PoolBackendCandidate> = None;
+    let mut next_work_observation = Instant::now() + Duration::from_secs(15);
 
     // All runtime errors leave ownership in these outer slots for the common
     // listener-first shutdown path. No preparation/currentness RPC joins this loop.
@@ -858,6 +867,14 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                     .as_ref()
                     .map(|current| current.candidate.retained.currentness_probe()),
             )?;
+            if Instant::now() >= next_work_observation {
+                next_work_observation = Instant::now() + Duration::from_secs(15);
+                if let Some(stats) = actor.try_zcash_work_observation() {
+                    record_native_backend_runtime(NativeBackendRuntimeEvent::ZcashWorkObservation(
+                        stats,
+                    ));
+                }
+            }
             if let Some(result) = preparation_worker.poll()? {
                 let expected = expected_preparation.take();
                 let valid_request = pool_backend_preparation_response_matches(
@@ -1021,6 +1038,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
 
     // Stop ingress before waiting for any already-bounded control RPC. Dropping
     // the preparation result receiver hands unpublished leases back to its owner.
+    recovery_authority.close();
     let listener_shutdown = listeners.request_shutdown();
     let preparation_shutdown = preparation_worker.request_shutdown();
     let currentness_shutdown = currentness_workers.request_shutdown();

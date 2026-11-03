@@ -1,4 +1,7 @@
-use std::{sync::Condvar, time::Duration};
+use std::{
+    sync::Condvar,
+    time::{Duration, Instant},
+};
 
 use super::*;
 use crate::{
@@ -60,6 +63,25 @@ fn observe(actor: &PoolBackendActor, snapshot: &PoolBackendWinnerSnapshot) -> Re
         .map_err(|error| error.to_string())
 }
 
+fn receive_distinct_chains_until(
+    receiver: &mpsc::Receiver<MergedChain>,
+    deadline: Instant,
+) -> [bool; 2] {
+    let mut entered = [false; 2];
+    while !entered.into_iter().all(|seen| seen) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(MergedChain::Wcash) => entered[0] = true,
+            Ok(MergedChain::Zcash) => entered[1] = true,
+            Err(_) => break,
+        }
+    }
+    entered
+}
+
 fn independent_dispatch(blocked_chain: MergedChain, recovered: bool) {
     let fixture = if recovered {
         IndependentWinnerFixture::retained_dual()
@@ -105,34 +127,37 @@ fn independent_dispatch(blocked_chain: MergedChain, recovered: bool) {
         reconcile,
     )
     .unwrap();
-    assert_eq!(workers.threads.len(), 4);
+    let started_threads = workers.threads.len();
     if !recovered {
         fixture.append(2, true, true);
     }
     // Capture results before assertions and release before worker Drop. Even
     // under the old serialized behavior a failing test exits promptly/safely.
-    let first = entered_rx.recv_timeout(DEADLINE);
-    let second = entered_rx.recv_timeout(DEADLINE);
+    // Audit redelivery can enter the unblocked chain again before the blocked
+    // lane is scheduled. Require both chains, not an ordering of two callbacks.
+    let deadline = Instant::now() + DEADLINE;
+    let entered = receive_distinct_chains_until(&entered_rx, deadline);
     // Wake both real audit lanes after publication of the live bounds, rather
     // than depending on their initial idle one-second pacing interval.
-    workers.threads[1].thread().unpark();
-    workers.threads[3].thread().unpark();
+    for index in [1, 3] {
+        if let Some(worker) = workers.threads.get(index) {
+            worker.thread().unpark();
+        }
+    }
     // Give the audit lane an opportunity to contend for the held exact key.
-    let extra = entered_rx.recv_timeout(Duration::from_millis(250));
+    let extra = entered_rx.recv_timeout(
+        Duration::from_millis(250).min(deadline.saturating_duration_since(Instant::now())),
+    );
     gate.release();
     let stopped = workers.request_shutdown();
+    assert_eq!(started_threads, 4);
     assert!(
         stopped.is_ok(),
         "all actual worker lanes must stop cleanly: {stopped:?}"
     );
-    let mut entered = vec![first.unwrap(), second.unwrap()];
-    entered.sort_by_key(|chain| match chain {
-        MergedChain::Wcash => 0,
-        MergedChain::Zcash => 1,
-    });
     assert_eq!(
         entered,
-        [MergedChain::Wcash, MergedChain::Zcash],
+        [true, true],
         "the other chain must enter reconciliation before the blocked chain is released"
     );
     // The unblocked chain can be audited again after the normal pacing delay;
