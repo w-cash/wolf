@@ -1356,6 +1356,8 @@ mod tests {
 
     #[test]
     fn zcashd_compat_config_rejects_peer_selection_extra_args() {
+        let _init_guard = zebra_test::init();
+
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: false,
@@ -1401,6 +1403,8 @@ mod tests {
 
     #[test]
     fn zcashd_compat_path_source_requires_explicit_path() {
+        let _init_guard = zebra_test::init();
+
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: true,
@@ -1498,6 +1502,8 @@ mod tests {
 
     #[test]
     fn zcashd_compat_supervisor_error_does_not_exit_zebra() {
+        let _init_guard = zebra_test::init();
+
         assert!(!StartCmd::zcashd_compat_supervisor_should_exit(Ok(Err(
             eyre!("simulated zcashd supervisor runtime failure"),
         ))));
