@@ -106,6 +106,7 @@ use crate::{
 };
 
 pub(crate) mod hex_data;
+mod response_deserialize;
 pub(crate) mod trees;
 pub(crate) mod types;
 mod wcash_aux_block;
@@ -5538,13 +5539,32 @@ impl SendRawTransactionResponse {
 /// Response to a `getblock` RPC request.
 ///
 /// See the notes for the [`RpcServer::get_block`] method.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(untagged)]
 pub enum GetBlockResponse {
     /// The request block, hex-encoded.
     Raw(#[serde(with = "hex")] SerializedBlock),
     /// The block object.
     Object(Box<BlockObject>),
+}
+
+impl<'de> serde::Deserialize<'de> for GetBlockResponse {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(transparent)]
+        struct RawBlock(#[serde(with = "hex")] SerializedBlock);
+
+        use response_deserialize::StringOrMap;
+        match <StringOrMap<RawBlock, Box<BlockObject>> as serde::Deserialize>::deserialize(
+            deserializer,
+        )? {
+            StringOrMap::String(RawBlock(block)) => Ok(Self::Raw(block)),
+            StringOrMap::Map(block) => Ok(Self::Object(block)),
+        }
+    }
 }
 
 #[deprecated(note = "Use `GetBlockResponse` instead")]
@@ -5702,7 +5722,7 @@ pub struct BlockObject {
     next_block_hash: Option<block::Hash>,
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(untagged)]
 /// The transaction list in a `getblock` call. Can be a list of transaction
 /// IDs or the full transaction details depending on verbosity.
@@ -5713,10 +5733,29 @@ pub enum GetBlockTransaction {
     Object(Box<TransactionObject>),
 }
 
+impl<'de> serde::Deserialize<'de> for GetBlockTransaction {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(transparent)]
+        struct TransactionHash(#[serde(with = "hex")] transaction::Hash);
+
+        use response_deserialize::StringOrMap;
+        match <StringOrMap<TransactionHash, Box<TransactionObject>> as serde::Deserialize>::deserialize(
+            deserializer,
+        )? {
+            StringOrMap::String(TransactionHash(hash)) => Ok(Self::Hash(hash)),
+            StringOrMap::Map(transaction) => Ok(Self::Object(transaction)),
+        }
+    }
+}
+
 /// Response to a `getblockheader` RPC request.
 ///
 /// See the notes for the [`RpcServer::get_block_header`] method.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(untagged)]
 pub enum GetBlockHeaderResponse {
     /// The request block header, hex-encoded.
@@ -5724,6 +5763,25 @@ pub enum GetBlockHeaderResponse {
 
     /// The block header object.
     Object(Box<BlockHeaderObject>),
+}
+
+impl<'de> serde::Deserialize<'de> for GetBlockHeaderResponse {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(transparent)]
+        struct RawHeader(#[serde(with = "hex")] Vec<u8>);
+
+        use response_deserialize::StringOrMap;
+        match <StringOrMap<RawHeader, Box<BlockHeaderObject>> as serde::Deserialize>::deserialize(
+            deserializer,
+        )? {
+            StringOrMap::String(RawHeader(header)) => Ok(Self::Raw(HexData(header))),
+            StringOrMap::Map(header) => Ok(Self::Object(header)),
+        }
+    }
 }
 
 #[deprecated(note = "Use `GetBlockHeaderResponse` instead")]
@@ -5898,13 +5956,32 @@ impl Default for GetBlockHashResponse {
 /// Response to a `getrawtransaction` RPC request.
 ///
 /// See the notes for the [`Rpc::get_raw_transaction` method].
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(untagged)]
 pub enum GetRawTransactionResponse {
     /// The raw transaction, encoded as hex bytes.
     Raw(#[serde(with = "hex")] SerializedTransaction),
     /// The transaction object.
     Object(Box<TransactionObject>),
+}
+
+impl<'de> serde::Deserialize<'de> for GetRawTransactionResponse {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(transparent)]
+        struct RawTransaction(#[serde(with = "hex")] SerializedTransaction);
+
+        use response_deserialize::StringOrMap;
+        match <StringOrMap<RawTransaction, Box<TransactionObject>> as serde::Deserialize>::deserialize(
+            deserializer,
+        )? {
+            StringOrMap::String(RawTransaction(transaction)) => Ok(Self::Raw(transaction)),
+            StringOrMap::Map(transaction) => Ok(Self::Object(transaction)),
+        }
+    }
 }
 
 #[deprecated(note = "Use `GetRawTransactionResponse` instead")]

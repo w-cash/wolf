@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: Fixed
+body: "Deserialize string/object and array/object RPC response variants directly, preserving typed numeric fields when serde_json arbitrary precision is enabled by another workspace crate."
+time: 2026-11-02T23:00:00.000000000Z
