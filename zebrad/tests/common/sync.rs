@@ -1,11 +1,8 @@
 //! `zebrad` sync-specific shared code for the `zebrad` tests.
 //!
-//! # Warning
-//!
-//! Test functions in this file will not be run.
-//! This file is only for test library code.
+//! Shared sync test-library code and Unix bounded-output regression tests.
 
-use std::{path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use tempfile::TempDir;
 
@@ -191,9 +188,63 @@ pub fn sync_until(
     checkpoint_sync: bool,
     check_legacy_chain: bool,
 ) -> Result<TempDir> {
+    sync_until_inner(
+        height,
+        network,
+        stop_regex,
+        timeout,
+        reuse_tempdir,
+        mempool_behavior,
+        checkpoint_sync,
+        check_legacy_chain,
+        None,
+    )
+}
+
+/// Sync using one explicit local peer, without public seeds or peer-cache discovery.
+///
+/// Unix callers also opt into a bounded full-output wait. Non-Unix retains the
+/// existing output wait behavior; no hard deadline guarantee is claimed there.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_until_with_genesis_peer(
+    height: Height,
+    network: &Network,
+    stop_regex: &str,
+    timeout: Duration,
+    reuse_tempdir: impl Into<Option<TempDir>>,
+    mempool_behavior: MempoolBehavior,
+    checkpoint_sync: bool,
+    check_legacy_chain: bool,
+    initial_peer: SocketAddr,
+) -> Result<TempDir> {
+    sync_until_inner(
+        height,
+        network,
+        stop_regex,
+        timeout,
+        reuse_tempdir,
+        mempool_behavior,
+        checkpoint_sync,
+        check_legacy_chain,
+        Some(initial_peer),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_until_inner(
+    height: Height,
+    network: &Network,
+    stop_regex: &str,
+    timeout: Duration,
+    reuse_tempdir: impl Into<Option<TempDir>>,
+    mempool_behavior: MempoolBehavior,
+    checkpoint_sync: bool,
+    check_legacy_chain: bool,
+    initial_peer: Option<SocketAddr>,
+) -> Result<TempDir> {
     let _init_guard = zebra_test::init();
 
-    if zebra_test::net::zebra_skip_network_tests() {
+    if initial_peer.is_none() && zebra_test::net::zebra_skip_network_tests() {
         return testdir();
     }
 
@@ -204,6 +255,26 @@ pub fn sync_until(
     config.state.debug_stop_at_height = Some(height.0);
     config.mempool.debug_enable_at_height = mempool_behavior.enable_at_height();
     config.consensus.checkpoint_sync = checkpoint_sync;
+    if let Some(peer) = initial_peer {
+        if !peer.ip().is_loopback() || peer.port() == 0 {
+            return Err(eyre::eyre!(
+                "the explicit genesis peer must be a bound loopback address"
+            ));
+        }
+        config.network.initial_mainnet_peers.clear();
+        config.network.initial_testnet_peers.clear();
+        match network {
+            Network::Mainnet => config
+                .network
+                .initial_mainnet_peers
+                .insert(peer.to_string()),
+            Network::Testnet(_) => config
+                .network
+                .initial_testnet_peers
+                .insert(peer.to_string()),
+        };
+        config.network.cache_dir = zebra_network::CacheDir::disabled();
+    }
 
     // Use the default lookahead limit if we're syncing lots of blocks.
     // (Most tests use a smaller limit to minimise redundant block downloads.)
@@ -258,7 +329,18 @@ pub fn sync_until(
             height.0 < 2_000_000,
             "zebrad must exit by itself, so we can collect all the output",
         );
-        let output = child.wait_with_output()?;
+        let output = if initial_peer.is_some() {
+            #[cfg(unix)]
+            {
+                wait_with_output_bounded(child)?
+            }
+            #[cfg(not(unix))]
+            {
+                child.wait_with_output()?
+            }
+        } else {
+            child.wait_with_output()?
+        };
 
         output.stdout_line_contains(&network_log)?;
 
@@ -282,6 +364,188 @@ pub fn sync_until(
 
         Ok(output.dir.expect("wait_with_output sets dir"))
     }
+}
+
+/// Collect both raw pipes without letting output activity or inherited writers
+/// bypass the original command deadline. Only the explicit local-peer path opts in.
+#[cfg(unix)]
+fn wait_with_output_bounded(
+    mut test_child: TestChild<TempDir>,
+) -> Result<zebra_test::command::TestOutput<TempDir>> {
+    use std::{
+        io::{self, Read},
+        os::fd::AsFd,
+        process::{ExitStatus, Output},
+        time::Instant,
+    };
+
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+
+    const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+    const CLEANUP_LIMIT: Duration = Duration::from_secs(5);
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    fn nonblocking(fd: &impl AsFd) -> Result<()> {
+        let flags = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL)?);
+        fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        Ok(())
+    }
+
+    fn drain<R: Read>(
+        pipe: &mut Option<R>,
+        output: &mut Vec<u8>,
+        captured: &mut usize,
+    ) -> io::Result<bool> {
+        let Some(reader) = pipe.as_mut() else {
+            return Ok(false);
+        };
+        let mut bytes = [0; 8192];
+        match reader.read(&mut bytes) {
+            Ok(0) => {
+                *pipe = None;
+                Ok(true)
+            }
+            Ok(count) => {
+                let remaining = OUTPUT_LIMIT.saturating_sub(*captured);
+                let keep = count.min(remaining);
+                output.extend_from_slice(&bytes[..keep]);
+                *captured += keep;
+                if keep != count {
+                    return Err(io::Error::other(
+                        "combined stdout/stderr exceeded the 8 MiB capture limit",
+                    ));
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
+    let deadline = test_child
+        .deadline
+        .ok_or_else(|| eyre::eyre!("the bounded sync wait requires its configured deadline"))?;
+    if test_child.stdout.is_some() || test_child.stderr.is_some() {
+        return Err(eyre::eyre!(
+            "the bounded sync wait requires untouched raw output pipes"
+        ));
+    }
+    let mut child = test_child
+        .child
+        .take()
+        .ok_or_else(|| eyre::eyre!("the bounded sync wait requires an owned child"))?;
+    // Match Child::wait_with_output: close parent stdin before waiting.
+    drop(child.stdin.take());
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut captured = 0;
+    let mut status = None;
+    let mut observed_before_deadline = false;
+    let mut stdout_nonblocking = false;
+    let mut stderr_nonblocking = false;
+
+    // Keep every fallible operation after taking Child inside this closure, so
+    // an error always reaches the owned kill/reap path below.
+    let result = (|| -> Result<ExitStatus> {
+        nonblocking(
+            stdout
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("missing child stdout"))?,
+        )?;
+        stdout_nonblocking = true;
+        nonblocking(
+            stderr
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("missing child stderr"))?,
+        )?;
+        stderr_nonblocking = true;
+        loop {
+            status = child.try_wait()?;
+            if Instant::now() >= deadline {
+                return Err(eyre::eyre!(
+                    "child did not exit with complete output before its deadline"
+                ));
+            }
+            observed_before_deadline = true;
+            let out_progress = drain(&mut stdout, &mut stdout_bytes, &mut captured)?;
+            let err_progress = drain(&mut stderr, &mut stderr_bytes, &mut captured)?;
+            if let Some(status) = status {
+                if stdout.is_none() && stderr.is_none() {
+                    if Instant::now() >= deadline {
+                        return Err(eyre::eyre!(
+                            "child did not exit with complete output before its deadline"
+                        ));
+                    }
+                    return Ok(status);
+                }
+            }
+            if !out_progress && !err_progress {
+                std::thread::sleep(
+                    POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
+    })();
+
+    let status = match result {
+        Ok(status) => status,
+        Err(error) => {
+            // Failed setup must not leave a blocking read in bounded cleanup.
+            if !stdout_nonblocking {
+                stdout = None;
+            }
+            if !stderr_nonblocking {
+                stderr = None;
+            }
+            let cleanup_deadline = Instant::now() + CLEANUP_LIMIT;
+            let mut cleanup_errors = Vec::new();
+            if status.is_none() {
+                if let Err(kill_error) = child.kill() {
+                    cleanup_errors.push(format!("owned kill: {kill_error}"));
+                }
+            }
+            loop {
+                match child.try_wait() {
+                    Ok(observed) => status = observed,
+                    Err(wait_error) => cleanup_errors.push(format!("owned reap: {wait_error}")),
+                }
+                if let Err(read_error) = drain(&mut stdout, &mut stdout_bytes, &mut captured) {
+                    cleanup_errors.push(format!("stdout cleanup: {read_error}"));
+                    stdout = None;
+                }
+                if let Err(read_error) = drain(&mut stderr, &mut stderr_bytes, &mut captured) {
+                    cleanup_errors.push(format!("stderr cleanup: {read_error}"));
+                    stderr = None;
+                }
+                if (status.is_some() && stdout.is_none() && stderr.is_none())
+                    || Instant::now() >= cleanup_deadline
+                {
+                    break;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            return Err(eyre::eyre!(
+                "{error}\nCommand: {}\nOwned child PID: {}\nReaped status: {status:?}\nPolled before deadline: {observed_before_deadline}\nCleanup: {cleanup_errors:?}\nStdout:\n{}\nStderr:\n{}",
+                test_child.cmd,
+                child.id(),
+                String::from_utf8_lossy(&stdout_bytes),
+                String::from_utf8_lossy(&stderr_bytes),
+            ));
+        }
+    };
+
+    Ok(zebra_test::command::TestOutput {
+        output: Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        },
+        cmd: test_child.cmd.clone(),
+        dir: test_child.dir.take(),
+    })
 }
 
 /// Check sync logs on `network` until `zebrad` logs `stop_regex`.
@@ -410,4 +674,135 @@ pub fn create_cached_database_height(
     child.kill(true)?;
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod bounded_output_tests {
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    use nix::{
+        errno::Errno,
+        sys::wait::{waitpid, WaitPidFlag},
+        unistd::Pid,
+    };
+
+    use super::*;
+
+    fn shell(script: &str) -> Result<TestChild<TempDir>> {
+        let dir = testdir()?;
+        let mut command = Command::new("/bin/sh");
+        command
+            .current_dir(dir.path())
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(command
+            .spawn2(dir, "/bin/sh")?
+            .with_timeout(STOP_ON_LOAD_TIMEOUT))
+    }
+
+    #[test]
+    fn bounded_output_preserves_both_large_pipes_and_partial_lines() -> Result<()> {
+        let _init_guard = zebra_test::init();
+        let out = "o".repeat(64);
+        let err = "e".repeat(64);
+        let script = format!(
+            "i=0; while [ \"$i\" -lt 2048 ]; do printf '{out}'; printf '{err}' >&2; i=$((i+1)); done; printf tail; printf end >&2"
+        );
+        let output = wait_with_output_bounded(shell(&script)?)?;
+        assert_eq!(
+            output.output.stdout,
+            format!("{}tail", out.repeat(2048)).as_bytes()
+        );
+        assert_eq!(
+            output.output.stderr,
+            format!("{}end", err.repeat(2048)).as_bytes()
+        );
+        output.assert_was_not_killed()?;
+        output.assert_success()?;
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_output_pending_deadline_drains_partial_lines_and_reaps() -> Result<()> {
+        let _init_guard = zebra_test::init();
+        // exec preserves the exact owned PID. There is no background child to
+        // inherit the output pipes or survive failure cleanup.
+        let mut child = shell(
+            "printf partial-stdout; printf partial-stderr >&2; : > ready; exec /bin/sleep 60",
+        )?;
+        let ready = child
+            .dir
+            .as_ref()
+            .expect("fixture directory is owned")
+            .path()
+            .join("ready");
+        let setup_deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            if Instant::now() >= setup_deadline
+                || child
+                    .child
+                    .as_mut()
+                    .expect("fixture child is owned")
+                    .try_wait()?
+                    .is_some()
+            {
+                child.deadline = Some(Instant::now());
+                let cleanup = wait_with_output_bounded(child);
+                return Err(eyre::eyre!(
+                    "held-pipe fixture did not become ready: {cleanup:?}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(child
+            .child
+            .as_mut()
+            .expect("fixture child is owned")
+            .try_wait()?
+            .is_none());
+        let pid = child.child.as_ref().expect("fixture child is owned").id();
+        child = child.with_timeout(Duration::from_secs(1));
+        let started = Instant::now();
+        let error =
+            wait_with_output_bounded(child).expect_err("held-open pipes must reach the deadline");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("Polled before deadline: true"));
+        assert!(diagnostic.contains("before its deadline"));
+        assert!(diagnostic.contains("partial-stdout"));
+        assert!(diagnostic.contains("partial-stderr"));
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert_eq!(
+            waitpid(
+                Pid::from_raw(i32::try_from(pid).expect("a process ID fits the platform PID type")),
+                Some(WaitPidFlag::WNOHANG),
+            ),
+            Err(Errno::ECHILD),
+            "the exact owned fixture child must already be reaped",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_output_silent_deadline_fails_and_reaps_owned_child() -> Result<()> {
+        let _init_guard = zebra_test::init();
+        let mut child = shell("while :; do :; done")?;
+        let pid = child.child.as_ref().expect("spawned child is owned").id();
+        // An already-expired absolute deadline is deterministic and cannot be
+        // hidden by a quiet pipe, a missing newline, or a fresh timeout reset.
+        child.deadline = Some(Instant::now());
+        let error = wait_with_output_bounded(child).expect_err("an expired deadline must fail");
+        assert!(error.to_string().contains("before its deadline"));
+        assert_eq!(
+            waitpid(
+                Pid::from_raw(i32::try_from(pid).expect("a process ID fits the platform PID type")),
+                Some(WaitPidFlag::WNOHANG),
+            ),
+            Err(Errno::ECHILD),
+            "the owned child must already be reaped",
+        );
+        Ok(())
+    }
 }
