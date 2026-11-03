@@ -14,6 +14,7 @@
 //! skip all the network tests by setting the `SKIP_NETWORK_TESTS` environmental variable.
 
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
@@ -34,11 +35,12 @@ use zebra_chain::{chain_tip::NoChainTip, parameters::Network, serialization::Dat
 use zebra_test::net::random_known_port;
 
 use crate::{
-    address_book_updater::AddressBookUpdater,
+    address_book_updater::{AddressBookRequest, AddressBookResponse, AddressBookUpdater},
     config::CacheDir,
     connect_isolated_tcp_direct_with_inbound, constants, init,
     meta_addr::{MetaAddr, PeerAddrState},
     peer::{self, ClientTestHarness, ConnectedAddr, HandshakeRequest, OutboundConnectorRequest},
+    peer_cache_updater::update_peer_cache_once,
     peer_set::{
         crawler_services,
         initialize::{
@@ -361,31 +363,83 @@ async fn peer_limit_two_testnet() {
 async fn written_peer_cache_can_be_read_manually() {
     let _init_guard = zebra_test::init();
 
-    if zebra_test::net::zebra_skip_network_tests() {
-        return;
-    }
+    tokio::time::timeout(PEER_CACHE_UPDATER_TEST_DURATION, async {
+        let peer_cache_dir =
+            tempfile::tempdir().expect("creating a temporary cache directory should succeed");
+        let config = Config {
+            network: Mainnet,
+            cache_dir: CacheDir::custom_path(peer_cache_dir.path()),
+            ..Config::default()
+        };
+        let cache_file = config
+            .cache_dir
+            .peer_cache_file_path(&config.network)
+            .expect("the custom cache directory enables peer caching");
+        let (
+            address_book,
+            _bans_receiver,
+            _change_sender,
+            mut address_book_service,
+            _address_metrics,
+            _updater_guard,
+        ) = AddressBookUpdater::spawn(&config, config.listen_addr);
 
-    let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
+        let initial_addr: PeerSocketAddr = "127.1.1.1:8233"
+            .parse()
+            .expect("the fixed initial peer address is valid");
+        let response = address_book_service
+            .clone()
+            .oneshot(AddressBookRequest::Change(MetaAddr::new_initial_peer(
+                initial_addr,
+            )))
+            .await
+            .expect("the controlled address book service should be running");
+        assert!(matches!(response, AddressBookResponse::Updated(Some(_))));
+        assert_eq!(
+            address_book
+                .lock()
+                .expect("previous thread panicked while holding address book lock")
+                .len(),
+            1
+        );
+        let response = address_book_service
+            .clone()
+            .oneshot(AddressBookRequest::CacheablePeers)
+            .await
+            .expect("the controlled address book service should be running");
+        assert!(matches!(response, AddressBookResponse::Peers(peers) if peers.is_empty()));
+        assert!(
+            !update_peer_cache_once(&config, &mut address_book_service)
+                .await
+                .expect("the empty cache update should succeed"),
+            "an unverified initial peer must not be written to the cache"
+        );
+        assert!(!cache_file
+            .try_exists()
+            .expect("the private cache path metadata should be readable"));
 
-    // Use a temporary peer cache directory, so this test doesn't read or write the default
-    // peer cache directory, which is shared with other tests and local zebrad instances.
-    let peer_cache_dir =
-        tempfile::tempdir().expect("creating a temporary cache directory should succeed");
-    let config = Config {
-        cache_dir: CacheDir::custom_path(peer_cache_dir.path()),
-        ..Config::default()
-    };
-    let address_book =
-        init_with_peer_limit(25, nil_inbound_service, Mainnet, None, config.clone()).await;
-
-    // Let the peer cache updater run for a while.
-    tokio::time::sleep(PEER_CACHE_UPDATER_TEST_DURATION).await;
-
-    let approximate_peer_count = address_book
-        .lock()
-        .expect("previous thread panicked while holding address book lock")
-        .len();
-    if approximate_peer_count > 0 {
+        let gossiped_addr: PeerSocketAddr = "127.1.1.2:8233"
+            .parse()
+            .expect("the fixed gossiped peer address is valid");
+        let change = MetaAddr::new_gossiped_meta_addr(
+            gossiped_addr,
+            PeerServices::NODE_NETWORK,
+            DateTime32::now(),
+        )
+        .new_gossiped_change()
+        .expect("the gossiped peer has the required services and last-seen time");
+        let response = address_book_service
+            .clone()
+            .oneshot(AddressBookRequest::Change(change))
+            .await
+            .expect("the controlled address book service should be running");
+        assert!(matches!(response, AddressBookResponse::Updated(Some(_))));
+        assert!(
+            update_peer_cache_once(&config, &mut address_book_service)
+                .await
+                .expect("the cacheable peer should be persisted"),
+            "the recently gossiped peer must be written to the cache"
+        );
         let cached_peers = config
             .load_peer_cache()
             .await
@@ -396,7 +450,10 @@ async fn written_peer_cache_can_be_read_manually() {
             "unexpected empty peer cache from manual load: {:?}",
             config.cache_dir.peer_cache_file_path(&config.network)
         );
-    }
+        assert_eq!(cached_peers, HashSet::from([gossiped_addr]));
+    })
+    .await
+    .expect("the controlled peer cache roundtrip should finish within 25 seconds");
 }
 
 /// Test zebra-network writes a peer cache file, and reads it back automatically.
