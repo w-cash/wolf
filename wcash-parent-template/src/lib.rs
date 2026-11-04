@@ -56,4 +56,26 @@ mod tests {
             parent_payout_address_commitment("u1test-address-2")
         );
     }
+
+    #[test]
+    fn ctutils_signed_minimum_negation_wraps_without_panicking() {
+        use ctutils::{Choice, CtNeg};
+
+        macro_rules! check {
+            ($int:ty) => {{
+                let minimum = <$int>::MIN;
+                for choice in [Choice::FALSE, Choice::TRUE] {
+                    assert_eq!(minimum.ct_neg(choice), minimum);
+                }
+                let cases: [($int, $int); 3] = [(0, 0), (1, -1), (-1, 1)];
+                for (value, negated) in cases {
+                    assert_eq!(value.ct_neg(Choice::FALSE), value);
+                    assert_eq!(value.ct_neg(Choice::TRUE), negated);
+                }
+            }};
+        }
+        check!(i8);
+        check!(i64);
+        check!(i128);
+    }
 }
