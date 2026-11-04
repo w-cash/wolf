@@ -81,6 +81,8 @@ pub enum AuxPowError {
     ParentTransactionIsNotCoinbase,
     /// Proof v2 requires a ZIP-244 transaction with an authorizing-data digest.
     UnsupportedParentCoinbaseVersion(u32),
+    /// The canonical coinbase's embedded branch is outside the selected rules.
+    UnsupportedParentCoinbaseBranch(u32),
     /// A parsed coinbase did not expose its authenticated miner data.
     MissingParentCoinbaseMinerData,
     /// The explicit parent Merkle index is not the required coinbase slot zero.
@@ -196,6 +198,10 @@ impl fmt::Display for AuxPowError {
             Self::UnsupportedParentCoinbaseVersion(version) => write!(
                 f,
                 "Zcash AuxPoW v2 requires a version 5 or 6 parent coinbase, got version {version}"
+            ),
+            Self::UnsupportedParentCoinbaseBranch(branch_id) => write!(
+                f,
+                "parent coinbase branch 0x{branch_id:08x} is not allowed by the selected Wcash parent rules"
             ),
             Self::MissingParentCoinbaseMinerData => {
                 f.write_str("parent coinbase input has no authenticated miner data")

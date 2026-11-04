@@ -114,6 +114,18 @@ Merkle, auth-data Merkle, block-commitments, carrier, authenticated Wcash
 target, header hash, and full Equihash checks. The parent header's `nBits` is
 diagnostic only; trusting it would let a miner choose Wcash difficulty.
 
+Parent coinbase domains are selected explicitly with
+`validate_with_parent_rules(..., ParentCoinbaseRules::Legacy)`. The existing
+`validate()` method selects the same legacy rules. Their accepted branch IDs
+are frozen independently of the transaction parser, so upgrading a dependency
+cannot automatically admit a new Wcash proof domain. The set preserves all
+15 branch IDs recognized by the existing production parser, including its
+Wcash domains; it does not assert parent-chain inclusion or branch activation.
+
+Only the legacy policy is implemented. NU7 parsing, its Wcash activation height
+and complete Zcash NU7 support require subsequent reviewed changes. See the
+[coordinated upgrade plan](../docs/nu7-merged-mining-upgrade.md).
+
 Template builders should call `miner_data_commitment()` for a fixed `[u8; 44]`
 or `commitment_payload()` for the same bytes as a `Vec<u8>`, append the result
 to existing miner data, then use `validate_miner_data_commitment()` as a local
