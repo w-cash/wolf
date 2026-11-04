@@ -36,6 +36,7 @@ pub use crate::methods::{
         },
         unified_address::ZListUnifiedReceiversResponse,
         validate_address::ValidateAddressResponse,
+        wcash_parent_context::WcashParentContext,
         z_validate_address::{ZValidateAddressResponse, ZValidateAddressType},
     },
     AddressStrings, BlockHeaderObject, BlockObject, EndOfService, GetAddressBalanceRequest,

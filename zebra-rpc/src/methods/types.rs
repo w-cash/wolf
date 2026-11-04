@@ -16,5 +16,6 @@ pub mod subsidy;
 pub mod transaction;
 pub mod unified_address;
 pub mod validate_address;
+pub mod wcash_parent_context;
 pub mod z_validate_address;
 pub mod zec;

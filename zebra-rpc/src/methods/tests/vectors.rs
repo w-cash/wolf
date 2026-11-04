@@ -5785,6 +5785,158 @@ async fn rpc_getblockstatus_distinguishes_committed_side_chain_from_unknown() {
     read_state.expect_no_requests().await;
 }
 
+/// The reward-context lookup binds every value read to an exact parent hash,
+/// and fails closed on reorgs, missing state and one whole-operation deadline.
+#[tokio::test(start_paused = true)]
+async fn rpc_getwcashparentcontext_is_exact_bounded_and_reorg_safe() {
+    let _init_guard = zebra_test::init();
+    let parent: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let different: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = parent.hash();
+    for scenario in [
+        "good",
+        "unknown",
+        "side",
+        "wrong_height",
+        "missing_info",
+        "reorg",
+        "different_hash",
+        "unexpected_response",
+        "state_error",
+        "deadline",
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let parent = parent.clone();
+        let different = different.clone();
+        let read_state = tower::service_fn(move |request| {
+            let call = observed.fetch_add(1, Ordering::SeqCst);
+            let response = match request {
+                ReadRequest::BlockStatus(requested) => {
+                    assert_eq!(requested, hash);
+                    let status = match scenario {
+                        "unknown" => None,
+                        "side" => Some(zebra_state::BlockStatus::SideChain {
+                            block: parent.clone(),
+                        }),
+                        "reorg" if call > 0 => Some(zebra_state::BlockStatus::SideChain {
+                            block: parent.clone(),
+                        }),
+                        _ => Some(zebra_state::BlockStatus::BestChain {
+                            block: if scenario == "different_hash" {
+                                different.clone()
+                            } else {
+                                parent.clone()
+                            },
+                            depth: 0,
+                        }),
+                    };
+                    if scenario == "unexpected_response" {
+                        ReadResponse::BlockInfo(None)
+                    } else {
+                        ReadResponse::BlockStatus(status)
+                    }
+                }
+                ReadRequest::BlockInfo(requested) => {
+                    assert_eq!(
+                        requested,
+                        hash.into(),
+                        "value lookup must use the exact hash"
+                    );
+                    let mut pools = zebra_chain::value_balance::ValueBalance::zero();
+                    pools.set_nsm_amount(123_456_789u64.try_into().unwrap());
+                    ReadResponse::BlockInfo(
+                        (scenario != "missing_info").then(|| BlockInfo::new(pools, 1)),
+                    )
+                }
+                _ => panic!("the context lookup must not request a template or a live tip"),
+            };
+            async move {
+                if scenario == "deadline" {
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                }
+                if scenario == "state_error" {
+                    Err::<_, BoxError>("injected state read failure".into())
+                } else {
+                    Ok::<_, BoxError>(response)
+                }
+            }
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (rpc, _queue) = RpcImpl::new(
+            Mainnet,
+            Default::default(),
+            Default::default(),
+            "0.0.1",
+            "RPC test",
+            MockService::build().for_unit_tests(),
+            MockService::build().for_unit_tests(),
+            read_state,
+            MockService::build().for_unit_tests(),
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            None,
+        );
+        let started = tokio::time::Instant::now();
+        let response = rpc
+            .get_wcash_parent_context(
+                hash.to_string(),
+                if scenario == "wrong_height" { 2 } else { 1 },
+            )
+            .await;
+        if scenario == "good" {
+            assert_eq!(
+                serde_json::to_value(response.unwrap()).unwrap(),
+                serde_json::json!({
+                    "version": 1,
+                    "previousblockhash": hash.to_string(),
+                    "height": 1,
+                    "parentnsmvaluebalance": 123_456_789,
+                })
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+        } else {
+            let error = response.unwrap_err();
+            assert_eq!(
+                error.code(),
+                if scenario == "wrong_height" {
+                    ErrorCode::InvalidParams.code()
+                } else {
+                    ErrorCode::InternalError.code()
+                }
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                match scenario {
+                    "missing_info" | "deadline" => 2,
+                    "reorg" => 3,
+                    _ => 1,
+                }
+            );
+        }
+        if scenario == "deadline" {
+            assert_eq!(started.elapsed(), WCASH_PARENT_CONTEXT_TIMEOUT);
+        }
+        let before_invalid = calls.load(Ordering::SeqCst);
+        for (requested_hash, height) in [("invalid".to_string(), 1), (hash.to_string(), 0)] {
+            assert_eq!(
+                rpc.get_wcash_parent_context(requested_hash, height)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::InvalidParams.code()
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), before_invalid);
+    }
+}
+
 /// The first commit can succeed while gossip admission fails. The backend's
 /// exact-byte retry must restore the obligation from committed best-chain state.
 #[tokio::test]

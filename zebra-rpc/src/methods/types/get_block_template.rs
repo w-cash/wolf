@@ -58,6 +58,7 @@ use crate::{
     },
     methods::types::{
         default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
+        wcash_parent_context::WcashParentContext,
     },
     server::error::{MapError, OkOrError},
     SubmitBlockChannel,
@@ -237,6 +238,21 @@ pub struct BlockTemplateResponse {
     )]
     #[new(default)]
     pub(crate) wcash_parent_payout_commitment: Option<String>,
+
+    /// Exact reward context, exposed only by the private carrier request.
+    #[serde(
+        rename = "wcashparentcontext",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    #[new(default)]
+    pub(crate) wcash_parent_context: Option<WcashParentContext>,
+
+    /// Retained from the same state view as the ordinary cached template. It
+    /// cannot be reconstructed from a serialized template or a later live tip.
+    #[serde(skip)]
+    #[new(default)]
+    pub(crate) template_parent_context: Option<WcashParentContext>,
 }
 
 impl fmt::Debug for BlockTemplateResponse {
@@ -297,6 +313,16 @@ impl BlockTemplateResponse {
         miner_params: &MinerParams,
         wcash_aux: WcashAuxRequest,
     ) -> Result<Self, TransactionError> {
+        let parent_context = self
+            .template_parent_context
+            .as_ref()
+            .filter(|context| context.matches_template(self.previous_block_hash, self.height))
+            .cloned()
+            .ok_or_else(|| {
+                TransactionError::CoinbaseConstruction(
+                    "wcashaux requires exact cached parent reward context".to_string(),
+                )
+            })?;
         self.coinbase_txn = self
             .coinbase_txn
             .with_wcash_aux(wcash_aux.block_hash().0, wcash_aux.nonce())?;
@@ -323,6 +349,7 @@ impl BlockTemplateResponse {
                     )
                 })?,
         );
+        self.wcash_parent_context = Some(parent_context);
 
         Ok(self)
     }
@@ -543,6 +570,12 @@ impl BlockTemplateResponse {
 
             submit_old,
             wcash_parent_payout_commitment: None,
+            wcash_parent_context: None,
+            template_parent_context: Some(WcashParentContext::new(
+                chain_info.tip_hash,
+                height,
+                u64::from(chain_info.chain_value_pools.nsm_amount()),
+            )),
         }
     }
 }

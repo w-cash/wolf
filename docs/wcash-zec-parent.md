@@ -20,6 +20,22 @@ domains, WEC emission/foundation rules, or a WEC database migration.
 - `wcashparentpayoutcommitment` attests the configured Zcash payout-address
   encoding using the backend's existing hash domain. Payout addresses and memos
   remain redacted from mining-configuration diagnostics.
+- `wcashparentcontext` is returned only for a `wcashaux` template. Its version-1
+  object contains `previousblockhash` (canonical display-order hash), `height`
+  (candidate height), and `parentnsmvaluebalance` (unsigned integer zatoshis after
+  that predecessor, excluding any seed added at candidate activation). These
+  values are retained from the same state view that constructed the cached
+  template and coinbase. Ordinary GBT responses omit this field; adding a child
+  commitment never resamples the live tip or invents a zero balance.
+- `getwcashparentcontext(previousblockhash, height)` independently returns the
+  same version-1 object without constructing another template or shielded
+  coinbase proof. The node checks exact best-chain membership and actual parent
+  height, reads value pools **by hash**, then rechecks membership. Unknown and
+  side-chain blocks, mismatched heights, absent value records and failures are
+  errors. One one-second deadline covers all readiness and state reads. Clients
+  must require matching context from their independent proposal validators and
+  retain their existing predecessor fences around proposal validation; this
+  lookup alone is neither a consensus vote nor a guarantee against a later reorg.
 - `getblockstatus` reports exact committed best-chain, side-chain and unknown
   membership. Best-chain confirmations and the block come from the same state
   view. Its implementation must preserve that membership view across reorgs.
@@ -54,6 +70,13 @@ The template construction preserves upstream's parent NSM balance and gross-fee
 cache context. NU7 miner fee totals exclude the NSM contribution, while ordinary
 transaction fee fields remain gross. Do not replace the upstream cache or
 coinbase construction with the old height/fee-only implementation.
+
+For a local reward calculation, use `parentnsmvaluebalance` with the
+parent-dependent subsidy helper, which applies any activation seed itself.
+Require the exact candidate height and predecessor hash to match the template
+and every independent context response. Reject missing or unsupported context
+versions; never substitute a live `getblocksubsidy` sample or an assumed zero.
+Independent validation of the exact prepared proposal remains mandatory.
 
 Record source and build features, the executable SHA-256, configuration
 identity, all test results and unexecuted gates. Preserve upstream's version and

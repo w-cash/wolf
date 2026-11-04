@@ -136,6 +136,7 @@ use types::{
     transaction::TransactionObject,
     unified_address::ZListUnifiedReceiversResponse,
     validate_address::ValidateAddressResponse,
+    wcash_parent_context::WcashParentContext,
     z_validate_address::ZValidateAddressResponse,
 };
 
@@ -143,6 +144,9 @@ include!(concat!(env!("OUT_DIR"), "/rpc_openrpc.rs"));
 
 /// Bounds readiness and lookup for canonical duplicate recovery.
 const COMMITTED_DUPLICATE_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Bounds all exact-parent membership and value-pool reads in one operation.
+const WCASH_PARENT_CONTEXT_TIMEOUT: Duration = Duration::from_secs(1);
 
 // TODO: Review the parameter descriptions below, and update them as needed:
 // https://github.com/ZcashFoundation/zebra/issues/10320
@@ -165,6 +169,8 @@ pub(super) const PARAM_COMMAND_DESC: &str = "The command to execute.";
 #[allow(non_upper_case_globals)]
 pub(super) const PARAM__PARAMETERS_DESC: &str = "The parameters for the command.";
 pub(super) const PARAM_BLOCK_HASH_DESC: &str = "The hash of the block to return.";
+pub(super) const PARAM_PREVIOUS_BLOCK_HASH_DESC: &str =
+    "The exact committed predecessor hash for the candidate parent block.";
 pub(super) const PARAM_ADDRESS_DESC: &str = "The address to return.";
 pub(super) const PARAM_ADDRESS_STRINGS_DESC: &str = "The addresses to return.";
 pub(super) const PARAM_ADDR_DESC: &str = "The address to return.";
@@ -578,6 +584,15 @@ pub trait Rpc {
     /// Returns exact committed parent block membership and atomic best-chain confirmations.
     #[method(name = "getblockstatus")]
     async fn get_block_status(&self, block_hash: String) -> Result<GetBlockStatusResponse>;
+
+    /// Returns reward context for one exact committed best-chain predecessor.
+    /// This never builds a template or a shielded coinbase proof.
+    #[method(name = "getwcashparentcontext")]
+    async fn get_wcash_parent_context(
+        &self,
+        previous_block_hash: String,
+        height: u32,
+    ) -> Result<WcashParentContext>;
 
     /// Submits block to the node to be validated and committed.
     /// Returns the [`SubmitBlockResponse`] for the operation, as a JSON string.
@@ -3085,6 +3100,79 @@ where
         }
     }
 
+    async fn get_wcash_parent_context(
+        &self,
+        previous_block_hash: String,
+        height: u32,
+    ) -> Result<WcashParentContext> {
+        let hash = block::Hash::from_hex(previous_block_hash).map_err(|_| {
+            ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "invalid parent block hash",
+                None,
+            )
+        })?;
+        let height = Height::try_from(height).map_err(|_| {
+            ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "candidate height is outside the supported range",
+                None,
+            )
+        })?;
+        if height == Height::MIN {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "candidate height must have a predecessor",
+                None,
+            ));
+        }
+
+        tokio::time::timeout(WCASH_PARENT_CONTEXT_TIMEOUT, async {
+            checked_wcash_parent_membership(
+                self.read_state
+                    .clone()
+                    .oneshot(zebra_state::ReadRequest::BlockStatus(hash))
+                    .await
+                    .map_err(|_| wcash_parent_context_unavailable())?,
+                hash,
+                height,
+            )?;
+
+            // Hash lookup binds these immutable values to the exact block that
+            // was checked above. A height lookup could sample a replacement
+            // block across a reorg and must never be used here.
+            let response = self
+                .read_state
+                .clone()
+                .oneshot(zebra_state::ReadRequest::BlockInfo(hash.into()))
+                .await
+                .map_err(|_| wcash_parent_context_unavailable())?;
+            let zebra_state::ReadResponse::BlockInfo(Some(info)) = response else {
+                return Err(wcash_parent_context_unavailable());
+            };
+
+            // Recheck membership after the hash-bound value read. Callers must
+            // still retain their existing tip fences around proposal checks.
+            checked_wcash_parent_membership(
+                self.read_state
+                    .clone()
+                    .oneshot(zebra_state::ReadRequest::BlockStatus(hash))
+                    .await
+                    .map_err(|_| wcash_parent_context_unavailable())?,
+                hash,
+                height,
+            )?;
+
+            Ok(WcashParentContext::new(
+                hash,
+                height,
+                u64::from(info.value_pools().nsm_amount()),
+            ))
+        })
+        .await
+        .map_err(|_| wcash_parent_context_unavailable())?
+    }
+
     async fn submit_block(
         &self,
         HexData(block_bytes): HexData,
@@ -5569,6 +5657,45 @@ pub enum AddNodeCommand {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct GetTxOutResponse(Option<types::transaction::OutputObject>);
+
+/// Fail closed if context cannot be read without mixing predecessor identities.
+fn wcash_parent_context_unavailable() -> ErrorObject<'static> {
+    ErrorObject::borrowed(
+        ErrorCode::InternalError.code(),
+        "exact parent reward context unavailable; retry with the current predecessor",
+        None,
+    )
+}
+
+/// Validates the exact predecessor hash and candidate height from committed state.
+fn checked_wcash_parent_membership(
+    response: zebra_state::ReadResponse,
+    expected_hash: block::Hash,
+    candidate_height: Height,
+) -> Result<()> {
+    let zebra_state::ReadResponse::BlockStatus(Some(zebra_state::BlockStatus::BestChain {
+        block,
+        ..
+    })) = response
+    else {
+        return Err(wcash_parent_context_unavailable());
+    };
+    if block.hash() != expected_hash {
+        return Err(wcash_parent_context_unavailable());
+    }
+    if block
+        .coinbase_height()
+        .and_then(|height| height.next().ok())
+        != Some(candidate_height)
+    {
+        return Err(ErrorObject::borrowed(
+            ErrorCode::InvalidParams.code(),
+            "candidate height does not follow the exact parent block",
+            None,
+        ));
+    }
+    Ok(())
+}
 
 /// Constructs membership evidence only from an exact committed block read.
 fn committed_parent_block_status(

@@ -235,6 +235,24 @@ fn nu7_cached_transform_is_child_isolated_and_preserves_budget_and_fees() {
         )
         .unwrap();
     assert!(ordinary.wcash_parent_payout_commitment.is_none());
+    assert!(ordinary.wcash_parent_context.is_none());
+    let context = first.wcash_parent_context.as_ref().unwrap();
+    assert!(context.matches_template(ordinary.previous_block_hash, ordinary.height));
+    assert_eq!(context.parent_nsm_value_balance, 0);
+    assert_eq!(first.wcash_parent_context, second.wcash_parent_context);
+    assert!(serde_json::to_value(&ordinary)
+        .unwrap()
+        .get("wcashparentcontext")
+        .is_none());
+    assert_eq!(
+        serde_json::to_value(&first).unwrap()["wcashparentcontext"],
+        serde_json::json!({
+            "version": 1,
+            "previousblockhash": ordinary.previous_block_hash.to_string(),
+            "height": ordinary.height,
+            "parentnsmvaluebalance": 0,
+        })
+    );
     assert_eq!(first.transactions, ordinary.transactions);
     assert_eq!(first.previous_block_hash, ordinary.previous_block_hash);
     assert_eq!(first.coinbase_txn.fee, ordinary.coinbase_txn.fee);
@@ -267,6 +285,22 @@ fn nu7_cached_transform_is_child_isolated_and_preserves_budget_and_fees() {
         )
         .unwrap();
     assert!(!extended.fits_parent_template_limits(&net));
+}
+
+#[test]
+fn wcash_parent_context_cannot_be_reconstructed_from_a_wire_template_or_new_tip() {
+    let (net, miner, ordinary) = nu7_template();
+    let request = WcashAuxRequest::new(block::Hash([0x44; 32]), 7);
+    let decoded: BlockTemplateResponse =
+        serde_json::from_value(serde_json::to_value(&ordinary).unwrap()).unwrap();
+    assert!(decoded.template_parent_context.is_none());
+    assert!(decoded.with_wcash_aux(&net, &miner, request).is_err());
+    let mut wrong_parent = ordinary.clone();
+    wrong_parent.previous_block_hash = block::Hash([0x99; 32]);
+    assert!(wrong_parent.with_wcash_aux(&net, &miner, request).is_err());
+    let mut wrong_height = ordinary;
+    wrong_height.height += 1;
+    assert!(wrong_height.with_wcash_aux(&net, &miner, request).is_err());
 }
 
 #[test]
@@ -513,6 +547,7 @@ fn nu7_aux_preserves_nonzero_aggregate_fees_and_parent_nsm_context() {
     assert_eq!(net.nsm_reissuance_height(), Some(height));
     let miner = configured_miner(&net);
     let cache = CoinbaseCache::default();
+    let mut retained_templates = Vec::new();
     // Both gross totals collect 8,001 zats, but require distinct gross-fee cache keys.
     for (first_fee, gross) in [(10_000u64, 20_001), (10_001, 20_002)] {
         let transactions: Vec<_> = [1u8, 2]
@@ -554,7 +589,13 @@ fn nu7_aux_preserves_nonzero_aggregate_fees_and_parent_nsm_context() {
             let mut chain_info = GetBlockTemplateChainInfo {
                 expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
                 tip_height: height.previous().unwrap(),
-                tip_hash: block::Hash([0xab; 32]),
+                tip_hash: block::Hash(
+                    [if reserve == 1_000_000_000_000 {
+                        0xab
+                    } else {
+                        0xcd
+                    }; 32],
+                ),
                 cur_time: DateTime32::from(1_654_008_617),
                 min_time: DateTime32::from(1_654_008_606),
                 max_time: DateTime32::from(1_654_008_719),
@@ -582,6 +623,11 @@ fn nu7_aux_preserves_nonzero_aggregate_fees_and_parent_nsm_context() {
                 .clone()
                 .with_wcash_aux(&net, &miner, WcashAuxRequest::new(block::Hash([7; 32]), 3))
                 .unwrap();
+            let context = extended.wcash_parent_context.as_ref().unwrap();
+            assert!(context.matches_template(chain_info.tip_hash, height.0));
+            assert_eq!(context.parent_nsm_value_balance, reserve);
+            assert_eq!(original.template_parent_context.as_ref(), Some(context));
+            retained_templates.push((original.clone(), context.clone()));
             let before: Transaction = original
                 .coinbase_txn
                 .data
@@ -634,6 +680,12 @@ fn nu7_aux_preserves_nonzero_aggregate_fees_and_parent_nsm_context() {
             paid_by_parent[0], paid_by_parent[1],
             "the parent reserve must affect the cached coinbase"
         );
+    }
+    for (retained, expected_context) in retained_templates {
+        let extended = retained
+            .with_wcash_aux(&net, &miner, WcashAuxRequest::new(block::Hash([8; 32]), 4))
+            .unwrap();
+        assert_eq!(extended.wcash_parent_context, Some(expected_context));
     }
 }
 
