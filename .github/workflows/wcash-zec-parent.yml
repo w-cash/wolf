@@ -2,7 +2,7 @@ name: Wcash ZEC parent compatibility
 
 on:
   pull_request:
-    branches: [zec-parent-v7.0.0]
+    branches: [zec-parent-v7.0.0, feat/nu7-parent-rpc-20261104]
   push:
     branches: [zec-parent-v7.0.0]
 
@@ -38,7 +38,9 @@ jobs:
           sudo apt-get install --no-install-recommends -y clang libclang-dev cmake pkg-config protobuf-compiler
       - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,cargo-deny@0.19.5
+      - name: Dependency security policy
+        run: cargo deny --locked check
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Strict workspace lint
