@@ -308,3 +308,118 @@ fn reserves_shielded_budget_for_sapling_coinbase() {
         sizing_tx.zcash_serialized_size()
     );
 }
+
+#[test]
+fn wcash_aux_reserves_exact_coinbase_bytes_and_sigops() {
+    use super::super::WcashAuxRequest;
+    use super::{select_mempool_transactions_with_wcash_aux, CoinbaseCache};
+    use wcash_zcash_aux::MINER_DATA_COMMITMENT_BYTES;
+    use zebra_consensus::MAX_BLOCK_SIGOPS;
+    let network = Network::Mainnet;
+    let height = Height(2_000_000);
+    let miner_params =
+        MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
+    let ordinary_coinbase =
+        TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero())
+            .expect("valid ZIP-244 coinbase transaction template");
+    let coinbase_cache = CoinbaseCache::default();
+    coinbase_cache.store(height, Amount::zero(), None, ordinary_coinbase.clone());
+    let mut block_hash = [0x42; 32];
+    block_hash[..4].copy_from_slice(&7u32.to_le_bytes());
+    let wcash_aux = WcashAuxRequest::new(zebra_chain::block::Hash(block_hash), 7);
+    let committed_coinbase = ordinary_coinbase
+        .clone()
+        .with_wcash_aux(wcash_aux.block_hash().0, wcash_aux.nonce())
+        .expect("the exact Wcash carrier fits in the fake coinbase");
+    assert_eq!(
+        committed_coinbase.data.as_ref().len(),
+        ordinary_coinbase.data.as_ref().len() + MINER_DATA_COMMITMENT_BYTES,
+        "the selection budget must reserve the frozen raw 44-byte suffix"
+    );
+    assert!(
+        committed_coinbase.sigops > ordinary_coinbase.sigops,
+        "the test vector must expose child-specific coinbase sigops"
+    );
+
+    let safe_byte_budget = usize::try_from(MAX_BLOCK_BYTES).expect("fits in memory")
+        - Header::serialized_size(&network)
+        - max_transaction_count_size()
+        - committed_coinbase.data.as_ref().len();
+    let mut byte_limited_tx = network
+        .unmined_transactions_in_blocks(..)
+        .next()
+        .expect("should not be empty");
+    byte_limited_tx.transaction.size = safe_byte_budget;
+    assert_eq!(
+        select_mempool_transactions_with_wcash_aux(
+            &network,
+            height,
+            &miner_params,
+            vec![byte_limited_tx.clone()],
+            TransactionDependencies::default(),
+            Some(&coinbase_cache),
+            None,
+            Some(wcash_aux),
+        )
+        .len(),
+        1,
+        "a transaction exactly filling the Wcash-aware byte budget is selected"
+    );
+    byte_limited_tx.transaction.size = safe_byte_budget + 1;
+    assert_eq!(
+        select_mempool_transactions_with_wcash_aux(
+            &network,
+            height,
+            &miner_params,
+            vec![byte_limited_tx],
+            TransactionDependencies::default(),
+            Some(&coinbase_cache),
+            None,
+            Some(wcash_aux),
+        ),
+        vec![],
+        "one byte beyond the Wcash-aware budget is rejected"
+    );
+
+    let mut sigop_limited_tx = network
+        .unmined_transactions_in_blocks(..)
+        .next()
+        .expect("should not be empty");
+    sigop_limited_tx.legacy_sigop_count = MAX_BLOCK_SIGOPS - committed_coinbase.sigops;
+    sigop_limited_tx.p2sh_sigop_count = 0;
+    assert_eq!(
+        select_mempool_transactions_with_wcash_aux(
+            &network,
+            height,
+            &miner_params,
+            vec![sigop_limited_tx.clone()],
+            TransactionDependencies::default(),
+            Some(&coinbase_cache),
+            None,
+            Some(wcash_aux),
+        )
+        .len(),
+        1,
+        "a transaction exactly filling the Wcash-aware sigop budget is selected"
+    );
+    sigop_limited_tx.legacy_sigop_count += 1;
+    assert_eq!(
+        select_mempool_transactions_with_wcash_aux(
+            &network,
+            height,
+            &miner_params,
+            vec![sigop_limited_tx],
+            TransactionDependencies::default(),
+            Some(&coinbase_cache),
+            None,
+            Some(wcash_aux),
+        ),
+        vec![],
+        "one sigop beyond the Wcash-aware budget is rejected"
+    );
+    assert_eq!(
+        coinbase_cache.get(height, Amount::zero(), None),
+        Some(ordinary_coinbase),
+        "child-specific selection must not contaminate the shared coinbase cache"
+    );
+}

@@ -6642,6 +6642,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wcash-parent-template"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "hex",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7553,6 +7562,8 @@ dependencies = [
  "tonic-reflection",
  "tower 0.4.13",
  "tracing",
+ "tracing-subscriber",
+ "wcash-parent-template",
  "which",
  "zcash_address",
  "zcash_keys",

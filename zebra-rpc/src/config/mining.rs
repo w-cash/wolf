@@ -31,7 +31,7 @@ pub(crate) const MAX_USER_COINBASE_DATA_LEN: usize =
 
 /// Mining configuration section.
 #[serde_as]
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Address for receiving miner subsidy and tx fees.
@@ -60,6 +60,24 @@ pub struct Config {
     /// The internal miner is off by default.
     #[serde(default)]
     pub internal_miner: bool,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field(
+                "miner_address",
+                &self.miner_address.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("extra_coinbase_data", &self.extra_coinbase_data)
+            .field(
+                "miner_memo",
+                &self.miner_memo.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("internal_miner", &self.internal_miner)
+            .finish()
+    }
 }
 
 impl Config {

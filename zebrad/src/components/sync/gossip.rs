@@ -2,12 +2,18 @@
 //!
 //! [`block::Hash`]: zebra_chain::block::Hash
 
-use std::time::Duration;
+use std::{
+    collections::{HashSet, VecDeque},
+    time::Duration,
+};
 
-use futures::TryFutureExt;
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
-use tower::{timeout::Timeout, Service, ServiceExt};
+use tokio::{
+    sync::{mpsc, watch},
+    time::{sleep_until, timeout, Instant},
+};
+use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 use zebra_chain::{block, chain_tip::ChainTip};
@@ -21,7 +27,17 @@ use crate::{
 
 use BlockGossipError::*;
 
-/// Errors that can occur when gossiping committed blocks
+#[cfg(test)]
+mod tests;
+
+/// Mined notifications retain their own delivery obligation; ordinary tip changes coalesce.
+const MAX_PENDING_MINED_BLOCKS: usize = 64;
+const FRESH_ATTEMPTS_PER_RETRY: u8 = 3;
+const MINED_ATTEMPTS_PER_COMMITTED: u8 = 4;
+const GOSSIP_RETRY_DELAY: Duration = Duration::from_secs(1);
+const GOSSIP_WARNING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Errors that can occur when gossiping committed blocks.
 #[derive(Error, Debug)]
 pub enum BlockGossipError {
     #[error("chain tip sender was dropped")]
@@ -34,196 +50,562 @@ pub enum BlockGossipError {
     PeerSetReadiness(zn::BoxError),
 }
 
-/// Run continuously, gossiping newly verified [`block::Hash`]es to peers.
+#[derive(Clone, Copy, Debug)]
+struct Advertisement {
+    hash: block::Hash,
+    height: block::Height,
+    mined: bool,
+    attempts: u32,
+    queued_at: Instant,
+    eligible_at: Instant,
+}
+
+impl Advertisement {
+    fn request(self) -> zn::Request {
+        if self.mined {
+            zn::Request::AdvertiseBlockToAll(self.hash)
+        } else {
+            zn::Request::AdvertiseBlock(self.hash, None)
+        }
+    }
+
+    fn kind(self) -> &'static str {
+        if self.mined {
+            "mined"
+        } else {
+            "committed"
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingGossip {
+    fresh: VecDeque<Advertisement>,
+    retries: VecDeque<(Advertisement, Instant)>,
+    mined_hashes: HashSet<block::Hash>,
+    committed: Option<(Advertisement, Instant)>,
+    fresh_since_retry: u8,
+    mined_since_committed: u8,
+    backpressured: bool,
+    last_backpressure_warning: Option<Instant>,
+}
+
+impl PendingGossip {
+    fn has_capacity(&self) -> bool {
+        self.mined_hashes.len() < MAX_PENDING_MINED_BLOCKS
+    }
+
+    fn enqueue_mined(&mut self, hash: block::Hash, height: block::Height, now: Instant) {
+        if self.mined_hashes.contains(&hash) {
+            metrics::counter!("sync.gossip.mined.duplicates").increment(1);
+            return;
+        }
+        assert!(
+            self.has_capacity(),
+            "the receiver is gated by pending mined capacity"
+        );
+        self.mined_hashes.insert(hash);
+        self.fresh.push_back(Advertisement {
+            hash,
+            height,
+            mined: true,
+            attempts: 0,
+            queued_at: now,
+            eligible_at: now,
+        });
+        metrics::counter!("sync.gossip.mined.enqueued").increment(1);
+    }
+
+    fn enqueue_committed(&mut self, hash: block::Hash, height: block::Height, now: Instant) {
+        self.committed = Some((
+            Advertisement {
+                hash,
+                height,
+                mined: false,
+                attempts: 0,
+                queued_at: now,
+                eligible_at: now,
+            },
+            now,
+        ));
+    }
+
+    fn take_ready(&mut self, now: Instant) -> Option<Advertisement> {
+        let retry_ready = self
+            .retries
+            .front()
+            .is_some_and(|(_, ready_at)| *ready_at <= now);
+        let committed_ready = self
+            .committed
+            .as_ref()
+            .is_some_and(|(_, ready_at)| *ready_at <= now);
+        let mut advertisement =
+            if committed_ready && self.mined_since_committed >= MINED_ATTEMPTS_PER_COMMITTED {
+                self.committed
+                    .take()
+                    .map(|(advertisement, _)| advertisement)
+            } else if !self.fresh.is_empty()
+                && (!retry_ready || self.fresh_since_retry < FRESH_ATTEMPTS_PER_RETRY)
+            {
+                return self.take_fresh();
+            } else if retry_ready {
+                self.fresh_since_retry = 0;
+                self.retries
+                    .pop_front()
+                    .map(|(advertisement, _)| advertisement)
+            } else if committed_ready {
+                self.committed
+                    .take()
+                    .map(|(advertisement, _)| advertisement)
+            } else {
+                None
+            }?;
+        if advertisement.mined {
+            self.mined_since_committed = self.mined_since_committed.saturating_add(1);
+        } else {
+            self.mined_since_committed = 0;
+        }
+        advertisement.attempts = advertisement.attempts.saturating_add(1);
+        Some(advertisement)
+    }
+
+    fn take_fresh(&mut self) -> Option<Advertisement> {
+        let mut advertisement = self.fresh.pop_front()?;
+        self.fresh_since_retry = self.fresh_since_retry.saturating_add(1);
+        self.mined_since_committed = self.mined_since_committed.saturating_add(1);
+        advertisement.attempts = advertisement.attempts.saturating_add(1);
+        Some(advertisement)
+    }
+
+    fn retry(&mut self, mut advertisement: Advertisement, now: Instant) {
+        if advertisement.mined {
+            advertisement.eligible_at = now + GOSSIP_RETRY_DELAY;
+            self.retries
+                .push_back((advertisement, advertisement.eligible_at));
+        }
+        // Ordinary tip advertisements remain best-effort, as before the dispatcher.
+        // Retrying one could race the delayed tip reader and advertise an older tip.
+    }
+
+    fn complete(&mut self, advertisement: Advertisement) {
+        if advertisement.mined {
+            self.mined_hashes.remove(&advertisement.hash);
+            if self
+                .committed
+                .as_ref()
+                .is_some_and(|(tip, _)| tip.hash == advertisement.hash)
+            {
+                self.committed = None;
+            }
+        }
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.retries
+            .front()
+            .map(|(_, deadline)| *deadline)
+            .into_iter()
+            .chain(self.committed.as_ref().map(|(_, deadline)| *deadline))
+            .min()
+    }
+
+    fn record_metrics(&mut self, in_flight: u8) {
+        let full = !self.has_capacity();
+        if full && !self.backpressured {
+            metrics::counter!("sync.gossip.mined.backpressure.events").increment(1);
+            let now = Instant::now();
+            if self
+                .last_backpressure_warning
+                .is_none_or(|previous| now.duration_since(previous) >= GOSSIP_WARNING_INTERVAL)
+            {
+                self.last_backpressure_warning = Some(now);
+                warn!(pending_mined = self.mined_hashes.len(), phase = "mined_backpressure",
+                    "mined gossip queue is full; retaining received hashes and pausing the bounded input channel");
+            }
+        }
+        self.backpressured = full;
+        // The queue is bounded at 64 entries, exactly representable by f64.
+        metrics::gauge!("sync.gossip.pending.mined").set(self.mined_hashes.len() as f64);
+        metrics::gauge!("sync.gossip.request.in_flight").set(f64::from(in_flight));
+        metrics::gauge!("sync.gossip.mined.backpressure").set(if self.has_capacity() {
+            0.0
+        } else {
+            1.0
+        });
+    }
+}
+
+enum AttemptOutcome {
+    Completed,
+    Incomplete(&'static str),
+    PermanentReadiness(BoxError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AttemptTiming {
+    queue_wait_ms: u64,
+    readiness_wait_ms: u64,
+    request_elapsed_ms: u64,
+    total_elapsed_ms: u64,
+}
+
+impl AttemptTiming {
+    fn capture(
+        advertisement: Advertisement,
+        started: Instant,
+        request_started: Option<Instant>,
+        finished: Instant,
+    ) -> Self {
+        let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        Self {
+            queue_wait_ms: millis(started.saturating_duration_since(advertisement.eligible_at)),
+            readiness_wait_ms: millis(
+                request_started
+                    .unwrap_or(finished)
+                    .saturating_duration_since(started),
+            ),
+            request_elapsed_ms: request_started
+                .map(|called| millis(finished.saturating_duration_since(called)))
+                .unwrap_or(0),
+            total_elapsed_ms: millis(finished.saturating_duration_since(advertisement.queued_at)),
+        }
+    }
+}
+
+struct AttemptReport {
+    outcome: AttemptOutcome,
+    timing: AttemptTiming,
+    transport: Option<zn::MinedBlockAdvertisement>,
+}
+
+enum AttemptFailure {
+    Readiness(BoxError),
+    Request(BoxError),
+}
+
+#[derive(Clone, Copy)]
+enum AttemptLane {
+    General,
+    FreshMined,
+}
+
+impl AttemptLane {
+    fn name(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::FreshMined => "fresh_mined",
+        }
+    }
+}
+
+fn broadcast_attempt<ZN>(
+    mut network: ZN,
+    advertisement: Advertisement,
+    lane: AttemptLane,
+) -> BoxFuture<'static, AttemptReport>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + 'static,
+    ZN::Future: Send,
+{
+    async move {
+        let started = Instant::now();
+        let mut request_started = None;
+        // Tower's Timeout only bounds call(), so readiness must share this deadline.
+        let result = timeout(TIPS_RESPONSE_TIMEOUT, async {
+            let ready = network.ready().await.map_err(AttemptFailure::Readiness)?;
+            // This can be a buffered service call, not physical peer readiness.
+            request_started = Some(Instant::now());
+            let request = advertisement.request();
+            ready
+                .call(request)
+                .await
+                .map_err(AttemptFailure::Request)
+        })
+        .await;
+        let timing = AttemptTiming::capture(advertisement, started, request_started, Instant::now());
+        let transport = match &result {
+            Ok(Ok(zn::Response::MinedBlockAdvertisement(report))) => Some(*report),
+            Ok(Err(AttemptFailure::Request(error))) => error
+                .downcast_ref::<zn::MinedBlockAdvertisementError>()
+                .map(zn::MinedBlockAdvertisementError::report),
+            _ => None,
+        };
+        let outcome = match result {
+            Ok(Ok(zn::Response::MinedBlockAdvertisement(report))) if advertisement.mined => {
+                if report.non_local_sent > 0 && report.failed == 0 {
+                    info!(hash = ?advertisement.hash, height = ?advertisement.height,
+                        attempt = advertisement.attempts, attempted = report.attempted(),
+                        non_local_sent = report.non_local_sent, local_sent = report.local_sent,
+                        failed = report.failed, lane = lane.name(),
+                        queue_wait_ms = timing.queue_wait_ms, readiness_wait_ms = timing.readiness_wait_ms,
+                        request_elapsed_ms = timing.request_elapsed_ms, total_elapsed_ms = timing.total_elapsed_ms,
+                        phase = "mined_transport_result",
+                        "RPC-submitted block inventory transport completed; independent peer receipt is unconfirmed");
+                    AttemptOutcome::Completed
+                } else {
+                    if advertisement.attempts == 1 {
+                        warn!(hash = ?advertisement.hash, height = ?advertisement.height,
+                            attempt = advertisement.attempts, attempted = report.attempted(),
+                            non_local_sent = report.non_local_sent, local_sent = report.local_sent,
+                            failed = report.failed, lane = lane.name(),
+                            queue_wait_ms = timing.queue_wait_ms, readiness_wait_ms = timing.readiness_wait_ms,
+                            request_elapsed_ms = timing.request_elapsed_ms, total_elapsed_ms = timing.total_elapsed_ms,
+                            phase = "mined_transport_result",
+                            "RPC-submitted block has incomplete non-local transport; retained for retry");
+                    }
+                    let reason = if report.non_local_sent > 0 && report.failed > 0 {
+                        "partial_transport_failure"
+                    } else if report.local_sent > 0 {
+                        "local_only_transport"
+                    } else if report.failed > 0 {
+                        "all_peer_sends_failed"
+                    } else {
+                        "no_peer_candidates"
+                    };
+                    AttemptOutcome::Incomplete(reason)
+                }
+            },
+            // Mined attempts require the advertiser's typed local-write report.
+            Ok(Ok(zn::Response::Nil)) if !advertisement.mined => AttemptOutcome::Completed,
+            Ok(Ok(_)) => AttemptOutcome::Incomplete("unexpected_network_response"),
+            Ok(Err(AttemptFailure::Readiness(error))) => AttemptOutcome::PermanentReadiness(error),
+            Ok(Err(AttemptFailure::Request(_))) => {
+                let reason = match transport {
+                    Some(report) if report.non_local_sent > 0 => "partial_transport_failure",
+                    Some(report) if report.local_sent > 0 => "local_only_transport",
+                    Some(report) if report.failed > 0 => "all_peer_sends_failed",
+                    Some(_) => "no_peer_candidates",
+                    None => "request_error",
+                };
+                AttemptOutcome::Incomplete(reason)
+            },
+            Err(_) if request_started.is_some() => AttemptOutcome::Incomplete("network_request_timeout"),
+            Err(_) => AttemptOutcome::Incomplete("service_readiness_timeout"),
+        };
+        AttemptReport { outcome, timing, transport }
+    }
+    .in_current_span()
+    .boxed()
+}
+
+async fn next_committed_tip(
+    mut sync_status: SyncStatus,
+    mut chain_tip: ChainTipChange,
+) -> Result<((block::Hash, block::Height), ChainTipChange), BlockGossipError> {
+    const WAIT_FOR_BLOCK_SUBMISSION_DELAY: Duration = Duration::from_micros(100);
+    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+    let tip_action = chain_tip.wait_for_tip_change().await.map_err(TipChange)?;
+    tokio::time::sleep(WAIT_FOR_BLOCK_SUBMISSION_DELAY).await;
+    sync_status
+        .wait_until_close_to_tip()
+        .await
+        .map_err(SyncStatus)?;
+    let best_tip = chain_tip
+        .last_tip_change()
+        .unwrap_or(tip_action)
+        .best_tip_hash_and_height();
+    Ok((best_tip, chain_tip))
+}
+
+/// Gossips committed tips and retains successfully received mined notifications for retry.
 ///
-/// Once the state has reached the chain tip, broadcast the [`block::Hash`]es
-/// of newly verified blocks to eligible connected peers, including busy peers.
-///
-/// Blocks are only gossiped if they are:
-/// - on the best chain, and
-/// - the most recent block verified since the last gossip.
-///
-/// In particular, if a lot of blocks are committed at the same time,
-/// gossips will be disabled or skipped until the state reaches the latest tip.
-///
-/// [`block::Hash`]: zebra_chain::block::Hash
+/// A completed network request is not proof that an independent peer received the block.
+/// Readiness and request waits are bounded together; no detached broadcast tasks survive
+/// a timeout. If pending mined storage fills, the bounded RPC channel applies backpressure.
+/// Ordinary tip changes coalesce while every distinct pending mined hash is retained.
+/// Zcash mined attempts also require a transport success beyond configured sidecars
+/// and loopback peers; this is not evidence of independent receipt or adoption.
+/// Failed ordinary tip advertisements are best-effort and are not retried.
+/// These in-memory obligations do not survive a process restart and do not replace
+/// durable winner submission or independent observation by the pool backend.
+/// This parent-only node uses a second owned attempt lane so a fresh RPC-origin
+/// notification can start while an earlier attempt is pending. At most two
+/// attempts run; the general lane schedules retries and ordinary tips fairly.
+/// These attempts call Zebra 7's bounded BlockAdvertiser, preserving its queue,
+/// authorization and completed-local-write checks. Repeated inventory adverts
+/// after partial failure are idempotent and remain bounded by those queues.
 pub async fn gossip_best_tip_block_hashes<ZN>(
+    sync_status: SyncStatus,
+    chain_state: ChainTipChange,
+    broadcast_network: ZN,
+    mined_block_receiver: Option<mpsc::Receiver<(block::Hash, block::Height)>>,
+) -> Result<(), BlockGossipError>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
+{
+    gossip_best_tip_block_hashes_with_policy(
+        sync_status,
+        chain_state,
+        broadcast_network,
+        mined_block_receiver,
+        true,
+    )
+    .await
+}
+
+async fn gossip_best_tip_block_hashes_with_policy<ZN>(
     sync_status: SyncStatus,
     mut chain_state: ChainTipChange,
     broadcast_network: ZN,
     mut mined_block_receiver: Option<mpsc::Receiver<(block::Hash, block::Height)>>,
+    prioritize_fresh_mined: bool,
 ) -> Result<(), BlockGossipError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
 {
     info!("initializing block gossip task");
-
-    // use the same timeout as tips requests,
-    // so broadcasts don't delay the syncer too long
-    let mut broadcast_network = Timeout::new(broadcast_network, TIPS_RESPONSE_TIMEOUT);
+    let mut pending = PendingGossip::default();
+    let mut committed_tip = next_committed_tip(sync_status.clone(), chain_state.clone()).boxed();
+    let mut attempts = FuturesUnordered::new();
+    let mut general_active = false;
+    let mut fresh_mined_active = false;
+    let mut last_warning: Option<Instant> = None;
+    let mut suppressed_warnings = 0_u64;
+    let mut last_ordinary_warning: Option<Instant> = None;
+    let mut suppressed_ordinary_warnings = 0_u64;
 
     loop {
-        // TODO: Refactor this into a struct and move the contents of this loop into its own method.
-        let mut sync_status = sync_status.clone();
-        let mut chain_tip = chain_state.clone();
-
-        // TODO: Move the contents of this async block to its own method
-        let tip_change_close_to_network_tip_fut = async move {
-            /// A brief duration to wait after a tip change for a new message in the mined block channel.
-            // TODO: Add a test to check that Zebra does not advertise mined blocks to peers twice.
-            const WAIT_FOR_BLOCK_SUBMISSION_DELAY: Duration = Duration::from_micros(100);
-
-            // wait for at least the network timeout between gossips
-            //
-            // in practice, we expect blocks to arrive approximately every 75 seconds,
-            // so waiting 6 seconds won't make much difference
-            tokio::time::sleep(PEER_GOSSIP_DELAY).await;
-
-            // wait for at least one tip change, to make sure we have a new block hash to broadcast
-            let tip_action = chain_tip.wait_for_tip_change().await.map_err(TipChange)?;
-
-            // wait for block submissions to be received through the `mined_block_receiver` if the tip
-            // change is from a block submission.
-            tokio::time::sleep(WAIT_FOR_BLOCK_SUBMISSION_DELAY).await;
-
-            // wait until we're close to the tip, because broadcasts are only useful for nodes near the tip
-            // (if they're a long way from the tip, they use the syncer and block locators), unless a mined block
-            // hash is received before `wait_until_close_to_tip()` is ready.
-            sync_status
-                .wait_until_close_to_tip()
-                .map_err(SyncStatus)
-                .await?;
-
-            // get the latest tip change when close to tip - it might be different to the change we awaited,
-            // because the syncer might take a long time to reach the tip
-            let best_tip = chain_tip
-                .last_tip_change()
-                .unwrap_or(tip_action)
-                .best_tip_hash_and_height();
-
-            Ok((best_tip, "sending committed block broadcast", chain_tip))
-        }
-        .in_current_span();
-
-        // TODO: Move this logic for selecting the first ready future and updating `chain_state` to its own method.
-        let (((mut hash, mut height), log_msg, updated_chain_state), mut is_block_submission) =
-            if let Some(mined_block_receiver) = mined_block_receiver.as_mut() {
-                tokio::select! {
-                    tip_change_close_to_network_tip = tip_change_close_to_network_tip_fut => {
-                        (tip_change_close_to_network_tip?, false)
-                    },
-
-                    Some(tip_change) = mined_block_receiver.recv() => {
-                       ((tip_change, "sending mined block broadcast", chain_state), true)
-                    }
-                }
-            } else {
-                (tip_change_close_to_network_tip_fut.await?, false)
-            };
-
-        chain_state = updated_chain_state;
-
-        // TODO: Move logic for calling the peer set to its own method.
-
-        info!(?height, ?hash, is_block_submission, log_msg);
-
-        // `tower::timeout::Timeout` only bounds the response future, not `poll_ready()`.
-        // If there are no eligible peers, only waiting for readiness would stop this task from
-        // consuming the mined block channel, and `submitblock` would eventually fail with a full
-        // channel even though the block was committed.
-        //
-        // So we keep receiving mined blocks while we wait, and only broadcast the latest one.
-        // The pending broadcast is kept until an eligible peer connects, even if it is busy with
-        // an ordinary request.
-        //
-        // A chain tip broadcast that is replaced by a mined block is sent after the mined block,
-        // unless the mined block is the new best tip. Mined blocks can be on side chains, and the
-        // tip change for the replaced broadcast has already been consumed from `chain_state`.
-        let mut displaced_tip = None;
-
-        loop {
-            let mut superseded_blocks: usize = 0;
-            let ready_result = loop {
-                tokio::select! {
-                    biased;
-
-                    // Dropping an unfinished `Ready` future doesn't affect the service's
-                    // readiness, and we call the service straight after it becomes ready.
-                    ready_result = broadcast_network.ready() => break ready_result.map(|_| ()),
-
-                    Some(mined_block) = recv_mined_block(&mut mined_block_receiver) => {
-                        if is_block_submission {
-                            superseded_blocks = superseded_blocks.saturating_add(1);
-                        } else {
-                            displaced_tip = Some((hash, height));
-                        }
-
-                        (hash, height) = mined_block;
-                        is_block_submission = true;
-                    }
-                }
-            };
-
-            ready_result.map_err(PeerSetReadiness)?;
-
-            if superseded_blocks > 0 {
-                info!(
-                    ?height,
-                    ?hash,
-                    superseded_blocks,
-                    "peers were not ready for block broadcasts, only sending the latest mined block",
+        if !general_active {
+            if let Some(advertisement) = pending.take_ready(Instant::now()) {
+                metrics::counter!("sync.gossip.request.attempts", "kind" => advertisement.kind())
+                    .increment(1);
+                attempts.push(
+                    broadcast_attempt(
+                        broadcast_network.clone(),
+                        advertisement,
+                        AttemptLane::General,
+                    )
+                    .map(move |outcome| (AttemptLane::General, advertisement, outcome))
+                    .boxed(),
                 );
-            }
-
-            // block broadcasts inform other nodes about new blocks,
-            // so our internal Grow or Reset state doesn't matter to them
-            let request = if is_block_submission {
-                zn::Request::AdvertiseBlockToAll(hash)
-            } else {
-                zn::Request::AdvertiseBlock(hash, None)
-            };
-
-            let broadcast_fut = broadcast_network.call(request);
-
-            // Await bounded local writes in a spawned task so they don't delay later broadcasts.
-            // Errors can represent partial delivery; don't retry and duplicate successful writes.
-            tokio::spawn(broadcast_fut);
-
-            // TODO: Move this logic for marking the last change hash as seen to its own method.
-
-            let is_best_tip = chain_state.latest_chain_tip().best_tip_hash() == Some(hash);
-
-            // Mark the last change hash of `chain_state` as the last block submission hash to avoid
-            // advertising a block hash to some peers twice.
-            if is_block_submission
-                && mined_block_receiver
-                    .as_ref()
-                    .is_some_and(|rx| rx.is_empty())
-                && is_best_tip
-            {
-                chain_state.mark_last_change_hash(hash);
-            }
-
-            match displaced_tip.take() {
-                Some(tip) if !is_best_tip => {
-                    (hash, height) = tip;
-                    is_block_submission = false;
-                }
-                _ => break,
+                general_active = true;
             }
         }
-    }
-}
-
-/// Receives the next mined block from `mined_block_receiver`.
-///
-/// Never resolves if there is no receiver, so it can be used in a `select!` with other futures.
-async fn recv_mined_block(
-    mined_block_receiver: &mut Option<mpsc::Receiver<(block::Hash, block::Height)>>,
-) -> Option<(block::Hash, block::Height)> {
-    match mined_block_receiver {
-        Some(mined_block_receiver) => mined_block_receiver.recv().await,
-        None => std::future::pending().await,
+        if prioritize_fresh_mined && !fresh_mined_active {
+            if let Some(advertisement) = pending.take_fresh() {
+                metrics::counter!("sync.gossip.request.attempts", "kind" => advertisement.kind())
+                    .increment(1);
+                attempts.push(
+                    broadcast_attempt(
+                        broadcast_network.clone(),
+                        advertisement,
+                        AttemptLane::FreshMined,
+                    )
+                    .map(move |outcome| (AttemptLane::FreshMined, advertisement, outcome))
+                    .boxed(),
+                );
+                fresh_mined_active = true;
+            }
+        }
+        pending.record_metrics(u8::from(general_active) + u8::from(fresh_mined_active));
+        let retry_deadline = if !general_active {
+            pending.next_deadline()
+        } else {
+            None
+        };
+        tokio::select! {
+            result = &mut committed_tip => {
+                let ((hash, height), updated_chain_state) = result.inspect_err(|error| {
+                    let reason = match error {
+                        TipChange(_) => "tip_change_closed",
+                        SyncStatus(_) => "sync_status_closed",
+                        PeerSetReadiness(_) => "peer_set_readiness",
+                    };
+                    error!(phase = "gossip_task_exit", reason,
+                        "block gossip task stopped; independent receipt is unconfirmed");
+                })?;
+                chain_state = updated_chain_state;
+                pending.enqueue_committed(hash, height, Instant::now());
+                committed_tip = next_committed_tip(sync_status.clone(), chain_state.clone()).boxed();
+            },
+            mined = async {
+                mined_block_receiver.as_mut().expect("the branch requires a receiver").recv().await
+            }, if mined_block_receiver.is_some() && pending.has_capacity() => {
+                if let Some((hash, height)) = mined {
+                    pending.enqueue_mined(hash, height, Instant::now());
+                } else {
+                    mined_block_receiver = None;
+                }
+            },
+            completed = attempts.next(), if !attempts.is_empty() => {
+                let (lane, advertisement, AttemptReport { outcome, timing, transport }) = completed.expect("an active lane owns its attempt");
+                match lane {
+                    AttemptLane::General => general_active = false,
+                    AttemptLane::FreshMined => fresh_mined_active = false,
+                }
+                match outcome {
+                    AttemptOutcome::Completed => {
+                        pending.complete(advertisement);
+                        metrics::counter!("sync.gossip.request.completed", "kind" => advertisement.kind()).increment(1);
+                        info!(hash = ?advertisement.hash, height = ?advertisement.height,
+                            kind = advertisement.kind(), attempt = advertisement.attempts, lane = lane.name(),
+                            queue_wait_ms = timing.queue_wait_ms, readiness_wait_ms = timing.readiness_wait_ms,
+                            request_elapsed_ms = timing.request_elapsed_ms, total_elapsed_ms = timing.total_elapsed_ms,
+                            phase = "network_request_completed",
+                            "block gossip network request completed; independent peer receipt is not confirmed");
+                        if advertisement.mined
+                            && mined_block_receiver.as_ref().is_none_or(|rx| rx.is_empty())
+                            && chain_state.latest_chain_tip().best_tip_hash() == Some(advertisement.hash)
+                        {
+                            chain_state.mark_last_change_hash(advertisement.hash);
+                            committed_tip = next_committed_tip(sync_status.clone(), chain_state.clone()).boxed();
+                        }
+                    },
+                    AttemptOutcome::Incomplete(reason) if advertisement.mined => {
+                        let now = Instant::now();
+                        pending.retry(advertisement, now);
+                        metrics::counter!("sync.gossip.request.retries", "kind" => advertisement.kind(), "reason" => reason).increment(1);
+                        if advertisement.attempts == 1 || last_warning.is_none_or(|previous| now.duration_since(previous) >= GOSSIP_WARNING_INTERVAL) {
+                            last_warning = Some(now);
+                            warn!(hash = ?advertisement.hash, height = ?advertisement.height,
+                                attempt = advertisement.attempts, lane = lane.name(),
+                                queue_wait_ms = timing.queue_wait_ms, readiness_wait_ms = timing.readiness_wait_ms,
+                                request_elapsed_ms = timing.request_elapsed_ms, total_elapsed_ms = timing.total_elapsed_ms,
+                                pending_seconds = now.duration_since(advertisement.queued_at).as_secs(),
+                                pending_mined = pending.mined_hashes.len(), reason, ?transport,
+                                suppressed = suppressed_warnings, phase = "retry_queued",
+                                "block gossip request incomplete; pending RPC-submitted hashes retained for retry");
+                            suppressed_warnings = 0;
+                        } else {
+                            suppressed_warnings = suppressed_warnings.saturating_add(1);
+                        }
+                    },
+                    AttemptOutcome::Incomplete(reason) => {
+                        metrics::counter!("sync.gossip.request.dropped", "kind" => advertisement.kind(), "reason" => reason).increment(1);
+                        let now = Instant::now();
+                        if last_ordinary_warning.is_none_or(|previous| now.duration_since(previous) >= GOSSIP_WARNING_INTERVAL) {
+                            last_ordinary_warning = Some(now);
+                            warn!(hash = ?advertisement.hash, height = ?advertisement.height,
+                                attempt = advertisement.attempts, reason, lane = lane.name(),
+                                queue_wait_ms = timing.queue_wait_ms, readiness_wait_ms = timing.readiness_wait_ms,
+                                request_elapsed_ms = timing.request_elapsed_ms, total_elapsed_ms = timing.total_elapsed_ms,
+                                suppressed = suppressed_ordinary_warnings, phase = "attempt_dropped",
+                                "ordinary tip gossip request incomplete; best-effort attempt dropped");
+                            suppressed_ordinary_warnings = 0;
+                        } else {
+                            suppressed_ordinary_warnings = suppressed_ordinary_warnings.saturating_add(1);
+                        }
+                    },
+                    AttemptOutcome::PermanentReadiness(error) => {
+                        error!(hash = ?advertisement.hash, height = ?advertisement.height,
+                            lane = lane.name(),
+                            queue_wait_ms = timing.queue_wait_ms, readiness_wait_ms = timing.readiness_wait_ms,
+                            request_elapsed_ms = timing.request_elapsed_ms, total_elapsed_ms = timing.total_elapsed_ms,
+                            phase = "gossip_task_exit", reason = "peer_set_readiness",
+                            "block gossip task stopped; independent receipt is unconfirmed");
+                        return Err(PeerSetReadiness(error));
+                    },
+                }
+            },
+            _ = async {
+                if let Some(deadline) = retry_deadline {
+                    sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {},
+        }
     }
 }

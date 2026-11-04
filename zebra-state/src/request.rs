@@ -1216,6 +1216,13 @@ pub enum ReadRequest {
     /// [`block::Height`] using `.into()`.
     Block(HashOrHeight),
 
+    /// Looks up exact committed membership using one non-finalized snapshot
+    /// and its immutable finalized prefix.
+    ///
+    /// Returns [`ReadResponse::BlockStatus`] with best-chain block and depth,
+    /// a retained side-chain block, or `None` when membership is unknown.
+    BlockStatus(block::Hash),
+
     /// Looks up a block by hash in any current chain or by height in the current best chain.
     ///
     /// Returns
@@ -1653,6 +1660,7 @@ impl ReadRequest {
             ReadRequest::BlockInfo(_) => "block_info",
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",
+            ReadRequest::BlockStatus(_) => "block_status",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",
             ReadRequest::BlockAndSize(_) => "block_and_size",
             ReadRequest::SpentOutputs(_) => "spent_outputs",

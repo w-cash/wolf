@@ -3,6 +3,7 @@
 use derive_getters::Getters;
 use derive_new::new;
 use schemars::JsonSchema;
+use zebra_chain::block;
 
 use crate::methods::{hex_data::HexData, types::long_poll::LongPollId};
 
@@ -57,6 +58,34 @@ pub enum GetBlockTemplateCapability {
     UnknownCapability,
 }
 
+/// A Wcash auxiliary-block commitment requested in a Zcash block template.
+///
+/// The block hash uses the conventional display byte order used by Zebra's
+/// JSON-RPC methods and block explorers. Template construction converts it to
+/// the raw byte order used by the Wcash commitment algorithm.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, Getters, JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct WcashAuxRequest {
+    /// The proof-independent Wcash block hash to commit to.
+    #[serde(rename = "blockhash", with = "hex")]
+    #[schemars(with = "String")]
+    #[getter(copy)]
+    pub(crate) block_hash: block::Hash,
+
+    /// The auxiliary-tree nonce used to derive the Wcash tree position.
+    #[getter(copy)]
+    pub(crate) nonce: u32,
+}
+
+impl WcashAuxRequest {
+    /// Creates a request for one Wcash auxiliary block.
+    pub fn new(block_hash: block::Hash, nonce: u32) -> Self {
+        Self { block_hash, nonce }
+    }
+}
+
 /// Optional parameter `jsonrequestobject` for `getblocktemplate` RPC request.
 ///
 /// The `data` field must be provided in `proposal` mode, and must be omitted in `template` mode.
@@ -106,9 +135,20 @@ pub struct GetBlockTemplateParameters {
     #[serde(rename = "workid")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) _work_id: Option<String>,
+
+    /// A child-specific commitment for a fresh parent template.
+    #[serde(rename = "wcashaux", skip_serializing_if = "Option::is_none", default)]
+    #[new(default)]
+    pub(crate) wcash_aux: Option<WcashAuxRequest>,
 }
 
 impl GetBlockTemplateParameters {
+    /// Adds an exact Wcash child commitment to this request.
+    pub fn with_wcash_aux(mut self, wcash_aux: WcashAuxRequest) -> Self {
+        self.wcash_aux = Some(wcash_aux);
+        self
+    }
+
     /// Returns Some(data) with the block proposal hexdata if in `Proposal` mode and `data` is provided.
     pub fn block_proposal_data(&self) -> Option<HexData> {
         match self {

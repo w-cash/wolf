@@ -1572,7 +1572,9 @@ where
 
         // TODO: split response handler into its own method
         match rsp.clone() {
-            Response::Nil => { /* generic success, do nothing */ }
+            Response::Nil | Response::MinedBlockAdvertisement(_) => {
+                // Typed advertisement outcomes are local metadata, never wire messages.
+            }
             Response::Peers(addrs) => {
                 if let Err(e) = self.peer_tx.send(Message::Addr(addrs)).await {
                     self.fail_with(e).await;

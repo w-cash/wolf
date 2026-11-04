@@ -41,6 +41,7 @@ proptest-impl = [
 
 
 [dependencies]
+wcash-zcash-aux = { workspace = true, default-features = false }
 chrono = { workspace = true, features = ["clock", "std"] }
 futures = { workspace = true }
 
@@ -125,6 +126,7 @@ tonic-prost-build = { workspace = true }
 which = { workspace = true }
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 bytes = { workspace = true }
 http-body = { workspace = true }
 insta = { workspace = true, features = ["redactions", "json", "ron"] }

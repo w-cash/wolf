@@ -105,6 +105,12 @@ impl PeerSetHarness {
         let peer = self.peers.len();
         let host = u8::try_from(peer + 1).expect("test peer count fits in an IPv4 octet");
         let addr: PeerSocketAddr = SocketAddr::from(([127, 0, 0, host], 8233)).into();
+        self.connect_peer_at(addr, services)
+    }
+
+    /// Discovers a client at an explicit fixture address for local/non-local outcome tests.
+    pub fn connect_peer_at(&mut self, addr: PeerSocketAddr, services: PeerServices) -> usize {
+        let peer = self.peers.len();
         let (mut client, handle) = ClientTestHarness::build()
             .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
             .with_services(services)

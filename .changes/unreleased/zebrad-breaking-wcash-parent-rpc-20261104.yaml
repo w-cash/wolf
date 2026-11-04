@@ -1,0 +1,4 @@
+project: zebrad
+kind: breaking
+body: Add the Wcash-maintained ZEC parent-node RPC contracts and bounded mined-block delivery accounting on the stable Zebra 7 source line. Preserve complete NU7 consensus and parent NSM/fee cache context; the WEC node and backend require separate compatibility releases.
+time: 2026-11-04T17:00:00Z

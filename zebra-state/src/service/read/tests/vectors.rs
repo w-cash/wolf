@@ -26,7 +26,7 @@ use crate::{
         non_finalized_state::Chain,
         read::{orchard_subtrees, sapling_subtrees},
     },
-    Config, ReadRequest, ReadResponse,
+    BlockStatus, Config, ReadRequest, ReadResponse,
 };
 
 /// Test that ReadStateService responds correctly when empty.
@@ -99,6 +99,14 @@ async fn populated_read_state_responds_correctly() -> Result<()> {
             (
                 ReadRequest::Block(block.hash().into()),
                 Ok(ReadResponse::Block(Some(block.clone()))),
+            ),
+            (
+                ReadRequest::BlockStatus(block.hash()),
+                Ok(ReadResponse::BlockStatus(Some(BlockStatus::BestChain {
+                    block: block.clone(),
+                    depth: tip_height.0
+                        - block.coinbase_height().expect("test block has a height").0,
+                }))),
             ),
             (
                 ReadRequest::Block(block.coinbase_height().unwrap().into()),
@@ -393,6 +401,10 @@ fn empty_state_test_cases() -> Vec<(ReadRequest, Result<ReadResponse, ExpectedTr
             Ok(ReadResponse::Block(None)),
         ),
         (
+            ReadRequest::BlockStatus(block.hash()),
+            Ok(ReadResponse::BlockStatus(None)),
+        ),
+        (
             ReadRequest::Block(block.coinbase_height().unwrap().into()),
             Ok(ReadResponse::Block(None)),
         ),
@@ -570,6 +582,118 @@ fn side_chain_fixture() -> Result<SideChainFixture> {
         best_hash,
         side_hash,
     })
+}
+
+/// Membership uses one whole chain snapshot instead of combining separate
+/// best-chain and any-chain requests across a reorg.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_status_classifies_membership_from_one_snapshot() -> Result<()> {
+    use crate::{
+        arbitrary::Prepare,
+        service::read::{any_block, block_status},
+        tests::FakeChainHelper,
+    };
+
+    let _init_guard = zebra_test::init();
+    let SideChainFixture {
+        mut non_finalized_state,
+        finalized_state,
+        best_hash,
+        side_hash,
+    } = side_chain_fixture()?;
+    let db = &finalized_state.db;
+    let finalized_tip = db.tip();
+    let old_snapshot = non_finalized_state.clone();
+    let best_block = any_block(old_snapshot.chain_iter(), db, best_hash.into()).unwrap();
+    let side_block = any_block(old_snapshot.chain_iter(), db, side_hash.into()).unwrap();
+    let new_tip = side_block.make_fake_child().set_work(100);
+    let new_tip_hash = new_tip.hash();
+
+    assert_eq!(
+        block_status(&old_snapshot, db, finalized_tip, best_hash),
+        Some(BlockStatus::BestChain {
+            block: best_block.clone(),
+            depth: 0,
+        })
+    );
+    assert_eq!(
+        block_status(&old_snapshot, db, finalized_tip, side_hash),
+        Some(BlockStatus::SideChain {
+            block: side_block.clone(),
+        })
+    );
+    assert!(block_status(&old_snapshot, db, finalized_tip, new_tip_hash).is_none());
+
+    non_finalized_state.commit_block(new_tip.prepare(), db)?;
+    assert_eq!(
+        block_status(&non_finalized_state, db, finalized_tip, side_hash),
+        Some(BlockStatus::BestChain {
+            block: side_block.clone(),
+            depth: 1,
+        })
+    );
+    assert!(matches!(
+        block_status(&non_finalized_state, db, finalized_tip, new_tip_hash),
+        Some(BlockStatus::BestChain { block, depth: 0 }) if block.hash() == new_tip_hash
+    ));
+    assert_eq!(
+        block_status(&non_finalized_state, db, finalized_tip, best_hash),
+        Some(BlockStatus::SideChain { block: best_block })
+    );
+    assert_eq!(
+        block_status(&old_snapshot, db, finalized_tip, side_hash),
+        Some(BlockStatus::SideChain { block: side_block })
+    );
+    assert!(block_status(&old_snapshot, db, finalized_tip, new_tip_hash).is_none());
+
+    // An older watch snapshot that conflicts with or lags the finalized
+    // anchor cannot establish side-chain or best-chain membership.
+    let old_tip_height = old_snapshot
+        .best_chain()
+        .unwrap()
+        .non_finalized_tip_height();
+    for stale_anchor in [
+        (old_tip_height, side_hash),
+        (old_tip_height.next().unwrap(), new_tip_hash),
+    ] {
+        assert!(block_status(&old_snapshot, db, Some(stale_anchor), best_hash).is_none());
+        assert!(block_status(&old_snapshot, db, Some(stale_anchor), side_hash).is_none());
+    }
+    Ok(())
+}
+
+/// Finalized records newer than the request's captured prefix are not mixed
+/// into an older non-finalized snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_status_respects_captured_finalized_prefix() -> Result<()> {
+    use crate::{service::read::block_status, NonFinalizedState};
+
+    let _init_guard = zebra_test::init();
+    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .map(|bytes| bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _, _) = populated_state(blocks.clone(), &Mainnet).await;
+    let empty_snapshot = NonFinalizedState::new(&Mainnet);
+    let genesis = blocks.first().expect("the fixture includes genesis");
+    let captured_tip = Some((Height::MIN, genesis.hash()));
+    assert_eq!(
+        block_status(
+            &empty_snapshot,
+            read_state.db(),
+            captured_tip,
+            genesis.hash()
+        ),
+        Some(BlockStatus::BestChain {
+            block: genesis.clone(),
+            depth: 0,
+        })
+    );
+    let newer = blocks.get(1).expect("the fixture extends genesis");
+    assert!(read_state.db().block(newer.hash().into()).is_some());
+    assert!(block_status(&empty_snapshot, read_state.db(), captured_tip, newer.hash()).is_none());
+    assert!(block_status(&empty_snapshot, read_state.db(), None, genesis.hash()).is_none());
+    Ok(())
 }
 
 /// Test that AnyChainBlock finds blocks in side chains, while Block does not.

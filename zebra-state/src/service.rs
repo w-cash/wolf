@@ -1521,6 +1521,21 @@ impl Service<ReadRequest> for ReadStateService {
                 hash_or_height,
             ))),
 
+            ReadRequest::BlockStatus(hash) => {
+                // Capture the immutable finalized prefix first. The watch
+                // snapshot can lag finalization; the reader checks overlap
+                // before using it and never follows newly finalized records
+                // beyond this anchor during the request.
+                let finalized_tip = state.db.tip();
+                let non_finalized_state = state.latest_non_finalized_state();
+                Ok(ReadResponse::BlockStatus(read::block_status(
+                    &non_finalized_state,
+                    &state.db,
+                    finalized_tip,
+                    hash,
+                )))
+            }
+
             ReadRequest::AnyChainBlock(hash_or_height) => Ok(ReadResponse::Block(read::any_block(
                 state.latest_non_finalized_state().chain_iter(),
                 &state.db,

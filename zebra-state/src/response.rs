@@ -371,6 +371,23 @@ impl PartialEq for NonFinalizedBlocksListener {
 
 impl Eq for NonFinalizedBlocksListener {}
 
+/// Exact committed block membership from one chain snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockStatus {
+    /// The block is in the best chain represented by this snapshot.
+    BestChain {
+        /// The exact committed block.
+        block: Arc<Block>,
+        /// The number of blocks above it in the same snapshot.
+        depth: u32,
+    },
+    /// The block is committed to a retained non-finalized side chain.
+    SideChain {
+        /// The exact committed block.
+        block: Arc<Block>,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a read-only
 /// [`ReadStateService`](crate::service::ReadStateService)'s [`ReadRequest`].
@@ -401,6 +418,10 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::Block`] with the specified block.
     Block(Option<Arc<Block>>),
+
+    /// Response to [`ReadRequest::BlockStatus`] with exact committed membership
+    /// from one chain snapshot, or `None` if membership is unknown.
+    BlockStatus(Option<BlockStatus>),
 
     /// Response to [`ReadRequest::BlockAndSize`] with the specified block and
     /// serialized size.
@@ -638,6 +659,7 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::UsageInfo(_)
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::BlockInfo(_)
+            | ReadResponse::BlockStatus(_)
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::SpentOutputs(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)

@@ -23,7 +23,7 @@ use zebra_chain::{
 use zebra_consensus::{ShieldedActionCounts, MAX_BLOCK_SIGOPS};
 use zebra_node_services::mempool::TransactionDependencies;
 
-use super::CoinbaseCache;
+use super::{CoinbaseCache, WcashAuxRequest};
 use crate::methods::types::transaction::TransactionTemplate;
 
 #[cfg(test)]
@@ -62,6 +62,30 @@ pub fn select_mempool_transactions(
     coinbase_cache: Option<&CoinbaseCache>,
     parent_nsm_value_balance: Option<Amount<NonNegative>>,
 ) -> Vec<SelectedMempoolTx> {
+    select_mempool_transactions_with_wcash_aux(
+        net,
+        height,
+        miner_params,
+        mempool_txs,
+        mempool_tx_deps,
+        coinbase_cache,
+        parent_nsm_value_balance,
+        None,
+    )
+}
+
+/// Selects transactions while reserving the exact optional AuxPoW carrier costs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_mempool_transactions_with_wcash_aux(
+    net: &Network,
+    height: Height,
+    miner_params: &MinerParams,
+    mempool_txs: Vec<VerifiedUnminedTx>,
+    mempool_tx_deps: TransactionDependencies,
+    coinbase_cache: Option<&CoinbaseCache>,
+    parent_nsm_value_balance: Option<Amount<NonNegative>>,
+    wcash_aux: Option<WcashAuxRequest>,
+) -> Vec<SelectedMempoolTx> {
     if let Some(cache) = coinbase_cache {
         cache.select(height, parent_nsm_value_balance);
     }
@@ -89,6 +113,18 @@ pub fn select_mempool_transactions(
             }
             cb
         });
+
+    // Cache only the unmodified parent coinbase; each child request sizes its
+    // own authenticated suffix without changing height/NSM/gross-fee keys.
+    let fake_coinbase_tx = match wcash_aux {
+        Some(wcash_aux) => {
+            match fake_coinbase_tx.with_wcash_aux(wcash_aux.block_hash().0, wcash_aux.nonce()) {
+                Ok(coinbase) => coinbase,
+                Err(_) => return Vec::new(),
+            }
+        }
+        None => fake_coinbase_tx,
+    };
 
     let tx_dependencies = mempool_tx_deps.dependencies();
     let (independent_mempool_txs, mut dependent_mempool_txs): (HashMap<_, _>, HashMap<_, _>) =

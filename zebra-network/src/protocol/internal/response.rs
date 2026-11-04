@@ -14,6 +14,69 @@ use proptest_derive::Arbitrary;
 
 use InventoryResponse::*;
 
+/// Completed local transport writes for a mined-block advertisement.
+///
+/// Inventory writes are not acknowledgments of remote receipt, validation or
+/// canonical-chain adoption. Non-local peers are not necessarily independently
+/// operated.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
+pub struct MinedBlockAdvertisement {
+    /// Completed writes to peers other than configured sidecars or loopback peers.
+    pub non_local_sent: usize,
+    /// Completed writes to configured sidecars or loopback peers.
+    pub local_sent: usize,
+    /// Selected writes that failed admission, authorization, transport or their deadline.
+    pub failed: usize,
+}
+
+impl MinedBlockAdvertisement {
+    /// The number of selected peer writes whose outcomes are included.
+    pub fn attempted(&self) -> usize {
+        self.non_local_sent
+            .saturating_add(self.local_sent)
+            .saturating_add(self.failed)
+    }
+}
+
+/// A mined-block advertisement with an incomplete local-write outcome.
+///
+/// Failure remains an error even if another selected write completed. The
+/// retained report lets callers diagnose partial delivery without interpreting
+/// it as remote receipt.
+#[derive(Debug)]
+pub struct MinedBlockAdvertisementError {
+    report: MinedBlockAdvertisement,
+    source: crate::BoxError,
+}
+
+impl MinedBlockAdvertisementError {
+    pub(crate) fn new(report: MinedBlockAdvertisement, source: crate::BoxError) -> Self {
+        Self { report, source }
+    }
+
+    /// The completed and failed local writes observed before this error.
+    pub fn report(&self) -> MinedBlockAdvertisement {
+        self.report
+    }
+}
+
+impl fmt::Display for MinedBlockAdvertisementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "mined-block advertisement local writes incomplete: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for MinedBlockAdvertisementError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// A response to a network request, represented in internal format.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
@@ -27,6 +90,10 @@ pub enum Response {
     ///
     /// (Inventory requests provide a list of missing hashes if none of the hashes were available.)
     Nil,
+
+    /// Successful local writes of an outbound mined-block inventory advertisement.
+    /// This metadata is never sent as a wire response.
+    MinedBlockAdvertisement(MinedBlockAdvertisement),
 
     /// A list of peers, used to respond to `GetPeers`.
     ///
@@ -87,6 +154,9 @@ impl fmt::Display for Response {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(&match self {
             Response::Nil => "Nil".to_string(),
+            Response::MinedBlockAdvertisement(report) => {
+                format!("MinedBlockAdvertisement {{ local writes: {report:?} }}")
+            }
 
             Response::Peers(peers) => format!("Peers {{ peers: {} }}", peers.len()),
 
@@ -133,6 +203,7 @@ impl Response {
     pub fn command(&self) -> &'static str {
         match self {
             Response::Nil => "Nil",
+            Response::MinedBlockAdvertisement(_) => "MinedBlockAdvertisement",
 
             Response::Peers(_) => "Peers",
 

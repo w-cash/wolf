@@ -17,10 +17,11 @@ pub use crate::methods::{
     },
     types::{
         default_roots::DefaultRoots,
+        get_block_status::GetBlockStatusResponse,
         get_block_template::{
             BlockProposalResponse, BlockTemplateResponse, BlockTemplateTimeSource,
             GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
-            GetBlockTemplateResponse,
+            GetBlockTemplateResponse, WcashAuxRequest,
         },
         get_blockchain_info::GetBlockchainInfoBalance,
         get_mining_info::GetMiningInfoResponse,

@@ -37,7 +37,8 @@ use zebra_chain::{block, chain_tip::ChainTip, parameters::Network};
 
 use crate::{
     constants::REQUEST_TIMEOUT, peer::MinimumPeerVersion, protocol::external::types::Version,
-    BanList, BoxError, PeerSocketAddr, Request, Response,
+    BanList, BoxError, MinedBlockAdvertisement, MinedBlockAdvertisementError, PeerSocketAddr,
+    Request, Response,
 };
 
 /// A queued advert acknowledges a completed local transport write, not remote receipt.
@@ -166,40 +167,62 @@ impl<C: ChainTip + Clone + Send + 'static> Service<Request> for AdvertisePeers<C
             .filter(|(addr, (version, _, sender))| {
                 *version >= minimum && !bans.is_banned(addr.ip()) && !sender.is_closed()
             })
-            .map(|(_, entry)| entry)
             .collect();
         selected.shuffle(&mut rand::rng());
         let sample = broadcast_peer_count(&self.network, selected.len());
         let mut writes = FuturesUnordered::new();
         let mut sampled = 0;
-        for (_, sidecar, sender) in selected {
+        for (addr, (_, sidecar, sender)) in selected {
             if !all && !*sidecar {
                 if sampled >= sample {
                     continue;
                 }
                 sampled += 1;
             }
+            let local = *sidecar || addr.ip().is_loopback();
             let (result, receiver) = oneshot::channel();
             let admission = sender
                 .try_send(BlockAdvert { hash, result })
                 .map_err(|error| -> BoxError { error.to_string().into() });
             writes.push(async move {
-                admission?;
-                tokio::time::timeout(REQUEST_TIMEOUT, receiver).await??
+                let outcome = async {
+                    admission?;
+                    tokio::time::timeout(REQUEST_TIMEOUT, receiver).await??
+                }
+                .await;
+                (local, outcome)
             });
         }
         async move {
             if writes.is_empty() {
-                return Err("no eligible peers for block advertisement".into());
+                let error: BoxError = "no eligible peers for block advertisement".into();
+                return if all {
+                    Err(Box::new(MinedBlockAdvertisementError::new(
+                        MinedBlockAdvertisement::default(),
+                        error,
+                    )) as BoxError)
+                } else {
+                    Err(error)
+                };
             }
             let mut failure = None;
-            while let Some(result) = writes.next().await {
-                if let Err(error) = result {
-                    failure.get_or_insert(error);
+            let mut report = MinedBlockAdvertisement::default();
+            while let Some((local, result)) = writes.next().await {
+                match result {
+                    Ok(()) if local => report.local_sent = report.local_sent.saturating_add(1),
+                    Ok(()) => report.non_local_sent = report.non_local_sent.saturating_add(1),
+                    Err(error) => {
+                        report.failed = report.failed.saturating_add(1);
+                        failure.get_or_insert(error);
+                    }
                 }
             }
             match failure {
+                Some(error) if all => {
+                    Err(Box::new(MinedBlockAdvertisementError::new(report, error)) as BoxError)
+                }
                 Some(error) => Err(error),
+                None if all => Ok(Response::MinedBlockAdvertisement(report)),
                 None => Ok(Response::Nil),
             }
         }
