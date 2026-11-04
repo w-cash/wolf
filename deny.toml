@@ -93,7 +93,7 @@ skip = [
     { name = "bip32", version = "=0.6.0" },
     { name = "bls12_381", version = "=0.9.0" },
     { name = "cbc", version = "=0.2.1" },
-    { name = "chacha20", version = "=0.10.1" },
+    { name = "chacha20", version = "=0.10.2" },
     { name = "chacha20poly1305", version = "=0.11.0" },
     { name = "cipher", version = "=0.5.2" },
     { name = "curve25519-dalek", version = "=5.0.0" },
@@ -141,6 +141,10 @@ skip = [
     { name = "zebra-chain", version = "=15.0.0" },
     { name = "zebra-test", version = "=5.0.0" },
     { name = "zip32", version = "=0.3.0" },
+    # howudoin uses flume 0.10; newer consumers use 0.11.
+    { name = "flume", version = "=0.10.14" },
+    # daggy/schemerz uses petgraph 0.7; prost-build uses 0.8.
+    { name = "petgraph", version = "=0.7.1" },
 ]
 
 # Similarly to `skip` allows you to skip certain crates during duplicate

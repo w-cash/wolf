@@ -22,6 +22,8 @@ sapling-crypto = { version = "=0.9.0", default-features = false }
 zcash_note_encryption = { version = "=0.5.1", default-features = false }
 
 [dev-dependencies]
+chacha20-modern = { package = "chacha20", version = "=0.10.2", default-features = false, features = ["cipher", "rng"] }
+chacha20-legacy = { package = "chacha20", version = "=0.9.1", default-features = false }
 zec-parent-chain = { package = "zebra-chain", git = "https://github.com/ZcashFoundation/zebra", rev = "e8db87eb69254e0d4eedd058eadd48bdfa09065a", default-features = false, features = ["proptest-impl"] }
 hex = { workspace = true }
 rand_core = "=0.10.1"

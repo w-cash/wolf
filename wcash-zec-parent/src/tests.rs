@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "crypto_tests.rs"]
+mod crypto_tests;
+
 const FIXTURES: [(&str, u32, &str, &str); 2] = [
     (
         include_str!("../test-vectors/nu7-v5-coinbase.hex"),
