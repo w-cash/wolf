@@ -25,7 +25,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use wcash_pool_protocol::{ChainTip, Hex32, MergedChain, WinnerDescriptor};
 use wcash_zcash_aux::{
-    child_payout_address_commitment, AuxPowProof, Target, WCASH_AUXILIARY_CHAIN_ID,
+    child_payout_address_commitment, AuxPowProof, ParentCoinbaseRules, Target,
+    WCASH_AUXILIARY_CHAIN_ID,
 };
 use zcash_address::unified::{Container, Receiver};
 use zcash_protocol::consensus::NetworkType;
@@ -703,7 +704,19 @@ impl NativeMiningSupervisor {
             .0;
 
         let auxiliary_nonce = reserve_auxiliary_nonce(&self.next_auxiliary_nonce)?;
-        let job = zcash.prepare_job_timed(child_hash, child_target, auxiliary_nonce, timing)?;
+        let parent_rules = ParentCoinbaseRules::for_candidate_height(
+            child.height,
+            self.wcash_network
+                .wcash_nu7_parent_activation_height()
+                .map(u32::from),
+        );
+        let job = zcash.prepare_job_timed_with_parent_rules(
+            child_hash,
+            child_target,
+            auxiliary_nonce,
+            timing,
+            parent_rules,
+        )?;
         let generation_descriptor = job.generation_descriptor(
             child_candidate.header.previous_block_hash.0,
             child_coinbase_txid_le,
@@ -2098,15 +2111,35 @@ fn validate_pool_winner_material(
             "backend winner bytes do not bind their durable parent header hash".to_string(),
         ));
     }
-    let block: Block = snapshot
-        .block_bytes()
-        .zcash_deserialize_into()
-        .map_err(|error| {
-            MinerError::InvalidRequest(format!(
-                "backend winner block became undecodable after validation: {error}"
-            ))
-        })?;
-    Ok(block.header.previous_block_hash.0)
+    match kind {
+        PersistedWinnerBlockKind::Wcash => {
+            let block: Block =
+                snapshot
+                    .block_bytes()
+                    .zcash_deserialize_into()
+                    .map_err(|error| {
+                        MinerError::InvalidRequest(format!(
+                            "backend Wcash winner became undecodable after validation: {error}"
+                        ))
+                    })?;
+            Ok(block.header.previous_block_hash.0)
+        }
+        PersistedWinnerBlockKind::Zcash => {
+            use wcash_zec_parent::chain::{
+                block::Block as ParentBlock,
+                serialization::ZcashDeserializeInto as ParentDeserialize,
+            };
+            let block: ParentBlock = ParentDeserialize::zcash_deserialize_into(
+                snapshot.block_bytes(),
+            )
+            .map_err(|error| {
+                MinerError::InvalidRequest(format!(
+                    "backend Zcash winner became undecodable after validation: {error}"
+                ))
+            })?;
+            Ok(block.header.previous_block_hash.0)
+        }
+    }
 }
 
 fn pool_chain_tip(tip: NativeChainTip) -> ChainTip {
@@ -3669,13 +3702,21 @@ pub(crate) enum PersistedWinnerBlockKind {
     Zcash,
 }
 
-/// Consensus-validates exact winner bytes and their immutable journal metadata.
+/// Validates canonical winner bytes, immutable metadata and real proof-of-work.
+/// Full contextual consensus remains the validating node's responsibility.
 pub(crate) fn validate_persisted_winner_block(
     block_bytes: &[u8],
     expected_hash_display: &str,
     expected_height: u32,
     kind: PersistedWinnerBlockKind,
 ) -> Result<[u8; 32], MinerError> {
+    if kind == PersistedWinnerBlockKind::Zcash {
+        return validate_persisted_zcash_winner_block(
+            block_bytes,
+            expected_hash_display,
+            expected_height,
+        );
+    }
     let block: Block = block_bytes.zcash_deserialize_into().map_err(|error| {
         MinerError::InvalidRequest(format!("share journal contains an invalid block: {error}"))
     })?;
@@ -3685,29 +3726,22 @@ pub(crate) fn validate_persisted_winner_block(
         ));
     }
     let expected_hash = parse_display_hash(expected_hash_display, "winner_outbox block hash")?;
-    let expected_version = match kind {
-        PersistedWinnerBlockKind::Wcash => Some(WCASH_BLOCK_WIRE_VERSION),
-        PersistedWinnerBlockKind::Zcash => None,
-    };
     if block.hash().0 != expected_hash
         || block.coinbase_height().map(u32::from) != Some(expected_height)
-        || expected_version.is_some_and(|version| block.header.version != version)
+        || block.header.version != WCASH_BLOCK_WIRE_VERSION
     {
         return Err(MinerError::InvalidRequest(
             "share journal winner metadata does not match its exact block".to_string(),
         ));
     }
-    if expected_version.is_some() {
-        // This shared gate also covers accounting reads and backend-journal
-        // recovery, so old no-fund winners cannot become trusted after upgrade.
-        validate_recovered_wcash_funding(&block)?;
-    }
-    if expected_version.is_some()
-        && block
-            .header
-            .solution
-            .as_wcash()
-            .is_none_or(|witness| witness.is_empty())
+    // This shared gate also covers accounting reads and backend-journal
+    // recovery, so old no-fund winners cannot become trusted after upgrade.
+    validate_recovered_wcash_funding(&block)?;
+    if block
+        .header
+        .solution
+        .as_wcash()
+        .is_none_or(|witness| witness.is_empty())
     {
         return Err(MinerError::InvalidRequest(
             "share journal Wcash winner has no AuxPoW witness".to_string(),
@@ -3718,22 +3752,14 @@ pub(crate) fn validate_persisted_winner_block(
         .difficulty_threshold
         .to_expanded()
         .ok_or_else(|| {
-            MinerError::InvalidRequest(format!(
-                "share journal {} winner has an invalid compact target",
-                match kind {
-                    PersistedWinnerBlockKind::Wcash => "Wcash",
-                    PersistedWinnerBlockKind::Zcash => "Zcash",
-                }
-            ))
+            MinerError::InvalidRequest(
+                "share journal Wcash winner has an invalid compact target".to_string(),
+            )
         })?;
     if expanded.to_compact() != block.header.difficulty_threshold {
-        return Err(MinerError::InvalidRequest(format!(
-            "share journal {} winner has a non-canonical compact target",
-            match kind {
-                PersistedWinnerBlockKind::Wcash => "Wcash",
-                PersistedWinnerBlockKind::Zcash => "Zcash",
-            }
-        )));
+        return Err(MinerError::InvalidRequest(
+            "share journal Wcash winner has a non-canonical compact target".to_string(),
+        ));
     }
     let expanded_value: U256 = expanded.into();
     let target = Target::from_le_bytes(expanded_value.to_little_endian()).map_err(|error| {
@@ -3742,41 +3768,103 @@ pub(crate) fn validate_persisted_winner_block(
         ))
     })?;
 
-    let parent_hash = if expected_version.is_some() {
-        let witness = block
-            .header
-            .solution
-            .as_wcash()
-            .expect("the Wcash witness variant and non-empty bytes were checked above");
-        let proof = AuxPowProof::decode(witness.as_bytes()).map_err(|error| {
-            MinerError::InvalidRequest(format!(
-                "share journal Wcash winner contains malformed AuxPoW: {error}"
-            ))
-        })?;
-        proof.validate(block.hash().0, target).map_err(|error| {
+    let witness = block
+        .header
+        .solution
+        .as_wcash()
+        .expect("the Wcash witness variant and non-empty bytes were checked above");
+    let proof = AuxPowProof::decode(witness.as_bytes()).map_err(|error| {
+        MinerError::InvalidRequest(format!(
+            "share journal Wcash winner contains malformed AuxPoW: {error}"
+        ))
+    })?;
+    let network = recovered_wcash_network(&block)?;
+    let rules = ParentCoinbaseRules::for_candidate_height(
+        expected_height,
+        network.wcash_nu7_parent_activation_height().map(u32::from),
+    );
+    proof
+        .validate_with_parent_rules(block.hash().0, target, rules)
+        .map_err(|error| {
             MinerError::InvalidRequest(format!(
                 "share journal Wcash winner contains invalid AuxPoW: {error}"
             ))
         })?;
-        proof.parent_header().block_hash().into_le_bytes()
-    } else {
-        if !target.is_met_by_le_hash(block.hash().0) {
-            return Err(MinerError::InvalidRequest(
-                "share journal Zcash winner does not meet its compact target".to_string(),
-            ));
-        }
-        block
-            .header
-            .solution
-            .check(&block.header)
-            .map_err(|error| {
-                MinerError::InvalidRequest(format!(
-                    "share journal Zcash winner contains invalid Equihash: {error}"
-                ))
-            })?;
-        block.hash().0
+    Ok(proof.parent_header().block_hash().into_le_bytes())
+}
+
+/// Decode Zcash with its independently pinned modern codec, while retaining
+/// every exact-byte, identity, target and real Equihash replay check.
+fn validate_persisted_zcash_winner_block(
+    block_bytes: &[u8],
+    expected_hash_display: &str,
+    expected_height: u32,
+) -> Result<[u8; 32], MinerError> {
+    use wcash_zec_parent::chain::{
+        block::Block as ParentBlock,
+        serialization::{ZcashDeserializeInto as ParentDeserialize, ZcashSerialize as _},
+        work::difficulty::U256 as ParentU256,
     };
-    Ok(parent_hash)
+
+    let block: ParentBlock =
+        ParentDeserialize::zcash_deserialize_into(block_bytes).map_err(|error| {
+            MinerError::InvalidRequest(format!(
+                "share journal contains an invalid Zcash block: {error}"
+            ))
+        })?;
+    if block.zcash_serialize_to_vec().map_err(|error| {
+        MinerError::InvalidRequest(format!(
+            "share journal Zcash block cannot be serialized: {error}"
+        ))
+    })? != block_bytes
+    {
+        return Err(MinerError::InvalidRequest(
+            "share journal contains a non-canonical Zcash block".to_string(),
+        ));
+    }
+    let expected_hash = parse_display_hash(expected_hash_display, "winner_outbox block hash")?;
+    if block.hash().0 != expected_hash
+        || block.coinbase_height().map(u32::from) != Some(expected_height)
+    {
+        return Err(MinerError::InvalidRequest(
+            "share journal winner metadata does not match its exact block".to_string(),
+        ));
+    }
+    let expanded = block
+        .header
+        .difficulty_threshold
+        .to_expanded()
+        .ok_or_else(|| {
+            MinerError::InvalidRequest(
+                "share journal Zcash winner has an invalid compact target".to_string(),
+            )
+        })?;
+    if expanded.to_compact() != block.header.difficulty_threshold {
+        return Err(MinerError::InvalidRequest(
+            "share journal Zcash winner has a non-canonical compact target".to_string(),
+        ));
+    }
+    let expanded: ParentU256 = expanded.into();
+    let target = Target::from_le_bytes(expanded.to_little_endian()).map_err(|error| {
+        MinerError::InvalidRequest(format!(
+            "share journal winner has an invalid target: {error}"
+        ))
+    })?;
+    if !target.is_met_by_le_hash(block.hash().0) {
+        return Err(MinerError::InvalidRequest(
+            "share journal Zcash winner does not meet its compact target".to_string(),
+        ));
+    }
+    block
+        .header
+        .solution
+        .check(&block.header)
+        .map_err(|error| {
+            MinerError::InvalidRequest(format!(
+                "share journal Zcash winner contains invalid Equihash: {error}"
+            ))
+        })?;
+    Ok(block.hash().0)
 }
 
 fn validate_recovered_wcash_winner(
@@ -3799,14 +3887,35 @@ fn validate_recovered_wcash_winner(
     validate_recovered_wcash_funding(&block)
 }
 
+/// Derives the historical child network from the preserved transaction domain,
+/// never from the current parent tip or today's payout configuration.
+fn recovered_wcash_network(block: &Block) -> Result<Network, MinerError> {
+    use zcash_protocol::consensus::BranchId;
+
+    let coinbase = block.transactions.first().ok_or_else(|| {
+        MinerError::InvalidRequest("retained Wcash winner has no coinbase".to_string())
+    })?;
+    match coinbase
+        .embedded_consensus_branch_id()
+        .and_then(|branch| BranchId::try_from(u32::from(branch)).ok())
+    {
+        Some(BranchId::WcashMainnetV1) => Network::try_new_wcash_mainnet().map_err(|error| {
+            MinerError::InvalidRequest(format!("cannot inspect retained Mainnet winner: {error}"))
+        }),
+        Some(BranchId::WcashTestnetV3) => Ok(Network::new_wcash_testnet()),
+        Some(BranchId::WcashRegtestV1) => Ok(Network::new_wcash_regtest()),
+        _ => Err(MinerError::InvalidRequest(
+            "retained Wcash winner has an unknown transaction domain; preserve the journal for operator review".to_string(),
+        )),
+    }
+}
+
 /// Validate current funding rules independently of an older journal's attestation.
 ///
 /// Historical payout authorities can differ from today's configured miner. Their
 /// original attribution remains bound to immutable coinbase bytes and job metadata;
 /// this check neither substitutes a new recipient nor rewrites retained winners.
 fn validate_recovered_wcash_funding(block: &Block) -> Result<(), MinerError> {
-    use zcash_protocol::consensus::BranchId;
-
     let height = block.coinbase_height().ok_or_else(|| {
         MinerError::InvalidRequest("retained Wcash winner has no coinbase height".to_string())
     })?;
@@ -3816,21 +3925,7 @@ fn validate_recovered_wcash_funding(block: &Block) -> Result<(), MinerError> {
     let coinbase = block.transactions.first().ok_or_else(|| {
         MinerError::InvalidRequest("retained Wcash winner has no coinbase".to_string())
     })?;
-    let network = match coinbase
-        .embedded_consensus_branch_id()
-        .and_then(|branch| BranchId::try_from(u32::from(branch)).ok())
-    {
-        Some(BranchId::WcashMainnetV1) => Network::try_new_wcash_mainnet().map_err(|error| {
-            MinerError::InvalidRequest(format!("cannot inspect retained Mainnet winner: {error}"))
-        })?,
-        Some(BranchId::WcashTestnetV3) => Network::new_wcash_testnet(),
-        Some(BranchId::WcashRegtestV1) => Network::new_wcash_regtest(),
-        _ => {
-            return Err(MinerError::InvalidRequest(
-                "retained Wcash winner has an unknown transaction domain; preserve the journal for operator review".to_string(),
-            ));
-        }
-    };
+    let network = recovered_wcash_network(block)?;
     if WCASH_FOUNDATION_TEST_FIXTURE_ENABLED && !network.is_wcash_regtest() {
         return Err(MinerError::InvalidRequest(
             "funding-test-fixture cannot recover public-network Wcash winners".to_string(),
@@ -9143,6 +9238,95 @@ pub(crate) mod tests {
             .expect_err("a shielded substitute cannot satisfy recovery funding policy")
             .to_string()
             .contains("foundation policy"));
+    }
+
+    #[test]
+    fn persisted_nu7_parent_fixtures_bind_metadata_but_unsolved_work_is_rejected() {
+        use wcash_zec_parent::chain::{
+            block::Block as ParentBlock,
+            serialization::{ZcashDeserializeInto as ParentDeserialize, ZcashSerialize as _},
+            work::difficulty::{CompactDifficulty as ParentCompact, U256 as ParentU256},
+        };
+
+        // These canonical v5/v6 coinbases carry the actual NU7 branch. The
+        // surrounding constructed blocks are deliberately NOT solved winners
+        // or consensus-valid reward fixtures; no Equihash solver is invoked.
+        for coinbase_hex in [
+            include_str!("../../wcash-zec-parent/test-vectors/nu7-v5-coinbase.hex"),
+            include_str!("../../wcash-zec-parent/test-vectors/nu7-v6-coinbase.hex"),
+        ] {
+            let genesis_bytes = mainnet_genesis_block().zcash_serialize_to_vec().unwrap();
+            let mut parent: ParentBlock =
+                ParentDeserialize::zcash_deserialize_into(genesis_bytes.as_slice()).unwrap();
+            let coinbase_bytes = hex::decode(coinbase_hex.trim()).unwrap();
+            let coinbase = wcash_zec_parent::canonical_nu7_coinbase(&coinbase_bytes).unwrap();
+            assert_eq!(
+                u32::from(coinbase.consensus_branch_id()),
+                wcash_zec_parent::NU7_BRANCH_ID
+            );
+            parent.transactions = vec![Arc::new(coinbase)];
+            let merkle_root = parent.transactions.iter().collect();
+            let header = Arc::make_mut(&mut parent.header);
+            header.merkle_root = merkle_root;
+            header.difficulty_threshold =
+                ParentCompact::from_bytes_in_display_order(&[0x20, 0x7f, 0xff, 0xff]).unwrap();
+            let expanded: ParentU256 = header.difficulty_threshold.to_expanded().unwrap().into();
+            let target = Target::from_le_bytes(expanded.to_little_endian()).unwrap();
+            // Only exercise the cheap hash threshold. Retain the unrelated
+            // genesis Equihash solution, which must fail real verification.
+            for nonce in 0u64..64 {
+                Arc::make_mut(&mut parent.header).nonce[..8].copy_from_slice(&nonce.to_le_bytes());
+                if target.is_met_by_le_hash(parent.hash().0) {
+                    break;
+                }
+            }
+            assert!(target.is_met_by_le_hash(parent.hash().0));
+            assert!(parent.header.solution.check(&parent.header).is_err());
+            let bytes = parent.zcash_serialize_to_vec().unwrap();
+            let decoded: ParentBlock =
+                ParentDeserialize::zcash_deserialize_into(bytes.as_slice()).unwrap();
+            assert_eq!(decoded.zcash_serialize_to_vec().unwrap(), bytes);
+            assert!(
+                zebra_chain::serialization::ZcashDeserializeInto::zcash_deserialize_into::<Block>(
+                    bytes.as_slice()
+                )
+                .is_err()
+            );
+            let height = u32::from(parent.coinbase_height().unwrap());
+            let expected_hash = display_hash(parent.hash().0);
+            assert!(validate_persisted_winner_block(
+                &bytes,
+                &expected_hash,
+                height,
+                PersistedWinnerBlockKind::Zcash,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("invalid Equihash"));
+            for (hash, height) in [
+                (display_hash([0x55; 32]), height),
+                (expected_hash.clone(), height + 1),
+            ] {
+                assert!(validate_persisted_winner_block(
+                    &bytes,
+                    &hash,
+                    height,
+                    PersistedWinnerBlockKind::Zcash,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("metadata"));
+            }
+            let mut trailing = bytes;
+            trailing.push(0);
+            assert!(validate_persisted_winner_block(
+                &trailing,
+                &expected_hash,
+                height,
+                PersistedWinnerBlockKind::Zcash,
+            )
+            .is_err());
+        }
     }
 
     #[test]

@@ -13,6 +13,19 @@ by parent `nBits` or by a miner.
 
 ## Native trust boundary
 
+The prepared NU7 backend requires the dedicated Zebra 7 parent release line
+described in the [upgrade plan](../docs/nu7-merged-mining-upgrade.md). Private NU7
+templates carry exact predecessor NSM context. Independent proposal validators
+must provide matching `getwcashparentcontext(hash,height)` context within their
+existing bounded RPC path. An ordinary legacy parent does not satisfy that
+contract. This performs a state read, not another shielded-template build.
+
+All shipped Wcash profiles retain disabled NU7 parent activation. The backend
+therefore rejects new NU7 merged jobs until a coordinated Wcash upgrade assigns
+the child height. Durable, independently valid Zcash winners use the modern
+canonical codec for recovery without inheriting the new-Wcash-job gate. This
+does not change PostgreSQL schema, journal framing or payout reservations.
+
 The production-path topology uses three nodes:
 
 1. a Wcash child template/submission node;

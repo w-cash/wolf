@@ -6,7 +6,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use zcash_address::ToAddress;
+use wcash_zec_parent::address::ToAddress;
 
 use super::*;
 
@@ -319,7 +319,7 @@ fn competing_fixture_block(different_predecessor: bool) -> Block {
 
 fn fixture_provider() -> NativeZcashProvider {
     let network = NativeZcashNetwork::Mainnet;
-    let config = NativeZcashConfig::new(
+    let config = NativeZcashConfig::from_encoded_payout(
         RpcEndpoint::new("http://127.0.0.1:1/", None, None).unwrap(),
         vec![RpcEndpoint::new("http://127.0.0.1:2/", None, None).unwrap()],
         network,

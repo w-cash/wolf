@@ -2,7 +2,9 @@
 
 use equihash::tromp::solve_200_9;
 use sha2::{Digest, Sha256};
-use wcash_zcash_aux::{block_commitments_hash, AuxPowProof, ParentHeader, Target};
+use wcash_zcash_aux::{
+    block_commitments_hash, AuxPowProof, ParentCoinbaseRules, ParentHeader, Target,
+};
 use zebra_chain::{
     block::Header,
     work::{
@@ -11,11 +13,19 @@ use zebra_chain::{
     },
 };
 
-use crate::{build_parent_coinbase, coinbase::canonical_parent_coinbase, MinerError, ParentOutput};
+use crate::{
+    build_parent_coinbase,
+    coinbase::{canonical_parent_coinbase, canonical_parent_coinbase_with_rules},
+    MinerError, ParentOutput,
+};
 
 const HEADER_INPUT_BYTES: usize = 108;
 const HEADER_NONCE_BYTES: usize = 32;
 const SOLUTION_COMPACT_SIZE: [u8; 3] = [0xfd, 0x40, 0x05];
+
+#[cfg(test)]
+#[path = "job/nu7_vectors.rs"]
+mod nu7_vectors;
 
 /// Exact compressed byte length of a Zcash Equihash `(200, 9)` solution.
 pub const EQUIHASH_SOLUTION_BYTES: usize = 1_344;
@@ -75,6 +85,7 @@ pub struct PreparedJob {
     auth_data_merkle_branch: Vec<[u8; 32]>,
     chain_history_root: [u8; 32],
     auxiliary_nonce: u32,
+    parent_coinbase_rules: ParentCoinbaseRules,
 }
 
 impl PreparedJob {
@@ -154,6 +165,7 @@ impl PreparedJob {
             auth_data_merkle_branch: Vec::new(),
             chain_history_root: config.chain_history_root,
             auxiliary_nonce: config.auxiliary_nonce,
+            parent_coinbase_rules: ParentCoinbaseRules::Legacy,
         })
     }
 
@@ -163,6 +175,7 @@ impl PreparedJob {
     /// [`crate::native::NativeZcashProvider`], which checks the complete parent
     /// block and all roots before providing these components.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn from_live_template(
         child_block_hash: [u8; 32],
         required_target: Target,
@@ -173,12 +186,39 @@ impl PreparedJob {
         chain_history_root: [u8; 32],
         auxiliary_nonce: u32,
     ) -> Result<Self, MinerError> {
+        Self::from_live_template_with_parent_rules(
+            child_block_hash,
+            required_target,
+            coinbase_bytes,
+            parent_header_input,
+            parent_merkle_branch,
+            auth_data_merkle_branch,
+            chain_history_root,
+            auxiliary_nonce,
+            ParentCoinbaseRules::Legacy,
+        )
+    }
+
+    /// Freezes the candidate Wcash block's consensus policy with the exact work.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_live_template_with_parent_rules(
+        child_block_hash: [u8; 32],
+        required_target: Target,
+        coinbase_bytes: Vec<u8>,
+        parent_header_input: [u8; HEADER_INPUT_BYTES],
+        parent_merkle_branch: Vec<[u8; 32]>,
+        auth_data_merkle_branch: Vec<[u8; 32]>,
+        chain_history_root: [u8; 32],
+        auxiliary_nonce: u32,
+        parent_coinbase_rules: ParentCoinbaseRules,
+    ) -> Result<Self, MinerError> {
         if parent_merkle_branch.len() != auth_data_merkle_branch.len() {
             return Err(MinerError::InvalidParentTemplate(
                 "transaction and auth-data branches have different depths".to_string(),
             ));
         }
-        let coinbase = canonical_parent_coinbase(&coinbase_bytes)?;
+        let coinbase =
+            canonical_parent_coinbase_with_rules(&coinbase_bytes, parent_coinbase_rules)?;
         let job_id_bytes = job_id(
             child_block_hash,
             required_target,
@@ -188,6 +228,7 @@ impl PreparedJob {
             &auth_data_merkle_branch,
             chain_history_root,
         );
+        let job_id_bytes = bind_parent_rules(job_id_bytes, parent_coinbase_rules)?;
         let job_id = hex::encode(job_id_bytes);
 
         Ok(Self {
@@ -202,6 +243,7 @@ impl PreparedJob {
             auth_data_merkle_branch,
             chain_history_root,
             auxiliary_nonce,
+            parent_coinbase_rules,
         })
     }
 
@@ -223,6 +265,11 @@ impl PreparedJob {
     /// Returns the authenticated Wcash target for the parent work.
     pub const fn required_target(&self) -> Target {
         self.required_target
+    }
+
+    /// Returns the immutable policy selected for the candidate Wcash network and height.
+    pub const fn parent_coinbase_rules(&self) -> ParentCoinbaseRules {
+        self.parent_coinbase_rules
     }
 
     /// Returns the exact canonical parent coinbase bytes.
@@ -269,7 +316,7 @@ impl PreparedJob {
 
     /// Validates submitted `(200,9)` work and constructs the canonical proof.
     ///
-    /// Validation uses `AuxPowProof::validate`, including Zebra coinbase parsing,
+    /// Validation uses the frozen parent policy, including canonical coinbase parsing,
     /// both Merkle bindings, the authenticated Wcash target, and real Equihash.
     pub fn finalize(&self, nonce: &[u8], solution: &[u8]) -> Result<SolvedAuxPow, MinerError> {
         let parent_header = self.parent_header(nonce, solution)?;
@@ -285,7 +332,11 @@ impl PreparedJob {
             0,
             parent_header,
         )?;
-        let validated = proof.validate(self.child_block_hash, self.required_target)?;
+        let validated = proof.validate_with_parent_rules(
+            self.child_block_hash,
+            self.required_target,
+            self.parent_coinbase_rules,
+        )?;
         let parent_block_hash_le = validated.parent_work().block_hash().into_le_bytes();
         let encoded_proof = proof.encode()?;
 
@@ -322,9 +373,11 @@ impl PreparedJob {
             return Err(MinerError::ChildHeaderMismatch);
         }
 
-        solved
-            .proof
-            .validate(self.child_block_hash, self.required_target)?;
+        solved.proof.validate_with_parent_rules(
+            self.child_block_hash,
+            self.required_target,
+            self.parent_coinbase_rules,
+        )?;
         header.solution = Solution::for_wcash(solved.encoded_proof.clone())
             .map_err(MinerError::WcashWitnessEncoding)?;
 
@@ -464,8 +517,28 @@ fn job_id(
     hash.finalize().into()
 }
 
+fn bind_parent_rules(
+    legacy_job_id: [u8; 32],
+    rules: ParentCoinbaseRules,
+) -> Result<[u8; 32], MinerError> {
+    match rules {
+        ParentCoinbaseRules::Legacy => Ok(legacy_job_id),
+        ParentCoinbaseRules::LegacyAndNu7 => {
+            let mut hash = Sha256::new();
+            hash.update(b"Wcash/ZcashAuxPoW/job/legacy-and-nu7/v1\0");
+            hash.update(legacy_job_id);
+            Ok(hash.finalize().into())
+        }
+        _ => Err(MinerError::InvalidParentTemplate(
+            "unsupported candidate Wcash parent-coinbase policy".to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use wcash_zcash_aux::AuxPowError;
+
     use super::*;
 
     fn job(child: [u8; 32]) -> PreparedJob {
@@ -485,6 +558,103 @@ mod tests {
             &first.parent_header_input()[36..68],
             &first.coinbase_transaction_id()
         );
+    }
+
+    #[test]
+    fn parent_policy_is_frozen_and_legacy_job_ids_remain_unchanged() {
+        let original = job([0x42; 32]);
+        let rebuild = |rules| {
+            PreparedJob::from_live_template_with_parent_rules(
+                original.child_block_hash,
+                original.required_target,
+                original.coinbase_bytes.clone(),
+                original.parent_header_input,
+                original.parent_merkle_branch.clone(),
+                original.auth_data_merkle_branch.clone(),
+                original.chain_history_root,
+                original.auxiliary_nonce,
+                rules,
+            )
+            .unwrap()
+        };
+        let legacy = rebuild(ParentCoinbaseRules::Legacy);
+        let upgraded = rebuild(ParentCoinbaseRules::for_candidate_height(100, Some(100)));
+        assert_eq!(legacy, original);
+        assert_eq!(legacy.parent_coinbase_rules(), ParentCoinbaseRules::Legacy);
+        assert_eq!(
+            upgraded.parent_coinbase_rules(),
+            ParentCoinbaseRules::LegacyAndNu7
+        );
+        assert_ne!(upgraded.job_id(), original.job_id());
+        assert_eq!(upgraded.coinbase_bytes(), original.coinbase_bytes());
+        assert_eq!(
+            upgraded.parent_header_input(),
+            original.parent_header_input()
+        );
+        assert_eq!(
+            ParentCoinbaseRules::for_candidate_height(99, Some(100)),
+            ParentCoinbaseRules::Legacy
+        );
+        assert_eq!(
+            upgraded.clone().parent_coinbase_rules(),
+            upgraded.parent_coinbase_rules()
+        );
+    }
+
+    #[test]
+    fn nu7_live_job_requires_candidate_policy_and_real_equihash() {
+        use wcash_zec_parent::chain::serialization::ZcashSerialize;
+
+        for fixture in [
+            include_str!("../../wcash-zec-parent/test-vectors/nu7-v5-coinbase.hex"),
+            include_str!("../../wcash-zec-parent/test-vectors/nu7-v6-coinbase.hex"),
+        ] {
+            // Constructed codec fixtures are deliberately unsolved. Admission of
+            // their domain must never be mistaken for an accepted mining proof.
+            let mut bytes = hex::decode(fixture.trim()).unwrap();
+            let original = wcash_zec_parent::canonical_nu7_coinbase(&bytes).unwrap();
+            assert_eq!(original.zcash_serialize_to_vec().unwrap(), bytes);
+            let script = original.inputs()[0].coinbase_script().unwrap();
+            let script_start = 20 + 1 + 36 + 1;
+            let script_end = script_start + script.len();
+            assert_eq!(&bytes[script_start..script_end], script.as_slice());
+            let carrier = wcash_zcash_aux::miner_data_commitment([0x42; 32], &[], 0, 7).unwrap();
+            bytes[script_end - carrier.len()..script_end].copy_from_slice(&carrier);
+            let coinbase = wcash_zec_parent::canonical_nu7_coinbase(&bytes).unwrap();
+            assert_eq!(coinbase.hash(), original.hash());
+            let mut header = [0; HEADER_INPUT_BYTES];
+            header[..4].copy_from_slice(&4u32.to_le_bytes());
+            header[36..68].copy_from_slice(&coinbase.hash().0);
+            header[68..100].copy_from_slice(&block_commitments_hash(
+                [0x22; 32],
+                coinbase.auth_digest().unwrap().0,
+            ));
+            header[104..108].copy_from_slice(&0x207f_ffffu32.to_le_bytes());
+            let prepare = |rules| {
+                PreparedJob::from_live_template_with_parent_rules(
+                    [0x42; 32],
+                    Target::MAX,
+                    bytes.clone(),
+                    header,
+                    Vec::new(),
+                    Vec::new(),
+                    [0x22; 32],
+                    7,
+                    rules,
+                )
+            };
+            assert!(matches!(
+                prepare(ParentCoinbaseRules::Legacy),
+                Err(MinerError::AuxPow(
+                    AuxPowError::UnsupportedParentCoinbaseBranch(wcash_zec_parent::NU7_BRANCH_ID)
+                ))
+            ));
+            let prepared = prepare(ParentCoinbaseRules::LegacyAndNu7).unwrap();
+            assert!(matches!(
+                prepared.finalize(&[0; HEADER_NONCE_BYTES], &[0; EQUIHASH_SOLUTION_BYTES]),
+                Err(MinerError::AuxPow(AuxPowError::InvalidEquihash))
+            ));
+        }
     }
 
     #[test]

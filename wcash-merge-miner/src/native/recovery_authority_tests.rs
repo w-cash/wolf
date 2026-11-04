@@ -159,12 +159,12 @@ fn configuration(
 ) -> (NativeZcashConfig, Vec<Server>) {
     assert_eq!(scripts.len(), 4);
     let (endpoints, servers): (Vec<_>, Vec<_>) = scripts.into_iter().map(scripted).unzip();
-    let mut config = NativeZcashConfig::new(
+    let mut config = NativeZcashConfig::from_encoded_payout(
         endpoints[0].clone(),
         vec![endpoints[1].clone()],
         network,
         network.consensus_parameters().genesis_hash().to_string(),
-        "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV".parse().unwrap(),
+        "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV",
     )
     .unwrap()
     .with_broadcast_nodes(vec![endpoints[2].clone()])

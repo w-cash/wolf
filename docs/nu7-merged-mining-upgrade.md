@@ -61,7 +61,29 @@ rewards, canonical-chain inclusion or end-to-end pool readiness. Normal tests
 verify the stored proofs; only the explicitly ignored, bounded offline generator
 runs a solver.
 
-## Remaining compatibility changes
+## Backend template and recovery capability
+
+The backend uses the isolated parent types for Zcash templates, submitted blocks
+and retained winners. Wcash blocks and historical monetary checks keep their
+existing codec. Each prepared job freezes its child-height parent policy; new
+jobs cannot use NU7 while the shipped Wcash activation height is unset.
+
+NU7 reward checks require the exact predecessor NSM balance, candidate height
+and hash supplied by the private parent template. Each independent proposal
+validator must return identical `getwcashparentcontext(hash,height)` context
+before voting on the exact block. Missing or changed context fails closed;
+scheduled supply and a guessed zero reserve are not substitutes. Fee checks sum
+gross selected-transaction fees with checked arithmetic and apply the aggregate
+ZIP-235 contribution rounding before checking the configured miner recipient
+and mandatory funding/disbursement outputs.
+
+Durable Zcash replay parses the modern canonical block and checks its exact
+hash, height, compact target and real proof of work without applying the Wcash
+new-job activation gate. Wcash replay derives the historical child policy from
+its preserved network and candidate height. Journal records and PostgreSQL
+schema are unchanged; this layer needs no accounting migration or rewrite.
+
+## Remaining qualification
 
 1. Qualify the [dedicated NU7 parent-node draft](https://github.com/w-cash/wolf/pull/60),
    including its private template, payout-commitment, block-status and exact
@@ -69,10 +91,10 @@ runs a solver.
    independent proposal validation and exact winning-block submission. Upgrade
    every Zcash role; an unmodified stock node cannot replace the custom template
    provider.
-2. Update Wolf's canonical parent parsing, height-selected branch, subsidy,
-   funding and fee checks. Preserve the immutable template and retained-job
-   recovery contracts. Do not enable experimental NU7 flags as a substitute for
-   complete consensus support.
+2. Qualify the prepared backend's parent parsing, branch selection, exact NSM,
+   subsidy, funding, fee and shielded-recipient checks against the matching
+   parent-node artifact. Preserve immutable templates and retained-job recovery.
+   Do not enable experimental NU7 flags as a substitute for complete consensus.
 3. Agree a future Wcash activation height with validating operators before
    enabling the prepared new-domain policy. No public-network height is assigned here.
    Never use an external live Zcash tip as Wcash consensus input. Preserve
