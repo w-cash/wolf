@@ -15,7 +15,7 @@ as the upstream references. The initial audited upstream commit is
 `e8db87eb69254e0d4eedd058eadd48bdfa09065a`; the production backend baseline is
 `153492512ebca3a3dcc104fec3ffeaab83cce41f`.
 
-## First prerequisite: explicit parent-domain rules
+## Legacy parent-domain guard
 
 `ParentCoinbaseRules::Legacy` freezes the 15 branch IDs recognized by the
 existing production parent parser, including its Wcash domains. Both the
@@ -29,14 +29,43 @@ values. Explicitly freezing the domain prevents a future library update from
 silently changing Wcash block acceptance. Experimental placeholder builds are
 not a supported production consensus profile.
 
-This prerequisite does not add NU7 parser support or activate new Wcash proofs.
-It does not change proof framing, Wcash subsidy, foundation policy, block
-spacing, wallets, accounting, PostgreSQL schema or node-state storage.
+The default API retains this guard. It does not activate new Wcash proofs or
+change proof framing, Wcash subsidy, foundation policy, block spacing, wallets,
+accounting, PostgreSQL schema or node-state storage.
+
+## Dormant NU7 parent capability
+
+`ParentCoinbaseRules::LegacyAndNu7` adds only the official NU7 parent domain to
+the frozen legacy set. Only that exact domain enters the isolated
+[`wcash-zec-parent` adapter](../wcash-zec-parent/README.md). Every legacy domain
+keeps its original canonical parser, including byte encodings accepted before
+this upgrade. A rejected legacy encoding is never retried with a newer parser.
+
+The adapter pins complete canonical Zcash types from the reviewed stable Zebra
+revision. [Source-isolated dependency snapshots](../vendor/nu7-compat/README.md)
+preserve Wcash's prerelease transaction/key libraries and its address parser's
+accepted-length range. Rust source is unchanged in those snapshots; only
+dependency paths differ. The adapter and its consumers require Rust 1.89 or
+newer; the repository's pinned build toolchain remains Rust 1.91.
+
+Node validation selects the policy from the candidate Wcash network and height.
+`Network::wcash_nu7_parent_activation_height()` returns `None` for **every shipped
+profile**, including Regtest. There is no production runtime override. Tests
+exercise an explicit synthetic boundary at child heights 99, 100 and 101. That
+test boundary is not a scheduled network upgrade.
+
+Four stored v5/v6 cryptographic vectors exercise WEC-only and dual-target work,
+real Equihash, both authenticated bindings, legacy rejection and height-policy
+selection. They use synthetic chain context and do not establish valid Zcash
+rewards, canonical-chain inclusion or end-to-end pool readiness. Normal tests
+verify the stored proofs; only the explicitly ignored, bounded offline generator
+runs a solver.
 
 ## Remaining compatibility changes
 
-1. Port the required private template, payout-commitment and block-status RPC
-   contracts onto the complete stable NU7 parent-node implementation. Preserve
+1. Qualify the [dedicated NU7 parent-node draft](https://github.com/w-cash/wolf/pull/60),
+   including its private template, payout-commitment, block-status and exact
+   parent-NSM context contracts. Preserve
    independent proposal validation and exact winning-block submission. Upgrade
    every Zcash role; an unmodified stock node cannot replace the custom template
    provider.
@@ -44,9 +73,8 @@ spacing, wallets, accounting, PostgreSQL schema or node-state storage.
    funding and fee checks. Preserve the immutable template and retained-job
    recovery contracts. Do not enable experimental NU7 flags as a substitute for
    complete consensus support.
-3. Add a new parent-proof policy and select it from the candidate Wcash network
-   and height. Agree a future Wcash activation height with validating operators
-   before enabling new-domain proofs. No Mainnet height is assigned here.
+3. Agree a future Wcash activation height with validating operators before
+   enabling the prepared new-domain policy. No public-network height is assigned here.
    Never use an external live Zcash tip as Wcash consensus input. Preserve
    historical supported proof behavior across reorgs and replay.
 4. Test the separate pool transports, assignment/winner handling, durable

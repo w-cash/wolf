@@ -1,0 +1,4 @@
+kind: Added
+body: Select explicit legacy-or-NU7 parent-proof rules from candidate Wcash network and height, preserving legacy validation and keeping every shipped activation disabled.
+time: 2026-11-04T20:00:00Z
+project: zebra-consensus

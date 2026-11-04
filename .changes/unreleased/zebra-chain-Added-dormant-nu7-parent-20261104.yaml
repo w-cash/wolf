@@ -1,0 +1,4 @@
+kind: Added
+body: Add a separate candidate-Wcash-height policy boundary for NU7 parent proofs, with activation unassigned on every shipped network and no monetary or spacing change.
+time: 2026-11-04T20:00:00Z
+project: zebra-chain

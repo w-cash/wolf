@@ -253,11 +253,17 @@ pub fn wcash_auxpow_is_valid(
         }
     })?;
 
-    // Parser support alone must not activate another parent transaction domain.
-    // A future policy must be selected from this candidate's Wcash network and
-    // height, never from a validator's external Zcash tip.
+    // Parent-domain support is selected only from this candidate's child
+    // consensus context. Every shipped profile remains disabled until a
+    // coordinated Wcash release assigns its activation height.
+    let parent_rules = ParentCoinbaseRules::for_candidate_height(
+        height.0,
+        network
+            .wcash_nu7_parent_activation_height()
+            .map(|height| height.0),
+    );
     proof
-        .validate_with_parent_rules(hash.0, target, ParentCoinbaseRules::Legacy)
+        .validate_with_parent_rules(hash.0, target, parent_rules)
         .map_err(|source| BlockError::InvalidWcashAuxPow {
             height: *height,
             hash: *hash,
@@ -668,6 +674,40 @@ pub fn merkle_root_validity(
 #[cfg(test)]
 mod wcash_auxpow_tests {
     use super::*;
+
+    #[test]
+    fn parent_policy_stays_legacy_on_shipped_profiles_and_tracks_explicit_regtest_height() {
+        for network in [
+            Network::new_wcash_mainnet_for_tests(),
+            Network::new_wcash_testnet(),
+            Network::new_wcash_regtest(),
+        ] {
+            for height in [0, 99, 100, 101, u32::MAX] {
+                assert_eq!(
+                    ParentCoinbaseRules::for_candidate_height(
+                        height,
+                        network
+                            .wcash_nu7_parent_activation_height()
+                            .map(|height| height.0)
+                    ),
+                    ParentCoinbaseRules::Legacy
+                );
+            }
+        }
+        // Test-only Regtest schedule; no network default or runtime override.
+        assert_eq!(
+            ParentCoinbaseRules::for_candidate_height(99, Some(100)),
+            ParentCoinbaseRules::Legacy
+        );
+        assert_eq!(
+            ParentCoinbaseRules::for_candidate_height(100, Some(100)),
+            ParentCoinbaseRules::LegacyAndNu7
+        );
+        assert_eq!(
+            ParentCoinbaseRules::for_candidate_height(101, Some(100)),
+            ParentCoinbaseRules::LegacyAndNu7
+        );
+    }
 
     #[test]
     fn target_conversion_uses_little_endian_numeric_order() {

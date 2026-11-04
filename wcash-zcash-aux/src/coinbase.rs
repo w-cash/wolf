@@ -80,6 +80,15 @@ pub(crate) struct ZebraCoinbaseVerifierWithRules(pub(crate) ParentCoinbaseRules)
 #[cfg(feature = "zebra")]
 impl CoinbaseVerifier for ZebraCoinbaseVerifierWithRules {
     fn verify(&self, serialized_coinbase: &[u8]) -> Result<CoinbaseSummary, AuxPowError> {
+        // Never retry a rejected legacy encoding with a newer parser: its
+        // accepted byte language differs from the frozen production parser.
+        // Only the official NU7 domain enters the isolated modern adapter.
+        if self.0 == ParentCoinbaseRules::LegacyAndNu7
+            && serialized_coinbase.get(8..12)
+                == Some(wcash_zec_parent::NU7_BRANCH_ID.to_le_bytes().as_slice())
+        {
+            return verify_nu7_coinbase(serialized_coinbase);
+        }
         use std::io::Cursor;
 
         use zebra_chain::{
@@ -133,6 +142,40 @@ impl CoinbaseVerifier for ZebraCoinbaseVerifierWithRules {
             miner_data,
         ))
     }
+}
+
+#[cfg(feature = "zebra")]
+fn verify_nu7_coinbase(serialized_coinbase: &[u8]) -> Result<CoinbaseSummary, AuxPowError> {
+    use wcash_zec_parent::{canonical_nu7_coinbase, ParentError};
+
+    let transaction = canonical_nu7_coinbase(serialized_coinbase).map_err(|error| match error {
+        ParentError::NonCanonicalCoinbase => AuxPowError::NonCanonicalParentCoinbase,
+        ParentError::NotCoinbase => AuxPowError::ParentTransactionIsNotCoinbase,
+        ParentError::UnsupportedVersion(version) => {
+            AuxPowError::UnsupportedParentCoinbaseVersion(version)
+        }
+        ParentError::UnsupportedBranch(branch) => {
+            AuxPowError::UnsupportedParentCoinbaseBranch(branch)
+        }
+        ParentError::CoinbaseTooLarge | ParentError::InvalidCoinbase => {
+            AuxPowError::InvalidParentCoinbase
+        }
+    })?;
+    let digest = transaction
+        .auth_digest()
+        .ok_or(AuxPowError::InvalidParentCoinbase)?
+        .0;
+    let inputs = transaction.inputs();
+    let miner_data = inputs
+        .first()
+        .and_then(|input| input.miner_data())
+        .ok_or(AuxPowError::MissingParentCoinbaseMinerData)?
+        .clone();
+    Ok(CoinbaseSummary::new(
+        transaction.hash().0,
+        digest,
+        miner_data,
+    ))
 }
 
 #[cfg(all(test, feature = "zebra"))]
@@ -207,7 +250,16 @@ mod tests {
                 let explicit = ZebraCoinbaseVerifierWithRules(ParentCoinbaseRules::Legacy)
                     .verify(&coinbase)
                     .expect("every frozen branch remains parseable for an empty-bundle coinbase");
-                assert_eq!(ZebraCoinbaseVerifier.verify(&coinbase), Ok(explicit));
+                assert_eq!(
+                    ZebraCoinbaseVerifier.verify(&coinbase),
+                    Ok(explicit.clone())
+                );
+                assert_eq!(
+                    ZebraCoinbaseVerifierWithRules(ParentCoinbaseRules::LegacyAndNu7)
+                        .verify(&coinbase),
+                    Ok(explicit),
+                    "the new policy must not replace the frozen legacy parser"
+                );
             }
         }
     }
@@ -229,6 +281,31 @@ mod tests {
                     verifier.verify(&coinbase).is_err(),
                     "unknown domains cannot bypass canonical parsing or the selected policy"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn official_nu7_coinbases_require_explicit_policy_and_exact_bytes() {
+        for encoded in [
+            include_str!("../../wcash-zec-parent/test-vectors/nu7-v5-coinbase.hex"),
+            include_str!("../../wcash-zec-parent/test-vectors/nu7-v6-coinbase.hex"),
+        ] {
+            let bytes = hex::decode(encoded.trim()).unwrap();
+            assert!(ZebraCoinbaseVerifier.verify(&bytes).is_err());
+            let verifier = ZebraCoinbaseVerifierWithRules(ParentCoinbaseRules::LegacyAndNu7);
+            let parsed = verifier.verify(&bytes).unwrap();
+            assert!(parsed.miner_data().starts_with(b"nu7-fixture"));
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert_eq!(
+                verifier.verify(&trailing),
+                Err(AuxPowError::NonCanonicalParentCoinbase)
+            );
+            for branch in [0xdead_beefu32, 0xffff_fffe, 0x7719_0ad8] {
+                let mut wrong_branch = bytes.clone();
+                wrong_branch[8..12].copy_from_slice(&branch.to_le_bytes());
+                assert!(verifier.verify(&wrong_branch).is_err());
             }
         }
     }

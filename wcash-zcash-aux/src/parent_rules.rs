@@ -19,9 +19,28 @@ pub enum ParentCoinbaseRules {
     /// proof acceptance; it does not assert Zcash canonical-chain inclusion.
     #[default]
     Legacy,
+    /// The unchanged legacy domains plus the official Zcash NU7 v5/v6 domain.
+    ///
+    /// This policy requires an explicit Wcash activation selected from the
+    /// candidate child block, independently of the live Zcash chain.
+    LegacyAndNu7,
 }
 
 impl ParentCoinbaseRules {
+    /// Selects parent rules from a deterministic candidate Wcash height.
+    ///
+    /// `None` keeps the legacy rules at every height. Shipped network profiles
+    /// have no activation until a coordinated Wcash release assigns one.
+    pub const fn for_candidate_height(
+        candidate_height: u32,
+        activation_height: Option<u32>,
+    ) -> Self {
+        match activation_height {
+            Some(activation) if candidate_height >= activation => Self::LegacyAndNu7,
+            _ => Self::Legacy,
+        }
+    }
+
     /// Check the exact branch embedded in a canonical v5 or v6 coinbase.
     ///
     /// These literal domains deliberately do not follow an upstream parser's
@@ -29,26 +48,25 @@ impl ParentCoinbaseRules {
     /// expand Wcash consensus. Experimental placeholder domains are excluded.
     #[cfg(any(feature = "zebra", test))]
     pub(crate) fn check_branch(self, branch_id: u32) -> Result<(), AuxPowError> {
-        let allowed = match self {
-            Self::Legacy => matches!(
-                branch_id,
-                0x0000_0000
-                    | 0x5ba8_1b19
-                    | 0x76b8_09bb
-                    | 0x2bb4_0e60
-                    | 0xf5b9_230b
-                    | 0xe9ff_75a6
-                    | 0xc2d6_d0b4
-                    | 0xc8e7_1055
-                    | 0x4dec_4df0
-                    | 0x5437_f330
-                    | 0x37a5_165b
-                    | 0xb3cf_d27e
-                    | 0x54ba_2bfb
-                    | 0xd9c6_a7ee
-                    | 0xc3a6_678a
-            ),
-        };
+        let legacy = matches!(
+            branch_id,
+            0x0000_0000
+                | 0x5ba8_1b19
+                | 0x76b8_09bb
+                | 0x2bb4_0e60
+                | 0xf5b9_230b
+                | 0xe9ff_75a6
+                | 0xc2d6_d0b4
+                | 0xc8e7_1055
+                | 0x4dec_4df0
+                | 0x5437_f330
+                | 0x37a5_165b
+                | 0xb3cf_d27e
+                | 0x54ba_2bfb
+                | 0xd9c6_a7ee
+                | 0xc3a6_678a
+        );
+        let allowed = legacy || (self == Self::LegacyAndNu7 && branch_id == 0x7719_0ad9);
 
         if allowed {
             Ok(())
@@ -96,6 +114,42 @@ mod tests {
             assert_eq!(
                 ParentCoinbaseRules::Legacy.check_branch(branch_id),
                 Err(AuxPowError::UnsupportedParentCoinbaseBranch(branch_id))
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_candidate_height_selects_the_policy_without_external_state() {
+        for height in [0, 99, 100, 101, u32::MAX] {
+            assert_eq!(
+                ParentCoinbaseRules::for_candidate_height(height, None),
+                ParentCoinbaseRules::Legacy
+            );
+        }
+        // A configured local Regtest boundary, not a shipped network activation.
+        for (height, expected) in [
+            (99, ParentCoinbaseRules::Legacy),
+            (100, ParentCoinbaseRules::LegacyAndNu7),
+            (101, ParentCoinbaseRules::LegacyAndNu7),
+            (99, ParentCoinbaseRules::Legacy),
+        ] {
+            assert_eq!(
+                ParentCoinbaseRules::for_candidate_height(height, Some(100)),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn nu7_policy_adds_only_the_official_domain() {
+        assert_eq!(
+            ParentCoinbaseRules::LegacyAndNu7.check_branch(0x7719_0ad9),
+            Ok(())
+        );
+        for branch in [0xdead_beef, 0xffff_ffff, 0xffff_fffe, 0x7719_0ad8] {
+            assert_eq!(
+                ParentCoinbaseRules::LegacyAndNu7.check_branch(branch),
+                Err(AuxPowError::UnsupportedParentCoinbaseBranch(branch))
             );
         }
     }

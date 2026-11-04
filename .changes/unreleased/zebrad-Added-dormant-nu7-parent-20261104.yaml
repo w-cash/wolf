@@ -1,0 +1,4 @@
+kind: Added
+body: Prepare isolated canonical NU7 parent parsing and solved cryptographic interoperability vectors while retaining Wcash transaction domains, address parsing, emission, foundation policy and state format. Activation remains unassigned.
+time: 2026-11-04T20:00:00Z
+project: zebrad

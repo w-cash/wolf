@@ -1,0 +1,32 @@
+[package]
+name = "wcash-zec-parent"
+version = "0.1.0"
+publish = false
+authors.workspace = true
+description = "Isolated canonical NU7 Zcash parent types for Wcash merged mining"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version = "1.89"
+
+[features]
+test-helpers = ["zec-parent-chain/proptest-impl"]
+
+[dependencies]
+zec-parent-chain = { package = "zebra-chain", git = "https://github.com/ZcashFoundation/zebra", rev = "e8db87eb69254e0d4eedd058eadd48bdfa09065a", default-features = false }
+zec-parent-address = { package = "zcash_address", version = "=0.14.0" }
+zec-parent-protocol = { package = "zcash_protocol", version = "=0.11.0" }
+zec-parent-transparent = { package = "zcash_transparent", version = "=0.11.0", default-features = false }
+orchard = { version = "=0.16.0", default-features = false }
+sapling-crypto = { version = "=0.9.0", default-features = false }
+zcash_note_encryption = { version = "=0.5.1", default-features = false }
+
+[dev-dependencies]
+zec-parent-chain = { package = "zebra-chain", git = "https://github.com/ZcashFoundation/zebra", rev = "e8db87eb69254e0d4eedd058eadd48bdfa09065a", default-features = false, features = ["proptest-impl"] }
+hex = { workspace = true }
+rand_core = "=0.10.1"
+zec-parent-primitives = { package = "zcash_primitives", version = "=0.31.0", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
