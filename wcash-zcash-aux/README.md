@@ -126,7 +126,7 @@ Wcash domains; it does not assert parent-chain inclusion or branch activation.
 modern Zcash parser. All legacy domains retain the exact old parser; there is
 no fallback from a rejected legacy encoding. Choose this policy only from the
 candidate Wcash network and height. This branch proposes Wcash Mainnet height
-51,000; other profiles remain unassigned. The proposal requires coordinated
+51,350; other profiles remain unassigned. The proposal requires coordinated
 adoption before finalization and is not deployment approval. The default
 `validate()` method remains legacy at every height; contextual node/backend
 callers select the policy from the shared network-height rule.

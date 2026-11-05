@@ -21,7 +21,7 @@ mod tests;
 
 // Provisional child height for the unmerged Mainnet NU7 parent-policy proposal.
 // This is not a finalized public activation schedule.
-const WCASH_MAINNET_NU7_PARENT_ACTIVATION_HEIGHT: Height = Height(51_000);
+const WCASH_MAINNET_NU7_PARENT_ACTIVATION_HEIGHT: Height = Height(51_350);
 
 // Mainnet temporary Orchard-disabling soft-fork height, shipped publicly in Zebra v4.5.3.
 // This is DISTINCT from the NU6.2 *activation* (re-enable) height (3_364_600, see
@@ -268,7 +268,7 @@ impl Network {
 
     /// The Wcash child height enabling official NU7 parent coinbases.
     ///
-    /// Mainnet height 51,000 is provisional in this unmerged proposal, not a
+    /// Mainnet height 51,350 is provisional in this unmerged proposal, not a
     /// finalized public schedule. Other profiles remain disabled. This rule
     /// never follows a live Zcash tip or an operator configuration knob.
     pub fn wcash_nu7_parent_activation_height(&self) -> Option<Height> {

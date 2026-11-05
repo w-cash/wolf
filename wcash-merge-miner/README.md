@@ -20,7 +20,7 @@ must provide matching `getwcashparentcontext(hash,height)` context within their
 existing bounded RPC path. An ordinary legacy parent does not satisfy that
 contract. This performs a state read, not another shielded-template build.
 
-This branch proposes NU7 parent acceptance from Wcash Mainnet height 51,000.
+This branch proposes NU7 parent acceptance from Wcash Mainnet height 51,350.
 The schedule is provisional and requires operator agreement before finalization;
 it is not deployment approval. Below that boundary, and on every other Wcash
 profile, the backend rejects new NU7 merged jobs. The default-feature backend

@@ -30,13 +30,13 @@ fn official_nu7_parent_support_is_mainnet_height_bound() {
     let mainnet = Network::new_wcash_mainnet_for_tests();
     assert_eq!(
         mainnet.wcash_nu7_parent_activation_height(),
-        Some(Height(51_000))
+        Some(Height(51_350))
     );
     assert_eq!(
         Network::try_new_wcash_mainnet()
             .expect("the production Mainnet anchor is frozen")
             .wcash_nu7_parent_activation_height(),
-        Some(Height(51_000))
+        Some(Height(51_350))
     );
     for network in [
         Network::Mainnet,
@@ -165,7 +165,7 @@ fn wcash_mainnet_profile_is_fully_wired_with_frozen_anchor() -> Result<(), Repor
     );
 
     // The parent-domain proposal changes neither the child branch/spacing nor
-    // the existing integer subsidy and foundation allocation at its boundary.
+    // the existing integer subsidy and foundation allocation at these fixed heights.
     for (height, subsidy_zat, miner_zat) in [
         (50_999, 2_170_380_811, 1_519_266_568),
         (51_000, 2_170_378_224, 1_519_264_757),

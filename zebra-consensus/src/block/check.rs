@@ -681,13 +681,13 @@ mod wcash_auxpow_tests {
         let activation = mainnet
             .wcash_nu7_parent_activation_height()
             .map(|height| height.0);
-        assert_eq!(activation, Some(51_000));
+        assert_eq!(activation, Some(51_350));
         for (height, expected) in [
             (0, ParentCoinbaseRules::Legacy),
-            (50_999, ParentCoinbaseRules::Legacy),
-            (51_000, ParentCoinbaseRules::LegacyAndNu7),
-            (51_001, ParentCoinbaseRules::LegacyAndNu7),
-            (50_999, ParentCoinbaseRules::Legacy),
+            (51_349, ParentCoinbaseRules::Legacy),
+            (51_350, ParentCoinbaseRules::LegacyAndNu7),
+            (51_351, ParentCoinbaseRules::LegacyAndNu7),
+            (51_349, ParentCoinbaseRules::Legacy),
             (Height::MAX.0, ParentCoinbaseRules::LegacyAndNu7),
         ] {
             assert_eq!(
@@ -703,7 +703,7 @@ mod wcash_auxpow_tests {
             Network::new_wcash_regtest(),
         ] {
             assert_eq!(network.wcash_nu7_parent_activation_height(), None);
-            for height in [0, 50_999, 51_000, 51_001, Height::MAX.0] {
+            for height in [0, 51_349, 51_350, 51_351, Height::MAX.0] {
                 assert_eq!(
                     ParentCoinbaseRules::for_candidate_height(
                         height,

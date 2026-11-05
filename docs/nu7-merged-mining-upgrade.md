@@ -7,7 +7,7 @@ Wcash's smooth emission, permanent tail, foundation allocation, transaction
 domain and network identity remain release invariants.
 
 This is a staged implementation plan, not a deployment or readiness claim.
-This branch proposes Wcash Mainnet height **51,000** for NU7 parent-proof
+This branch proposes Wcash Mainnet height **51,350** for NU7 parent-proof
 acceptance. The height is provisional: operator readiness, canonical chain
 progress and the parent activation window still need agreement. Keep this
 proposal unmerged and off production until that scheduling decision and the
@@ -55,7 +55,7 @@ dependency paths differ. The adapter and its consumers require Rust 1.89 or
 newer; the repository's pinned build toolchain remains Rust 1.91.
 
 Node validation selects the policy from the candidate Wcash network and height.
-`Network::wcash_nu7_parent_activation_height()` selects the proposed **51,000**
+`Network::wcash_nu7_parent_activation_height()` selects the proposed **51,350**
 boundary only for Wcash Mainnet. Earlier candidates retain `Legacy`; candidates
 at or above the boundary select `LegacyAndNu7`. Wcash Testnet, Regtest, inherited
 Zcash networks and configured testnets retain `None`. There is no production
