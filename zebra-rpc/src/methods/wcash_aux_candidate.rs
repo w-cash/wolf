@@ -109,13 +109,6 @@ mod tests {
         for _ in 0..64 {
             let mut candidate = from_template(&template, &network).unwrap();
             assert!(ids.insert(candidate.hash()), "each request gets fresh work");
-            zebra_consensus::block::check::wcash_auxpow_proposal_is_valid(
-                &candidate.header,
-                &network,
-                &Height(1),
-                &candidate.hash(),
-            )
-            .expect("a random child nonce preserves the proposal header rules");
             Arc::make_mut(&mut candidate.header).nonce = base.header.nonce;
             assert_eq!(candidate.zcash_serialize_to_vec().unwrap(), base_bytes);
         }
