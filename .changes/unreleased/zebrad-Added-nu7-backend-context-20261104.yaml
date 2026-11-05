@@ -1,0 +1,4 @@
+kind: Added
+body: Prepare NU7 merged templates with exact predecessor NSM and fee validation, frozen child-height policy and modern durable Zcash winner recovery. Wcash activation remains unassigned; no accounting schema or journal rewrite is required.
+time: 2026-11-04T20:30:00Z
+project: zebrad

@@ -2388,49 +2388,95 @@ fn validate_exact_winner_block(
             reason: "block proof does not bind the receipt parent hash".to_string(),
         });
     }
-    let block: Block = block_bytes.zcash_deserialize_into().map_err(|error| {
-        PoolBackendJournalError::InvalidWinnerBlock {
-            event_seq,
-            chain,
-            reason: format!("canonical block could not be decoded for metadata binding: {error}"),
+    validate_exact_winner_metadata(block_bytes, winner, job, event_seq)
+}
+
+/// Bind metadata only after the caller validates canonical proof-of-work.
+/// Keeping this separate does not authorize an unsolved fixture as a winner.
+fn validate_exact_winner_metadata(
+    block_bytes: &[u8],
+    winner: &WinnerDescriptor,
+    job: &JobDescriptor,
+    event_seq: u64,
+) -> Result<(), PoolBackendJournalError> {
+    let chain = chain_name(winner.chain);
+    let metadata_error = |reason| PoolBackendJournalError::InvalidWinnerBlock {
+        event_seq,
+        chain,
+        reason,
+    };
+    let (previous_hash, target_le, coinbase_txid) = match winner.chain {
+        MergedChain::Wcash => {
+            let block: Block = block_bytes.zcash_deserialize_into().map_err(|error| {
+                metadata_error(format!(
+                    "canonical Wcash block could not be decoded for metadata binding: {error}"
+                ))
+            })?;
+            let expanded: U256 = block
+                .header
+                .difficulty_threshold
+                .to_expanded()
+                .ok_or_else(|| metadata_error("block has an invalid compact target".to_string()))?
+                .into();
+            (
+                block.header.previous_block_hash.0,
+                expanded.to_little_endian(),
+                block
+                    .transactions
+                    .first()
+                    .map(|transaction| transaction.hash().0),
+            )
         }
-    })?;
+        MergedChain::Zcash => {
+            use wcash_zec_parent::chain::{
+                block::Block as ParentBlock,
+                serialization::ZcashDeserializeInto as ParentDeserialize,
+                work::difficulty::U256 as ParentU256,
+            };
+            let block: ParentBlock = ParentDeserialize::zcash_deserialize_into(block_bytes)
+                .map_err(|error| {
+                    metadata_error(format!(
+                        "canonical Zcash block could not be decoded for metadata binding: {error}"
+                    ))
+                })?;
+            let expanded: ParentU256 = block
+                .header
+                .difficulty_threshold
+                .to_expanded()
+                .ok_or_else(|| metadata_error("block has an invalid compact target".to_string()))?
+                .into();
+            (
+                block.header.previous_block_hash.0,
+                expanded.to_little_endian(),
+                block
+                    .transactions
+                    .first()
+                    .map(|transaction| transaction.hash().0),
+            )
+        }
+    };
     let expected_previous = match winner.chain {
         MergedChain::Wcash => &job.wcash_previous_hash_le,
         MergedChain::Zcash => &job.zcash_previous_hash_le,
     };
-    if block.header.previous_block_hash.0 != *expected_previous.as_bytes() {
+    if previous_hash != *expected_previous.as_bytes() {
         return Err(PoolBackendJournalError::InvalidWinnerBlock {
             event_seq,
             chain,
             reason: "block predecessor does not match its activated job".to_string(),
         });
     }
-    let expanded_target = block
-        .header
-        .difficulty_threshold
-        .to_expanded()
-        .ok_or_else(|| PoolBackendJournalError::InvalidWinnerBlock {
-            event_seq,
-            chain,
-            reason: "block has an invalid compact target".to_string(),
-        })?;
-    let expanded_target: U256 = expanded_target.into();
     let expected_target = match winner.chain {
         MergedChain::Wcash => &job.wcash_target_le,
         MergedChain::Zcash => &job.zcash_target_le,
     };
-    if expanded_target.to_little_endian() != *expected_target.as_bytes() {
+    if target_le != *expected_target.as_bytes() {
         return Err(PoolBackendJournalError::InvalidWinnerBlock {
             event_seq,
             chain,
             reason: "block target does not match its activated job".to_string(),
         });
     }
-    let coinbase_txid = block
-        .transactions
-        .first()
-        .map(|transaction| transaction.hash().0);
     if coinbase_txid != Some(*winner.coinbase_txid_le.as_bytes()) {
         return Err(PoolBackendJournalError::InvalidWinnerBlock {
             event_seq,
@@ -3617,6 +3663,95 @@ mod tests {
             .expect("replay state is reconstructed");
         assert!(replay.replayed);
         assert_eq!(reopened.current_event_seq().unwrap(), 2);
+    }
+
+    #[test]
+    fn nu7_parent_metadata_uses_modern_codec_without_authorizing_unsolved_work() {
+        use wcash_zec_parent::chain::{
+            block::Block as ParentBlock,
+            serialization::{ZcashDeserializeInto as ParentDeserialize, ZcashSerialize as _},
+            work::difficulty::U256 as ParentU256,
+        };
+
+        for encoded in [
+            include_str!("../../wcash-zec-parent/test-vectors/nu7-v5-coinbase.hex"),
+            include_str!("../../wcash-zec-parent/test-vectors/nu7-v6-coinbase.hex"),
+        ] {
+            let historical = hex::decode(
+                include_str!("../../zebra-test/src/vectors/block-main-0-000-001.txt").trim(),
+            )
+            .unwrap();
+            let mut block: ParentBlock =
+                ParentDeserialize::zcash_deserialize_into(historical.as_slice()).unwrap();
+            let coinbase =
+                wcash_zec_parent::canonical_nu7_coinbase(&hex::decode(encoded.trim()).unwrap())
+                    .unwrap();
+            assert_eq!(
+                u32::from(coinbase.consensus_branch_id()),
+                wcash_zec_parent::NU7_BRANCH_ID
+            );
+            block.transactions = vec![std::sync::Arc::new(coinbase)];
+            let merkle_root = block.transactions.iter().collect();
+            std::sync::Arc::make_mut(&mut block.header).merkle_root = merkle_root;
+            let bytes = block.zcash_serialize_to_vec().unwrap();
+            let mut descriptor = job(9);
+            descriptor.zcash_previous_hash_le = Hex32::new(block.header.previous_block_hash.0);
+            descriptor.zcash_height = u32::from(block.coinbase_height().unwrap());
+            descriptor.zcash_coinbase_txid_le = Hex32::new(block.transactions[0].hash().0);
+            let expanded: ParentU256 = block
+                .header
+                .difficulty_threshold
+                .to_expanded()
+                .unwrap()
+                .into();
+            descriptor.zcash_target_le = TargetLe::new(expanded.to_little_endian());
+            let winner = WinnerDescriptor {
+                chain: MergedChain::Zcash,
+                block_hash_le: Hex32::new(block.hash().0),
+                height: descriptor.zcash_height,
+                coinbase_txid_le: descriptor.zcash_coinbase_txid_le.clone(),
+                reward_zat: descriptor.zcash_reward_zat,
+                maturity_confirmations: descriptor.zcash_maturity_confirmations,
+            };
+
+            // Metadata-only coverage: the constructed NU7 block has no genuine
+            // Equihash solution or parent-consensus-valid reward provenance.
+            validate_exact_winner_metadata(&bytes, &winner, &descriptor, 1).unwrap();
+            let mut wrong_previous = descriptor.clone();
+            wrong_previous.zcash_previous_hash_le = Hex32::new([0x71; 32]);
+            assert!(
+                validate_exact_winner_metadata(&bytes, &winner, &wrong_previous, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("predecessor")
+            );
+            let mut wrong_target = descriptor.clone();
+            wrong_target.zcash_target_le = TargetLe::new([0x72; 32]);
+            assert!(
+                validate_exact_winner_metadata(&bytes, &winner, &wrong_target, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("target")
+            );
+            let mut wrong_coinbase = winner.clone();
+            wrong_coinbase.coinbase_txid_le = Hex32::new([0x73; 32]);
+            assert!(
+                validate_exact_winner_metadata(&bytes, &wrong_coinbase, &descriptor, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("coinbase transaction ID")
+            );
+            assert!(
+                validate_persisted_winner_block(
+                    &bytes,
+                    &block.hash().to_string(),
+                    winner.height,
+                    PersistedWinnerBlockKind::Zcash,
+                )
+                .is_err(),
+                "metadata success must never authorize unsolved work"
+            );
+        }
     }
 
     #[test]

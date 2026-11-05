@@ -2,7 +2,9 @@
 
 use std::io::Cursor;
 
-use wcash_zcash_aux::{commitment_payload, validate_miner_data_commitment, AuxPowError};
+use wcash_zcash_aux::{
+    commitment_payload, validate_miner_data_commitment, AuxPowError, ParentCoinbaseRules,
+};
 use zebra_chain::{
     amount::{Amount, NonNegative, MAX_SINGLE_TRANSACTION_VALUE},
     block::Height,
@@ -147,6 +149,44 @@ pub(crate) fn canonical_parent_coinbase(
         .inputs()
         .first()
         .and_then(Input::miner_data)
+        .ok_or(AuxPowError::MissingParentCoinbaseMinerData)?
+        .clone();
+    Ok(CanonicalCoinbase {
+        transaction_id: transaction.hash().0,
+        authorizing_data_digest,
+        miner_data,
+    })
+}
+
+/// Retains the historical decoder while admitting only the explicitly enabled NU7 domain.
+pub(crate) fn canonical_parent_coinbase_with_rules(
+    serialized_coinbase: &[u8],
+    rules: ParentCoinbaseRules,
+) -> Result<CanonicalCoinbase, MinerError> {
+    let branch = serialized_coinbase
+        .get(8..12)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(u32::from_le_bytes);
+    if branch != Some(wcash_zec_parent::NU7_BRANCH_ID) {
+        return canonical_parent_coinbase(serialized_coinbase);
+    }
+    if rules != ParentCoinbaseRules::LegacyAndNu7 {
+        return Err(
+            AuxPowError::UnsupportedParentCoinbaseBranch(wcash_zec_parent::NU7_BRANCH_ID).into(),
+        );
+    }
+    let transaction = wcash_zec_parent::canonical_nu7_coinbase(serialized_coinbase)
+        .map_err(|_| AuxPowError::InvalidParentCoinbase)?;
+    let authorizing_data_digest = transaction
+        .auth_digest()
+        .ok_or(AuxPowError::UnsupportedParentCoinbaseVersion(
+            transaction.version(),
+        ))?
+        .0;
+    let miner_data = transaction
+        .inputs()
+        .first()
+        .and_then(|input| input.miner_data())
         .ok_or(AuxPowError::MissingParentCoinbaseMinerData)?
         .clone();
     Ok(CanonicalCoinbase {

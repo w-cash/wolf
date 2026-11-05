@@ -1213,6 +1213,10 @@ mod tests {
             read_message(&mut client),
             BackendMessage::JobSnapshot { id: 2, .. }
         ));
+        // Keep the descriptor alive until the server reads EOF: on Darwin,
+        // dropping it first can make SO_RCVTIMEO fail before the EOF read.
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
     }
 
     #[test]
