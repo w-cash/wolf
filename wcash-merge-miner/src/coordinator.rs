@@ -5923,7 +5923,17 @@ pub(crate) mod tests {
 
     #[test]
     fn retained_parent_winner_delivers_while_wcash_candidate_proof_response_is_blocked() {
-        // A held loopback response models an unfinished Wcash candidate proof.
+        retained_parent_winner_delivers_while_wcash_candidate_response_is_held(-32_001);
+    }
+
+    #[test]
+    fn retained_parent_winner_delivers_while_wcash_candidate_capacity_is_exhausted() {
+        retained_parent_winner_delivers_while_wcash_candidate_response_is_held(-32_002);
+    }
+
+    fn retained_parent_winner_delivers_while_wcash_candidate_response_is_held(error_code: i64) {
+        // A held loopback response models an unfinished Wcash candidate proof
+        // or a capacity response while the independent winner is submitted.
         // This exercises the actual supervisor's transport/lock isolation, not
         // proof generation, consensus acceptance, or independent public receipt.
         let directory = tempdir().unwrap();
@@ -5949,7 +5959,7 @@ pub(crate) mod tests {
                 Ok(json!(Network::new_wcash_regtest()
                     .genesis_hash()
                     .to_string())),
-                Err(json!({"code":-32001,"message":"bounded fixture preparation stop"})),
+                Err(json!({"code":error_code,"message":"bounded fixture preparation stop"})),
             ],
             move |index, request| {
                 if index == 1 {
@@ -6005,9 +6015,9 @@ pub(crate) mod tests {
         assert!(matches!(
             preparation_result,
             Err(MinerError::RpcError {
-                code: Some(-32001),
+                code: Some(actual),
                 ..
-            })
+            }) if actual == error_code
         ));
         assert!(winner_result.is_ok());
         assert_eq!(hex::encode(snapshot.block_bytes()), expected_bytes);

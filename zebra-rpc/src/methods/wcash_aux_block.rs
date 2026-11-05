@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
 use subtle::ConstantTimeEq;
 use zebra_chain::{
@@ -22,6 +23,9 @@ use zebra_state::KnownBlock;
 /// fixed cap prevents unauthenticated RPC polling from growing memory without
 /// bound while allowing pools to overlap several in-flight jobs.
 pub(crate) const AUX_BLOCK_CACHE_CAPACITY: usize = 16;
+
+/// Retryable resource pressure while every candidate-cache slot is occupied.
+pub(crate) const AUX_BLOCK_CACHE_FULL_ERROR_CODE: i32 = -32_002;
 
 /// Maximum number of independently retireable jobs that may share one exact candidate.
 const AUX_BLOCK_MAX_ACTIVE_LEASES: usize = 16;
@@ -55,6 +59,24 @@ pub(crate) enum CandidateInsertError {
     Full,
     /// Another request is still publishing the same exact candidate.
     Publishing,
+}
+
+impl CandidateInsertError {
+    /// Preserve fatal errors while giving bounded cache pressure its own code.
+    pub(crate) fn into_rpc_error(self) -> ErrorObject<'static> {
+        match self {
+            Self::Full => ErrorObject::borrowed(
+                AUX_BLOCK_CACHE_FULL_ERROR_CODE,
+                "Wcash auxiliary candidate cache is full of active jobs; retire unused owned candidates or retry with backoff",
+                None,
+            ),
+            Self::Publishing => ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "the same Wcash auxiliary candidate is being published concurrently; retry createauxblock",
+                None,
+            ),
+        }
+    }
 }
 
 /// An authenticated lease for one exact candidate-cache entry.
@@ -571,7 +593,7 @@ fn remember_retired_token(inner: &mut CacheInner, id: block::Hash, token: [u8; 3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zebra_chain::block::genesis::wcash_regtest_genesis_block;
+    use zebra_chain::{block::genesis::wcash_regtest_genesis_block, serialization::ZcashSerialize};
 
     fn candidate(tag: u8, previous_block_hash: block::Hash) -> Arc<Block> {
         let mut candidate = wcash_regtest_genesis_block().as_ref().clone();
@@ -664,6 +686,59 @@ mod tests {
         assert!(cache
             .insert_at(candidate(4, tip), now + Duration::from_secs(11))
             .is_ok());
+    }
+
+    #[test]
+    fn saturated_cache_reports_resource_pressure_and_recovers_without_replacing_issued_work() {
+        let cache = AuxBlockCandidateCache::default();
+        let tip = block::Hash([0x19; 32]);
+        let mut issued = Vec::new();
+        for tag in 0..u8::try_from(AUX_BLOCK_CACHE_CAPACITY).unwrap() {
+            let block = candidate(tag, tip);
+            let bytes = block.zcash_serialize_to_vec().unwrap();
+            let lease = cache.insert(Arc::clone(&block)).unwrap();
+            cache.publish(lease);
+            issued.push((lease, block, bytes));
+        }
+        let extra = candidate(u8::try_from(AUX_BLOCK_CACHE_CAPACITY).unwrap(), tip);
+        let error = cache
+            .insert(Arc::clone(&extra))
+            .expect_err("all sixteen issued candidates occupy their original slots")
+            .into_rpc_error();
+        assert_eq!(error.code(), -32_002);
+        assert!(error.data().is_none());
+
+        let (retired, _, _) = issued.remove(0);
+        assert_eq!(
+            cache.retire(retired.id(), retired.retire_token()).unwrap(),
+            CandidateRetirement::Retired
+        );
+        let replacement = cache
+            .insert(Arc::clone(&extra))
+            .expect("retiring one owned candidate releases one slot without restarting");
+        cache.publish(replacement);
+        for (lease, block, bytes) in issued {
+            let retained = cache.begin_submission(lease.id()).unwrap();
+            assert!(Arc::ptr_eq(&retained, &block));
+            assert_eq!(retained.zcash_serialize_to_vec().unwrap(), bytes);
+        }
+        let retained = cache.begin_submission(replacement.id()).unwrap();
+        assert!(Arc::ptr_eq(&retained, &extra));
+        assert_eq!(
+            retained.zcash_serialize_to_vec().unwrap(),
+            extra.zcash_serialize_to_vec().unwrap()
+        );
+    }
+
+    #[test]
+    fn concurrent_publication_keeps_its_existing_internal_error_code() {
+        let cache = AuxBlockCandidateCache::default();
+        let block = candidate(1, block::Hash([0x29; 32]));
+        let unpublished = cache.insert(Arc::clone(&block)).unwrap();
+        let error = cache.insert(block).unwrap_err().into_rpc_error();
+        assert_eq!(error.code(), ErrorCode::InternalError.code());
+        assert_ne!(error.code(), AUX_BLOCK_CACHE_FULL_ERROR_CODE);
+        cache.discard_unpublished(unpublished);
     }
 
     #[test]

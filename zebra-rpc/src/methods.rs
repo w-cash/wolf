@@ -3582,18 +3582,7 @@ where
         let candidate_lease = self
             .wcash_aux_blocks
             .insert(Arc::clone(&candidate))
-            .map_err(|error| match error {
-                CandidateInsertError::Full => ErrorObject::borrowed(
-                    ErrorCode::InternalError.code(),
-                    "Wcash auxiliary candidate cache is full of active jobs; retry after a job expires",
-                    None,
-                ),
-                CandidateInsertError::Publishing => ErrorObject::borrowed(
-                    ErrorCode::InternalError.code(),
-                    "the same Wcash auxiliary candidate is being published concurrently; retry createauxblock",
-                    None,
-                ),
-            })?;
+            .map_err(CandidateInsertError::into_rpc_error)?;
         debug_assert_eq!(candidate_lease.id(), hash);
         if self.latest_chain_tip.best_tip_hash() != Some(expected_tip) {
             // This reservation was never returned to a pool. Discard only the
