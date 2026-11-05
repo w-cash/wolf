@@ -2,9 +2,10 @@ name: Wcash NU7 compatibility
 
 on:
   pull_request:
-    branches: [main, feat/nu7-parent-policy-20261104, feat/nu7-parent-compat-20261104]
+    branches: [main, feat/nu7-parent-policy-20261104, feat/nu7-parent-compat-20261104, feat/nu7-backend-compat-20261104]
     paths:
       - "Cargo.*"
+      - "deny.toml"
       - "wcash-zec-parent/**"
       - "wcash-zcash-aux/**"
       - "wcash-merge-miner/**"
@@ -46,7 +47,9 @@ jobs:
           sudo apt-get install --no-install-recommends -y clang libclang-dev cmake pkg-config protobuf-compiler
       - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,cargo-deny@0.19.5
+      - name: Dependency security policy
+        run: cargo deny --locked check
       - name: Verify dependency isolation
         run: |
           cargo metadata --locked --format-version 1 > /tmp/wcash-nu7-metadata.json
@@ -64,3 +67,7 @@ jobs:
         run: |
           cargo check --locked -p zebra-consensus@15.0.0 --features wcash-consensus --tests
           cargo nextest run --locked -p zebra-chain@12.0.0 -p zebra-consensus@15.0.0 --features wcash-consensus --lib --profile ci -E 'test(wcash) | test(parent_policy_stays_legacy) | test(official_nu7_parent_support)'
+      - name: Forced SSE2 crypto vectors
+        env:
+          RUSTFLAGS: '--cfg chacha20_backend="sse2"'
+        run: cargo nextest run --locked -p wcash-zec-parent --lib --profile ci -E 'test(crypto_tests)'

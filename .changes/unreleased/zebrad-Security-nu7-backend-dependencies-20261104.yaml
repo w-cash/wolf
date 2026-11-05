@@ -1,0 +1,4 @@
+kind: Security
+body: Update TLS, runtime, compression-build and documentation dependencies to patched releases, and replace the yanked ChaCha20 release while retaining separate legacy Wcash and NU7 parent cryptographic libraries.
+time: 2026-11-04T20:50:00Z
+project: zebrad

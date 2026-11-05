@@ -412,6 +412,9 @@ fn is_loopback_host(url: &Url) -> bool {
 }
 
 #[cfg(test)]
+mod tls_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

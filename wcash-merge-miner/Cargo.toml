@@ -40,6 +40,7 @@ zebra-chain = { path = "../zebra-chain", version = "12.0.0" }
 zeroize = "1.8"
 
 [dev-dependencies]
+rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 wcash-zec-parent = { path = "../wcash-zec-parent", features = ["test-helpers"] }
 tempfile.workspace = true
 zebra-chain = { path = "../zebra-chain", version = "12.0.0", features = [
