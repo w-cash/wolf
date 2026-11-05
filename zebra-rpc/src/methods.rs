@@ -110,6 +110,7 @@ mod response_deserialize;
 pub(crate) mod trees;
 pub(crate) mod types;
 mod wcash_aux_block;
+mod wcash_aux_candidate;
 
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
@@ -3416,15 +3417,10 @@ where
                 )?
                 .zatoshis();
 
-        let candidate = Arc::new(
-            proposal_block_from_template(&template, None, &self.network).map_err(|error| {
-                ErrorObject::owned(
-                    ErrorCode::InternalError.code(),
-                    format!("failed to construct Wcash auxiliary block: {error}"),
-                    None::<()>,
-                )
-            })?,
-        );
+        let candidate = Arc::new(wcash_aux_candidate::from_template(
+            &template,
+            &self.network,
+        )?);
         let hash = candidate.hash();
         let candidate_height = candidate.coinbase_height().ok_or_error(
             ErrorCode::InternalError,

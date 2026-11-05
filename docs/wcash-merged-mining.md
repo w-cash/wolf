@@ -74,6 +74,13 @@ difficulty, and empty witness. Candidates are bounded to 16 entries and expire
 after ten minutes. A candidate remains exact and retryable across a shallow
 child reorg while its parent is retained in either committed chain.
 
+Each successful request uses a new 256-bit child-header nonce from the operating
+system CSPRNG, so requests using the same cached template receive independently
+generated candidate IDs. This does not shift the template timestamp or rebuild
+its coinbase proof. An issued candidate's bytes never change. Unused candidates
+must be retired with their own token once all miners and share handlers have
+stopped using them; per-request uniqueness does not remove the 16-entry bound.
+
 When a caller selects a payout different from the node's configured recipient,
 the handler retains a bounded set of four recipient-isolated coinbase caches.
 Repeated requests with exactly the same miner parameters, height and fees can
