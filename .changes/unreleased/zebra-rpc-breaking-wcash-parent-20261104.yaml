@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: breaking
+body: Add private Wcash parent-template and payout-attestation extensions, exact committed block status, and retryable canonical duplicate gossip recovery.
+time: 2026-11-04T17:00:00Z

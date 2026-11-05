@@ -1,6 +1,7 @@
 //! Types and functions for the `getblocktemplate` RPC.
 
 pub mod constants;
+mod gossip_log;
 pub mod parameters;
 pub(crate) mod precompute;
 pub mod proposal;
@@ -8,6 +9,8 @@ pub mod zip317;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wcash_parent_tests;
 
 use std::{
     collections::HashMap,
@@ -42,7 +45,9 @@ use zebra_chain::{
 #[allow(unused_imports)]
 use zebra_chain::serialization::BytesInDisplayOrder;
 
-use zebra_consensus::{router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS};
+use zebra_consensus::{
+    error::TransactionError, router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS,
+};
 use zebra_node_services::mempool::{self, TransactionDependencies};
 use zebra_state::GetBlockTemplateChainInfo;
 
@@ -53,6 +58,7 @@ use crate::{
     },
     methods::types::{
         default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
+        wcash_parent_context::WcashParentContext,
     },
     server::error::{MapError, OkOrError},
     SubmitBlockChannel,
@@ -64,6 +70,7 @@ use constants::{
 };
 pub use parameters::{
     GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
+    WcashAuxRequest,
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
 
@@ -222,6 +229,30 @@ pub struct BlockTemplateResponse {
     #[serde(rename = "submitold")]
     #[getter(copy)]
     pub(crate) submit_old: Option<bool>,
+
+    /// Attests the configured payout only for private merged-mining templates.
+    #[serde(
+        rename = "wcashparentpayoutcommitment",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    #[new(default)]
+    pub(crate) wcash_parent_payout_commitment: Option<String>,
+
+    /// Exact reward context, exposed only by the private carrier request.
+    #[serde(
+        rename = "wcashparentcontext",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    #[new(default)]
+    pub(crate) wcash_parent_context: Option<WcashParentContext>,
+
+    /// Retained from the same state view as the ordinary cached template. It
+    /// cannot be reconstructed from a serialized template or a later live tip.
+    #[serde(skip)]
+    #[new(default)]
+    pub(crate) template_parent_context: Option<WcashParentContext>,
 }
 
 impl fmt::Debug for BlockTemplateResponse {
@@ -257,6 +288,13 @@ impl fmt::Debug for BlockTemplateResponse {
             .field("height", &self.height)
             .field("max_time", &self.max_time)
             .field("submit_old", &self.submit_old)
+            .field(
+                "wcash_parent_payout_commitment",
+                &self
+                    .wcash_parent_payout_commitment
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -265,6 +303,91 @@ impl BlockTemplateResponse {
     /// Returns a `Vec` of capabilities supported by the `getblocktemplate` RPC
     pub fn all_capabilities() -> Vec<String> {
         CAPABILITIES_FIELD.iter().map(ToString::to_string).collect()
+    }
+
+    /// Adds one child-specific Wcash commitment to a child-independent
+    /// precomputed parent template.
+    pub(crate) fn with_wcash_aux(
+        mut self,
+        net: &Network,
+        miner_params: &MinerParams,
+        wcash_aux: WcashAuxRequest,
+    ) -> Result<Self, TransactionError> {
+        let parent_context = self
+            .template_parent_context
+            .as_ref()
+            .filter(|context| context.matches_template(self.previous_block_hash, self.height))
+            .cloned()
+            .ok_or_else(|| {
+                TransactionError::CoinbaseConstruction(
+                    "wcashaux requires exact cached parent reward context".to_string(),
+                )
+            })?;
+        self.coinbase_txn = self
+            .coinbase_txn
+            .with_wcash_aux(wcash_aux.block_hash().0, wcash_aux.nonce())?;
+
+        let height = block::Height(self.height);
+        self.default_roots = DefaultRoots::from_transaction_templates(
+            net,
+            height,
+            &self.coinbase_txn,
+            Some(self.default_roots.chain_history_root),
+            &self.transactions,
+        );
+        self.block_commitments_hash = self.default_roots.block_commitments_hash;
+        self.light_client_root_hash = self.default_roots.block_commitments_hash;
+        self.final_sapling_root_hash = self.default_roots.block_commitments_hash;
+        self.wcash_parent_payout_commitment = Some(
+            miner_params
+                .parent_payout_address_commitment()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    TransactionError::CoinbaseConstruction(
+                        "wcashaux requires an attested configured parent payout address"
+                            .to_string(),
+                    )
+                })?,
+        );
+        self.wcash_parent_context = Some(parent_context);
+
+        Ok(self)
+    }
+
+    /// Checks the exact serialized byte and sigop budgets after a carrier transform.
+    pub(crate) fn fits_parent_template_limits(&self, net: &Network) -> bool {
+        use zebra_chain::serialization::{CompactSizeMessage, ZcashSerialize};
+        let Some(count) = self.transactions.len().checked_add(1) else {
+            return false;
+        };
+        let Ok(count) = CompactSizeMessage::try_from(count) else {
+            return false;
+        };
+        let Some(mut bytes) =
+            block::Header::serialized_size(net).checked_add(count.zcash_serialized_size())
+        else {
+            return false;
+        };
+        let mut sigops = 0u32;
+        for transaction in std::iter::once(&self.coinbase_txn)
+            .map(|coinbase| (coinbase.data.as_ref().len(), coinbase.sigops))
+            .chain(
+                self.transactions
+                    .iter()
+                    .map(|transaction| (transaction.data.as_ref().len(), transaction.sigops)),
+            )
+        {
+            let Some(next_bytes) = bytes.checked_add(transaction.0) else {
+                return false;
+            };
+            let Some(next_sigops) = sigops.checked_add(transaction.1) else {
+                return false;
+            };
+            bytes = next_bytes;
+            sigops = next_sigops;
+        }
+        u64::try_from(bytes).is_ok_and(|bytes| bytes <= self.size_limit)
+            && sigops <= self.sigop_limit
     }
 
     /// Returns a new [`BlockTemplateResponse`] struct, based on the supplied arguments and defaults.
@@ -446,6 +569,13 @@ impl BlockTemplateResponse {
             max_time: chain_info.max_time,
 
             submit_old,
+            wcash_parent_payout_commitment: None,
+            wcash_parent_context: None,
+            template_parent_context: Some(WcashParentContext::new(
+                chain_info.tip_hash,
+                height,
+                u64::from(chain_info.chain_value_pools.nsm_amount()),
+            )),
         }
     }
 }
@@ -480,7 +610,7 @@ impl GetBlockTemplateResponse {
 }
 
 /// Miner parameters.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MinerParams {
     /// Address for receiving miner subsidy and tx fees.
     addr: Address,
@@ -492,6 +622,27 @@ pub struct MinerParams {
     ///
     /// Applies only if [`Self::addr`] contains a shielded component.
     memo: Option<MemoBytes>,
+
+    /// Domain-separated attestation derived only from validated mining configuration.
+    parent_payout_address_commitment: Option<String>,
+}
+
+impl fmt::Debug for MinerParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MinerParams")
+            .field("addr", &"[REDACTED]")
+            .field("data", &self.data)
+            .field("memo", &self.memo.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "parent_payout_address_commitment",
+                &self
+                    .parent_payout_address_commitment
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 /// Builds the coinbase input data for a block Zebra constructs: the [`ZEBRA_COINBASE_MARKER`],
@@ -511,10 +662,11 @@ impl MinerParams {
     // length-validated), not a recoverable error.
     #[allow(clippy::unwrap_in_result)]
     pub fn new(net: &Network, conf: config::mining::Config) -> Result<Self, MinerParamsError> {
-        let addr = conf
-            .miner_address
-            .map(|addr| Address::try_from_zcash_address(net, addr))
-            .ok_or(MinerParamsError::MissingAddr)??;
+        let configured_address = conf.miner_address.ok_or(MinerParamsError::MissingAddr)?;
+        let parent_payout_address_commitment = Some(hex::encode(
+            wcash_zcash_aux::parent_payout_address_commitment(&configured_address.to_string()),
+        ));
+        let addr = Address::try_from_zcash_address(net, configured_address)?;
 
         // Always tag the coinbase with the Zebra marker, even without configured
         // `extra_coinbase_data`, so every block Zebra builds is identifiable. The type of
@@ -531,7 +683,12 @@ impl MinerParams {
             .map(|memo| MemoBytes::from_bytes(memo.as_bytes()))
             .transpose()?;
 
-        Ok(Self { addr, data, memo })
+        Ok(Self {
+            addr,
+            data,
+            memo,
+            parent_payout_address_commitment,
+        })
     }
 
     /// Returns the miner address.
@@ -562,6 +719,11 @@ impl MinerParams {
         }
     }
 
+    /// Returns the attestation for parameters originating from validated configuration.
+    fn parent_payout_address_commitment(&self) -> Option<&str> {
+        self.parent_payout_address_commitment.as_deref()
+    }
+
     /// Randomizes the memo.
     pub fn randomize_memo(&mut self) {
         let mut random = [0u8; 512];
@@ -583,6 +745,7 @@ impl From<Address> for MinerParams {
             addr,
             data: None,
             memo: None,
+            parent_payout_address_commitment: None,
         }
     }
 }
@@ -715,6 +878,10 @@ where
     /// so they can be advertised to peers.
     mined_block_sender: mpsc::Sender<(block::Hash, block::Height)>,
 
+    /// Fixed-size, shared admission guard for positively checked canonical duplicates.
+    /// Fresh blocks bypass it; only successful admission consumes the one-second interval.
+    duplicate_gossip_admission: Arc<Mutex<Option<tokio::time::Instant>>>,
+
     /// Caches the most recently built coinbase transaction, so short-polling miners don't re-run
     /// the shielded-coinbase proof on every request within a block.
     coinbase_cache: CoinbaseCache,
@@ -747,6 +914,7 @@ where
             sync_status,
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
+            duplicate_gossip_admission: Arc::new(Mutex::new(None)),
             coinbase_cache: CoinbaseCache::default(),
             template_cache: Some(precompute::TemplateCache::default()),
         }
@@ -799,7 +967,51 @@ where
         block: block::Hash,
         height: block::Height,
     ) -> Result<(), TrySendError<(block::Hash, block::Height)>> {
-        self.mined_block_sender.try_send((block, height))
+        let result = self.mined_block_sender.try_send((block, height));
+        gossip_log::record(block, height, false, &result);
+        result
+    }
+
+    /// Reannounces a positively checked canonical duplicate at most once per
+    /// second across all handler clones. Freshly accepted blocks bypass this
+    /// limit; denied or failed admission remains a retryable RPC error.
+    pub(crate) fn advertise_committed_duplicate(
+        &self,
+        block: block::Hash,
+        height: block::Height,
+    ) -> RpcResult<()> {
+        let mut last_admission = self.duplicate_gossip_admission.try_lock().map_err(|_| {
+            ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "duplicate gossip admission state unavailable; retry the same submission",
+                None,
+            )
+        })?;
+        let now = tokio::time::Instant::now();
+        if last_admission.is_some_and(|previous| {
+            now.duration_since(previous) < std::time::Duration::from_secs(1)
+        }) {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "duplicate gossip admission limited; retry the same submission after one second",
+                None,
+            ));
+        }
+        let result = self.mined_block_sender.try_send((block, height));
+        // Release the existing admission lock before formatting any diagnostic.
+        if result.is_ok() {
+            *last_admission = Some(now);
+        }
+        drop(last_admission);
+        gossip_log::record(block, height, true, &result);
+        result.map_err(|_| {
+            ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "committed duplicate could not be queued for gossip; retry the same submission",
+                None,
+            )
+        })?;
+        Ok(())
     }
 
     /// Randomizes the coinbase data, if miner parameters are set.
@@ -836,6 +1048,19 @@ where
 ///
 /// Returns an error if there's a mismatch between the mode and whether `data` is provided.
 pub fn check_parameters(parameters: &Option<GetBlockTemplateParameters>) -> RpcResult<()> {
+    if let Some(parameters) = parameters {
+        if parameters.wcash_aux.is_some()
+            && (parameters.mode != GetBlockTemplateRequestMode::Template
+                || parameters.long_poll_id.is_some())
+        {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "wcashaux requires template mode without longpollid",
+                None,
+            ));
+        }
+    }
+
     let Some(parameters) = parameters else {
         return Ok(());
     };

@@ -238,7 +238,9 @@ pub enum Request {
     ///
     /// # Returns
     ///
-    /// Returns [`Response::Nil`](super::Response::Nil) only after all selected local writes succeed.
+    /// Returns [`Response::MinedBlockAdvertisement`](super::Response::MinedBlockAdvertisement)
+    /// only after all selected local writes succeed. An incomplete write remains an error,
+    /// carrying a [`MinedBlockAdvertisementError`](super::MinedBlockAdvertisementError) report.
     AdvertiseBlockToAll(block::Hash),
 
     /// Request the contents of this node's mempool.

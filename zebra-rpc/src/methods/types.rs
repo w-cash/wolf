@@ -1,6 +1,7 @@
 //! Types used in RPC methods.
 
 pub mod default_roots;
+pub mod get_block_status;
 pub mod get_block_template;
 pub mod get_blockchain_info;
 pub mod get_mempool_info;
@@ -15,5 +16,6 @@ pub mod subsidy;
 pub mod transaction;
 pub mod unified_address;
 pub mod validate_address;
+pub mod wcash_parent_context;
 pub mod z_validate_address;
 pub mod zec;

@@ -1,5 +1,11 @@
 ![Zebra logotype](https://zfnd.org/wp-content/uploads/2022/03/zebra-logotype.png)
 
+This branch is the Wcash-maintained **ZEC parent node**, based on stable Zebra
+7.0.0 with the private merged-mining RPC extensions. Its release line is
+`zec-parent-v7.0.0`; it is not the WEC node source line. Read the
+[parent-node release guide](docs/wcash-zec-parent.md) before building or upgrading.
+Upstream attribution and documentation follow below.
+
 ---
 
 [![Unit Tests](https://github.com/ZcashFoundation/zebra/actions/workflows/tests-unit.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/tests-unit.yml)

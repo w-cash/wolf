@@ -1,0 +1,4 @@
+project: zebra-state
+kind: breaking
+body: Add an anchored single-snapshot committed block membership query for exact parent winner reconciliation without changing the on-disk schema.
+time: 2026-11-04T17:00:00Z

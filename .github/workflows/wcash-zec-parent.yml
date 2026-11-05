@@ -1,0 +1,51 @@
+name: Wcash ZEC parent compatibility
+
+on:
+  pull_request:
+    branches: [zec-parent-v7.0.0]
+  push:
+    branches: [zec-parent-v7.0.0]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wcash-zec-parent-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_BACKTRACE: "1"
+      RAYON_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: 1.91.0
+          cache: false
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang libclang-dev cmake pkg-config protobuf-compiler
+      - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+        with:
+          tool: cargo-nextest
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Strict workspace lint
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Native library qualification
+        # No internal miner or Equihash solving is enabled. Upstream stateful
+        # and E2E scopes remain separate release gates.
+        run: cargo nextest run --locked --workspace --lib --profile ci
+      - name: Documentation examples
+        run: cargo test --locked --workspace --doc

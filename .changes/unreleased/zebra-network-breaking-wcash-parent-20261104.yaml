@@ -1,0 +1,4 @@
+project: zebra-network
+kind: breaking
+body: Report completed local and nonlocal mined-block advertisement writes and partial failures while retaining bounded Zebra 7 advertiser queues.
+time: 2026-11-04T17:00:00Z

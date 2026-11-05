@@ -329,6 +329,18 @@ fn peer_set_route_inv_empty_registry() {
     });
 }
 
+/// All selected writes must complete; the mined variant also reports their classes.
+fn assert_complete_block_advertisement(response: Response) {
+    match response {
+        Response::Nil => {}
+        Response::MinedBlockAdvertisement(report) => {
+            assert!(report.attempted() > 0);
+            assert_eq!(report.failed, 0);
+        }
+        other => panic!("unexpected block advertisement response: {other:?}"),
+    }
+}
+
 /// A busy peer receives the advert before its request channel has any capacity.
 #[tokio::test]
 async fn block_advert_to_all_reaches_unready_peer() {
@@ -372,7 +384,7 @@ async fn block_advert_to_all_reaches_unready_peer() {
         for handle in &mut handles {
             assert_eq!(handle.receive_block_advert(), hash);
         }
-        assert_eq!(advert.await.unwrap(), Response::Nil);
+        assert_complete_block_advertisement(advert.await.unwrap());
     })
     .await
     .expect("the ready peer permits dispatch while the busy peer remains unready");
@@ -431,7 +443,7 @@ async fn block_advert_bypasses_buffer_with_all_peers_busy() {
         assert_eq!(queued.hash, hash);
         queued.result.send(Ok(())).unwrap();
     }
-    assert_eq!(advert.await.unwrap(), Response::Nil);
+    assert_complete_block_advertisement(advert.await.unwrap());
     assert!(ordinary.as_mut().now_or_never().is_none());
     drop(pending_requests);
 }
@@ -509,7 +521,7 @@ async fn advert_discovers_peer_while_buffer_idle(all_peers: bool) {
             old_write,
             Some(Message::Inv(vec![InventoryHash::Block(hash)]))
         );
-        assert_eq!(delivery.unwrap(), Response::Nil);
+        assert_complete_block_advertisement(delivery.unwrap());
         assert_eq!(
             new_write.expect("idle ordinary traffic must not strand a newly discovered peer"),
             Some(Message::Inv(vec![InventoryHash::Block(hash)])),
@@ -600,7 +612,7 @@ async fn block_advert_does_not_ack_a_barrier_arriving_during_discovery() {
             old_write,
             Some(Message::Inv(vec![InventoryHash::Block(hash)]))
         );
-        assert_eq!(delivery.unwrap(), Response::Nil);
+        assert_complete_block_advertisement(delivery.unwrap());
         assert_eq!(
             new_write
                 .expect("a maintenance barrier must include discovery queued before that barrier"),
@@ -664,7 +676,7 @@ async fn block_advert_barriers_survive_partial_discovery_drains() {
                 .call(Request::AdvertiseBlockToAll(hash));
             let (delivery, old_write, new_write) =
                 tokio::join!(advert, old_messages.next(), new_messages.next());
-            assert_eq!(delivery.unwrap(), Response::Nil);
+            assert_complete_block_advertisement(delivery.unwrap());
             assert_eq!(
                 old_write,
                 Some(Message::Inv(vec![InventoryHash::Block(hash)]))
@@ -736,7 +748,7 @@ async fn block_advert_late_barrier_is_rescheduled_after_retained_batch() {
             .call(Request::AdvertiseBlockToAll(hash));
         let (delivery, message) = tokio::join!(advert, messages.next());
         connection.abort();
-        assert_eq!(delivery.unwrap(), Response::Nil);
+        assert_complete_block_advertisement(delivery.unwrap());
         assert_eq!(
             message,
             Some(Message::Inv(vec![InventoryHash::Block(hash)]))
@@ -779,7 +791,7 @@ async fn advertiser_bootstraps_discovery_and_does_not_own_network_shutdown() {
             .unwrap()
             .call(Request::AdvertiseBlockToAll(hash));
         let (delivery, message) = tokio::join!(advert, messages.next());
-        assert_eq!(delivery.unwrap(), Response::Nil);
+        assert_complete_block_advertisement(delivery.unwrap());
         assert_eq!(
             message,
             Some(Message::Inv(vec![InventoryHash::Block(hash)]))
@@ -918,7 +930,7 @@ async fn advert_maintenance_does_not_register_rejected_discoveries() {
                 .unwrap()
                 .call(Request::AdvertiseBlockToAll(hash));
             let (delivery, message) = tokio::join!(first, old_messages.next());
-            assert_eq!(delivery.unwrap(), Response::Nil);
+            assert_complete_block_advertisement(delivery.unwrap());
             assert_eq!(
                 message,
                 Some(Message::Inv(vec![InventoryHash::Block(hash)]))
@@ -934,7 +946,7 @@ async fn advert_maintenance_does_not_register_rejected_discoveries() {
                 .call(Request::AdvertiseBlockToAll(hash));
             let (delivery, existing, rejected) =
                 tokio::join!(advert, old_messages.next(), new_messages.next());
-            assert_eq!(delivery.unwrap(), Response::Nil);
+            assert_complete_block_advertisement(delivery.unwrap());
             assert_eq!(
                 existing,
                 Some(Message::Inv(vec![InventoryHash::Block(hash)]))
@@ -1044,12 +1056,11 @@ async fn block_advert_success_waits_for_peer_write() {
         Message::Inv(vec![InventoryHash::Block(hash)])
     );
     assert!(connection.as_mut().now_or_never().is_none());
-    assert_eq!(
+    assert_complete_block_advertisement(
         timeout(Duration::from_secs(1), advert)
             .await
             .unwrap()
             .unwrap(),
-        Response::Nil
     );
 }
 
@@ -1088,10 +1099,17 @@ async fn failed_block_advert_write(all_peers: bool) {
         harness.current_error().is_some(),
         "the connection detected the write failure"
     );
-    assert!(
-        result.is_err(),
-        "zero successful peer writes must not be reported as success"
-    );
+    let error = result.expect_err("zero successful peer writes must not be reported as success");
+    if all_peers {
+        let report = error
+            .downcast_ref::<crate::MinedBlockAdvertisementError>()
+            .expect("mined write failure preserves its typed local outcomes")
+            .report();
+        assert_eq!(report.attempted(), 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.local_sent, 0);
+        assert_eq!(report.non_local_sent, 0);
+    }
 }
 
 /// Committed adverts must propagate actual connection write failures.
@@ -3411,11 +3429,10 @@ async fn readiness_expiry_removes_busy_peer_from_advertisers() {
             .expect("the surviving peer remains eligible for adverts")
             .call(Request::AdvertiseBlockToAll(hash));
         assert_eq!(handles[1].receive_block_advert(), hash);
-        assert_eq!(
+        assert_complete_block_advertisement(
             advert
                 .await
                 .expect("the surviving peer acknowledged the advert"),
-            Response::Nil
         );
         assert!(
             handles[0].block_advert_receiver.try_recv().is_err(),
@@ -3953,4 +3970,76 @@ fn peer_set_waits_for_busy_failed_peer_as_last_resort() {
             "the waiting retry should be routed to the peer once it is ready",
         );
     });
+}
+
+/// Reports classify completed writes; partial failure stays an error.
+#[tokio::test(start_paused = true)]
+async fn mined_block_advertisement_reports_exact_local_write_outcomes() {
+    let _init_guard = zebra_test::init();
+    for fail_loopback in [false, true] {
+        let addresses: Vec<PeerSocketAddr> = vec![
+            SocketAddr::from(([198, 51, 100, 1], 8233)).into(),
+            SocketAddr::from(([198, 51, 100, 2], 8233)).into(),
+            SocketAddr::from(([127, 0, 0, 1], 8233)).into(),
+        ];
+        let mut handles = Vec::new();
+        let mut changes = Vec::new();
+        for addr in &addresses {
+            let (client, handle) = ClientTestHarness::build()
+                .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+                .with_connected_addr(ConnectedAddr::new_inbound_direct(*addr))
+                .finish();
+            handles.push(handle);
+            changes.push(Ok::<_, BoxError>(Change::Insert(*addr, client.into())));
+        }
+        let (minimum, _best_tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let (mut peer_set, _guard) = PeerSetBuilder::new()
+            .with_discover(stream::iter(changes).chain(stream::pending()))
+            .with_minimum_peer_version(minimum)
+            .with_block_gossip_peer_ips(vec![addresses[1].ip()])
+            .build();
+        timeout(Duration::from_secs(1), peer_set.ready())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut advertiser = peer_set.block_advertiser();
+        let (_network, _poll_task) = peer_set.into_buffer(PEERSET_BUFFER_SIZE);
+        let hash = block::Hash([0x71; 32]);
+        let delivery = advertiser
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::AdvertiseBlockToAll(hash));
+        for (index, handle) in handles.iter_mut().enumerate() {
+            let advert = handle.block_advert_receiver.recv().await.unwrap();
+            assert_eq!(advert.hash, hash);
+            let outcome = if fail_loopback && index == 2 {
+                Err("fixture connection rejected the write".into())
+            } else {
+                Ok(())
+            };
+            advert.result.send(outcome).unwrap();
+        }
+        let expected = crate::MinedBlockAdvertisement {
+            non_local_sent: 1,
+            local_sent: if fail_loopback { 1 } else { 2 },
+            failed: usize::from(fail_loopback),
+        };
+        let outcome = delivery.await;
+        if fail_loopback {
+            let error = outcome.expect_err("one failed selected write remains an error");
+            assert_eq!(
+                error
+                    .downcast_ref::<crate::MinedBlockAdvertisementError>()
+                    .unwrap()
+                    .report(),
+                expected,
+            );
+        } else {
+            assert_eq!(
+                outcome.unwrap(),
+                Response::MinedBlockAdvertisement(expected)
+            );
+        }
+    }
 }

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+        "wcash-parent-template",
         "zebrad",
         "zebra-chain",
         "zebra-network",
@@ -29,6 +30,7 @@ edition = "2021"
 # `cargo release` settings
 
 [workspace.dependencies]
+wcash-zcash-aux = { package = "wcash-parent-template", path = "wcash-parent-template", default-features = false }
 incrementalmerkletree = { version = "0.9", features = ["legacy-api"] }
 orchard = "0.16.0"
 # Used to build Orchard/Ironwood bundles in test helpers; must match orchard's version.

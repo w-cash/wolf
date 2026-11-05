@@ -1,0 +1,21 @@
+[package]
+name = "wcash-parent-template"
+version = "0.1.0"
+publish = false
+authors.workspace = true
+description = "Bounded Wcash commitment helpers for the Zcash parent template node"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake2b_simd.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

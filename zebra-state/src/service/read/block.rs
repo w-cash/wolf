@@ -25,7 +25,7 @@ use zebra_chain::{
 };
 
 use crate::{
-    response::{AnyTx, MinedTx},
+    response::{AnyTx, BlockStatus, MinedTx},
     service::{
         finalized_state::ZebraDb,
         non_finalized_state::{Chain, NonFinalizedState},
@@ -62,6 +62,70 @@ where
     C: AsRef<Chain>,
 {
     any_block(chain.iter(), db, hash_or_height)
+}
+
+/// Returns exact committed membership from one non-finalized snapshot and
+/// a finalized prefix anchored before that snapshot was captured.
+pub fn block_status(
+    non_finalized_state: &NonFinalizedState,
+    db: &ZebraDb,
+    finalized_tip: Option<(Height, block::Hash)>,
+    hash: block::Hash,
+) -> Option<BlockStatus> {
+    let best_chain = non_finalized_state
+        .best_chain()
+        .filter(|chain| chain_extends_finalized_tip(chain, finalized_tip));
+    let tip_height = best_chain
+        .map(|chain| chain.non_finalized_tip_height())
+        .or_else(|| finalized_tip.map(|(height, _)| height))?;
+
+    if let Some(block) = best_chain.and_then(|chain| chain.block(hash.into())) {
+        return Some(BlockStatus::BestChain {
+            block: block.block.clone(),
+            depth: tip_height.0.checked_sub(block.height.0)?,
+        });
+    }
+
+    // Finalized blocks cannot change or disappear. Ignore records appended
+    // after the captured tip rather than mixing them with an older snapshot.
+    if let Some((finalized_height, _)) = finalized_tip {
+        if let Some(block) = db.block(hash.into()) {
+            let height = block.coinbase_height()?;
+            if height <= finalized_height {
+                return Some(BlockStatus::BestChain {
+                    block,
+                    depth: tip_height.0.checked_sub(height.0)?,
+                });
+            }
+        }
+    }
+
+    // If finalization overtook the best snapshot, none of its side-chain
+    // classifications can establish current membership. A fresh query retries.
+    best_chain?;
+    non_finalized_state
+        .chain_iter()
+        .skip(1)
+        .filter(|chain| chain_extends_finalized_tip(chain, finalized_tip))
+        .find_map(|chain| chain.block(hash.into()))
+        .filter(|block| finalized_tip.is_none_or(|(height, _)| block.height > height))
+        .map(|block| BlockStatus::SideChain {
+            block: block.block.clone(),
+        })
+}
+
+/// Checks overlap with the immutable finalized prefix without consulting a
+/// mutable live tip or trusting a stale non-finalized branch.
+fn chain_extends_finalized_tip(
+    chain: &Chain,
+    finalized_tip: Option<(Height, block::Hash)>,
+) -> bool {
+    finalized_tip.is_none_or(|(height, hash)| {
+        chain.non_finalized_tip_height() >= height
+            && chain
+                .block(height.into())
+                .is_none_or(|block| block.hash == hash)
+    })
 }
 
 /// Returns the [`Block`] with [`block::Hash`] or

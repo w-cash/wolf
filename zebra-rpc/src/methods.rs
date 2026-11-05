@@ -112,6 +112,7 @@ pub(crate) mod types;
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
 use types::{
+    get_block_status::GetBlockStatusResponse,
     get_block_template::{
         constants::{
             DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MEMPOOL_LONG_POLL_INTERVAL,
@@ -135,13 +136,21 @@ use types::{
     transaction::TransactionObject,
     unified_address::ZListUnifiedReceiversResponse,
     validate_address::ValidateAddressResponse,
+    wcash_parent_context::WcashParentContext,
     z_validate_address::ZValidateAddressResponse,
 };
 
 include!(concat!(env!("OUT_DIR"), "/rpc_openrpc.rs"));
 
+/// Bounds readiness and lookup for canonical duplicate recovery.
+const COMMITTED_DUPLICATE_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Bounds all exact-parent membership and value-pool reads in one operation.
+const WCASH_PARENT_CONTEXT_TIMEOUT: Duration = Duration::from_secs(1);
+
 // TODO: Review the parameter descriptions below, and update them as needed:
 // https://github.com/ZcashFoundation/zebra/issues/10320
+
 pub(super) const PARAM_VERBOSE_DESC: &str =
     "Boolean flag to indicate verbosity, true for a json object, false for hex encoded data.";
 pub(super) const PARAM_POOL_DESC: &str =
@@ -160,6 +169,8 @@ pub(super) const PARAM_COMMAND_DESC: &str = "The command to execute.";
 #[allow(non_upper_case_globals)]
 pub(super) const PARAM__PARAMETERS_DESC: &str = "The parameters for the command.";
 pub(super) const PARAM_BLOCK_HASH_DESC: &str = "The hash of the block to return.";
+pub(super) const PARAM_PREVIOUS_BLOCK_HASH_DESC: &str =
+    "The exact committed predecessor hash for the candidate parent block.";
 pub(super) const PARAM_ADDRESS_DESC: &str = "The address to return.";
 pub(super) const PARAM_ADDRESS_STRINGS_DESC: &str = "The addresses to return.";
 pub(super) const PARAM_ADDR_DESC: &str = "The address to return.";
@@ -569,6 +580,19 @@ pub trait Rpc {
         &self,
         parameters: Option<GetBlockTemplateParameters>,
     ) -> Result<GetBlockTemplateResponse>;
+
+    /// Returns exact committed parent block membership and atomic best-chain confirmations.
+    #[method(name = "getblockstatus")]
+    async fn get_block_status(&self, block_hash: String) -> Result<GetBlockStatusResponse>;
+
+    /// Returns reward context for one exact committed best-chain predecessor.
+    /// This never builds a template or a shielded coinbase proof.
+    #[method(name = "getwcashparentcontext")]
+    async fn get_wcash_parent_context(
+        &self,
+        previous_block_hash: String,
+        height: u32,
+    ) -> Result<WcashParentContext>;
 
     /// Submits block to the node to be validated and committed.
     /// Returns the [`SubmitBlockResponse`] for the operation, as a JSON string.
@@ -2725,8 +2749,13 @@ where
         use types::get_block_template::{
             check_parameters, check_synced_to_tip, fetch_chain_info, fetch_mempool_transactions,
             nsm_value_balance_for_next_block, validate_block_proposal,
-            zip317::select_mempool_transactions,
+            zip317::select_mempool_transactions_with_wcash_aux,
         };
+
+        check_parameters(&parameters)?;
+        let wcash_aux = parameters
+            .as_ref()
+            .and_then(|parameters| parameters.wcash_aux);
 
         // Clone Services
         let mempool = self.mempool.clone();
@@ -2750,8 +2779,6 @@ where
         }
 
         // To implement long polling correctly, we split this RPC into multiple phases.
-        check_parameters(&parameters)?;
-
         let client_long_poll_id = parameters.as_ref().and_then(|params| params.long_poll_id);
 
         let miner_params = self
@@ -2769,7 +2796,20 @@ where
             .precomputed_block_template(client_long_poll_id, long_poll_started)
             .await
         {
-            return Ok(template.into());
+            let template = match wcash_aux {
+                Some(wcash_aux) => template
+                    .with_wcash_aux(&self.network, miner_params, wcash_aux)
+                    .map_error_with_prefix(
+                        ErrorCode::InvalidParams,
+                        "invalid wcashaux parent-template request",
+                    )?,
+                None => return Ok(template.into()),
+            };
+            // A full ordinary cached template may not have room for the carrier.
+            // Select again with the exact extended sizing coinbase in that case.
+            if template.fits_parent_template_limits(&self.network) {
+                return Ok(template.into());
+            }
         }
 
         // - Checks and fetches that can change during long polling
@@ -2955,7 +2995,7 @@ where
         let coinbase_cache = self.gbt.coinbase_cache();
         let parent_nsm_value_balance = nsm_value_balance_for_next_block(&self.network, &chain_info);
 
-        let mempool_txs = select_mempool_transactions(
+        let mempool_txs = select_mempool_transactions_with_wcash_aux(
             &self.network,
             height,
             miner_params,
@@ -2963,6 +3003,7 @@ where
             mempool_tx_deps,
             Some(&coinbase_cache),
             parent_nsm_value_balance,
+            wcash_aux,
         );
 
         tracing::debug!(
@@ -2985,6 +3026,23 @@ where
             submit_old,
         );
 
+        let template = match wcash_aux {
+            Some(wcash_aux) => template
+                .with_wcash_aux(&self.network, miner_params, wcash_aux)
+                .map_error_with_prefix(
+                    ErrorCode::InvalidParams,
+                    "invalid wcashaux parent-template request",
+                )?,
+            None => template,
+        };
+        if wcash_aux.is_some() && !template.fits_parent_template_limits(&self.network) {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "parent template exceeds byte or sigop limits",
+                None,
+            ));
+        }
+
         // Coinbase construction can take seconds. Recheck the whole advertised range after it,
         // just as the cache does, rather than returning timestamps invalidated by clock rollback.
         (template.max_time
@@ -2993,6 +3051,126 @@ where
                 .saturating_add(Duration32::from_hours(2)))
         .then(|| template.into())
         .ok_or_misc_error("local clock moved backwards while building the block template")
+    }
+
+    async fn get_block_status(&self, block_hash: String) -> Result<GetBlockStatusResponse> {
+        let hash = block::Hash::from_hex(block_hash).map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                format!("invalid Zcash block hash: {error}"),
+                None::<()>,
+            )
+        })?;
+        let response = tokio::time::timeout(
+            COMMITTED_DUPLICATE_STATUS_TIMEOUT,
+            self.read_state
+                .clone()
+                .oneshot(zebra_state::ReadRequest::BlockStatus(hash)),
+        )
+        .await
+        .map_err(|_| {
+            ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "committed block status lookup timed out; retry the same request",
+                None,
+            )
+        })?
+        .map_err(|_| {
+            ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "committed block status unavailable; retry the same request",
+                None,
+            )
+        })?;
+        let zebra_state::ReadResponse::BlockStatus(status) = response else {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InternalError.code(),
+                "unexpected committed block status response",
+                None,
+            ));
+        };
+        match status {
+            Some(zebra_state::BlockStatus::BestChain { block, depth }) => {
+                committed_parent_block_status(&block, hash, Some(depth))
+            }
+            Some(zebra_state::BlockStatus::SideChain { block }) => {
+                committed_parent_block_status(&block, hash, None)
+            }
+            None => Ok(GetBlockStatusResponse::Unknown {}),
+        }
+    }
+
+    async fn get_wcash_parent_context(
+        &self,
+        previous_block_hash: String,
+        height: u32,
+    ) -> Result<WcashParentContext> {
+        let hash = block::Hash::from_hex(previous_block_hash).map_err(|_| {
+            ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "invalid parent block hash",
+                None,
+            )
+        })?;
+        let height = Height::try_from(height).map_err(|_| {
+            ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "candidate height is outside the supported range",
+                None,
+            )
+        })?;
+        if height == Height::MIN {
+            return Err(ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "candidate height must have a predecessor",
+                None,
+            ));
+        }
+
+        tokio::time::timeout(WCASH_PARENT_CONTEXT_TIMEOUT, async {
+            checked_wcash_parent_membership(
+                self.read_state
+                    .clone()
+                    .oneshot(zebra_state::ReadRequest::BlockStatus(hash))
+                    .await
+                    .map_err(|_| wcash_parent_context_unavailable())?,
+                hash,
+                height,
+            )?;
+
+            // Hash lookup binds these immutable values to the exact block that
+            // was checked above. A height lookup could sample a replacement
+            // block across a reorg and must never be used here.
+            let response = self
+                .read_state
+                .clone()
+                .oneshot(zebra_state::ReadRequest::BlockInfo(hash.into()))
+                .await
+                .map_err(|_| wcash_parent_context_unavailable())?;
+            let zebra_state::ReadResponse::BlockInfo(Some(info)) = response else {
+                return Err(wcash_parent_context_unavailable());
+            };
+
+            // Recheck membership after the hash-bound value read. Callers must
+            // still retain their existing tip fences around proposal checks.
+            checked_wcash_parent_membership(
+                self.read_state
+                    .clone()
+                    .oneshot(zebra_state::ReadRequest::BlockStatus(hash))
+                    .await
+                    .map_err(|_| wcash_parent_context_unavailable())?,
+                hash,
+                height,
+            )?;
+
+            Ok(WcashParentContext::new(
+                hash,
+                height,
+                u64::from(info.value_pools().nsm_amount()),
+            ))
+        })
+        .await
+        .map_err(|_| wcash_parent_context_unavailable())?
     }
 
     async fn submit_block(
@@ -3062,7 +3240,58 @@ where
         };
 
         let response = match chain_error {
-            Ok(source) if source.is_duplicate_request() => SubmitBlockErrorResponse::Duplicate,
+            Ok(source) if source.is_duplicate_request() => {
+                // A verifier duplicate can be merely queued. Recover a lost
+                // gossip obligation only from one positive canonical snapshot,
+                // including exact serialized identity, and never from side-chain
+                // or unknown state. The backend retains and retries its durable
+                // winner record if lookup or queue admission is unavailable.
+                let response = tokio::time::timeout(
+                    COMMITTED_DUPLICATE_STATUS_TIMEOUT,
+                    self.read_state
+                        .clone()
+                        .oneshot(zebra_state::ReadRequest::BlockStatus(block_hash)),
+                )
+                .await
+                .map_err(|_| {
+                    ErrorObject::borrowed(
+                        ErrorCode::InternalError.code(),
+                        "committed duplicate status lookup timed out; retry the same submission",
+                        None,
+                    )
+                })?
+                .map_err(|_| {
+                    ErrorObject::borrowed(
+                        ErrorCode::InternalError.code(),
+                        "committed duplicate status unavailable; retry the same submission",
+                        None,
+                    )
+                })?;
+                let zebra_state::ReadResponse::BlockStatus(status) = response else {
+                    return Err(ErrorObject::borrowed(
+                        ErrorCode::InternalError.code(),
+                        "unexpected committed duplicate status response; retry the same submission",
+                        None,
+                    ));
+                };
+                if let Some(zebra_state::BlockStatus::BestChain {
+                    block: committed, ..
+                }) = status
+                {
+                    if committed.hash() != block_hash
+                        || committed.coinbase_height() != Some(height)
+                        || committed.zcash_serialize_to_vec().map_misc_error()? != block_bytes
+                    {
+                        return Err(ErrorObject::borrowed(
+                            ErrorCode::InternalError.code(),
+                            "committed duplicate does not match the submitted Zcash block",
+                            None,
+                        ));
+                    }
+                    self.gbt.advertise_committed_duplicate(block_hash, height)?;
+                }
+                SubmitBlockErrorResponse::Duplicate
+            }
 
             // Currently, these match arms return Reject for the older duplicate in a queue,
             // but queued duplicates should be DuplicateInconclusive.
@@ -5428,3 +5657,79 @@ pub enum AddNodeCommand {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct GetTxOutResponse(Option<types::transaction::OutputObject>);
+
+/// Fail closed if context cannot be read without mixing predecessor identities.
+fn wcash_parent_context_unavailable() -> ErrorObject<'static> {
+    ErrorObject::borrowed(
+        ErrorCode::InternalError.code(),
+        "exact parent reward context unavailable; retry with the current predecessor",
+        None,
+    )
+}
+
+/// Validates the exact predecessor hash and candidate height from committed state.
+fn checked_wcash_parent_membership(
+    response: zebra_state::ReadResponse,
+    expected_hash: block::Hash,
+    candidate_height: Height,
+) -> Result<()> {
+    let zebra_state::ReadResponse::BlockStatus(Some(zebra_state::BlockStatus::BestChain {
+        block,
+        ..
+    })) = response
+    else {
+        return Err(wcash_parent_context_unavailable());
+    };
+    if block.hash() != expected_hash {
+        return Err(wcash_parent_context_unavailable());
+    }
+    if block
+        .coinbase_height()
+        .and_then(|height| height.next().ok())
+        != Some(candidate_height)
+    {
+        return Err(ErrorObject::borrowed(
+            ErrorCode::InvalidParams.code(),
+            "candidate height does not follow the exact parent block",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Constructs membership evidence only from an exact committed block read.
+fn committed_parent_block_status(
+    block: &Block,
+    expected_hash: block::Hash,
+    depth: Option<u32>,
+) -> Result<GetBlockStatusResponse> {
+    if block.hash() != expected_hash {
+        return Err(ErrorObject::borrowed(
+            ErrorCode::InternalError.code(),
+            "committed block status returned a different block hash",
+            None,
+        ));
+    }
+    let height = block.coinbase_height().map(u32::from).ok_or_else(|| {
+        ErrorObject::borrowed(
+            ErrorCode::InternalError.code(),
+            "committed block has no coinbase height",
+            None,
+        )
+    })?;
+    let hash = expected_hash.to_string();
+    match depth {
+        Some(depth) => Ok(GetBlockStatusResponse::BestChain {
+            hash,
+            height,
+            confirmations: depth.checked_add(1).ok_or_else(|| {
+                ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "committed block confirmation count overflowed",
+                    None,
+                )
+            })?,
+        }),
+        None => Ok(GetBlockStatusResponse::SideChain { hash, height }),
+    }
+}

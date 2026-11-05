@@ -3832,6 +3832,7 @@ async fn getblocktemplate_long_poll_waits_for_a_new_template() {
                 capabilities: vec![],
                 long_poll_id: Some(long_poll_id),
                 _work_id: None,
+                wcash_aux: None,
             }))
             .await
         }
@@ -4268,7 +4269,8 @@ async fn rpc_submitblock_errors() {
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (mined_sender, mut mined_receiver) = tokio::sync::mpsc::channel(1);
+    let (rpc, queue) = RpcImpl::new(
         Mainnet,
         Default::default(),
         Default::default(),
@@ -4282,7 +4284,7 @@ async fn rpc_submitblock_errors() {
         tip.clone(),
         MockAddressBookPeers::default(),
         rx,
-        None,
+        Some(mined_sender),
     );
 
     // Try to submit pre-populated blocks and assert that it responds with duplicate.
@@ -4293,6 +4295,12 @@ async fn rpc_submitblock_errors() {
             submit_block_response,
             Ok(SubmitBlockErrorResponse::Duplicate.into())
         );
+        let block: Block = block_bytes.zcash_deserialize_into().unwrap();
+        assert_eq!(
+            mined_receiver.try_recv().unwrap(),
+            (block.hash(), block.coinbase_height().unwrap())
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
     let submit_block_response = rpc
@@ -4308,6 +4316,7 @@ async fn rpc_submitblock_errors() {
     );
 
     mempool.expect_no_requests().await;
+    queue.abort();
 
     // See zebrad's `integration::regtest::regtest_block_templates_are_valid_block_submissions`
     // for the success case.
@@ -5708,4 +5717,507 @@ async fn rpc_getnetworkinfo_does_not_block_on_address_book_contention() {
         .expect("RPC task should not panic")
         .expect("RPC should succeed");
     assert_eq!(response.connections, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getblockstatus_distinguishes_committed_side_chain_from_unknown() {
+    let _init_guard = zebra_test::init();
+    let block: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+    for state_name in ["best_chain", "side_chain", "unknown"] {
+        let request_rpc = rpc.clone();
+        let request =
+            tokio::spawn(async move { request_rpc.get_block_status(hash.to_string()).await });
+        let status = match state_name {
+            "best_chain" => Some(zebra_state::BlockStatus::BestChain {
+                block: block.clone(),
+                depth: 4,
+            }),
+            "side_chain" => Some(zebra_state::BlockStatus::SideChain {
+                block: block.clone(),
+            }),
+            _ => None,
+        };
+        read_state
+            .expect_request(ReadRequest::BlockStatus(hash))
+            .await
+            .respond(ReadResponse::BlockStatus(status));
+        let response = request.await.unwrap().unwrap();
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(response["state"], state_name);
+        if state_name == "unknown" {
+            assert_eq!(response, serde_json::json!({"state":"unknown"}));
+        } else {
+            assert_eq!(response["hash"], hash.to_string());
+            assert_eq!(response["height"], 0);
+            assert_eq!(
+                response.get("confirmations"),
+                (state_name == "best_chain").then_some(&serde_json::json!(5))
+            );
+        }
+    }
+    assert!(committed_parent_block_status(&block, Hash([0x91; 32]), None).is_err());
+    assert!(committed_parent_block_status(&block, hash, Some(u32::MAX)).is_err());
+    // A queued or merely remembered hash must never be accepted as a commit.
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+}
+
+/// The reward-context lookup binds every value read to an exact parent hash,
+/// and fails closed on reorgs, missing state and one whole-operation deadline.
+#[tokio::test(start_paused = true)]
+async fn rpc_getwcashparentcontext_is_exact_bounded_and_reorg_safe() {
+    let _init_guard = zebra_test::init();
+    let parent: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let different: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = parent.hash();
+    for scenario in [
+        "good",
+        "unknown",
+        "side",
+        "wrong_height",
+        "missing_info",
+        "reorg",
+        "different_hash",
+        "unexpected_response",
+        "state_error",
+        "deadline",
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let parent = parent.clone();
+        let different = different.clone();
+        let read_state = tower::service_fn(move |request| {
+            let call = observed.fetch_add(1, Ordering::SeqCst);
+            let response = match request {
+                ReadRequest::BlockStatus(requested) => {
+                    assert_eq!(requested, hash);
+                    let status = match scenario {
+                        "unknown" => None,
+                        "side" => Some(zebra_state::BlockStatus::SideChain {
+                            block: parent.clone(),
+                        }),
+                        "reorg" if call > 0 => Some(zebra_state::BlockStatus::SideChain {
+                            block: parent.clone(),
+                        }),
+                        _ => Some(zebra_state::BlockStatus::BestChain {
+                            block: if scenario == "different_hash" {
+                                different.clone()
+                            } else {
+                                parent.clone()
+                            },
+                            depth: 0,
+                        }),
+                    };
+                    if scenario == "unexpected_response" {
+                        ReadResponse::BlockInfo(None)
+                    } else {
+                        ReadResponse::BlockStatus(status)
+                    }
+                }
+                ReadRequest::BlockInfo(requested) => {
+                    assert_eq!(
+                        requested,
+                        hash.into(),
+                        "value lookup must use the exact hash"
+                    );
+                    let mut pools = zebra_chain::value_balance::ValueBalance::zero();
+                    pools.set_nsm_amount(123_456_789u64.try_into().unwrap());
+                    ReadResponse::BlockInfo(
+                        (scenario != "missing_info").then(|| BlockInfo::new(pools, 1)),
+                    )
+                }
+                _ => panic!("the context lookup must not request a template or a live tip"),
+            };
+            async move {
+                if scenario == "deadline" {
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                }
+                if scenario == "state_error" {
+                    Err::<_, BoxError>("injected state read failure".into())
+                } else {
+                    Ok::<_, BoxError>(response)
+                }
+            }
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (rpc, _queue) = RpcImpl::new(
+            Mainnet,
+            Default::default(),
+            Default::default(),
+            "0.0.1",
+            "RPC test",
+            MockService::build().for_unit_tests(),
+            MockService::build().for_unit_tests(),
+            read_state,
+            MockService::build().for_unit_tests(),
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            None,
+        );
+        let started = tokio::time::Instant::now();
+        let response = rpc
+            .get_wcash_parent_context(
+                hash.to_string(),
+                if scenario == "wrong_height" { 2 } else { 1 },
+            )
+            .await;
+        if scenario == "good" {
+            assert_eq!(
+                serde_json::to_value(response.unwrap()).unwrap(),
+                serde_json::json!({
+                    "version": 1,
+                    "previousblockhash": hash.to_string(),
+                    "height": 1,
+                    "parentnsmvaluebalance": 123_456_789,
+                })
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+        } else {
+            let error = response.unwrap_err();
+            assert_eq!(
+                error.code(),
+                if scenario == "wrong_height" {
+                    ErrorCode::InvalidParams.code()
+                } else {
+                    ErrorCode::InternalError.code()
+                }
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                match scenario {
+                    "missing_info" | "deadline" => 2,
+                    "reorg" => 3,
+                    _ => 1,
+                }
+            );
+        }
+        if scenario == "deadline" {
+            assert_eq!(started.elapsed(), WCASH_PARENT_CONTEXT_TIMEOUT);
+        }
+        let before_invalid = calls.load(Ordering::SeqCst);
+        for (requested_hash, height) in [("invalid".to_string(), 1), (hash.to_string(), 0)] {
+            assert_eq!(
+                rpc.get_wcash_parent_context(requested_hash, height)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::InvalidParams.code()
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), before_invalid);
+    }
+}
+
+/// The first commit can succeed while gossip admission fails. The backend's
+/// exact-byte retry must restore the obligation from committed best-chain state.
+#[tokio::test]
+async fn rpc_submitblock_commit_then_admission_failure_recovers_on_duplicate() {
+    let _init_guard = zebra_test::init();
+    let bytes = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.to_vec();
+    let block: Arc<Block> = bytes.zcash_deserialize_into().unwrap();
+    let hash = block.hash();
+    let height = block.coinbase_height().unwrap();
+    let commits = Arc::new(AtomicUsize::new(0));
+    let calls = commits.clone();
+    let router = tower::service_fn(move |_| {
+        let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+        async move {
+            if first {
+                Ok::<Hash, BoxError>(hash)
+            } else {
+                Err(zebra_consensus::router::RouterError::from(
+                    zebra_consensus::VerifyCheckpointError::NewerRequest { height, hash },
+                )
+                .into())
+            }
+        }
+    });
+    let read_state = tower::service_fn(move |request| {
+        assert!(matches!(request, ReadRequest::BlockStatus(requested) if requested == hash));
+        let block = block.clone();
+        async move {
+            Ok::<_, BoxError>(ReadResponse::BlockStatus(Some(
+                zebra_state::BlockStatus::BestChain { block, depth: 0 },
+            )))
+        }
+    });
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (mined_sender, mut mined_receiver) = tokio::sync::mpsc::channel(1);
+    let notification = (hash, height);
+    mined_sender.try_send(notification).unwrap();
+    let (rpc, queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        read_state,
+        router,
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        Some(mined_sender),
+    );
+    assert!(
+        rpc.submit_block(HexData(bytes.clone()), None)
+            .await
+            .is_err(),
+        "commit does not acknowledge failed queue admission"
+    );
+    assert_eq!(mined_receiver.try_recv().unwrap(), notification);
+    assert_eq!(
+        rpc.submit_block(HexData(bytes.clone()), None).await,
+        Ok(SubmitBlockErrorResponse::Duplicate.into())
+    );
+    assert_eq!(
+        mined_receiver.try_recv().unwrap(),
+        notification,
+        "exact committed retry restores gossip after admission failure"
+    );
+    assert!(
+        rpc.submit_block(HexData(bytes), None).await.is_err(),
+        "cooldown is an explicit retryable error, never an acknowledgement without admission"
+    );
+    assert!(matches!(
+        mined_receiver.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(commits.load(Ordering::SeqCst), 3);
+    queue.abort();
+}
+
+/// Side-chain and merely queued duplicates never get priority gossip. Best-chain
+/// replies must match the exact submitted bytes, not just a transaction/header ID.
+#[tokio::test]
+async fn rpc_submitblock_duplicate_requires_exact_canonical_status() {
+    let _init_guard = zebra_test::init();
+    let bytes = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.to_vec();
+    let block: Arc<Block> = bytes.zcash_deserialize_into().unwrap();
+    let hash = block.hash();
+    let height = block.coinbase_height().unwrap();
+    let wrong_hash: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let mut wrong_bytes = block.as_ref().clone();
+    wrong_bytes.transactions.push(block.transactions[0].clone());
+    assert_eq!(
+        wrong_bytes.hash(),
+        hash,
+        "same-header fixture requires all-byte validation"
+    );
+    for (status, read_failure, wrong_response, expected_error) in [
+        (None, false, false, false),
+        (
+            Some(zebra_state::BlockStatus::SideChain {
+                block: block.clone(),
+            }),
+            false,
+            false,
+            false,
+        ),
+        (None, true, false, true),
+        (None, false, true, true),
+        (
+            Some(zebra_state::BlockStatus::BestChain {
+                block: wrong_hash,
+                depth: 0,
+            }),
+            false,
+            false,
+            true,
+        ),
+        (
+            Some(zebra_state::BlockStatus::BestChain {
+                block: Arc::new(wrong_bytes),
+                depth: 0,
+            }),
+            false,
+            false,
+            true,
+        ),
+    ] {
+        let router = tower::service_fn(move |_| async move {
+            Err::<Hash, BoxError>(
+                zebra_consensus::router::RouterError::from(
+                    zebra_consensus::VerifyCheckpointError::NewerRequest { height, hash },
+                )
+                .into(),
+            )
+        });
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let calls = read_calls.clone();
+        let read_state = tower::service_fn(move |request| {
+            assert!(matches!(request, ReadRequest::BlockStatus(requested) if requested == hash));
+            calls.fetch_add(1, Ordering::SeqCst);
+            let status = status.clone();
+            async move {
+                if read_failure {
+                    Err::<ReadResponse, BoxError>("test state unavailable".into())
+                } else if wrong_response {
+                    Ok(ReadResponse::Tip(None))
+                } else {
+                    Ok(ReadResponse::BlockStatus(status))
+                }
+            }
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (mined_sender, mut mined_receiver) = tokio::sync::mpsc::channel(1);
+        let (rpc, queue) = RpcImpl::new(
+            Mainnet,
+            Default::default(),
+            Default::default(),
+            "0.0.1",
+            "RPC test",
+            MockService::build().for_unit_tests(),
+            MockService::build().for_unit_tests(),
+            read_state,
+            router,
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            Some(mined_sender),
+        );
+        let result = rpc.submit_block(HexData(bytes.clone()), None).await;
+        if expected_error {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result, Ok(SubmitBlockErrorResponse::Duplicate.into()));
+        }
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            mined_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        queue.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn rpc_submitblock_duplicate_status_lookup_has_a_deadline() {
+    let _init_guard = zebra_test::init();
+    let bytes = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.to_vec();
+    let block: Block = bytes.zcash_deserialize_into().unwrap();
+    let hash = block.hash();
+    let height = block.coinbase_height().unwrap();
+    let router = tower::service_fn(move |_| async move {
+        Err::<Hash, BoxError>(
+            zebra_consensus::router::RouterError::from(
+                zebra_consensus::VerifyCheckpointError::NewerRequest { height, hash },
+            )
+            .into(),
+        )
+    });
+    let read_state = tower::service_fn(move |request| {
+        assert!(matches!(request, ReadRequest::BlockStatus(requested) if requested == hash));
+        std::future::pending::<std::result::Result<ReadResponse, BoxError>>()
+    });
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (mined_sender, mut mined_receiver) = tokio::sync::mpsc::channel(1);
+    let (rpc, queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        read_state,
+        router,
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        Some(mined_sender),
+    );
+    let started = tokio::time::Instant::now();
+    let result = rpc.submit_block(HexData(bytes), None).await.unwrap_err();
+    assert!(result.message().contains("retry the same submission"));
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        COMMITTED_DUPLICATE_STATUS_TIMEOUT
+    );
+    assert!(matches!(
+        mined_receiver.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    queue.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn rpc_getblockstatus_state_wait_is_bounded_and_retryable() {
+    let _init_guard = zebra_test::init();
+    let hash = Hash([0x61; 32]);
+    for state_unavailable in [false, true] {
+        let read_state = tower::service_fn(move |request| {
+            assert!(matches!(request, ReadRequest::BlockStatus(requested) if requested == hash));
+            async move {
+                if state_unavailable {
+                    Err::<ReadResponse, BoxError>("test state unavailable".into())
+                } else {
+                    std::future::pending::<std::result::Result<ReadResponse, BoxError>>().await
+                }
+            }
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (rpc, queue) = RpcImpl::new(
+            Mainnet,
+            Default::default(),
+            Default::default(),
+            "0.0.1",
+            "RPC test",
+            MockService::build().for_unit_tests(),
+            MockService::build().for_unit_tests(),
+            read_state,
+            MockService::build().for_unit_tests(),
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            None,
+        );
+        let started = tokio::time::Instant::now();
+        let error = rpc.get_block_status(hash.to_string()).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InternalError.code());
+        assert!(error.message().contains("retry the same request"));
+        let expected = if state_unavailable {
+            Duration::ZERO
+        } else {
+            COMMITTED_DUPLICATE_STATUS_TIMEOUT
+        };
+        assert_eq!(tokio::time::Instant::now() - started, expected);
+        queue.abort();
+    }
 }

@@ -912,112 +912,104 @@ async fn setup(
 }
 
 mod submitblock_test {
-    use std::io;
-    use std::sync::{Arc, Mutex};
-    use tracing::{Instrument, Level};
-    use tracing_subscriber::fmt;
+    use tracing::Instrument;
     use zebra_rpc::SubmitBlockChannel;
 
     use super::*;
 
-    use crate::components::sync::PEER_GOSSIP_DELAY;
-
-    // Custom in-memory writer to capture logs
-    struct TestWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for TestWriter {
-        #[allow(clippy::unwrap_in_result)]
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let mut logs = self.0.lock().unwrap();
-            logs.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn submitblock_channel() -> Result<(), crate::BoxError> {
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let log_sink = logs.clone();
-
-        // Set up a tracing subscriber with a custom writer
-        let subscriber = fmt()
-            .with_max_level(Level::INFO)
-            .with_writer(move || TestWriter(log_sink.clone())) // Write logs to an in-memory buffer
-            .finish();
-
-        let _guard = tracing::subscriber::set_default(subscriber);
-
+        let _init_guard = zebra_test::init();
         let (sync_status, _recent_syncs) = SyncStatus::new();
+        let (_tip, _, chain_tip_change) = zebra_state::ChainTipSender::new(None, &Network::Mainnet);
+        let mut peers = zebra_network::test_support::PeerSetHarness::new(&[], None).await;
+        let peer = peers.connect_peer_at(
+            SocketAddr::from(([198, 51, 100, 1], 8233)).into(),
+            zebra_network::types::PeerServices::NODE_NETWORK,
+        );
+        let block_advertiser = peers.block_advertiser.clone();
 
-        // State
-        let state_config = StateConfig::ephemeral();
-        let (_state_service, _read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zebra_state::init(state_config, &Network::Mainnet, Height::MAX, 0).await;
-
-        let config_listen_addr = "127.0.0.1:0".parse().unwrap();
-
-        // Network
-        let network_config = NetworkConfig {
-            network: Network::Mainnet,
-            listen_addr: config_listen_addr,
-
-            // Stop Zebra making outbound connections
-            initial_mainnet_peers: IndexSet::new(),
-            initial_testnet_peers: IndexSet::new(),
-            cache_dir: CacheDir::disabled(),
-
-            ..NetworkConfig::default()
-        };
-
-        // Inbound
-        let (_setup_tx, setup_rx) = oneshot::channel();
-        let inbound_service = Inbound::new(MAX_INBOUND_CONCURRENCY, setup_rx);
-        let inbound_service = ServiceBuilder::new()
-            .load_shed()
-            .buffer(10)
-            .service(BoxService::new(inbound_service));
-
-        let (_peer_set, _address_book, _misbehavior_tx, block_advertiser) = zebra_network::init(
-            network_config,
-            inbound_service.clone(),
-            latest_chain_tip.clone(),
-            "Zebra user agent".to_string(),
-        )
-        .await;
+        // The real buffered peer set needs an eligible client before advertiser
+        // readiness completes. The harness supplies its real bounded advert
+        // channel, with controllable local-write acknowledgments and no sockets.
+        let (outcome_sender, mut outcomes) = tokio::sync::mpsc::channel(2);
+        let observed_advertiser = tower::service_fn(move |request: Request| {
+            let advertiser = block_advertiser.clone();
+            let outcome_sender = outcome_sender.clone();
+            async move {
+                let hash = match request {
+                    Request::AdvertiseBlockToAll(hash) => hash,
+                    _ => panic!("the mined channel must request all-peer advertisement"),
+                };
+                let result = advertiser.oneshot(request).await;
+                let report = match &result {
+                    Ok(Response::MinedBlockAdvertisement(report)) => *report,
+                    Err(error) => error
+                        .downcast_ref::<zebra_network::MinedBlockAdvertisementError>()
+                        .expect("mined advertisement errors retain typed write outcomes")
+                        .report(),
+                    Ok(_) => panic!("mined advertisements return typed local-write outcomes"),
+                };
+                outcome_sender.send((hash, report)).await.unwrap();
+                result
+            }
+        });
 
         // Start the block gossip task with a SubmitBlockChannel
         let submitblock_channel = SubmitBlockChannel::new();
+        let submitted_hash = block::Hash([1; 32]);
         // Send a block to the channel
         submitblock_channel
             .sender()
-            .send((block::Hash([1; 32]), block::Height(1)))
+            .send((submitted_hash, block::Height(1)))
             .await
             .unwrap();
         let gossip_task_handle = tokio::spawn(
             sync::gossip_best_tip_block_hashes(
                 sync_status.clone(),
                 chain_tip_change,
-                block_advertiser,
+                observed_advertiser,
                 Some(submitblock_channel.receiver()),
             )
             .in_current_span(),
         );
 
-        // Wait for the block gossip task to process the block
-        tokio::time::sleep(PEER_GOSSIP_DELAY).await;
-
-        // Check that the block was processed as a mnined block by the gossip task
-        let captured_logs = logs.lock().unwrap();
-        let log_output = String::from_utf8(captured_logs.clone()).unwrap();
-
-        assert!(log_output.contains("initializing block gossip task"));
-        assert!(log_output.contains("sending mined block broadcast"));
-
-        std::mem::drop(gossip_task_handle);
+        timeout(Duration::from_secs(5), async {
+            for fail_write in [true, false] {
+                let (hash, write) = loop {
+                    if let Some(advert) = peers.next_block_advert(peer).await {
+                        break advert;
+                    }
+                };
+                assert_eq!(hash, submitted_hash);
+                write
+                    .send(if fail_write {
+                        Err("injected local write failure".into())
+                    } else {
+                        Ok(())
+                    })
+                    .unwrap();
+                let (hash, report) = outcomes.recv().await.unwrap();
+                assert_eq!(hash, submitted_hash);
+                assert_eq!(
+                    report,
+                    zebra_network::MinedBlockAdvertisement {
+                        non_local_sent: usize::from(!fail_write),
+                        local_sent: 0,
+                        failed: usize::from(fail_write),
+                    }
+                );
+            }
+        })
+        .await
+        .expect("the mined hash must retry after a failed write and then complete");
+        assert!(
+            peers.next_block_advert(peer).await.is_none(),
+            "successful non-local writes complete the retained obligation"
+        );
+        assert!(!gossip_task_handle.is_finished());
+        gossip_task_handle.abort();
+        assert!(gossip_task_handle.await.unwrap_err().is_cancelled());
 
         Ok(())
     }
