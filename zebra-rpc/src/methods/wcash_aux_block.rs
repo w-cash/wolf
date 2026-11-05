@@ -371,17 +371,24 @@ impl AuxBlockCandidateCache {
 
     /// Discards a reservation that was never returned to its caller.
     pub(crate) fn discard_unpublished(&self, lease: CandidateLease) {
-        if !lease.needs_publication {
-            return;
-        }
-
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let should_remove = inner.entries.get(&lease.id).is_some_and(|entry| {
-            entry.state == CacheEntryState::Publishing
-                && contains_token(&entry.active_retire_tokens, &lease.retire_token)
+        let should_remove = inner.entries.get_mut(&lease.id).is_some_and(|entry| {
+            let Some(token_index) = token_index(&entry.active_retire_tokens, &lease.retire_token)
+            else {
+                return false;
+            };
+            match (entry.state, lease.needs_publication) {
+                (CacheEntryState::Publishing, true) => true,
+                (CacheEntryState::Published | CacheEntryState::SubmissionStarted, false) => {
+                    entry.active_retire_tokens.swap_remove(token_index);
+                    entry.state == CacheEntryState::Published
+                        && entry.active_retire_tokens.is_empty()
+                }
+                _ => false,
+            }
         });
         if should_remove {
             inner.entries.remove(&lease.id);
@@ -869,6 +876,159 @@ mod tests {
                 .retire(replacement.id(), replacement.retire_token())
                 .expect("published candidate retires"),
             CandidateRetirement::Retired
+        );
+    }
+
+    #[test]
+    fn reissued_tip_race_cleanup_preserves_the_issued_lease() {
+        let cache = AuxBlockCandidateCache::new(1, Duration::from_secs(600));
+        let now = Instant::now();
+        let candidate = candidate(1, block::Hash([0x52; 32]));
+        let issued = cache
+            .insert_at(Arc::clone(&candidate), now)
+            .expect("cache has room for the original job");
+        cache.publish(issued);
+
+        for _ in 0..64 {
+            let abandoned = cache
+                .insert_at(Arc::clone(&candidate), now)
+                .expect("abandoned reissues must not accumulate active leases");
+            cache.discard_unpublished(abandoned);
+        }
+
+        assert_eq!(
+            cache
+                .retire(issued.id(), issued.retire_token())
+                .expect("the originally issued lease stays authorized"),
+            CandidateRetirement::Retired
+        );
+        assert_eq!(
+            cache.begin_submission_at(issued.id(), now),
+            Err(CandidateLookupError::Unknown),
+            "the original lease is the only remaining owner"
+        );
+    }
+
+    #[test]
+    fn abandoned_last_reissue_releases_capacity_after_original_retirement() {
+        let cache = AuxBlockCandidateCache::new(1, Duration::from_secs(600));
+        let now = Instant::now();
+        let tip = block::Hash([0x53; 32]);
+        let original = candidate(1, tip);
+        let issued = cache
+            .insert_at(Arc::clone(&original), now)
+            .expect("cache has room for the original job");
+        cache.publish(issued);
+        let abandoned = cache
+            .insert_at(original, now)
+            .expect("the candidate can be reissued");
+
+        assert_eq!(
+            cache
+                .retire(issued.id(), issued.retire_token())
+                .expect("the original caller can retire its lease concurrently"),
+            CandidateRetirement::Retired
+        );
+        cache.discard_unpublished(abandoned);
+
+        assert!(
+            cache.insert_at(candidate(2, tip), now).is_ok(),
+            "rolling back the last unreturned lease must release the cache slot"
+        );
+    }
+
+    #[test]
+    fn reissued_tip_race_cleanup_preserves_a_started_submission() {
+        let cache = AuxBlockCandidateCache::new(1, Duration::from_secs(600));
+        let now = Instant::now();
+        let candidate = candidate(1, block::Hash([0x54; 32]));
+        let issued = cache
+            .insert_at(Arc::clone(&candidate), now)
+            .expect("cache has room for the original job");
+        cache.publish(issued);
+        let abandoned = cache
+            .insert_at(Arc::clone(&candidate), now)
+            .expect("the candidate can be reissued before submission starts");
+
+        assert!(cache.begin_submission_at(issued.id(), now).is_ok());
+        cache.discard_unpublished(abandoned);
+        for _ in 0..64 {
+            let abandoned = cache
+                .insert_at(Arc::clone(&candidate), now)
+                .expect("aborted reissues must release their leases during submission");
+            cache.discard_unpublished(abandoned);
+        }
+
+        assert_eq!(
+            cache
+                .retire(issued.id(), issued.retire_token())
+                .expect("the original lease stays authorized during submission"),
+            CandidateRetirement::SubmissionStarted
+        );
+        let retry = cache
+            .begin_submission_at(issued.id(), now)
+            .expect("the started submission remains retryable");
+        assert!(Arc::ptr_eq(&candidate, &retry));
+    }
+
+    #[test]
+    fn abandoning_the_last_lease_preserves_a_started_submission() {
+        let cache = AuxBlockCandidateCache::new(1, Duration::from_secs(600));
+        let now = Instant::now();
+        let candidate = candidate(1, block::Hash([0x56; 32]));
+        let issued = cache
+            .insert_at(Arc::clone(&candidate), now)
+            .expect("cache has room for the original job");
+        cache.publish(issued);
+        let abandoned = cache
+            .insert_at(Arc::clone(&candidate), now)
+            .expect("the candidate can be reissued");
+        assert_eq!(
+            cache
+                .retire(issued.id(), issued.retire_token())
+                .expect("the original lease can retire before submission starts"),
+            CandidateRetirement::Retired
+        );
+        assert!(cache.begin_submission_at(issued.id(), now).is_ok());
+
+        cache.discard_unpublished(abandoned);
+
+        let retry = cache
+            .begin_submission_at(issued.id(), now)
+            .expect("an in-flight proof remains retryable without an active lease");
+        assert!(Arc::ptr_eq(&candidate, &retry));
+    }
+
+    #[test]
+    fn stale_tip_race_cleanup_cannot_remove_a_replacement_lease() {
+        let cache = AuxBlockCandidateCache::new(1, Duration::from_secs(600));
+        let now = Instant::now();
+        let candidate = candidate(1, block::Hash([0x55; 32]));
+        let issued = cache
+            .insert_at(Arc::clone(&candidate), now)
+            .expect("cache has room for the original job");
+        cache.publish(issued);
+        let abandoned = cache
+            .insert_at(Arc::clone(&candidate), now)
+            .expect("the original candidate can be reissued");
+        cache.remove(issued.id());
+
+        let replacement = cache
+            .insert_at(candidate, now)
+            .expect("the completed candidate can be replaced");
+        cache.publish(replacement);
+        cache.discard_unpublished(abandoned);
+        cache.discard_unpublished(issued);
+
+        assert!(
+            cache.begin_submission_at(replacement.id(), now).is_ok(),
+            "rollback must match the exact lease token, not just the block hash"
+        );
+        assert_eq!(
+            cache
+                .retire(replacement.id(), replacement.retire_token())
+                .expect("the replacement keeps its independent capability"),
+            CandidateRetirement::SubmissionStarted
         );
     }
 

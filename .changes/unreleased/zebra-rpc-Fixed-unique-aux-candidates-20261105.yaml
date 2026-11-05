@@ -1,0 +1,4 @@
+kind: Fixed
+body: Give each Wcash createauxblock request an independently random child nonce without rebuilding cached coinbase proofs, and release only the unreturned lease when candidate publication races a tip change.
+time: 2026-11-05T18:00:00Z
+project: zebra-rpc
