@@ -81,6 +81,14 @@ its coinbase proof. An issued candidate's bytes never change. Unused candidates
 must be retired with their own token once all miners and share handlers have
 stopped using them; per-request uniqueness does not remove the 16-entry bound.
 
+When all candidate slots are occupied, `createauxblock` returns the dedicated
+JSON-RPC error code `-32002`. This means temporary resource pressure, not an
+invalid template. Pools should retry with bounded backoff while retaining
+independently usable work and delivering recorded winners. Reclaim only their
+own unused candidates through `retireauxblock`; never discard another miner's
+active work. Other internal errors, including generic `-32603`, retain their
+existing failure policy.
+
 When a caller selects a payout different from the node's configured recipient,
 the handler retains a bounded set of four recipient-isolated coinbase caches.
 Repeated requests with exactly the same miner parameters, height and fees can

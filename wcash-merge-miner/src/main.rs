@@ -52,9 +52,12 @@ const DEFAULT_BIND: &str = "127.0.0.1:28237";
 const DEFAULT_SHARE_JOURNAL: &str = ".wcash-share-journal-v2.jsonl";
 const INITIAL_NATIVE_PREPARATION_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_NATIVE_PREPARATION_BACKOFF: Duration = Duration::from_secs(60);
+const MAX_CANDIDATE_CAPACITY_BACKOFF: Duration = Duration::from_secs(5);
 const TIP_RACE_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// Stable `createauxblock` server error for an ordinary Wcash best-tip race.
 const WCASH_AUX_TIP_CHANGED_ERROR_CODE: i64 = -32_001;
+/// Stable `createauxblock` error when issued candidates occupy every cache slot.
+const WCASH_AUX_CAPACITY_ERROR_CODE: i64 = -32_002;
 const POOL_BACKEND_MONITOR_INTERVAL: Duration = Duration::from_millis(50);
 const POOL_BACKEND_SUPERSEDED_GRACE: Duration = Duration::from_secs(2);
 // Every in-flight/prepared/active/draining/retiring generation owns one slot.
@@ -1691,6 +1694,10 @@ fn is_retryable_native_preparation_error(error: &MinerError) -> bool {
             code: Some(-9 | -10 | -28 | WCASH_AUX_TIP_CHANGED_ERROR_CODE),
             ..
         } => true,
+        MinerError::RpcError {
+            code: Some(WCASH_AUX_CAPACITY_ERROR_CODE),
+            ..
+        } => true,
         MinerError::Io(error) => is_retryable_io_kind(error.kind()),
         MinerError::ParentTipMismatch { .. }
         | MinerError::ChildTipMismatch { .. }
@@ -1708,6 +1715,10 @@ fn native_preparation_retry_delay(error: &MinerError, backoff: Duration) -> Dura
             code: Some(WCASH_AUX_TIP_CHANGED_ERROR_CODE),
             ..
         } => TIP_RACE_RETRY_DELAY,
+        MinerError::RpcError {
+            code: Some(WCASH_AUX_CAPACITY_ERROR_CODE),
+            ..
+        } => backoff.min(MAX_CANDIDATE_CAPACITY_BACKOFF),
         _ => backoff,
     }
 }
@@ -1721,6 +1732,10 @@ fn next_native_preparation_backoff(error: &MinerError, backoff: Duration) -> Dur
             code: Some(WCASH_AUX_TIP_CHANGED_ERROR_CODE),
             ..
         } => INITIAL_NATIVE_PREPARATION_BACKOFF,
+        MinerError::RpcError {
+            code: Some(WCASH_AUX_CAPACITY_ERROR_CODE),
+            ..
+        } => (backoff * 2).min(MAX_CANDIDATE_CAPACITY_BACKOFF),
         _ => (backoff * 2).min(MAX_NATIVE_PREPARATION_BACKOFF),
     }
 }
@@ -3163,12 +3178,25 @@ mod tests {
             );
         }
 
-        for code in [-9, -10, -28, WCASH_AUX_TIP_CHANGED_ERROR_CODE] {
+        for code in [
+            -9,
+            -10,
+            -28,
+            WCASH_AUX_TIP_CHANGED_ERROR_CODE,
+            WCASH_AUX_CAPACITY_ERROR_CODE,
+        ] {
             assert!(is_retryable_native_preparation_error(&rpc_error(Some(
                 code
             ))));
         }
-        for code in [None, Some(-1), Some(-5), Some(-8), Some(-32601)] {
+        for code in [
+            None,
+            Some(-1),
+            Some(-5),
+            Some(-8),
+            Some(-32601),
+            Some(-32603),
+        ] {
             assert!(
                 !is_retryable_native_preparation_error(&rpc_error(code)),
                 "RPC code {code:?} must stop the supervisor"
@@ -3331,6 +3359,29 @@ mod tests {
         assert_eq!(
             next_native_preparation_backoff(&unavailable, Duration::from_secs(32)),
             MAX_NATIVE_PREPARATION_BACKOFF
+        );
+    }
+
+    #[test]
+    fn candidate_capacity_uses_paced_capped_backoff() {
+        let capacity = rpc_error(Some(WCASH_AUX_CAPACITY_ERROR_CODE));
+        assert!(is_retryable_native_preparation_error(&capacity));
+        let mut backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
+        let mut observed = Vec::new();
+        for _ in 0..10 {
+            let delay = native_preparation_retry_delay(&capacity, backoff);
+            observed.push(delay.as_secs());
+            backoff = next_native_preparation_backoff(&capacity, backoff);
+        }
+        assert_eq!(observed, [1, 2, 4, 5, 5, 5, 5, 5, 5, 5]);
+        assert_eq!(
+            native_preparation_retry_delay(&capacity, MAX_NATIVE_PREPARATION_BACKOFF),
+            MAX_CANDIDATE_CAPACITY_BACKOFF,
+            "capacity retries stay bounded after a different transient failure"
+        );
+        assert_eq!(
+            next_native_preparation_backoff(&capacity, MAX_NATIVE_PREPARATION_BACKOFF),
+            MAX_CANDIDATE_CAPACITY_BACKOFF
         );
     }
 

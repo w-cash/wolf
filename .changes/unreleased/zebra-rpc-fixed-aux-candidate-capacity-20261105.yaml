@@ -1,0 +1,4 @@
+kind: Fixed
+body: Return a dedicated retryable createauxblock error when its bounded candidate cache is full, preserving issued work while pools wait for capacity.
+time: 2026-11-05T20:00:00Z
+project: zebra-rpc
