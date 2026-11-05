@@ -26,6 +26,19 @@ use crate::{
 };
 
 #[test]
+fn official_nu7_parent_support_is_disabled_on_every_shipped_network() {
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_wcash_mainnet_for_tests(),
+        Network::new_wcash_testnet(),
+        Network::new_wcash_regtest(),
+    ] {
+        assert_eq!(network.wcash_nu7_parent_activation_height(), None);
+    }
+}
+
+#[test]
 fn compiled_consensus_profile_is_mutually_exclusive() {
     let zcash = Network::Mainnet;
     let wcash_networks = [

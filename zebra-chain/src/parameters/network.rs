@@ -262,6 +262,14 @@ impl Network {
         self.wcash_network() == Some(wcash_genesis::WcashNetwork::Regtest)
     }
 
+    /// The coordinated Wcash height enabling official NU7 parent coinbases.
+    ///
+    /// No shipped network has an assigned activation. This child-consensus
+    /// rule never follows a live Zcash tip or an operator configuration knob.
+    pub fn wcash_nu7_parent_activation_height(&self) -> Option<Height> {
+        None
+    }
+
     /// Returns true when this network matches the monetary and consensus profile
     /// selected when `zebra-chain` was compiled.
     ///

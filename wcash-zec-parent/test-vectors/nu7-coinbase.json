@@ -1,0 +1,20 @@
+[
+  {
+    "version": 5,
+    "branch_id": "77190ad9",
+    "height": 3543405,
+    "transaction_id_raw": "cdf0b8040c1bf060fbdb32e0073483054581adfdd25a57406695a9df74096876",
+    "authorizing_data_digest_raw": "1d338a9291232e6d46273f21482c7a918548c04f3622af67f06e61990b92fa31",
+    "miner_data": "6e75372d66697874757265fabe6d6d828c9a504f6f9792169ae8c5751624ce48aa43476dd83ca2e481a01cdd5980b30100000007000000",
+    "classification": "constructed coinbase codec fixture; unsolved; not a valid parent reward"
+  },
+  {
+    "version": 6,
+    "branch_id": "77190ad9",
+    "height": 3543405,
+    "transaction_id_raw": "7a3eb6ba3f4cf7b19c7f7b2380d2fb7a691e158c17ac883f7e838683f4d43cc7",
+    "authorizing_data_digest_raw": "554b5da95a3e645775ed8ce2f82dd8fb44857fbec99d4517f6181003d07d8048",
+    "miner_data": "6e75372d66697874757265fabe6d6d828c9a504f6f9792169ae8c5751624ce48aa43476dd83ca2e481a01cdd5980b30100000007000000",
+    "classification": "constructed coinbase codec fixture; unsolved; not a valid parent reward"
+  }
+]

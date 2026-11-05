@@ -85,7 +85,62 @@ deny = [
 #
 # Certain crates/versions that will be skipped when doing duplicate detection.
 skip = [
-
+    # Reviewed modern parent versions coexist with frozen WEC libraries.
+    # Exact duplicate allowances do not waive advisories or yanked packages.
+    { name = "aead", version = "=0.6.1" },
+    { name = "aes", version = "=0.9.2" },
+    { name = "bellman", version = "=0.15.0" },
+    { name = "bip32", version = "=0.6.0" },
+    { name = "bls12_381", version = "=0.9.0" },
+    { name = "cbc", version = "=0.2.1" },
+    { name = "chacha20", version = "=0.10.1" },
+    { name = "chacha20poly1305", version = "=0.11.0" },
+    { name = "cipher", version = "=0.5.2" },
+    { name = "curve25519-dalek", version = "=5.0.0" },
+    { name = "ed25519", version = "=3.0.0" },
+    { name = "ed25519-zebra", version = "=5.0.0" },
+    { name = "f4jumble", version = "=0.1.2" },
+    { name = "ff", version = "=0.14.0" },
+    { name = "fiat-crypto", version = "=0.3.0" },
+    { name = "fpe", version = "=0.7.0" },
+    { name = "group", version = "=0.14.0" },
+    { name = "halo2_gadgets", version = "=0.6.0" },
+    { name = "halo2_poseidon", version = "=0.2.0" },
+    { name = "halo2_proofs", version = "=0.4.0" },
+    { name = "hmac", version = "=0.13.0" },
+    { name = "incrementalmerkletree", version = "=0.9.0" },
+    { name = "inout", version = "=0.2.2" },
+    { name = "jubjub", version = "=0.11.1" },
+    { name = "num-bigint", version = "=0.5.1" },
+    { name = "orchard", version = "=0.16.0" },
+    { name = "pairing", version = "=0.24.0" },
+    { name = "pasta_curves", version = "=0.6.1" },
+    { name = "poly1305", version = "=0.9.1" },
+    { name = "rand", version = "=0.10.2" },
+    { name = "rand_chacha", version = "=0.10.0" },
+    { name = "rand_core", version = "=0.10.1" },
+    { name = "reddsa", version = "=0.6.1" },
+    { name = "redjubjub", version = "=0.9.0" },
+    { name = "ripemd", version = "=0.2.0" },
+    { name = "sapling-crypto", version = "=0.9.0" },
+    { name = "secp256k1", version = "=0.33.1" },
+    { name = "secp256k1-sys", version = "=0.14.1" },
+    { name = "sha2", version = "=0.11.0" },
+    { name = "signature", version = "=3.0.0" },
+    { name = "sinsemilla", version = "=0.2.0" },
+    { name = "universal-hash", version = "=0.6.1" },
+    { name = "x25519-dalek", version = "=3.0.0" },
+    { name = "zcash_address", version = "=0.14.0" },
+    { name = "zcash_encoding", version = "=0.5.0" },
+    { name = "zcash_history", version = "=0.6.0" },
+    { name = "zcash_note_encryption", version = "=0.5.1" },
+    { name = "zcash_primitives", version = "=0.31.0" },
+    { name = "zcash_protocol", version = "=0.11.0" },
+    { name = "zcash_script", version = "=0.6.0" },
+    { name = "zcash_transparent", version = "=0.11.0" },
+    { name = "zebra-chain", version = "=15.0.0" },
+    { name = "zebra-test", version = "=5.0.0" },
+    { name = "zip32", version = "=0.3.0" },
 ]
 
 # Similarly to `skip` allows you to skip certain crates during duplicate
@@ -171,14 +226,18 @@ unknown-registry = "deny"
 # Lint level for what to happen when a crate from a git repository that is not
 # in the allow list is encountered
 unknown-git = "deny"
+required-git-spec = "rev"
 
 # List of URLs for allowed crate registries. Defaults to the crates.io index
 # if not specified. If it is specified but empty, no registries are allowed.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories.
-# Empty: every dependency comes from the crates.io registry.
-allow-git = []
+# Parent-only consensus types and the existing private pool protocol are revision-pinned.
+allow-git = [
+    "https://github.com/ZcashFoundation/zebra",
+    "https://github.com/w-cash/pool.git",
+]
 
 [sources.allow-org]
 github = [

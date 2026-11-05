@@ -122,9 +122,19 @@ cannot automatically admit a new Wcash proof domain. The set preserves all
 15 branch IDs recognized by the existing production parser, including its
 Wcash domains; it does not assert parent-chain inclusion or branch activation.
 
-Only the legacy policy is implemented. NU7 parsing, its Wcash activation height
-and complete Zcash NU7 support require subsequent reviewed changes. See the
-[coordinated upgrade plan](../docs/nu7-merged-mining-upgrade.md).
+`LegacyAndNu7` adds the official NU7 domain through an isolated, revision-pinned
+modern Zcash parser. All legacy domains retain the exact old parser; there is
+no fallback from a rejected legacy encoding. Choose this policy only from the
+candidate Wcash network and height. Every shipped network's activation remains
+unassigned, so the default method and deployed-network selection stay legacy.
+The default parser feature now requires Rust 1.89; the pinned toolchain is 1.91.
+See the [coordinated upgrade plan](../docs/nu7-merged-mining-upgrade.md).
+
+The [NU7 proof vectors](test-vectors/nu7/manifest.json) contain actual Equihash
+solutions for both v5/v6 and WEC-only/dual-target cases. Their chain context is
+synthetic: successful cryptographic verification is not proof of a valid Zcash
+reward, canonical-chain inclusion or pool deployment readiness. Normal tests
+only verify these stored vectors.
 
 Template builders should call `miner_data_commitment()` for a fixed `[u8; 44]`
 or `commitment_payload()` for the same bytes as a `Vec<u8>`, append the result

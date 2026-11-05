@@ -179,8 +179,8 @@ impl AuxPowProof {
     ///
     /// Parser support alone never authorizes a new parent transaction domain.
     /// The caller must select these rules from the candidate Wcash block's
-    /// consensus context, never a live external Zcash tip. Only the existing
-    /// legacy domain is enabled by this release.
+    /// consensus context, never a live external Zcash tip. Shipped Wcash
+    /// network profiles still select the legacy policy at every height.
     #[cfg(feature = "zebra")]
     pub fn validate_with_parent_rules(
         &self,
@@ -581,6 +581,173 @@ mod tests {
         );
         assert_eq!(implicit, Err(AuxPowError::InvalidEquihash));
         assert_eq!(explicit, implicit);
+    }
+
+    #[cfg(feature = "zebra")]
+    #[test]
+    fn solved_nu7_vectors_bind_height_policy_and_independent_targets() {
+        let cases = [
+            (
+                include_str!("../test-vectors/nu7/nu7-v5-wec-only.proof.hex"),
+                include_str!("../test-vectors/nu7/nu7-v5-wec-only.json"),
+                false,
+            ),
+            (
+                include_str!("../test-vectors/nu7/nu7-v5-dual.proof.hex"),
+                include_str!("../test-vectors/nu7/nu7-v5-dual.json"),
+                true,
+            ),
+            (
+                include_str!("../test-vectors/nu7/nu7-v6-wec-only.proof.hex"),
+                include_str!("../test-vectors/nu7/nu7-v6-wec-only.json"),
+                false,
+            ),
+            (
+                include_str!("../test-vectors/nu7/nu7-v6-dual.proof.hex"),
+                include_str!("../test-vectors/nu7/nu7-v6-dual.json"),
+                true,
+            ),
+        ];
+        for (encoded, metadata, dual) in cases {
+            // Real Equihash and authenticated targets; synthetic chain context
+            // does not establish valid Zcash rewards or network acceptance.
+            let metadata: serde_json::Value = serde_json::from_str(metadata).unwrap();
+            let raw = |name: &str| -> [u8; 32] {
+                hex::decode(metadata[name].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            };
+            let bytes = hex::decode(encoded.trim()).unwrap();
+            let proof = AuxPowProof::decode(&bytes).unwrap();
+            assert_eq!(proof.encode().unwrap(), bytes);
+            let child = raw("child_hash_le");
+            let child_target = Target::from_le_bytes(raw("child_target_le")).unwrap();
+            let parent_target = Target::from_le_bytes(raw("parent_target_le")).unwrap();
+            for height in [99, 100, 101] {
+                let rules = ParentCoinbaseRules::for_candidate_height(height, Some(100));
+                let verified = proof.validate_with_parent_rules(child, child_target, rules);
+                if height < 100 {
+                    assert!(verified.is_err());
+                } else {
+                    let verified = verified.unwrap();
+                    assert_eq!(
+                        verified.parent_work().block_hash().into_le_bytes(),
+                        raw("parent_hash_le")
+                    );
+                }
+            }
+            assert!(proof.validate(child, child_target).is_err());
+            assert!(proof.parent_header().validate_work(child_target).is_ok());
+            assert_eq!(
+                proof.parent_header().validate_work(parent_target).is_ok(),
+                dual
+            );
+            let mut other_child = child;
+            other_child[0] ^= 1;
+            assert!(proof
+                .validate_with_parent_rules(
+                    other_child,
+                    child_target,
+                    ParentCoinbaseRules::LegacyAndNu7
+                )
+                .is_err());
+        }
+    }
+
+    #[cfg(feature = "zebra")]
+    #[test]
+    fn nu7_policy_preserves_both_bindings_and_real_equihash_at_child_boundary() {
+        use crate::coinbase::ZebraCoinbaseVerifierWithRules;
+
+        let auxiliary_hash = std::array::from_fn(|index| u8::try_from(index).unwrap());
+        let verifier = ZebraCoinbaseVerifierWithRules(ParentCoinbaseRules::LegacyAndNu7);
+        for encoded in [
+            include_str!("../../wcash-zec-parent/test-vectors/nu7-v5-coinbase.hex"),
+            include_str!("../../wcash-zec-parent/test-vectors/nu7-v6-coinbase.hex"),
+        ] {
+            let coinbase = hex::decode(encoded.trim()).unwrap();
+            let summary = verifier.verify(&coinbase).unwrap();
+            let chain_history_root = [0x31; 32];
+            let header = header_with_roots(
+                summary.transaction_id(),
+                block_commitments_hash(chain_history_root, summary.authorizing_data_digest()),
+            );
+            let proof = AuxPowProof::new(
+                coinbase.clone(),
+                vec![],
+                0,
+                vec![],
+                0,
+                chain_history_root,
+                vec![],
+                0,
+                header,
+            )
+            .unwrap();
+
+            // The local Regtest schedule is an explicit test input. Replaying
+            // height 99 after height 101 selects Legacy again, independently
+            // of the observed Zcash tip. The zero Equihash solution remains
+            // deliberately invalid even when the new parser is authorized.
+            for height in [99, 100, 101, 99] {
+                let rules = ParentCoinbaseRules::for_candidate_height(height, Some(100));
+                let result = proof.validate_with_parent_rules(auxiliary_hash, Target::MAX, rules);
+                if height < 100 {
+                    assert!(result.is_err());
+                    assert_ne!(result, Err(AuxPowError::InvalidEquihash));
+                } else {
+                    assert_eq!(result, Err(AuxPowError::InvalidEquihash));
+                }
+            }
+            assert!(proof.validate(auxiliary_hash, Target::MAX).is_err());
+
+            // Coinbase scripts are excluded from txid but authenticated by
+            // the separate ZIP-244 auth digest and header commitment.
+            let mut changed_script = proof.clone();
+            changed_script.coinbase_bytes[62] ^= 1;
+            assert_eq!(
+                changed_script.validate_with_parent_rules(
+                    auxiliary_hash,
+                    Target::MAX,
+                    ParentCoinbaseRules::LegacyAndNu7
+                ),
+                Err(AuxPowError::ParentBlockCommitmentsMismatch)
+            );
+
+            // A changed output instead breaks the independently bound txid.
+            let mut changed_output = proof.clone();
+            let output_value_start = 58 + usize::from(coinbase[57]) + 5;
+            changed_output.coinbase_bytes[output_value_start] ^= 1;
+            assert_eq!(
+                changed_output.validate_with_parent_rules(
+                    auxiliary_hash,
+                    Target::MAX,
+                    ParentCoinbaseRules::LegacyAndNu7
+                ),
+                Err(AuxPowError::ParentMerkleRootMismatch)
+            );
+
+            let mut wrong_child = auxiliary_hash;
+            wrong_child[0] ^= 1;
+            assert!(proof
+                .validate_with_parent_rules(
+                    wrong_child,
+                    Target::MAX,
+                    ParentCoinbaseRules::LegacyAndNu7
+                )
+                .is_err());
+            let mut tiny_target = [0; 32];
+            tiny_target[0] = 1;
+            assert!(matches!(
+                proof.validate_with_parent_rules(
+                    auxiliary_hash,
+                    Target::from_le_bytes(tiny_target).unwrap(),
+                    ParentCoinbaseRules::LegacyAndNu7
+                ),
+                Err(AuxPowError::InsufficientParentWork { .. })
+            ));
+        }
     }
 
     fn header_with_roots(merkle_root: [u8; 32], block_commitments: [u8; 32]) -> ParentHeader {

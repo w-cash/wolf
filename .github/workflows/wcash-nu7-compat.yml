@@ -1,0 +1,66 @@
+name: Wcash NU7 compatibility
+
+on:
+  pull_request:
+    branches: [main, feat/nu7-parent-policy-20261104, feat/nu7-parent-compat-20261104]
+    paths:
+      - "Cargo.*"
+      - "wcash-zec-parent/**"
+      - "wcash-zcash-aux/**"
+      - "wcash-merge-miner/**"
+      - "vendor/nu7-compat/**"
+      - "zebra-chain/src/parameters/network.rs"
+      - "zebra-consensus/src/block/check.rs"
+      - ".github/workflows/wcash-nu7-compat.yml"
+      - ".github/scripts/verify-nu7-parent-snapshots.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wcash-nu7-compat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_BACKTRACE: "1"
+      RAYON_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: 1.91.0
+          cache: false
+      - name: Native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang libclang-dev cmake pkg-config protobuf-compiler
+      - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+        with:
+          tool: cargo-nextest
+      - name: Verify dependency isolation
+        run: |
+          cargo metadata --locked --format-version 1 > /tmp/wcash-nu7-metadata.json
+          python3 .github/scripts/verify-nu7-parent-snapshots.py --metadata /tmp/wcash-nu7-metadata.json
+      - name: Formatting and strict lint
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Parent codec and backend regressions
+        # Ignored generators and real solvers are never enabled in this job.
+        run: cargo nextest run --locked -p wcash-zec-parent -p wcash-zcash-aux -p wcash-merge-miner --lib --profile ci
+      - name: AuxPoW without default parser
+        run: cargo nextest run --locked -p wcash-zcash-aux --no-default-features --lib --profile ci
+      - name: Wcash consensus profile
+        run: |
+          cargo check --locked -p zebra-consensus@15.0.0 --features wcash-consensus --tests
+          cargo nextest run --locked -p zebra-chain@12.0.0 -p zebra-consensus@15.0.0 --features wcash-consensus --lib --profile ci -E 'test(wcash) | test(parent_policy_stays_legacy) | test(official_nu7_parent_support)'

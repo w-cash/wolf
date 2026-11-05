@@ -1,0 +1,12 @@
+{
+  "cases": [
+    "nu7-v5-wec-only",
+    "nu7-v5-dual",
+    "nu7-v6-wec-only",
+    "nu7-v6-dual"
+  ],
+  "complete": true,
+  "global_wall_clock_seconds": 120,
+  "max_nonces_per_case": 8,
+  "qualification": "synthetic cryptographic vector only; not canonical parent-chain, reward, network activation, or full-stack qualification"
+}

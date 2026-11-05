@@ -4,3 +4,4 @@
 # release notes and license files contain upstream whitespace that must not be
 # normalized as part of the Wcash consensus patch.
 vendor/** -whitespace
+vendor/nu7-compat/** linguist-vendored

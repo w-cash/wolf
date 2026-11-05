@@ -14,6 +14,7 @@ members = [
         "tower-fallback",
         "wcash-genesis",
         "wcash-zcash-aux",
+        "wcash-zec-parent",
         "wcash-merge-miner",
         "wcash-wallet",
 ]
@@ -21,6 +22,7 @@ exclude = [
         "vendor/zcash_primitives",
         "vendor/zcash_protocol",
         "vendor/pczt",
+        "vendor/nu7-compat/*",
 ]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
@@ -43,6 +45,7 @@ edition = "2021"
 [workspace.dependencies]
 wcash-genesis = { path = "wcash-genesis" }
 wcash-zcash-aux = { path = "wcash-zcash-aux" }
+wcash-zec-parent = { path = "wcash-zec-parent" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 orchard = "0.15.0"
 # Used to build Orchard/Ironwood bundles in test helpers; must match orchard's version.
@@ -199,6 +202,18 @@ which = "8.0.0"
 zcash_primitives = { path = "vendor/zcash_primitives" }
 zcash_protocol = { path = "vendor/zcash_protocol" }
 pczt = { path = "vendor/pczt" }
+
+# Released parent-library snapshots use explicit dependency paths to coexist
+# with Wcash prereleases. Rust source remains unchanged; see SNAPSHOTS.json.
+aead_nu7 = { package = "aead", path = "vendor/nu7-compat/aead" }
+cipher_nu7 = { package = "cipher", path = "vendor/nu7-compat/cipher" }
+curve25519_dalek_nu7 = { package = "curve25519-dalek", path = "vendor/nu7-compat/curve25519-dalek" }
+ed25519_zebra_nu7 = { package = "ed25519-zebra", path = "vendor/nu7-compat/ed25519-zebra" }
+universal_hash_nu7 = { package = "universal-hash", path = "vendor/nu7-compat/universal-hash" }
+zcash_script_nu7 = { package = "zcash_script", path = "vendor/nu7-compat/zcash_script" }
+zcash_transparent_nu7 = { package = "zcash_transparent", path = "vendor/nu7-compat/zcash_transparent" }
+
+zcash_address_nu7 = { package = "zcash_address", path = "vendor/nu7-compat/zcash_address" }
 
 [workspace.metadata.release]
 
