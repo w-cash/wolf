@@ -1,12 +1,18 @@
 # Zcash NU7 merged-mining upgrade
 
-The maintainer-approved direction is Wcash at its existing 75-second target
-spacing and Zcash at NU7's 25-second target spacing. The chains check work
+Wcash keeps its existing 75-second target spacing while Zcash follows NU7's
+25-second target spacing. The chains check work
 against independent targets; matching their block intervals is unnecessary.
 Wcash's smooth emission, permanent tail, foundation allocation, transaction
 domain and network identity remain release invariants.
 
 This is a staged implementation plan, not a deployment or readiness claim.
+This branch proposes Wcash Mainnet height **51,000** for NU7 parent-proof
+acceptance. The height is provisional: operator readiness, canonical chain
+progress and the parent activation window still need agreement. Keep this
+proposal unmerged and off production until that scheduling decision and the
+matching release checks are complete. Deployment requires separate approval.
+
 Zcash NU7 is scheduled at Mainnet height 3,543,405, with branch ID
 `0x77190AD9` and minimum peer protocol 170190. Use the
 [deployment specification](https://zips.z.cash/zip-0259) and
@@ -49,10 +55,12 @@ dependency paths differ. The adapter and its consumers require Rust 1.89 or
 newer; the repository's pinned build toolchain remains Rust 1.91.
 
 Node validation selects the policy from the candidate Wcash network and height.
-`Network::wcash_nu7_parent_activation_height()` returns `None` for **every shipped
-profile**, including Regtest. There is no production runtime override. Tests
-exercise an explicit synthetic boundary at child heights 99, 100 and 101. That
-test boundary is not a scheduled network upgrade.
+`Network::wcash_nu7_parent_activation_height()` selects the proposed **51,000**
+boundary only for Wcash Mainnet. Earlier candidates retain `Legacy`; candidates
+at or above the boundary select `LegacyAndNu7`. Wcash Testnet, Regtest, inherited
+Zcash networks and configured testnets retain `None`. There is no production
+runtime override. The default proof-validation API still selects `Legacy`.
+Tests also retain the separate synthetic 99/100/101 boundary.
 
 Four stored v5/v6 cryptographic vectors exercise WEC-only and dual-target work,
 real Equihash, both authenticated bindings, legacy rejection and height-policy
@@ -66,7 +74,8 @@ runs a solver.
 The backend uses the isolated parent types for Zcash templates, submitted blocks
 and retained winners. Wcash blocks and historical monetary checks keep their
 existing codec. Each prepared job freezes its child-height parent policy; new
-jobs cannot use NU7 while the shipped Wcash activation height is unset.
+jobs cannot use NU7 below the selected Wcash boundary or on an unassigned
+profile. The default-feature backend and Wcash node consume the same selector.
 
 NU7 reward checks require the exact predecessor NSM balance, candidate height
 and hash supplied by the private parent template. Each independent proposal
@@ -85,7 +94,7 @@ schema are unchanged; this layer needs no accounting migration or rewrite.
 
 ## Remaining qualification
 
-1. Qualify the [dedicated NU7 parent-node draft](https://github.com/w-cash/wolf/pull/60),
+1. Use the [dedicated NU7 parent-node release line](https://github.com/w-cash/wolf/pull/60),
    including its private template, payout-commitment, block-status and exact
    parent-NSM context contracts. Preserve
    independent proposal validation and exact winning-block submission. Upgrade
@@ -95,8 +104,11 @@ schema are unchanged; this layer needs no accounting migration or rewrite.
    subsidy, funding, fee and shielded-recipient checks against the matching
    parent-node artifact. Preserve immutable templates and retained-job recovery.
    Do not enable experimental NU7 flags as a substitute for complete consensus.
-3. Agree a future Wcash activation height with validating operators before
-   enabling the prepared new-domain policy. No public-network height is assigned here.
+3. Finalize the proposed Mainnet height with validating operators before merging
+   or distributing an activation release. Confirm that it remains future and
+   permits coordinated adoption before the first Zcash NU7 candidate template;
+   that candidate is requested when the parent tip is still one block below
+   activation. Revisit this unmerged proposal if those conditions cannot hold.
    Never use an external live Zcash tip as Wcash consensus input. Preserve
    historical supported proof behavior across reorgs and replay.
 4. Test the separate pool transports, assignment/winner handling, durable

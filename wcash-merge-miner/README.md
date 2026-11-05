@@ -20,9 +20,12 @@ must provide matching `getwcashparentcontext(hash,height)` context within their
 existing bounded RPC path. An ordinary legacy parent does not satisfy that
 contract. This performs a state read, not another shielded-template build.
 
-All shipped Wcash profiles retain disabled NU7 parent activation. The backend
-therefore rejects new NU7 merged jobs until a coordinated Wcash upgrade assigns
-the child height. Durable, independently valid Zcash winners use the modern
+This branch proposes NU7 parent acceptance from Wcash Mainnet height 51,000.
+The schedule is provisional and requires operator agreement before finalization;
+it is not deployment approval. Below that boundary, and on every other Wcash
+profile, the backend rejects new NU7 merged jobs. The default-feature backend
+uses the same height selector as the Wcash node. Durable, independently valid
+Zcash winners use the modern
 canonical codec for recovery without inheriting the new-Wcash-job gate. This
 does not change PostgreSQL schema, journal framing or payout reservations.
 
