@@ -1,0 +1,4 @@
+project: zebra-consensus
+kind: breaking
+body: Propose legacy parent rules before Wcash Mainnet height 51,350 and legacy-plus-NU7 rules from that candidate height, including historical replay and reorgs. The proposed boundary requires coordinated adoption before finalization.
+time: 2026-11-05T04:45:00Z

@@ -1,0 +1,4 @@
+project: zebra-chain
+kind: breaking
+body: Propose a shared Wcash Mainnet NU7 parent-compatibility boundary at height 51,350 for node and default-feature backend callers. Other network selectors remain unassigned; the proposed height is not a finalized public schedule.
+time: 2026-11-05T04:45:00Z

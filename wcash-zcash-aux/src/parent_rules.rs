@@ -29,8 +29,8 @@ pub enum ParentCoinbaseRules {
 impl ParentCoinbaseRules {
     /// Selects parent rules from a deterministic candidate Wcash height.
     ///
-    /// `None` keeps the legacy rules at every height. Shipped network profiles
-    /// have no activation until a coordinated Wcash release assigns one.
+    /// `None` keeps the legacy rules at every height. Contextual callers supply
+    /// their network's fixed boundary; this helper does not follow a live tip.
     pub const fn for_candidate_height(
         candidate_height: u32,
         activation_height: Option<u32>,

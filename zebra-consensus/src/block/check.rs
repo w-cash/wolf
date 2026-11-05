@@ -254,8 +254,8 @@ pub fn wcash_auxpow_is_valid(
     })?;
 
     // Parent-domain support is selected only from this candidate's child
-    // consensus context. Every shipped profile remains disabled until a
-    // coordinated Wcash release assigns its activation height.
+    // consensus context. Mainnet's fixed child height governs this rule;
+    // other profiles remain disabled.
     let parent_rules = ParentCoinbaseRules::for_candidate_height(
         height.0,
         network
@@ -676,13 +676,34 @@ mod wcash_auxpow_tests {
     use super::*;
 
     #[test]
-    fn parent_policy_stays_legacy_on_shipped_profiles_and_tracks_explicit_regtest_height() {
+    fn parent_policy_tracks_mainnet_activation_and_disabled_profiles() {
+        let mainnet = Network::new_wcash_mainnet_for_tests();
+        let activation = mainnet
+            .wcash_nu7_parent_activation_height()
+            .map(|height| height.0);
+        assert_eq!(activation, Some(51_350));
+        for (height, expected) in [
+            (0, ParentCoinbaseRules::Legacy),
+            (51_349, ParentCoinbaseRules::Legacy),
+            (51_350, ParentCoinbaseRules::LegacyAndNu7),
+            (51_351, ParentCoinbaseRules::LegacyAndNu7),
+            (51_349, ParentCoinbaseRules::Legacy),
+            (Height::MAX.0, ParentCoinbaseRules::LegacyAndNu7),
+        ] {
+            assert_eq!(
+                ParentCoinbaseRules::for_candidate_height(height, activation),
+                expected
+            );
+        }
         for network in [
-            Network::new_wcash_mainnet_for_tests(),
+            Network::Mainnet,
+            Network::new_default_testnet(),
+            Network::new_regtest(Default::default()),
             Network::new_wcash_testnet(),
             Network::new_wcash_regtest(),
         ] {
-            for height in [0, 99, 100, 101, u32::MAX] {
+            assert_eq!(network.wcash_nu7_parent_activation_height(), None);
+            for height in [0, 51_349, 51_350, 51_351, Height::MAX.0] {
                 assert_eq!(
                     ParentCoinbaseRules::for_candidate_height(
                         height,
@@ -695,18 +716,17 @@ mod wcash_auxpow_tests {
             }
         }
         // Test-only Regtest schedule; no network default or runtime override.
-        assert_eq!(
-            ParentCoinbaseRules::for_candidate_height(99, Some(100)),
-            ParentCoinbaseRules::Legacy
-        );
-        assert_eq!(
-            ParentCoinbaseRules::for_candidate_height(100, Some(100)),
-            ParentCoinbaseRules::LegacyAndNu7
-        );
-        assert_eq!(
-            ParentCoinbaseRules::for_candidate_height(101, Some(100)),
-            ParentCoinbaseRules::LegacyAndNu7
-        );
+        for (height, expected) in [
+            (99, ParentCoinbaseRules::Legacy),
+            (100, ParentCoinbaseRules::LegacyAndNu7),
+            (101, ParentCoinbaseRules::LegacyAndNu7),
+            (99, ParentCoinbaseRules::Legacy),
+        ] {
+            assert_eq!(
+                ParentCoinbaseRules::for_candidate_height(height, Some(100)),
+                expected
+            );
+        }
     }
 
     #[test]

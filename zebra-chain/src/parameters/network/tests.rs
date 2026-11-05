@@ -26,11 +26,22 @@ use crate::{
 };
 
 #[test]
-fn official_nu7_parent_support_is_disabled_on_every_shipped_network() {
+fn official_nu7_parent_support_is_mainnet_height_bound() {
+    let mainnet = Network::new_wcash_mainnet_for_tests();
+    assert_eq!(
+        mainnet.wcash_nu7_parent_activation_height(),
+        Some(Height(51_350))
+    );
+    assert_eq!(
+        Network::try_new_wcash_mainnet()
+            .expect("the production Mainnet anchor is frozen")
+            .wcash_nu7_parent_activation_height(),
+        Some(Height(51_350))
+    );
     for network in [
         Network::Mainnet,
         Network::new_default_testnet(),
-        Network::new_wcash_mainnet_for_tests(),
+        Network::new_regtest(Default::default()),
         Network::new_wcash_testnet(),
         Network::new_wcash_regtest(),
     ] {
@@ -152,6 +163,35 @@ fn wcash_mainnet_profile_is_fully_wired_with_frozen_anchor() -> Result<(), Repor
         ),
         zcash_protocol::consensus::BranchId::WcashMainnetV1
     );
+
+    // The parent-domain proposal changes neither the child branch/spacing nor
+    // the existing integer subsidy and foundation allocation at these fixed heights.
+    for (height, subsidy_zat, miner_zat) in [
+        (50_999, 2_170_380_811, 1_519_266_568),
+        (51_000, 2_170_378_224, 1_519_264_757),
+        (51_001, 2_170_375_637, 1_519_262_946),
+        (50_999, 2_170_380_811, 1_519_266_568),
+    ] {
+        let height = Height(height);
+        assert_eq!(
+            NetworkUpgrade::current(&mainnet, height),
+            NetworkUpgrade::Nu6_3
+        );
+        assert_eq!(
+            ConsensusBranchId::current(&mainnet, height),
+            Some(WCASH_MAINNET_V1_BRANCH_ID)
+        );
+        assert_eq!(
+            NetworkUpgrade::target_spacing_for_height(&mainnet, height).num_seconds(),
+            75
+        );
+        let subsidy = block_subsidy(height, &mainnet)?;
+        assert_eq!(subsidy.zatoshis(), subsidy_zat);
+        assert_eq!(
+            miner_subsidy(height, &mainnet, subsidy)?.zatoshis(),
+            miner_zat
+        );
+    }
 
     Ok(())
 }

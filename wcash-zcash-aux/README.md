@@ -125,8 +125,11 @@ Wcash domains; it does not assert parent-chain inclusion or branch activation.
 `LegacyAndNu7` adds the official NU7 domain through an isolated, revision-pinned
 modern Zcash parser. All legacy domains retain the exact old parser; there is
 no fallback from a rejected legacy encoding. Choose this policy only from the
-candidate Wcash network and height. Every shipped network's activation remains
-unassigned, so the default method and deployed-network selection stay legacy.
+candidate Wcash network and height. This branch proposes Wcash Mainnet height
+51,350; other profiles remain unassigned. The proposal requires coordinated
+adoption before finalization and is not deployment approval. The default
+`validate()` method remains legacy at every height; contextual node/backend
+callers select the policy from the shared network-height rule.
 The default parser feature now requires Rust 1.89; the pinned toolchain is 1.91.
 See the [coordinated upgrade plan](../docs/nu7-merged-mining-upgrade.md).
 

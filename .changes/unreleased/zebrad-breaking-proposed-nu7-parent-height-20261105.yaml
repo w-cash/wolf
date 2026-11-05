@@ -1,0 +1,4 @@
+project: zebrad
+kind: breaking
+body: Propose NU7 parent-proof acceptance from Wcash Mainnet height 51,350 while retaining 75-second blocks, existing monetary rules and historical proof validation. Other profiles remain unassigned; the proposal requires coordinated adoption before finalization and deployment.
+time: 2026-11-05T04:45:00Z
