@@ -1,0 +1,4 @@
+project: zebrad
+kind: Security
+body: Update the parent node lockfile to patched libz-sys, pulldown-cmark, Tokio and ctutils releases, with a regression check for signed-minimum conditional negation.
+time: 2026-11-04T20:52:37Z
