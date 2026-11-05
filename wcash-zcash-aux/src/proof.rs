@@ -8,6 +8,8 @@ use crate::{
     MAX_PARENT_BRANCH_DEPTH, MAX_PROOF_BYTES, PARENT_HEADER_BYTES, PROOF_MAGIC, PROOF_VERSION,
 };
 
+#[cfg(feature = "zebra")]
+use crate::ParentCoinbaseRules;
 #[cfg(any(feature = "zebra", test))]
 use crate::{
     commitment::validate_miner_data_commitment,
@@ -158,7 +160,7 @@ impl AuxPowProof {
         Ok(output)
     }
 
-    /// Performs complete validation with the pinned Zebra coinbase adapter.
+    /// Performs complete validation with the legacy parent-coinbase rules.
     #[cfg(feature = "zebra")]
     pub fn validate(
         &self,
@@ -169,6 +171,27 @@ impl AuxPowProof {
             auxiliary_block_hash,
             required_target,
             &crate::ZebraCoinbaseVerifier,
+            &Equihash200_9,
+        )
+    }
+
+    /// Performs complete validation with explicit Wcash parent-coinbase rules.
+    ///
+    /// Parser support alone never authorizes a new parent transaction domain.
+    /// The caller must select these rules from the candidate Wcash block's
+    /// consensus context, never a live external Zcash tip. Only the existing
+    /// legacy domain is enabled by this release.
+    #[cfg(feature = "zebra")]
+    pub fn validate_with_parent_rules(
+        &self,
+        auxiliary_block_hash: [u8; 32],
+        required_target: Target,
+        parent_rules: ParentCoinbaseRules,
+    ) -> Result<ValidatedAuxPow, AuxPowError> {
+        self.validate_with_verifiers(
+            auxiliary_block_hash,
+            required_target,
+            &crate::coinbase::ZebraCoinbaseVerifierWithRules(parent_rules),
             &Equihash200_9,
         )
     }
@@ -194,9 +217,9 @@ impl AuxPowProof {
     ///
     /// The Wcash target check is always performed by this crate before either
     /// adapter can authorize the proof. This method is private so the only
-    /// production API capable of returning [`ValidatedAuxPow`] is
-    /// [`Self::validate`], which selects the pinned Zebra parser and fixed
-    /// Equihash `(200, 9)` verifier.
+    /// production APIs capable of returning [`ValidatedAuxPow`] are
+    /// [`Self::validate`] and [`Self::validate_with_parent_rules`], which select
+    /// the pinned Zebra parser and fixed Equihash `(200, 9)` verifier.
     #[cfg(any(feature = "zebra", test))]
     fn validate_with_verifiers<C, W>(
         &self,
@@ -533,6 +556,31 @@ mod tests {
         fn verify(&self, _header: &ParentHeader) -> Result<(), AuxPowError> {
             Ok(())
         }
+    }
+
+    #[cfg(feature = "zebra")]
+    #[test]
+    fn explicit_legacy_validation_preserves_real_equihash_rejection() {
+        let bytes =
+            hex::decode(include_str!("../test-vectors/auxpow-v2-non-palindromic.hex").trim())
+                .expect("the published interoperability fixture is hexadecimal");
+        let proof = AuxPowProof::decode(&bytes)
+            .expect("the published interoperability fixture has canonical framing");
+        let auxiliary_block_hash = std::array::from_fn(|index| {
+            u8::try_from(index).expect("the auxiliary ID contains only 32 bytes")
+        });
+
+        // This published fixture binds its coinbase and Merkle paths but is
+        // deliberately unsolved. Both production entry points must still run
+        // the real Equihash verifier rather than treating policy as proof.
+        let implicit = proof.validate(auxiliary_block_hash, Target::MAX);
+        let explicit = proof.validate_with_parent_rules(
+            auxiliary_block_hash,
+            Target::MAX,
+            ParentCoinbaseRules::Legacy,
+        );
+        assert_eq!(implicit, Err(AuxPowError::InvalidEquihash));
+        assert_eq!(explicit, implicit);
     }
 
     fn header_with_roots(merkle_root: [u8; 32], block_commitments: [u8; 32]) -> ParentHeader {

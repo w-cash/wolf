@@ -5,7 +5,7 @@ use std::{collections::HashSet, sync::Arc};
 use chrono::{DateTime, Utc};
 
 use mset::MultiSet;
-use wcash_zcash_aux::{AuxPowProof, Target};
+use wcash_zcash_aux::{AuxPowProof, ParentCoinbaseRules, Target};
 use zebra_chain::{
     amount::{
         Amount, DeferredPoolBalanceChange, Error as AmountError, NegativeAllowed, NonNegative,
@@ -253,8 +253,11 @@ pub fn wcash_auxpow_is_valid(
         }
     })?;
 
+    // Parser support alone must not activate another parent transaction domain.
+    // A future policy must be selected from this candidate's Wcash network and
+    // height, never from a validator's external Zcash tip.
     proof
-        .validate(hash.0, target)
+        .validate_with_parent_rules(hash.0, target, ParentCoinbaseRules::Legacy)
         .map_err(|source| BlockError::InvalidWcashAuxPow {
             height: *height,
             hash: *hash,

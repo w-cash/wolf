@@ -1,0 +1,4 @@
+project: zebrad
+kind: breaking
+body: Add explicit legacy parent-coinbase rules that freeze the accepted AuxPoW branch domain independently of parser upgrades, with a typed unsupported-branch error. NU7 acceptance remains unassigned.
+time: 2026-11-04T16:40:00Z

@@ -31,6 +31,7 @@ mod commitment;
 mod error;
 mod header;
 mod merkle;
+mod parent_rules;
 mod proof;
 mod target;
 
@@ -49,6 +50,7 @@ pub use header::{ParentBlockHash, ParentHeader, ValidatedParentWork};
 pub use merkle::{
     auth_data_merkle_root, block_commitments_hash, expected_auxiliary_index, sha256d_merkle_root,
 };
+pub use parent_rules::ParentCoinbaseRules;
 pub use proof::{AuxPowProof, ValidatedAuxPow};
 pub use target::Target;
 

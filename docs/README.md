@@ -20,6 +20,7 @@ consensus profile or release.
 | Distinguish current and retired testing networks | [Testnet reference](wcash-testnet.md) |
 | Inspect genesis anchors and encoding | [Genesis crate guide](../wcash-genesis/README.md) |
 | Integrate child and parent mining RPC | [Merged-mining contract](wcash-merged-mining.md) |
+| Prepare Zcash NU7 with Wcash at 75 seconds | [NU7 merged-mining upgrade plan](nu7-merged-mining-upgrade.md) |
 | Check pool/backend compatibility | [Pool compatibility](wcash-pool-compatibility.md) |
 | Run isolated mining and wallet exercises | [Local Regtest guide](wcash-local.md) |
 | Use the experimental local wallet | [Wallet guide](../wcash-wallet/README.md) |
