@@ -4,5 +4,6 @@
 
 mod prop;
 mod snapshot;
+mod template_pending;
 pub mod utils;
 mod vectors;

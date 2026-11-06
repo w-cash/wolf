@@ -181,8 +181,7 @@ pub(super) const PARAM_HEX_DATA_DESC: &str = "The hex-encoded data to return.";
 pub(super) const PARAM_AUX_POW_DESC: &str = "The hex-encoded Wcash AuxPoW proof.";
 pub(super) const PARAM_RETIRE_TOKEN_DESC: &str =
     "The 32-byte hexadecimal capability returned by createauxblock for this candidate.";
-/// Stable server error returned when an exact Wcash auxiliary candidate loses
-/// a best-tip race while it is being constructed or proposal-validated.
+/// Stable retryable Wcash candidate construction or best-tip race error.
 const WCASH_AUX_TIP_CHANGED_ERROR_CODE: i32 = -32_001;
 
 /// Returns true only when proposal verification rejected the exact candidate
@@ -3154,46 +3153,53 @@ where
 
         let height = chain_info.tip_height.next().map_misc_error()?;
 
-        // Randomly select some mempool transactions.
+        // Selection and a cold shielded coinbase (including a singleflight
+        // cache wait) are blocking work. Keep the exact fetched snapshot, but
+        // let metadata, tip updates and block submissions continue on Tokio.
         let coinbase_cache = self.gbt.coinbase_cache();
-        let mempool_txs = select_mempool_transactions(
-            &self.network,
-            height,
-            miner_params,
-            mempool_txs,
-            mempool_tx_deps,
-            Some(&coinbase_cache),
-            wcash_aux,
-        )
-        .map_error_with_prefix(
-            ErrorCode::InvalidParams,
-            "invalid wcashaux parent-template request",
-        )?;
+        let network = self.network.clone();
+        let miner_params = miner_params.clone();
+        let response = self
+            .gbt
+            .build_template(move || {
+                let mempool_txs = select_mempool_transactions(
+                    &network,
+                    height,
+                    &miner_params,
+                    mempool_txs,
+                    mempool_tx_deps,
+                    Some(&coinbase_cache),
+                    wcash_aux,
+                )
+                .map_error_with_prefix(
+                    ErrorCode::InvalidParams,
+                    "invalid wcashaux parent-template request",
+                )?;
 
-        tracing::debug!(
-            selected_mempool_tx_hashes = ?mempool_txs
-                .iter()
-                .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id.mined_id())
-                .collect::<Vec<_>>(),
-            "selected transactions for the template from the mempool"
-        );
+                tracing::debug!(
+                    selected_mempool_tx_hashes = ?mempool_txs
+                        .iter()
+                        .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id.mined_id())
+                        .collect::<Vec<_>>(),
+                    "selected transactions for the template from the mempool"
+                );
 
-        // - After this point, the template only depends on the previously fetched data.
-
-        let response = BlockTemplateResponse::new_internal(
-            &self.network,
-            &coinbase_cache,
-            miner_params,
-            wcash_aux,
-            &chain_info,
-            server_long_poll_id,
-            mempool_txs,
-            submit_old,
-        )
-        .map_error_with_prefix(
-            ErrorCode::InvalidParams,
-            "invalid wcashaux parent-template request",
-        )?;
+                BlockTemplateResponse::new_internal(
+                    &network,
+                    &coinbase_cache,
+                    &miner_params,
+                    wcash_aux,
+                    &chain_info,
+                    server_long_poll_id,
+                    mempool_txs,
+                    submit_old,
+                )
+                .map_error_with_prefix(
+                    ErrorCode::InvalidParams,
+                    "invalid wcashaux parent-template request",
+                )
+            })
+            .await?;
 
         Ok(response.into())
     }
@@ -3381,7 +3387,20 @@ where
         }
         let template = candidate_rpc
             .get_block_template(None)
-            .await?
+            .await
+            .map_err(|error| {
+                if types::get_block_template::is_pending_template_build(&error) {
+                    // Keep candidate retries on the existing short race delay,
+                    // rather than the backend's generic node-warmup backoff.
+                    ErrorObject::borrowed(
+                        WCASH_AUX_TIP_CHANGED_ERROR_CODE,
+                        "Wcash candidate construction is pending; retry createauxblock",
+                        None,
+                    )
+                } else {
+                    error
+                }
+            })?
             .try_into_template()
             .ok_or_else(|| {
                 ErrorObject::borrowed(
