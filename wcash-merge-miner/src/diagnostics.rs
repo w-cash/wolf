@@ -90,6 +90,8 @@ thread_local! {
 
 /// Runtime notices for the persistent native backend, independent of console I/O.
 pub enum NativeBackendRuntimeEvent<'a> {
+    /// Cumulative bounded child-prefetch results, sampled by the control loop.
+    ChildPrefetchObservation(NativeChildPrefetchStats),
     /// Cumulative accepted work classified by cached Zcash predecessor evidence.
     ZcashWorkObservation(PoolBackendZcashWorkStats),
     /// An authoritative job was activated; this is not an ASIC-notification receipt.
@@ -106,8 +108,36 @@ pub enum NativeBackendRuntimeEvent<'a> {
     ActivationRetirementFailed(&'a MinerError),
 }
 
+/// Fixed public counters for one-ahead child acquisition; no candidate capabilities.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeChildPrefetchStats {
+    /// Background acquisition requests started.
+    pub started: u64,
+    /// Validated child responses received.
+    pub completed: u64,
+    /// Failed background acquisition requests.
+    pub failed: u64,
+    /// Parent preparations supplied with one owned ready child.
+    pub hits: u64,
+    /// Parent preparations using the existing synchronous child path.
+    pub misses: u64,
+    /// Unused ready children rejected by their original age or handoff fence.
+    pub expired: u64,
+    /// Duration of the latest completed child acquisition, in milliseconds.
+    pub last_acquisition_ms: Option<u64>,
+    /// Age of the latest child moved to parent preparation, in milliseconds.
+    pub last_ready_age_ms: Option<u64>,
+    /// Detected replacement requests that waited for an in-flight child.
+    pub demand_waits: u64,
+    /// Latest detected-demand wait for child acquisition, in milliseconds.
+    pub last_demand_wait_ms: Option<u64>,
+    /// Existing ownership permits held across every candidate lifecycle.
+    pub slots_in_use: usize,
+}
+
 #[derive(Clone, Copy)]
 enum RuntimeMetadata {
+    ChildPrefetch(NativeChildPrefetchStats),
     ZcashWork(PoolBackendZcashWorkStats),
     RecoverySampleExpired {
         elapsed_ms: u64,
@@ -193,6 +223,7 @@ pub fn record_native_backend_runtime(event: NativeBackendRuntimeEvent<'_>) {
         NativeBackendRuntimeEvent::JobActivated(_)
             | NativeBackendRuntimeEvent::Stopped
             | NativeBackendRuntimeEvent::ZcashWorkObservation(_)
+            | NativeBackendRuntimeEvent::ChildPrefetchObservation(_)
     ) && !runtime_info_enabled()
     {
         return;
@@ -204,6 +235,12 @@ fn runtime_event(event: NativeBackendRuntimeEvent<'_>) -> Event {
     #[cfg(test)]
     RUNTIME_EVENT_BUILDS.with(|builds| builds.set(builds.get().saturating_add(1)));
     match event {
+        NativeBackendRuntimeEvent::ChildPrefetchObservation(stats) => {
+            let mut event = Event::new(None, "child_prefetch_observation", "cumulative");
+            event.noisy = false;
+            event.runtime = Some(RuntimeMetadata::ChildPrefetch(stats));
+            event
+        }
         NativeBackendRuntimeEvent::ZcashWorkObservation(stats) => {
             let mut event = Event::new(None, "zcash_work_observation", "cumulative");
             event.noisy = false;
@@ -1232,6 +1269,18 @@ impl Reporter {
             })
         });
         let runtime = event.runtime.map(|metadata| match metadata {
+            RuntimeMetadata::ChildPrefetch(stats) => json!({
+                "scope":"process_cumulative_owned_child_prefetch",
+                "started":stats.started,"completed":stats.completed,"failed":stats.failed,
+                "hits":stats.hits,"misses":stats.misses,"expired":stats.expired,
+                "last_acquisition_ms":stats.last_acquisition_ms,
+                "last_ready_age_ms":stats.last_ready_age_ms,
+                "demand_waits":stats.demand_waits,
+                "last_demand_wait_ms":stats.last_demand_wait_ms,
+                "slots_in_use":stats.slots_in_use,"maximum_slots":6,
+                "maximum_ready_age_ms":45000,
+                "asserts_asic_notify_time":false
+            }),
             RuntimeMetadata::RecoverySampleExpired {
                 elapsed_ms,
                 maximum_age_ms,

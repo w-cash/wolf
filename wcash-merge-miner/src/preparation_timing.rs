@@ -254,6 +254,7 @@ pub(crate) fn preparation_error_class(error: &MinerError) -> &'static str {
         MinerError::ParentTipMismatch { .. } => "parent_tip_mismatch",
         MinerError::ChildTipMismatch { .. } => "child_tip_mismatch",
         MinerError::StaleNativeJob(_) => "stale_job",
+        MinerError::PrefetchedChildExpired => "prefetched_child_expired",
         MinerError::RpcTransport(_) => "rpc_transport",
         MinerError::RpcHttpStatus(_) => "rpc_http_status",
         MinerError::RpcError { .. } => "rpc_error",

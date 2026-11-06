@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "The native pool backend prepares one owned Wcash child ahead of a parent refresh, using the existing single preparation worker and six candidate slots. Ready work expires after 45 seconds, retains exact retirement ownership and still requires fresh parent proposal validation and exact chain-tip checks. Bounded diagnostics report cache and demand-wait results."
+time: 2026-11-06T20:00:00.000000000Z

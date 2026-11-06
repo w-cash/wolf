@@ -306,8 +306,18 @@ impl<Q: Send + 'static, R: Send + 'static> PoolBackendControlWorker<Q, R> {
     /// Spawns one bounded worker. `abandon` must preserve owned cleanup duties.
     pub fn spawn(
         name: &str,
+        work: impl FnMut(Q) -> R + Send + 'static,
+        abandon: impl FnMut(R) + Send + 'static,
+    ) -> Result<Self, io::Error> {
+        Self::spawn_with_owned_requests(name, work, abandon, drop)
+    }
+
+    /// Preserves accepted request ownership if shutdown happens before work starts.
+    pub fn spawn_with_owned_requests(
+        name: &str,
         mut work: impl FnMut(Q) -> R + Send + 'static,
         mut abandon: impl FnMut(R) + Send + 'static,
+        mut abandon_request: impl FnMut(Q) + Send + 'static,
     ) -> Result<Self, io::Error> {
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(0);
@@ -318,6 +328,7 @@ impl<Q: Send + 'static, R: Send + 'static> PoolBackendControlWorker<Q, R> {
             .spawn(move || {
                 while let Ok(request) = request_rx.recv() {
                     if stopped.load(Ordering::Acquire) {
+                        abandon_request(request);
                         break;
                     }
                     if let Err(error) = result_tx.send(work(request)) {
@@ -347,6 +358,28 @@ impl<Q: Send + 'static, R: Send + 'static> PoolBackendControlWorker<Q, R> {
             .map_err(|_| io::Error::other("control worker request channel unavailable"))?;
         self.in_flight = true;
         Ok(true)
+    }
+
+    /// Returns the exact request owner when this bounded handoff cannot accept it.
+    pub fn request_owned(&mut self, request: Q) -> Result<(), (Q, io::Error)> {
+        if self.in_flight {
+            return Err((request, io::Error::other("control worker is busy")));
+        }
+        let Some(sender) = self.requests.as_ref() else {
+            return Err((request, io::Error::other("control worker stopped")));
+        };
+        match sender.try_send(request) {
+            Ok(()) => {
+                self.in_flight = true;
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Full(request) | mpsc::TrySendError::Disconnected(request)) => {
+                Err((
+                    request,
+                    io::Error::other("control worker request channel unavailable"),
+                ))
+            }
+        }
     }
 
     /// Nonblocking result handoff. No RPC or thread join occurs here.
@@ -397,6 +430,8 @@ impl<Q, R> Drop for PoolBackendControlWorker<Q, R> {
 
 #[cfg(test)]
 mod tests {
+    #[path = "owned_prefetch_tests.rs"]
+    mod owned_prefetch_tests;
     use super::*;
     use std::sync::atomic::AtomicUsize;
 

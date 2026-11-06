@@ -381,8 +381,34 @@ admitted validators stop before bounded control RPCs are joined; actor ownership
 is released before retirement is joined. Failure to enqueue retains ownership
 in the same bounded cleanup budget until shutdown recovery.
 
-This changes supervision responsiveness, not the time required to construct a
-valid dual-chain job. Observer catch-up, coinbase proof generation, final exact
+After an active generation is available, that same worker can acquire one
+validated Wcash child ahead of the next parent refresh. It owns one of the same
+six candidate slots and no parent job or journal activation. The child is
+move-only, keeps its creating supervisor and exact retirement capability, and
+expires 45 seconds after acquisition started. The controller retires an expired
+or abandoned child on the existing cleanup lane. Queued requests and returned
+results retain ownership across worker shutdown and failed handoff.
+
+A ready hit consumes the child once, repeats the original network-identity
+checks, obtains and independently proposal-validates a fresh Zcash parent, and
+checks the exact Wcash predecessor before and after parent preparation. Its
+ready deadline is checked again before journal activation. The native parent
+job's original 45-second lease begins after full preparation, as before; the
+prefetch does not restart any existing job lease or the node's ten-minute child
+cache lifetime. No other child acquisition runs while this worker is busy. A
+miss uses the existing complete preparation path, and an in-flight acquisition
+must finish before fresh parent preparation starts.
+
+The prefetched child freezes Wcash transaction selection and fee totals. Newly
+arriving Wcash transactions can wait for the next child; existing bytes and
+coinbase value are never rewritten with a newer fee total. The bounded runtime
+diagnostics sample cumulative hits, misses, acquisition failures, expired
+children, ownership counts and observed demand-wait durations every 15 seconds.
+These are backend timings and do not certify ASIC notification or solve time.
+
+The supervision lanes keep control responsive; a ready hit removes child
+acquisition from that parent refresh's critical path. Observer catch-up,
+coinbase proof generation on misses, final exact
 predecessor checks and proposal validation remain required. It does not claim
 zero stale work, zero propagation delay, or guaranteed public acceptance of the
 next winner. The exact-byte winner journal, independent per-chain delivery,
