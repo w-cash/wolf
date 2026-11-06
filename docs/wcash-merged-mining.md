@@ -111,6 +111,14 @@ eviction, restart, reorg, or blocks arriving before the next proof is ready can
 still require proving on demand. A proof is reused only for its exact recipient,
 height and fees; a previous fee total is never substituted into a new candidate.
 
+Foreground template selection, coinbase construction and cache waits run on
+blocking workers so a cold proof cannot hold an async RPC worker. Configured
+and alternate-payout requests share two foreground build slots. Saturation
+returns retryable JSON-RPC `-28` without queuing more proof work; pools should
+retry with bounded backoff. Cancelling a waiting request does not free its slot
+until the blocking build finishes. Prewarming and its existing limits are
+unchanged. This isolates RPC scheduling; it does not shorten the proof itself.
+
 `createauxblock.coinbasevalue` is the miner's **net** payout including all fees:
 `subsidy - foundation + fees`. It excludes the compulsory transparent foundation
 output. During Mainnet heights 33000–621454, pool accounting must credit miners

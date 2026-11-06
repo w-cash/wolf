@@ -3154,46 +3154,53 @@ where
 
         let height = chain_info.tip_height.next().map_misc_error()?;
 
-        // Randomly select some mempool transactions.
+        // Selection and a cold shielded coinbase (including a singleflight
+        // cache wait) are blocking work. Keep the exact fetched snapshot, but
+        // let metadata, tip updates and block submissions continue on Tokio.
         let coinbase_cache = self.gbt.coinbase_cache();
-        let mempool_txs = select_mempool_transactions(
-            &self.network,
-            height,
-            miner_params,
-            mempool_txs,
-            mempool_tx_deps,
-            Some(&coinbase_cache),
-            wcash_aux,
-        )
-        .map_error_with_prefix(
-            ErrorCode::InvalidParams,
-            "invalid wcashaux parent-template request",
-        )?;
+        let network = self.network.clone();
+        let miner_params = miner_params.clone();
+        let response = self
+            .gbt
+            .build_template(move || {
+                let mempool_txs = select_mempool_transactions(
+                    &network,
+                    height,
+                    &miner_params,
+                    mempool_txs,
+                    mempool_tx_deps,
+                    Some(&coinbase_cache),
+                    wcash_aux,
+                )
+                .map_error_with_prefix(
+                    ErrorCode::InvalidParams,
+                    "invalid wcashaux parent-template request",
+                )?;
 
-        tracing::debug!(
-            selected_mempool_tx_hashes = ?mempool_txs
-                .iter()
-                .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id.mined_id())
-                .collect::<Vec<_>>(),
-            "selected transactions for the template from the mempool"
-        );
+                tracing::debug!(
+                    selected_mempool_tx_hashes = ?mempool_txs
+                        .iter()
+                        .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id.mined_id())
+                        .collect::<Vec<_>>(),
+                    "selected transactions for the template from the mempool"
+                );
 
-        // - After this point, the template only depends on the previously fetched data.
-
-        let response = BlockTemplateResponse::new_internal(
-            &self.network,
-            &coinbase_cache,
-            miner_params,
-            wcash_aux,
-            &chain_info,
-            server_long_poll_id,
-            mempool_txs,
-            submit_old,
-        )
-        .map_error_with_prefix(
-            ErrorCode::InvalidParams,
-            "invalid wcashaux parent-template request",
-        )?;
+                BlockTemplateResponse::new_internal(
+                    &network,
+                    &coinbase_cache,
+                    &miner_params,
+                    wcash_aux,
+                    &chain_info,
+                    server_long_poll_id,
+                    mempool_txs,
+                    submit_old,
+                )
+                .map_error_with_prefix(
+                    ErrorCode::InvalidParams,
+                    "invalid wcashaux parent-template request",
+                )
+            })
+            .await?;
 
         Ok(response.into())
     }

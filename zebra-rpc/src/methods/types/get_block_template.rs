@@ -6,6 +6,7 @@ mod gossip_log;
 pub mod parameters;
 pub(crate) mod precompute;
 pub mod proposal;
+mod template_build;
 pub mod zip317;
 
 #[cfg(test)]
@@ -1121,6 +1122,9 @@ where
     /// Optional, bounded next-height proof work for alternate auxiliary recipients.
     auxiliary_precomputer: auxiliary_precompute::AuxiliaryPrecomputer,
 
+    /// Bounded foreground CPU work, shared by configured and auxiliary handler clones.
+    template_builder: template_build::TemplateBuildExecutor,
+
     /// A block template for the current chain tip, kept up to date by the task spawned by
     /// `RpcImpl::spawn_block_template_updater()`, so `getblocktemplate` can answer without reading
     /// the state and the mempool.
@@ -1159,6 +1163,7 @@ where
             coinbase_cache: CoinbaseCache::default(),
             auxiliary_coinbase_caches: AuxiliaryCoinbaseCaches::default(),
             auxiliary_precomputer: auxiliary_precompute::AuxiliaryPrecomputer::default(),
+            template_builder: template_build::TemplateBuildExecutor::default(),
             template_cache: Some(precompute::TemplateCache::default()),
         }
     }
@@ -1201,6 +1206,15 @@ where
     /// Returns a handle to the coinbase transaction cache.
     pub(crate) fn coinbase_cache(&self) -> CoinbaseCache {
         self.coinbase_cache.clone()
+    }
+
+    /// Runs one foreground snapshot build without blocking an async RPC worker.
+    pub(crate) async fn build_template<T, F>(&self, build: F) -> RpcResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> RpcResult<T> + Send + 'static,
+    {
+        self.template_builder.run(build).await
     }
 
     /// Schedules optional next-height proof work only after an auxiliary candidate is published.
