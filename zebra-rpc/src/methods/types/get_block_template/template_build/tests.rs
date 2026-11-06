@@ -132,12 +132,12 @@ async fn template_build_pending_deadline_retains_capacity_until_completion() {
     let (first_release, first) = held_build(&executor).await;
     let (second_release, second) = held_build(&executor).await;
 
-    // Start the fake clock only after both real blocking workers have entered.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(2)).await;
+    // Use the real server deadline: blocking workers and Tokio then share the
+    // same clock, while their external five-second release guard stays bounded.
     for task in [first, second] {
-        let error = task
+        let error = timeout(Duration::from_secs(4), task)
             .await
+            .expect("the two-second pending response precedes the external release guard")
             .expect("the server-side waiter returns normally")
             .expect_err("the server reports pending before its proof finishes");
         assert_eq!(error.code(), -28);
@@ -146,8 +146,6 @@ async fn template_build_pending_deadline_retains_capacity_until_completion() {
             "block template construction is pending; retry"
         );
     }
-    tokio::time::resume();
-
     assert_eq!(executor.permits.available_permits(), 0);
     let error = executor
         .run(|| -> RpcResult<usize> { panic!("pending work still owns both permits") })
