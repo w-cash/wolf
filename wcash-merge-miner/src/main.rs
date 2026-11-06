@@ -34,11 +34,11 @@ use wcash_merge_miner::{
     },
     CoordinatorConfig, GenerationRetirement, JobConfig, MinerError, NativeBackendRuntimeEvent,
     NativeMiningCoordinator, NativeMiningSupervisor, NativePoolBackendRetainedJob,
-    NativePoolZcashRecoveryAuthority, NativePreparationTiming, NativeZcashConfig,
-    NativeZcashNetwork, PoolBackendActor, PoolBackendActorError, PoolBackendRetainedJob,
-    PoolBackendWinnerWorkers, PreparationPhase, PreparedJob, ShareProcessor,
-    WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config, Zip301LoopbackListener,
-    NATIVE_JOB_MAX_AGE_SECONDS,
+    NativePoolZcashRecoveryAuthority, NativePreparationTiming, NativePreparedChild,
+    NativeZcashConfig, NativeZcashNetwork, PoolBackendActor, PoolBackendActorError,
+    PoolBackendRetainedJob, PoolBackendWinnerWorkers, PreparationPhase, PreparedJob,
+    ShareProcessor, WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config,
+    Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
 };
 use wcash_pool_protocol::{Hex32, JobInvalidationReason, TargetBe, TargetLe};
 use wcash_zcash_aux::{Target, WCASH_AUXILIARY_CHAIN_ID};
@@ -384,10 +384,31 @@ struct DrainingPoolBackendGeneration {
     close_at: Instant,
 }
 
+struct PoolBackendPrefetchedChild {
+    child: NativePreparedChild,
+    _slot: PoolBackendCandidateSlot,
+}
+
+enum PoolBackendPreparationWork {
+    Baseline(PoolBackendCandidateSlot),
+    Prefetch(PoolBackendCandidateSlot),
+    FromChild(PoolBackendPrefetchedChild),
+}
+
+enum PoolBackendPreparedOutput {
+    Generation(PoolBackendCandidate),
+    Child(PoolBackendPrefetchedChild),
+}
+
+enum PoolBackendCleanup {
+    Generation(PoolBackendCandidate),
+    Child(PoolBackendPrefetchedChild),
+}
+
 struct PoolBackendPreparationRequest {
     id: u64,
     requested_at: Instant,
-    slot: PoolBackendCandidateSlot,
+    work: PoolBackendPreparationWork,
 }
 
 struct PoolBackendPreparationResult {
@@ -395,26 +416,27 @@ struct PoolBackendPreparationResult {
     requested_at: Instant,
     completed_at: Instant,
     timing: NativePreparationTiming,
-    result: Result<PoolBackendCandidate, MinerError>,
+    prefetch: bool,
+    result: Result<PoolBackendPreparedOutput, MinerError>,
 }
 
 struct PoolBackendRetirementWorker {
-    sender: Option<mpsc::SyncSender<PoolBackendCandidate>>,
+    sender: Option<mpsc::SyncSender<PoolBackendCleanup>>,
     thread: Option<thread::JoinHandle<()>>,
-    stranded: Arc<Mutex<Vec<PoolBackendCandidate>>>,
+    stranded: Arc<Mutex<Vec<PoolBackendCleanup>>>,
     failure: mpsc::Sender<String>,
 }
 
 impl PoolBackendRetirementWorker {
     fn spawn(failure: mpsc::Sender<String>) -> Result<Self, io::Error> {
         let (sender, receiver) =
-            mpsc::sync_channel::<PoolBackendCandidate>(POOL_BACKEND_RETIREMENT_QUEUE);
+            mpsc::sync_channel::<PoolBackendCleanup>(POOL_BACKEND_RETIREMENT_QUEUE);
         let worker_failure = failure.clone();
         let thread = thread::Builder::new()
             .name("wcash-candidate-retirement".to_string())
             .spawn(move || {
                 while let Ok(candidate) = receiver.recv() {
-                    retire_owned_pool_backend_candidate(candidate, &worker_failure);
+                    retire_owned_pool_backend_cleanup(candidate, &worker_failure);
                 }
             })?;
         Ok(Self {
@@ -427,6 +449,14 @@ impl PoolBackendRetirementWorker {
 
     fn enqueue(&self, candidate: PoolBackendCandidate) -> Result<(), MinerError> {
         enqueue_pool_backend_retirement(self.sender.as_ref(), &self.stranded, candidate)
+    }
+
+    fn enqueue_child(&self, child: PoolBackendPrefetchedChild) -> Result<(), MinerError> {
+        enqueue_owned_pool_backend_cleanup(
+            self.sender.as_ref(),
+            &self.stranded,
+            PoolBackendCleanup::Child(child),
+        )
     }
 
     fn request_shutdown(&mut self) -> Result<(), io::Error> {
@@ -455,7 +485,7 @@ impl PoolBackendRetirementWorker {
                     let Some(candidate) = candidate else {
                         break;
                     };
-                    retire_owned_pool_backend_candidate(candidate, &failure);
+                    retire_owned_pool_backend_cleanup(candidate, &failure);
                 })?
                 .join()
                 .map_err(|_| io::Error::other("candidate recovery worker panicked"))?;
@@ -468,12 +498,12 @@ impl PoolBackendRetirementWorker {
 }
 
 fn enqueue_pool_backend_retirement(
-    sender: Option<&mpsc::SyncSender<PoolBackendCandidate>>,
-    stranded: &Mutex<Vec<PoolBackendCandidate>>,
+    sender: Option<&mpsc::SyncSender<PoolBackendCleanup>>,
+    stranded: &Mutex<Vec<PoolBackendCleanup>>,
     candidate: PoolBackendCandidate,
 ) -> Result<(), MinerError> {
     candidate.retained.close_currentness();
-    enqueue_owned_pool_backend_cleanup(sender, stranded, candidate)
+    enqueue_owned_pool_backend_cleanup(sender, stranded, PoolBackendCleanup::Generation(candidate))
 }
 
 fn enqueue_owned_pool_backend_cleanup<T>(
@@ -501,6 +531,40 @@ fn enqueue_owned_pool_backend_cleanup<T>(
         .unwrap_or_else(|error| error.into_inner())
         .push(candidate);
     Err(MinerError::InvalidRequest(reason.to_string()))
+}
+
+fn retire_owned_pool_backend_cleanup(
+    candidate: PoolBackendCleanup,
+    failure: &mpsc::Sender<String>,
+) {
+    match candidate {
+        PoolBackendCleanup::Generation(candidate) => {
+            retire_owned_pool_backend_candidate(candidate, failure)
+        }
+        PoolBackendCleanup::Child(PoolBackendPrefetchedChild { mut child, _slot }) => {
+            if retire_pool_backend_candidate(|| child.retire()).is_err() {
+                let _ = failure.send(
+                    "unused prefetched child retirement failed after bounded retry".to_string(),
+                );
+            }
+        }
+    }
+}
+
+fn retain_prepared_pool_backend_generation(
+    coordinator: NativeMiningCoordinator,
+    slot: PoolBackendCandidateSlot,
+) -> Result<PoolBackendCandidate, MinerError> {
+    match NativePoolBackendRetainedJob::new_recoverable(coordinator) {
+        Ok(retained) => Ok(PoolBackendCandidate {
+            retained: Arc::new(retained),
+            _slot: slot,
+        }),
+        Err((mut coordinator, error)) => {
+            retire_pool_backend_candidate(|| coordinator.retire_generation())?;
+            Err(MinerError::InvalidRequest(error.to_string()))
+        }
+    }
 }
 
 fn retire_owned_pool_backend_candidate(
@@ -779,44 +843,74 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     let abandoned_candidates = Arc::clone(&retirement_worker.stranded);
     let preparation_supervisor = Arc::clone(&supervisor);
     let abandoned_failure = listener_failure_tx.clone();
-    let mut preparation_worker = PoolBackendControlWorker::spawn(
+    let abandoned_request_sender = retirement_sender.clone();
+    let abandoned_request_candidates = Arc::clone(&abandoned_candidates);
+    let abandoned_request_failure = listener_failure_tx.clone();
+    let mut preparation_worker = PoolBackendControlWorker::spawn_with_owned_requests(
         "wcash-job-preparation",
         move |request: PoolBackendPreparationRequest| {
             let mut timing = NativePreparationTiming::new();
-            let result = preparation_supervisor
-                .prepare_generation_timed(&mut timing)
-                .and_then(|coordinator| {
-                    match NativePoolBackendRetainedJob::new_recoverable(coordinator) {
-                        Ok(retained) => Ok(PoolBackendCandidate {
-                            retained: Arc::new(retained),
-                            _slot: request.slot,
-                        }),
-                        Err((mut coordinator, error)) => {
-                            // Descriptor failure is exceptional; preserve and retire
-                            // the lease here, never by dropping it on the controller.
-                            let retirement =
-                                retire_pool_backend_candidate(|| coordinator.retire_generation());
-                            retirement?;
-                            Err(MinerError::InvalidRequest(error.to_string()))
-                        }
-                    }
-                });
+            let prefetch = matches!(&request.work, PoolBackendPreparationWork::Prefetch(_));
+            let result = match request.work {
+                PoolBackendPreparationWork::Baseline(slot) => preparation_supervisor
+                    .prepare_generation_timed(&mut timing)
+                    .and_then(|coordinator| {
+                        retain_prepared_pool_backend_generation(coordinator, slot)
+                    })
+                    .map(PoolBackendPreparedOutput::Generation),
+                PoolBackendPreparationWork::Prefetch(slot) => preparation_supervisor
+                    .prepare_child_candidate_timed(&mut timing)
+                    .map(|child| {
+                        PoolBackendPreparedOutput::Child(PoolBackendPrefetchedChild {
+                            child,
+                            _slot: slot,
+                        })
+                    }),
+                PoolBackendPreparationWork::FromChild(PoolBackendPrefetchedChild {
+                    child,
+                    _slot,
+                }) => child
+                    .prepare_generation_timed(&mut timing)
+                    .and_then(|coordinator| {
+                        retain_prepared_pool_backend_generation(coordinator, _slot)
+                    })
+                    .map(PoolBackendPreparedOutput::Generation),
+            };
             PoolBackendPreparationResult {
                 id: request.id,
                 requested_at: request.requested_at,
                 completed_at: Instant::now(),
                 timing,
+                prefetch,
                 result,
             }
         },
         move |result: PoolBackendPreparationResult| {
             if let Ok(candidate) = result.result {
-                if let Err(error) = enqueue_pool_backend_retirement(
+                let cleanup = match candidate {
+                    PoolBackendPreparedOutput::Generation(candidate) => {
+                        candidate.retained.close_currentness();
+                        PoolBackendCleanup::Generation(candidate)
+                    }
+                    PoolBackendPreparedOutput::Child(child) => PoolBackendCleanup::Child(child),
+                };
+                if let Err(error) = enqueue_owned_pool_backend_cleanup(
                     Some(&retirement_sender),
                     &abandoned_candidates,
-                    candidate,
+                    cleanup,
                 ) {
                     let _ = abandoned_failure.send(error.to_string());
+                }
+            }
+        },
+        move |request: PoolBackendPreparationRequest| {
+            if let PoolBackendPreparationWork::FromChild(child) = request.work {
+                if let Err(error) = enqueue_owned_pool_backend_cleanup(
+                    Some(&abandoned_request_sender),
+                    &abandoned_request_candidates,
+                    PoolBackendCleanup::Child(child),
+                ) {
+                    let _ = abandoned_request_failure.send(error.to_string());
                 }
             }
         },
@@ -835,6 +929,10 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     let mut active: Option<ActivePoolBackendGeneration> = None;
     let mut draining = Vec::new();
     let mut unpublished: Option<PoolBackendCandidate> = None;
+    let mut ready_child: Option<PoolBackendPrefetchedChild> = None;
+    let mut prefetch_stats = wcash_merge_miner::NativeChildPrefetchStats::default();
+    let mut prefetch_in_flight = false;
+    let mut demand_wait_started: Option<Instant> = None;
     let mut next_work_observation = Instant::now() + Duration::from_secs(15);
 
     // All runtime errors leave ownership in these outer slots for the common
@@ -872,13 +970,31 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
             )?;
             if Instant::now() >= next_work_observation {
                 next_work_observation = Instant::now() + Duration::from_secs(15);
+                prefetch_stats.slots_in_use = slots.load(Ordering::Acquire);
+                record_native_backend_runtime(NativeBackendRuntimeEvent::ChildPrefetchObservation(
+                    prefetch_stats,
+                ));
                 if let Some(stats) = actor.try_zcash_work_observation() {
                     record_native_backend_runtime(NativeBackendRuntimeEvent::ZcashWorkObservation(
                         stats,
                     ));
                 }
             }
+            if ready_child
+                .as_ref()
+                .is_some_and(|ready| !ready.child.is_fresh())
+            {
+                prefetch_stats.expired = prefetch_stats.expired.saturating_add(1);
+                retirement_worker
+                    .enqueue_child(ready_child.take().expect("expired ready child"))?;
+            }
             if let Some(result) = preparation_worker.poll()? {
+                prefetch_in_flight = false;
+                if let Some(started) = demand_wait_started.take() {
+                    prefetch_stats.last_demand_wait_ms = Some(duration_milliseconds(
+                        Instant::now().saturating_duration_since(started),
+                    ));
+                }
                 let expected = expected_preparation.take();
                 let valid_request = pool_backend_preparation_response_matches(
                     expected,
@@ -888,7 +1004,32 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                     Instant::now(),
                 );
                 match result.result {
-                    Ok(candidate) => {
+                    Ok(PoolBackendPreparedOutput::Child(child)) => {
+                        prefetch_stats.completed = prefetch_stats.completed.saturating_add(1);
+                        prefetch_stats.last_acquisition_ms = Some(duration_milliseconds(
+                            result
+                                .completed_at
+                                .saturating_duration_since(result.requested_at),
+                        ));
+                        if valid_request
+                            && !shutdown.load(Ordering::Acquire)
+                            && child.child.is_fresh()
+                        {
+                            if ready_child.is_some() {
+                                retirement_worker.enqueue_child(child)?;
+                                return Err(MinerError::InvalidRequest(
+                                    "prefetch result arrived while an owned child was ready"
+                                        .to_string(),
+                                )
+                                .into());
+                            }
+                            ready_child = Some(child);
+                        } else {
+                            prefetch_stats.expired = prefetch_stats.expired.saturating_add(1);
+                            retirement_worker.enqueue_child(child)?;
+                        }
+                    }
+                    Ok(PoolBackendPreparedOutput::Generation(candidate)) => {
                         unpublished = Some(candidate);
                         if !pool_backend_preparation_can_activate(
                             valid_request,
@@ -962,6 +1103,9 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                         currentness_workers.generation_changed();
                     }
                     Err(error) => {
+                        if result.prefetch {
+                            prefetch_stats.failed = prefetch_stats.failed.saturating_add(1);
+                        }
                         result.timing.finish_error(&error);
                         if !valid_request || !is_retryable_native_preparation_error(&error) {
                             return Err(error.into());
@@ -1001,23 +1145,61 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                 Instant::now() >= current.rotation_deadline
                     || current.candidate.retained.replacement_requested()
             });
-            if replacement_needed
-                && !preparation_worker.is_busy()
-                && Instant::now() >= next_preparation
-            {
-                if let Some(slot) = PoolBackendCandidateSlot::acquire(&slots) {
-                    request_id = request_id.checked_add(1).ok_or_else(|| {
-                        MinerError::InvalidRequest(
-                            "preparation request identity exhausted".to_string(),
-                        )
-                    })?;
+            if replacement_needed && prefetch_in_flight && demand_wait_started.is_none() {
+                prefetch_stats.demand_waits = prefetch_stats.demand_waits.saturating_add(1);
+                demand_wait_started = Some(Instant::now());
+            }
+            if let Some(choice) = pool_backend_preparation_choice(
+                replacement_needed,
+                active.is_some(),
+                ready_child.is_some(),
+                preparation_worker.is_busy(),
+                Instant::now() >= next_preparation,
+            ) {
+                let next_request_id = request_id.checked_add(1).ok_or_else(|| {
+                    MinerError::InvalidRequest("preparation request identity exhausted".to_string())
+                })?;
+                let work = match choice {
+                    PoolBackendPreparationChoice::ParentFromReady => {
+                        let ready = ready_child
+                            .take()
+                            .expect("ready child selected by controller");
+                        prefetch_stats.hits = prefetch_stats.hits.saturating_add(1);
+                        prefetch_stats.last_ready_age_ms =
+                            ready.child.ready_age().map(duration_milliseconds);
+                        Some(PoolBackendPreparationWork::FromChild(ready))
+                    }
+                    PoolBackendPreparationChoice::Baseline => {
+                        PoolBackendCandidateSlot::acquire(&slots).map(|slot| {
+                            prefetch_stats.misses = prefetch_stats.misses.saturating_add(1);
+                            PoolBackendPreparationWork::Baseline(slot)
+                        })
+                    }
+                    PoolBackendPreparationChoice::Prefetch => {
+                        PoolBackendCandidateSlot::acquire(&slots).map(|slot| {
+                            prefetch_stats.started = prefetch_stats.started.saturating_add(1);
+                            PoolBackendPreparationWork::Prefetch(slot)
+                        })
+                    }
+                };
+                if let Some(work) = work {
+                    let is_prefetch = matches!(&work, PoolBackendPreparationWork::Prefetch(_));
+                    request_id = next_request_id;
                     let requested_at = Instant::now();
-                    preparation_worker.request(PoolBackendPreparationRequest {
-                        id: request_id,
-                        requested_at,
-                        slot,
-                    })?;
+                    if let Err((request, error)) =
+                        preparation_worker.request_owned(PoolBackendPreparationRequest {
+                            id: request_id,
+                            requested_at,
+                            work,
+                        })
+                    {
+                        if let PoolBackendPreparationWork::FromChild(child) = request.work {
+                            retirement_worker.enqueue_child(child)?;
+                        }
+                        return Err(error.into());
+                    }
                     expected_preparation = Some((request_id, requested_at));
+                    prefetch_in_flight = is_prefetch;
                 }
             }
             // Both active and retry/backoff modes use this same bounded tick.
@@ -1043,6 +1225,10 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     // the preparation result receiver hands unpublished leases back to its owner.
     recovery_authority.close();
     let listener_shutdown = listeners.request_shutdown();
+    let ready_retirement = ready_child
+        .take()
+        .map(|child| retirement_worker.enqueue_child(child))
+        .transpose();
     let preparation_shutdown = preparation_worker.request_shutdown();
     let currentness_shutdown = currentness_workers.request_shutdown();
     let unpublished_retirement = unpublished
@@ -1066,6 +1252,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     let retirement_shutdown = retirement_worker.request_shutdown();
     listener_shutdown?;
     preparation_shutdown?;
+    ready_retirement?;
     currentness_shutdown?;
     unpublished_retirement?;
     running_retirement?;
@@ -1074,6 +1261,40 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     runtime_result?;
     record_native_backend_runtime(NativeBackendRuntimeEvent::Stopped);
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PoolBackendPreparationChoice {
+    ParentFromReady,
+    Baseline,
+    Prefetch,
+}
+
+fn pool_backend_preparation_choice(
+    replacement_needed: bool,
+    active: bool,
+    ready: bool,
+    busy: bool,
+    retry_due: bool,
+) -> Option<PoolBackendPreparationChoice> {
+    if busy || !retry_due {
+        return None;
+    }
+    if replacement_needed {
+        Some(if ready {
+            PoolBackendPreparationChoice::ParentFromReady
+        } else {
+            PoolBackendPreparationChoice::Baseline
+        })
+    } else if active && !ready {
+        Some(PoolBackendPreparationChoice::Prefetch)
+    } else {
+        None
+    }
+}
+
+fn duration_milliseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn replace_owned_pool_backend_generation<T>(active: &mut Option<T>, replacement: T) -> Option<T> {
@@ -1701,7 +1922,8 @@ fn is_retryable_native_preparation_error(error: &MinerError) -> bool {
         MinerError::Io(error) => is_retryable_io_kind(error.kind()),
         MinerError::ParentTipMismatch { .. }
         | MinerError::ChildTipMismatch { .. }
-        | MinerError::StaleNativeJob(_) => true,
+        | MinerError::StaleNativeJob(_)
+        | MinerError::PrefetchedChildExpired => true,
         _ => false,
     }
 }
@@ -1710,7 +1932,8 @@ fn native_preparation_retry_delay(error: &MinerError, backoff: Duration) -> Dura
     match error {
         MinerError::ParentTipMismatch { .. }
         | MinerError::ChildTipMismatch { .. }
-        | MinerError::StaleNativeJob(_) => TIP_RACE_RETRY_DELAY,
+        | MinerError::StaleNativeJob(_)
+        | MinerError::PrefetchedChildExpired => TIP_RACE_RETRY_DELAY,
         MinerError::RpcError {
             code: Some(WCASH_AUX_TIP_CHANGED_ERROR_CODE),
             ..
@@ -1727,7 +1950,8 @@ fn next_native_preparation_backoff(error: &MinerError, backoff: Duration) -> Dur
     match error {
         MinerError::ParentTipMismatch { .. }
         | MinerError::ChildTipMismatch { .. }
-        | MinerError::StaleNativeJob(_) => INITIAL_NATIVE_PREPARATION_BACKOFF,
+        | MinerError::StaleNativeJob(_)
+        | MinerError::PrefetchedChildExpired => INITIAL_NATIVE_PREPARATION_BACKOFF,
         MinerError::RpcError {
             code: Some(WCASH_AUX_TIP_CHANGED_ERROR_CODE),
             ..
@@ -3143,6 +3367,100 @@ mod tests {
         drop(replacement);
         drop(owners);
         assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn stalled_child_prefetch_prioritizes_fresh_parent_without_duplicate_acquisition() {
+        enum Work {
+            Child(PoolBackendCandidateSlot),
+            Parent(PoolBackendCandidateSlot),
+        }
+        enum Output {
+            Child(PoolBackendCandidateSlot),
+            Parent(PoolBackendCandidateSlot, usize),
+        }
+        let slots = Arc::new(AtomicUsize::new(0));
+        let creates = Arc::new(AtomicUsize::new(0));
+        let parent_epoch = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let worker_creates = Arc::clone(&creates);
+        let worker_parent = Arc::clone(&parent_epoch);
+        let mut worker = PoolBackendControlWorker::spawn_with_owned_requests(
+            "fixture-child-prefetch",
+            move |work| match work {
+                Work::Child(slot) => {
+                    worker_creates.fetch_add(1, Ordering::AcqRel);
+                    entered_tx.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Output::Child(slot)
+                }
+                Work::Parent(slot) => Output::Parent(slot, worker_parent.load(Ordering::Acquire)),
+            },
+            drop,
+            drop,
+        )
+        .unwrap();
+        assert!(worker
+            .request_owned(Work::Child(
+                PoolBackendCandidateSlot::acquire(&slots).unwrap()
+            ))
+            .is_ok());
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        parent_epoch.store(1, Ordering::Release);
+        assert_eq!(
+            pool_backend_preparation_choice(true, true, false, worker.is_busy(), true),
+            None
+        );
+        // The independent parent-currentness lane can finish while child RPC is
+        // held. A replacement request cannot launch a competing child creator.
+        let probe_parent = Arc::clone(&parent_epoch);
+        let mut probe = PoolBackendControlWorker::spawn(
+            "fixture-parent-probe",
+            move |()| probe_parent.load(Ordering::Acquire),
+            drop,
+        )
+        .unwrap();
+        assert!(probe.request(()).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let epoch = loop {
+            if let Some(epoch) = probe.poll().unwrap() {
+                break epoch;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        };
+        assert_eq!(epoch, 1);
+        assert_eq!(creates.load(Ordering::Acquire), 1);
+        assert_eq!(slots.load(Ordering::Acquire), 1);
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let slot = loop {
+            if let Some(Output::Child(slot)) = worker.poll().unwrap() {
+                break slot;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        };
+        assert_eq!(
+            pool_backend_preparation_choice(true, true, true, worker.is_busy(), true),
+            Some(PoolBackendPreparationChoice::ParentFromReady)
+        );
+        assert!(worker.request_owned(Work::Parent(slot)).is_ok());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (slot, epoch) = loop {
+            if let Some(Output::Parent(slot, epoch)) = worker.poll().unwrap() {
+                break (slot, epoch);
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        };
+        assert_eq!(epoch, 1);
+        assert_eq!(creates.load(Ordering::Acquire), 1);
+        drop(slot);
+        assert_eq!(slots.load(Ordering::Acquire), 0);
+        worker.request_shutdown().unwrap();
+        probe.request_shutdown().unwrap();
     }
 
     #[test]

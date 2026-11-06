@@ -51,13 +51,13 @@ pub const NATIVE_COINBASE_MATURITY_CONFIRMATIONS: u32 =
 pub use coinbase::{build_parent_coinbase, ParentOutput};
 pub use coordinator::{
     CoordinatorConfig, GenerationRetirement, NativeMiningCoordinator, NativeMiningSupervisor,
-    NativeWinnerBlock, NativeWinnerMaterial, PoolWinnerReconciliationError,
+    NativePreparedChild, NativeWinnerBlock, NativeWinnerMaterial, PoolWinnerReconciliationError,
     WcashIncomingViewingKey, WinnerOutboxStatus,
 };
 pub use diagnostics::{
     record_native_backend_runtime, record_native_winner_persistence_failure,
     record_native_winner_reconciliation, start_native_backend_diagnostics,
-    NativeBackendRuntimeEvent,
+    NativeBackendRuntimeEvent, NativeChildPrefetchStats,
 };
 pub use error::MinerError;
 pub use job::{JobConfig, PreparedJob, SolvedAuxPow, EQUIHASH_SOLUTION_BYTES};

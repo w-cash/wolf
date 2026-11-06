@@ -252,6 +252,86 @@ pub struct NativeMiningCoordinator {
     journal: Arc<ShareJournal>,
 }
 
+/// One validated, move-only child candidate waiting for a fresh Zcash parent.
+///
+/// It retains its creating supervisor and secret retirement capability. It is
+/// neither an active job nor a cloneable lease; unused work must be retired.
+pub struct NativePreparedChild {
+    supervisor: Arc<NativeMiningSupervisor>,
+    child: Option<Box<ValidatedNativeChild>>,
+}
+
+impl fmt::Debug for NativePreparedChild {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativePreparedChild")
+            .field("ready_age", &self.ready_age())
+            .field("fresh", &self.is_fresh())
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativePreparedChild {
+    /// Returns age since before acquisition, without resetting the child clock.
+    pub fn ready_age(&self) -> Option<Duration> {
+        self.child
+            .as_ref()
+            .map(|child| Instant::now().saturating_duration_since(child.acquired_at))
+    }
+
+    /// Tests the original ready deadline without making any RPC.
+    pub fn is_fresh(&self) -> bool {
+        self.child
+            .as_ref()
+            .is_some_and(|child| child.ensure_fresh_at(Instant::now()).is_ok())
+    }
+
+    /// Consumes this child once, retaining all fresh parent and final tip checks.
+    pub fn prepare_generation_timed(
+        mut self,
+        timing: &mut NativePreparationTiming,
+    ) -> Result<NativeMiningCoordinator, MinerError> {
+        let child = self
+            .child
+            .take()
+            .ok_or(MinerError::PrefetchedChildExpired)?;
+        self.supervisor
+            .prepare_generation_with_child_timed(Some(*child), timing)
+    }
+
+    /// Retires only this unused lease; a failed call retains it for retry.
+    pub fn retire(&mut self) -> Result<GenerationRetirement, MinerError> {
+        let Some(child) = self.child.as_ref() else {
+            return Ok(GenerationRetirement::Retired);
+        };
+        let result = retire_child_candidate(&self.supervisor.wcash_node, &child.lease)?;
+        self.child.take();
+        Ok(result)
+    }
+}
+
+struct ValidatedNativeChild {
+    child: ChildTemplate,
+    child_hash: [u8; 32],
+    child_target: Target,
+    child_previous_hash: [u8; 32],
+    child_candidate_bytes: Arc<[u8]>,
+    child_payout: ValidatedWcashCandidatePayout,
+    child_coinbase_txid_le: [u8; 32],
+    lease: ChildCandidateLease,
+    acquired_at: Instant,
+    ready_deadline: Option<Instant>,
+}
+
+impl ValidatedNativeChild {
+    fn ensure_fresh_at(&self, now: Instant) -> Result<(), MinerError> {
+        if self.ready_deadline.is_some_and(|deadline| now >= deadline) {
+            return Err(MinerError::PrefetchedChildExpired);
+        }
+        Ok(())
+    }
+}
+
 struct OutboxRetryState {
     last_maintenance: Mutex<Instant>,
     requested: AtomicBool,
@@ -399,6 +479,7 @@ pub(crate) enum PoolGenerationCurrentness {
 // A fresh child and independently proposal-validated parent are required: merely
 // replaying the same header could restart a miner's duplicate nonce search.
 const MAX_JOB_AGE: Duration = Duration::from_secs(NATIVE_JOB_MAX_AGE_SECONDS);
+const MAX_PREFETCHED_CHILD_AGE: Duration = Duration::from_secs(45);
 const TIP_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 const OUTBOX_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const OUTBOX_MAINTENANCE_BATCH_SIZE: usize = 2;
@@ -539,70 +620,57 @@ impl NativeMiningSupervisor {
         &self,
         timing: &mut NativePreparationTiming,
     ) -> Result<NativeMiningCoordinator, MinerError> {
+        self.prepare_generation_with_child_timed(None, timing)
+    }
+
+    /// Acquires one owned child ahead of the next parent refresh.
+    ///
+    /// This creates no parent job, journal activation or native job lease.
+    /// Callers must retain a bounded ownership permit and retire unused work.
+    /// A supervisor may have only one outstanding prefetched child. Its caller
+    /// must serialize acquisition and parent preparation on one control worker;
+    /// it must not run baseline preparation while retaining another ready child.
+    pub fn prepare_child_candidate_timed(
+        self: &Arc<Self>,
+        timing: &mut NativePreparationTiming,
+    ) -> Result<NativePreparedChild, MinerError> {
         let _preparation = self
             .generation_preparation
             .lock()
-            .map_err(|_| coordinator_mutex_error("native generation preparation"))?;
-        let config = &self.config;
-        let wcash_node = self.wcash_node.clone();
-        let zcash = self.zcash.clone();
-        let journal = Arc::clone(&self.journal);
-        let expected_zcash_genesis_hash = config.zcash.expected_genesis_hash().to_string();
-
-        // Replay each chain independently once after startup. Live winners are
-        // submitted by their own generation below, while older unresolved
-        // entries move through bounded background maintenance. A stale
-        // historical winner must never block every fresh job rotation.
+            .map_err(|_| coordinator_mutex_error("native child preparation"))?;
         timing.enter(PreparationPhase::NetworkIdentity);
-        let wcash_identity =
-            require_wcash_network_identity(&wcash_node, &config.expected_wcash_genesis_hash);
-        let zcash_identity = zcash.require_network_identity(&expected_zcash_genesis_hash);
-        let initial_outbox_recovery = !self
+        // Normal background acquisition follows an identity-checked full job.
+        // A first standalone caller still checks the node before allocation;
+        // consuming any ready child repeats the full original identity checks.
+        if !self
             .initial_outbox_recovery_complete
-            .load(Ordering::Acquire);
-        if initial_outbox_recovery && wcash_identity.is_ok() {
-            timing.enter(PreparationPhase::Other);
-            let pending = journal.all_pending()?;
-            retry_pending_winners_with(
-                &wcash_node,
-                &zcash,
-                &journal,
-                pending
-                    .iter()
-                    .filter(|winner| winner.key.chain == WinnerChain::Wcash)
-                    .cloned()
-                    .collect(),
+            .load(Ordering::Acquire)
+        {
+            require_wcash_network_identity(
+                &self.wcash_node,
+                &self.config.expected_wcash_genesis_hash,
             )?;
         }
-        if initial_outbox_recovery && zcash_identity.is_ok() {
-            timing.enter(PreparationPhase::Other);
-            let pending = journal.all_pending()?;
-            retry_pending_winners_with(
-                &wcash_node,
-                &zcash,
-                &journal,
-                pending
-                    .into_iter()
-                    .filter(|winner| winner.key.chain == WinnerChain::Zcash)
-                    .collect(),
-            )?;
-        }
-        wcash_identity?;
-        // A transient failure after a prior `createauxblock` must be resolved
-        // before another candidate is requested. This makes preparation
-        // retries cache-capacity neutral even during a prolonged parent outage.
         timing.enter(PreparationPhase::CandidateRetirement);
         self.retry_pending_candidate_retirement()?;
-        zcash_identity?;
-        timing.enter(PreparationPhase::ObserverCatchup);
-        zcash.relay_observer_blocks_to_work_nodes()?;
-        self.initial_outbox_recovery_complete
-            .store(true, Ordering::Release);
+        let child = self.acquire_child_candidate_timed(timing, true)?;
+        Ok(NativePreparedChild {
+            supervisor: Arc::clone(self),
+            child: Some(Box::new(child)),
+        })
+    }
 
+    fn acquire_child_candidate_timed(
+        &self,
+        timing: &mut NativePreparationTiming,
+        prefetched: bool,
+    ) -> Result<ValidatedNativeChild, MinerError> {
+        let acquired_at = Instant::now();
+        let ready_deadline = prefetched.then_some(acquired_at + MAX_PREFETCHED_CHILD_AGE);
         timing.enter(PreparationPhase::WcashCandidate);
-        let child: ChildTemplate = wcash_node.call(
+        let child: ChildTemplate = self.wcash_node.call(
             "createauxblock",
-            json!([config.wcash_payout_address.clone()]),
+            json!([self.config.wcash_payout_address.clone()]),
         )?;
         timing.set_wcash_height(child.height);
         timing.enter(PreparationPhase::WcashDecode);
@@ -703,6 +771,127 @@ impl NativeMiningSupervisor {
             .hash()
             .0;
 
+        let prepared = ValidatedNativeChild {
+            child,
+            child_hash,
+            child_target,
+            child_previous_hash,
+            child_candidate_bytes: child_candidate_bytes.into(),
+            child_payout,
+            child_coinbase_txid_le,
+            lease: child_candidate_lease,
+            acquired_at,
+            ready_deadline,
+        };
+        prepared.ensure_fresh_at(Instant::now())?;
+        preparation_guard.disarm();
+        Ok(prepared)
+    }
+
+    fn prepare_generation_with_child_timed(
+        &self,
+        prefetched: Option<ValidatedNativeChild>,
+        timing: &mut NativePreparationTiming,
+    ) -> Result<NativeMiningCoordinator, MinerError> {
+        let _preparation = match self.generation_preparation.lock() {
+            Ok(preparation) => preparation,
+            Err(_) => {
+                if let Some(child) = prefetched {
+                    self.retire_failed_preparation(child.lease);
+                }
+                return Err(coordinator_mutex_error("native generation preparation"));
+            }
+        };
+        // The retirement guard drops before the serialization lock, preserving
+        // the supervisor's single pending-retirement owner on every failure.
+        let mut preparation_guard = CandidatePreparationGuard {
+            supervisor: self,
+            lease: prefetched.as_ref().map(|child| child.lease.clone()),
+        };
+        if let Some(child) = prefetched.as_ref() {
+            child.ensure_fresh_at(Instant::now())?;
+        }
+        let config = &self.config;
+        let wcash_node = self.wcash_node.clone();
+        let zcash = self.zcash.clone();
+        let journal = Arc::clone(&self.journal);
+        let expected_zcash_genesis_hash = config.zcash.expected_genesis_hash().to_string();
+
+        // Replay each chain independently once after startup. Live winners are
+        // submitted by their own generation below, while older unresolved
+        // entries move through bounded background maintenance. A stale
+        // historical winner must never block every fresh job rotation.
+        timing.enter(PreparationPhase::NetworkIdentity);
+        let wcash_identity =
+            require_wcash_network_identity(&wcash_node, &config.expected_wcash_genesis_hash);
+        let zcash_identity = zcash.require_network_identity(&expected_zcash_genesis_hash);
+        let initial_outbox_recovery = !self
+            .initial_outbox_recovery_complete
+            .load(Ordering::Acquire);
+        if initial_outbox_recovery && wcash_identity.is_ok() {
+            timing.enter(PreparationPhase::Other);
+            let pending = journal.all_pending()?;
+            retry_pending_winners_with(
+                &wcash_node,
+                &zcash,
+                &journal,
+                pending
+                    .iter()
+                    .filter(|winner| winner.key.chain == WinnerChain::Wcash)
+                    .cloned()
+                    .collect(),
+            )?;
+        }
+        if initial_outbox_recovery && zcash_identity.is_ok() {
+            timing.enter(PreparationPhase::Other);
+            let pending = journal.all_pending()?;
+            retry_pending_winners_with(
+                &wcash_node,
+                &zcash,
+                &journal,
+                pending
+                    .into_iter()
+                    .filter(|winner| winner.key.chain == WinnerChain::Zcash)
+                    .collect(),
+            )?;
+        }
+        wcash_identity?;
+        // A transient failure after a prior `createauxblock` must be resolved
+        // before another candidate is requested. This makes preparation
+        // retries cache-capacity neutral even during a prolonged parent outage.
+        timing.enter(PreparationPhase::CandidateRetirement);
+        self.retry_pending_candidate_retirement()?;
+        zcash_identity?;
+        timing.enter(PreparationPhase::ObserverCatchup);
+        zcash.relay_observer_blocks_to_work_nodes()?;
+        self.initial_outbox_recovery_complete
+            .store(true, Ordering::Release);
+
+        let prepared = match prefetched {
+            Some(prepared) => prepared,
+            None => self.acquire_child_candidate_timed(timing, false)?,
+        };
+        preparation_guard.lease = Some(prepared.lease.clone());
+        prepared.ensure_fresh_at(Instant::now())?;
+        let ValidatedNativeChild {
+            child,
+            child_hash,
+            child_target,
+            child_previous_hash,
+            child_candidate_bytes,
+            child_payout,
+            child_coinbase_txid_le,
+            lease: child_candidate_lease,
+            ready_deadline,
+            ..
+        } = prepared;
+        timing.set_wcash_height(child.height);
+        // A prefetched child can outlive its predecessor. Reject it before
+        // constructing the fresh parent, and retain the final fence below.
+        if ready_deadline.is_some() {
+            require_child_candidate_tip(&wcash_node, &child)?;
+        }
+
         let auxiliary_nonce = reserve_auxiliary_nonce(&self.next_auxiliary_nonce)?;
         let parent_rules = ParentCoinbaseRules::for_candidate_height(
             child.height,
@@ -718,7 +907,7 @@ impl NativeMiningSupervisor {
             parent_rules,
         )?;
         let generation_descriptor = job.generation_descriptor(
-            child_candidate.header.previous_block_hash.0,
+            child_previous_hash,
             child_coinbase_txid_le,
             child.height,
             child_payout.value_zatoshis,
@@ -728,25 +917,11 @@ impl NativeMiningSupervisor {
                 zcash: config.zcash.expected_parent_payout_commitment(),
             },
         );
-        let expected_child_height = child.height.checked_sub(1).ok_or_else(|| {
-            MinerError::InvalidParentTemplate("child height must be positive".to_string())
-        })?;
         timing.enter(PreparationPhase::CurrentnessFences);
-        let child_tip_height: u32 = wcash_node.call("getblockcount", json!([]))?;
-        let child_tip: String = wcash_node.call("getbestblockhash", json!([]))?;
-        if child_tip_height != expected_child_height
-            || !child_tip.eq_ignore_ascii_case(&child.previous_block_hash)
-        {
-            return Err(MinerError::ChildTipMismatch {
-                expected: format!(
-                    "{} at height {expected_child_height}",
-                    child.previous_block_hash
-                ),
-                endpoint: wcash_node.label().to_string(),
-                actual: format!("{child_tip} at height {child_tip_height}"),
-            });
+        require_child_candidate_tip(&wcash_node, &child)?;
+        if ready_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(MinerError::PrefetchedChildExpired);
         }
-        let child_candidate_bytes: Arc<[u8]> = child_candidate_bytes.into();
         timing.enter(PreparationPhase::GenerationJournal);
         journal.activate_job(ActiveJournalJob {
             job_id: job.job().job_id().to_string(),
@@ -810,6 +985,30 @@ impl NativeMiningSupervisor {
             MergedChain::Zcash => reconcile_zcash_pool_winner(&self.zcash, snapshot),
         }
     }
+}
+
+fn require_child_candidate_tip(
+    wcash_node: &ZebraRpcClient,
+    child: &ChildTemplate,
+) -> Result<(), MinerError> {
+    let expected_child_height = child.height.checked_sub(1).ok_or_else(|| {
+        MinerError::InvalidParentTemplate("child height must be positive".to_string())
+    })?;
+    let child_tip_height: u32 = wcash_node.call("getblockcount", json!([]))?;
+    let child_tip: String = wcash_node.call("getbestblockhash", json!([]))?;
+    if child_tip_height != expected_child_height
+        || !child_tip.eq_ignore_ascii_case(&child.previous_block_hash)
+    {
+        return Err(MinerError::ChildTipMismatch {
+            expected: format!(
+                "{} at height {expected_child_height}",
+                child.previous_block_hash
+            ),
+            endpoint: wcash_node.label().to_string(),
+            actual: format!("{child_tip} at height {child_tip_height}"),
+        });
+    }
+    Ok(())
 }
 
 fn reserve_auxiliary_nonce(counter: &AtomicU64) -> Result<u32, MinerError> {
@@ -4516,6 +4715,8 @@ fn decode_bounded_hex(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[path = "prefetch_tests.rs"]
+    mod prefetch_tests;
     use std::{
         fs,
         io::{ErrorKind, Read},

@@ -212,6 +212,10 @@ pub enum MinerError {
     #[error("stale native merged-mining job: {0}")]
     StaleNativeJob(String),
 
+    /// An unused prefetched child reached its original ready deadline.
+    #[error("prefetched Wcash child candidate exceeded its ready lifetime")]
+    PrefetchedChildExpired,
+
     /// The live parent template failed a local invariant before reaching miners.
     #[error("invalid parent template: {0}")]
     InvalidParentTemplate(String),
