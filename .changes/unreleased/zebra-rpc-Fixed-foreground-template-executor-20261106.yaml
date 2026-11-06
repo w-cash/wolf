@@ -1,4 +1,4 @@
 kind: Fixed
-body: Keep foreground block-template construction and coinbase cache waits off async RPC workers, with bounded shared worker capacity.
+body: Keep foreground block-template construction and coinbase cache waits off async RPC workers, with bounded shared worker capacity and retryable pending results before candidate publication.
 time: 2026-11-06T21:20:08Z
 project: zebra-rpc

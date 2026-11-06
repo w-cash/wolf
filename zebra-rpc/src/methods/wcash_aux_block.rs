@@ -283,6 +283,23 @@ impl Default for AuxBlockCandidateCache {
 }
 
 impl AuxBlockCandidateCache {
+    #[cfg(test)]
+    pub(crate) fn allocation_counts(&self) -> (usize, usize, usize) {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            inner.entries.len(),
+            inner
+                .entries
+                .values()
+                .map(|entry| entry.active_retire_tokens.len())
+                .sum(),
+            inner.retired_tokens.len(),
+        )
+    }
+
     fn new(capacity: usize, ttl: Duration) -> Self {
         assert!(
             capacity > 0,

@@ -181,8 +181,7 @@ pub(super) const PARAM_HEX_DATA_DESC: &str = "The hex-encoded data to return.";
 pub(super) const PARAM_AUX_POW_DESC: &str = "The hex-encoded Wcash AuxPoW proof.";
 pub(super) const PARAM_RETIRE_TOKEN_DESC: &str =
     "The 32-byte hexadecimal capability returned by createauxblock for this candidate.";
-/// Stable server error returned when an exact Wcash auxiliary candidate loses
-/// a best-tip race while it is being constructed or proposal-validated.
+/// Stable retryable Wcash candidate construction or best-tip race error.
 const WCASH_AUX_TIP_CHANGED_ERROR_CODE: i32 = -32_001;
 
 /// Returns true only when proposal verification rejected the exact candidate
@@ -3388,7 +3387,20 @@ where
         }
         let template = candidate_rpc
             .get_block_template(None)
-            .await?
+            .await
+            .map_err(|error| {
+                if types::get_block_template::is_pending_template_build(&error) {
+                    // Keep candidate retries on the existing short race delay,
+                    // rather than the backend's generic node-warmup backoff.
+                    ErrorObject::borrowed(
+                        WCASH_AUX_TIP_CHANGED_ERROR_CODE,
+                        "Wcash candidate construction is pending; retry createauxblock",
+                        None,
+                    )
+                } else {
+                    error
+                }
+            })?
             .try_into_template()
             .ok_or_else(|| {
                 ErrorObject::borrowed(

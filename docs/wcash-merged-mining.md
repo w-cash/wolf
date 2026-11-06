@@ -114,10 +114,15 @@ height and fees; a previous fee total is never substituted into a new candidate.
 Foreground template selection, coinbase construction and cache waits run on
 blocking workers so a cold proof cannot hold an async RPC worker. Configured
 and alternate-payout requests share two foreground build slots. Saturation
-returns retryable JSON-RPC `-28` without queuing more proof work; pools should
-retry with bounded backoff. Cancelling a waiting request does not free its slot
-until the blocking build finishes. Prewarming and its existing limits are
-unchanged. This isolates RPC scheduling; it does not shorten the proof itself.
+returns retryable JSON-RPC `-28` without queuing more proof work. A build still
+pending after two seconds returns the same retryable result. `createauxblock`
+maps only these two template-build conditions to its existing short-retry
+code `-32001`, before publishing any candidate or retirement token; unrelated
+node warmup errors keep their original codes. The worker continues filling its
+exact coinbase cache entry for a later retry. Cancelling or timing out the
+request does not free its slot until the blocking build finishes. Prewarming
+and its existing limits are unchanged. This bounds the foreground wait and
+isolates RPC scheduling; it does not shorten the proof itself.
 
 `createauxblock.coinbasevalue` is the miner's **net** payout including all fees:
 `subsidy - foundation + fees`. It excludes the compulsory transparent foundation

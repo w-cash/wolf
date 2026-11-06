@@ -18,6 +18,32 @@ use super::{super::CoinbaseCache, *};
 
 const TEST_LIMIT: Duration = Duration::from_secs(5);
 
+#[test]
+fn template_build_pending_error_identification_is_exact() {
+    for message in [TEMPLATE_BUILD_BUSY, TEMPLATE_BUILD_PENDING] {
+        assert!(is_pending_template_build(&ErrorObject::borrowed(
+            -28, message, None,
+        )));
+        assert!(!is_pending_template_build(&ErrorObject::borrowed(
+            -1, message, None,
+        )));
+        assert!(!is_pending_template_build(&ErrorObject::owned(
+            -28,
+            message,
+            Some("unrelated error data"),
+        )));
+    }
+    for message in [
+        "node warming up",
+        "block template construction is pending; retry later",
+        "prefix: block template construction is busy; retry",
+    ] {
+        assert!(!is_pending_template_build(&ErrorObject::borrowed(
+            -28, message, None,
+        )));
+    }
+}
+
 async fn held_build(
     executor: &TemplateBuildExecutor,
 ) -> (mpsc::Sender<()>, JoinHandle<RpcResult<usize>>) {
@@ -98,6 +124,54 @@ async fn template_build_cancelled_waiter_retains_running_capacity() {
     .expect("capacity returns only after the detached build finishes");
     assert_eq!(executor.run(|| Ok(19)).await.unwrap(), 19);
     finish_build(second_release, second).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn template_build_pending_deadline_retains_capacity_until_completion() {
+    let executor = TemplateBuildExecutor::default();
+    let (first_release, first) = held_build(&executor).await;
+    let (second_release, second) = held_build(&executor).await;
+
+    // Start the fake clock only after both real blocking workers have entered.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for task in [first, second] {
+        let error = task
+            .await
+            .expect("the server-side waiter returns normally")
+            .expect_err("the server reports pending before its proof finishes");
+        assert_eq!(error.code(), -28);
+        assert_eq!(
+            error.message(),
+            "block template construction is pending; retry"
+        );
+    }
+    tokio::time::resume();
+
+    assert_eq!(executor.permits.available_permits(), 0);
+    let error = executor
+        .run(|| -> RpcResult<usize> { panic!("pending work still owns both permits") })
+        .await
+        .expect_err("a pending response must not create unlimited replacement work");
+    assert_eq!(error.code(), -28);
+
+    first_release.send(()).unwrap();
+    timeout(TEST_LIMIT, async {
+        while executor.permits.available_permits() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("one completed detached build releases one slot");
+    assert_eq!(executor.run(|| Ok(29)).await.unwrap(), 29);
+    second_release.send(()).unwrap();
+    timeout(TEST_LIMIT, async {
+        while executor.permits.available_permits() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both detached builds eventually release their slots");
 }
 
 #[tokio::test(flavor = "current_thread")]

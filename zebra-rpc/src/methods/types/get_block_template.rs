@@ -78,6 +78,10 @@ pub use parameters::{
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
 
+pub(crate) fn is_pending_template_build(error: &ErrorObject<'_>) -> bool {
+    template_build::is_pending_template_build(error)
+}
+
 /// An alias to indicate that a usize value represents the depth of in-block dependencies of a
 /// transaction.
 ///
