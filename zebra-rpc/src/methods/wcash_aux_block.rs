@@ -283,7 +283,7 @@ impl Default for AuxBlockCandidateCache {
 }
 
 impl AuxBlockCandidateCache {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "wcash-consensus"))]
     pub(crate) fn allocation_counts(&self) -> (usize, usize, usize) {
         let inner = self
             .inner
