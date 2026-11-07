@@ -402,6 +402,13 @@ expires 45 seconds after acquisition started. The controller retires an expired
 or abandoned child on the existing cleanup lane. Queued requests and returned
 results retain ownership across worker shutdown and failed handoff.
 
+Speculative child acquisition and demanded generation preparation keep separate
+retry deadlines and backoff. A failed background acquisition cannot postpone a
+replacement requested by either chain's currentness probe, generation expiry,
+or normal rotation. A failed demanded replacement still observes its own paced
+retry, and no speculative work starts while that replacement is needed. The
+single preparation worker and six-candidate bound continue to apply.
+
 A ready hit consumes the child once, repeats the original network-identity
 checks, obtains and independently proposal-validates a fresh Zcash parent, and
 checks the exact Wcash predecessor before and after parent preparation. Its
