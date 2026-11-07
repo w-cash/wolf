@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "The native merged-mining backend can relay a bounded recent Zcash canonical branch through normal node validation when a work node lags on a competing fork. Exact ancestry, shared request and byte budgets, paced submissions, final tip convergence and independent proposal checks remain required before new work is issued."
+time: 2026-11-07T18:28:24.832336Z

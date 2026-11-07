@@ -135,6 +135,8 @@ impl fmt::Debug for RpcEndpoint {
 pub struct ZebraRpcClient {
     endpoint: RpcEndpoint,
     client: Client,
+    request_timeout: Duration,
+    request_deadline: Option<Instant>,
     next_id: Arc<AtomicU64>,
     active_coinbase_prewarms: Arc<Mutex<HashSet<u32>>>,
 }
@@ -176,6 +178,8 @@ impl ZebraRpcClient {
         Ok(Self {
             endpoint,
             client,
+            request_timeout: timeout,
+            request_deadline: None,
             next_id: Arc::new(AtomicU64::new(1)),
             active_coinbase_prewarms: Arc::new(Mutex::new(HashSet::new())),
         })
@@ -184,6 +188,17 @@ impl ZebraRpcClient {
     /// Returns the credential-free endpoint label.
     pub fn label(&self) -> &str {
         self.endpoint.label()
+    }
+
+    /// Shares the connection pool while bounding every request by one absolute deadline.
+    pub(crate) fn with_deadline(&self, deadline: Instant) -> Self {
+        let mut client = self.clone();
+        client.request_deadline = Some(
+            client
+                .request_deadline
+                .map_or(deadline, |existing| existing.min(deadline)),
+        );
+        client
     }
 
     /// Calls one JSON-RPC method and decodes its result.
@@ -218,6 +233,15 @@ impl ZebraRpcClient {
             .header(ACCEPT, "application/json")
             .header(ACCEPT_ENCODING, "identity")
             .json(&request);
+        if let Some(deadline) = self.request_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(MinerError::StaleNativeJob(
+                    "bounded native RPC attempt deadline elapsed".to_string(),
+                ));
+            }
+            builder = builder.timeout(remaining.min(self.request_timeout));
+        }
         if let (Some(username), Some(password)) = (&self.endpoint.username, &self.endpoint.password)
         {
             builder = builder.basic_auth(username, Some(password));
@@ -226,6 +250,14 @@ impl ZebraRpcClient {
         let response = builder.send().map_err(MinerError::RpcTransport)?;
         let status = response.status();
         let response = read_bounded_response(response)?;
+        if self
+            .request_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(MinerError::StaleNativeJob(
+                "bounded native RPC attempt deadline elapsed".to_string(),
+            ));
+        }
         classify_http_rpc_response(status, &response, id, self.label())
     }
 

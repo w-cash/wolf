@@ -264,6 +264,8 @@ fn client(server: &Server, host: &str, trust_ca: bool, password: Option<&str>) -
     ZebraRpcClient {
         endpoint,
         client: builder.build().expect("bounded test TLS client builds"),
+        request_timeout: Duration::from_secs(2),
+        request_deadline: None,
         next_id: Arc::new(super::AtomicU64::new(1)),
         active_coinbase_prewarms: Arc::new(Mutex::new(HashSet::new())),
     }
