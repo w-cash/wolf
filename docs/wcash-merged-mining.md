@@ -357,8 +357,30 @@ and initial hard storage failures bypass that noisy-event budget, while the
 queue remains bounded. `suppressed_total` and `diagnostic_dropped_total` expose
 suppression and queue loss when output is available. A stalled or failed sink
 can still lose diagnostics: the preserved authoritative journal and independent
-exact-hash observation remain the recovery evidence. No new diagnostics run
-for ordinary shares, and no diagnostic adds an fsync or validation pass.
+exact-hash observation remain the recovery evidence. Ordinary shares emit no
+per-share diagnostic events, and no diagnostic adds an fsync or validation pass.
+
+Observer-catchup preparation failures include public tip heights and a fixed
+configured node role and index when an error identifies one unambiguous
+endpoint. Unknown or aliased catch-up participants remain unidentified;
+raw endpoint labels and error bodies
+never enter the diagnostic queue. Candidate RPC code `-32001` also has a fixed
+`rpc_subreason` distinguishing construction pending, proposal timeout, acceptance
+during proposal validation and the individual tip-change stages. Unknown text
+uses `unrecognized_candidate_retry`; this does not alter retry decisions.
+
+The existing 15-second observation cadence includes
+`submission_attempt_observation`. These saturating process-cumulative counters
+cover shape-validated submit requests that reached the actor, including retries.
+They reset on restart and exclude authentication, framing, frontend queue,
+transport, invalid dispatch kinds and actor-lock failures. Late-Zcash
+target-prefilter counts precede Equihash validation and cannot establish that a
+valid proof was lost. Response outcomes and observed durable share receipts are
+counted separately: a wakeup or response failure after a
+durable commit must not erase that receipt from the observations. A journal
+append error can also have an uncertain disk outcome. The journal
+remains authoritative. Counter snapshots use a nonblocking state read and the
+existing lossy writer; silence cannot diagnose that writer's permanent failure.
 
 ### Pool-backend job supervision
 

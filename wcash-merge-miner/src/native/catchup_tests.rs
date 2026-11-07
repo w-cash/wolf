@@ -382,7 +382,7 @@ fn competing_fixture_block(different_predecessor: bool) -> Block {
     block
 }
 
-fn fixture_provider() -> NativeZcashProvider {
+pub(super) fn fixture_provider() -> NativeZcashProvider {
     let network = NativeZcashNetwork::Mainnet;
     let config = NativeZcashConfig::from_encoded_payout(
         RpcEndpoint::new("http://127.0.0.1:1/", None, None).unwrap(),

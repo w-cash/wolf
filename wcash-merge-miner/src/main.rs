@@ -978,6 +978,11 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                         stats,
                     ));
                 }
+                if let Some(stats) = actor.try_submission_observation() {
+                    record_native_backend_runtime(
+                        NativeBackendRuntimeEvent::SubmissionObservation(stats),
+                    );
+                }
             }
             if ready_child
                 .as_ref()

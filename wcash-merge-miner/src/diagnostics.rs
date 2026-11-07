@@ -21,7 +21,7 @@ use wcash_pool_protocol::{Hex32, MergedChain, WinnerDescriptor};
 use crate::{
     pool_backend_journal::PoolBackendJournalError,
     preparation_timing::{PreparationPhase, PreparationReport},
-    MinerError, PoolBackendWinnerSnapshot, PoolBackendZcashWorkStats,
+    MinerError, NativeSubmissionStats, PoolBackendWinnerSnapshot, PoolBackendZcashWorkStats,
     PoolWinnerReconciliationError,
 };
 
@@ -94,6 +94,8 @@ pub enum NativeBackendRuntimeEvent<'a> {
     ChildPrefetchObservation(NativeChildPrefetchStats),
     /// Cumulative accepted work classified by cached Zcash predecessor evidence.
     ZcashWorkObservation(PoolBackendZcashWorkStats),
+    /// Process-cumulative shape-validated submit requests and late-prefilter attempts.
+    SubmissionObservation(NativeSubmissionStats),
     /// An authoritative job was activated; this is not an ASIC-notification receipt.
     JobActivated(&'a wcash_pool_protocol::JobDescriptor),
     /// Shutdown cleanup completed.
@@ -139,6 +141,7 @@ pub struct NativeChildPrefetchStats {
 enum RuntimeMetadata {
     ChildPrefetch(NativeChildPrefetchStats),
     ZcashWork(PoolBackendZcashWorkStats),
+    Submissions(NativeSubmissionStats),
     RecoverySampleExpired {
         elapsed_ms: u64,
         maximum_age_ms: u64,
@@ -163,6 +166,9 @@ struct RuntimeFailure {
     retry_delay_ms: Option<u64>,
     expected_tip_hash: Option<[u8; 32]>,
     actual_tip_hash: Option<[u8; 32]>,
+    expected_tip_height: Option<u32>,
+    actual_tip_height: Option<u32>,
+    rpc_subreason: Option<&'static str>,
     rpc_http_status: Option<u16>,
     rpc_error_code: Option<i64>,
     worker_index: Option<usize>,
@@ -170,7 +176,10 @@ struct RuntimeFailure {
 
 impl RuntimeFailure {
     fn from_error(error: &MinerError) -> Self {
-        let mut metadata = Self::default();
+        let mut metadata = Self {
+            rpc_subreason: crate::preparation_timing::candidate_rpc_subreason(error),
+            ..Self::default()
+        };
         match error {
             MinerError::ParentTipMismatch {
                 expected, actual, ..
@@ -178,11 +187,14 @@ impl RuntimeFailure {
             | MinerError::ChildTipMismatch {
                 expected, actual, ..
             } => {
-                if let (Some(expected), Some(actual)) =
-                    (runtime_tip_hash(expected), runtime_tip_hash(actual))
-                {
+                if let (Some((expected, expected_height)), Some((actual, actual_height))) = (
+                    crate::preparation_timing::public_tip(expected),
+                    crate::preparation_timing::public_tip(actual),
+                ) {
                     metadata.expected_tip_hash = Some(expected);
                     metadata.actual_tip_hash = Some(actual);
+                    metadata.expected_tip_height = expected_height;
+                    metadata.actual_tip_height = actual_height;
                 }
             }
             MinerError::RpcHttpStatus(status) => metadata.rpc_http_status = Some(status.as_u16()),
@@ -193,27 +205,9 @@ impl RuntimeFailure {
     }
 }
 
+#[cfg(test)]
 fn runtime_tip_hash(value: &str) -> Option<[u8; 32]> {
-    const HEIGHT_PREFIX: &str = " at height ";
-    const MAX_BYTES: usize = 64 + HEIGHT_PREFIX.len() + 10;
-    if !(64..=MAX_BYTES).contains(&value.len()) {
-        return None;
-    }
-    let hash = value.get(..64)?;
-    let suffix = value.get(64..)?;
-    if !suffix.is_empty() {
-        let height = suffix.strip_prefix(HEIGHT_PREFIX)?;
-        if height.is_empty()
-            || (height.len() > 1 && height.starts_with('0'))
-            || !height.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return None;
-        }
-        height.parse::<u32>().ok()?;
-    }
-    let mut decoded = [0; 32];
-    hex::decode_to_slice(hash, &mut decoded).ok()?;
-    Some(decoded)
+    crate::preparation_timing::public_tip(value).map(|(hash, _)| hash)
 }
 
 /// Records fixed public metadata without waiting for diagnostic capacity or I/O.
@@ -223,6 +217,7 @@ pub fn record_native_backend_runtime(event: NativeBackendRuntimeEvent<'_>) {
         NativeBackendRuntimeEvent::JobActivated(_)
             | NativeBackendRuntimeEvent::Stopped
             | NativeBackendRuntimeEvent::ZcashWorkObservation(_)
+            | NativeBackendRuntimeEvent::SubmissionObservation(_)
             | NativeBackendRuntimeEvent::ChildPrefetchObservation(_)
     ) && !runtime_info_enabled()
     {
@@ -245,6 +240,12 @@ fn runtime_event(event: NativeBackendRuntimeEvent<'_>) -> Event {
             let mut event = Event::new(None, "zcash_work_observation", "cumulative");
             event.noisy = false;
             event.runtime = Some(RuntimeMetadata::ZcashWork(stats));
+            event
+        }
+        NativeBackendRuntimeEvent::SubmissionObservation(stats) => {
+            let mut event = Event::new(None, "submission_attempt_observation", "cumulative");
+            event.warning = false;
+            event.runtime = Some(RuntimeMetadata::Submissions(stats));
             event
         }
         NativeBackendRuntimeEvent::JobActivated(job) => {
@@ -1262,6 +1263,15 @@ impl Reporter {
                 "error_class":report.result.error_class(),
                 "wcash_candidate_height":report.wcash_height,
                 "zcash_candidate_height":report.zcash_height,
+                "rpc_subreason":report.rpc_subreason,
+                "parent_failure":report.failure_context.map(|context| json!({
+                    "node_role":context.role.map(|role| role.name()),
+                    "node_index":context.index,
+                    "expected_tip_hash":context.expected_hash.map(hex::encode),
+                    "expected_tip_height":context.expected_height,
+                    "actual_tip_hash":context.actual_hash.map(hex::encode),
+                    "actual_tip_height":context.actual_height
+                })),
                 "phase_accounting":"exclusive_caller_phases",
                 "slow_threshold_ms":1000,
                 "asserts_asic_notify_time":false,
@@ -1309,6 +1319,27 @@ impl Reporter {
                     "asserts_canonical_reward_eligibility":false
                 })
             }
+            RuntimeMetadata::Submissions(stats) => {
+                let responses: std::collections::BTreeMap<_, _> = crate::submission_observation::RESPONSE_LABELS
+                    .iter().copied().zip(stats.responses).collect();
+                let late: std::collections::BTreeMap<_, _> = crate::submission_observation::LATE_LABELS
+                    .iter().copied().zip(stats.late).collect();
+                json!({
+                    "scope":"process_cumulative_submit_request_attempts",
+                    "attempts":stats.attempts,
+                    "responses":responses,
+                    "late_zcash_target_prefilter_attempts":late,
+                    "fresh_durable_receipts_observed":stats.fresh_durable_receipts,
+                    "replayed_durable_receipts_observed":stats.replayed_durable_receipts,
+                    "overflowed":stats.overflowed,
+                    "resets_on_restart":true,
+                    "includes_retries":true,
+                    "includes_pre_actor_rejections":false,
+                    "asserts_prefilter_equihash_validity":false,
+                    "asserts_error_means_proof_lost":false,
+                    "asserts_canonical_reward_eligibility":false
+                })
+            }
             RuntimeMetadata::Activated {
                 job,
                 wcash_height,
@@ -1323,6 +1354,9 @@ impl Reporter {
                 "retry_delay_ms":metadata.retry_delay_ms,
                 "expected_tip_hash":metadata.expected_tip_hash.map(hex::encode),
                 "actual_tip_hash":metadata.actual_tip_hash.map(hex::encode),
+                "expected_tip_height":metadata.expected_tip_height,
+                "actual_tip_height":metadata.actual_tip_height,
+                "rpc_subreason":metadata.rpc_subreason,
                 "rpc_http_status":metadata.rpc_http_status,
                 "rpc_error_code":metadata.rpc_error_code,
                 "worker_index":metadata.worker_index
@@ -1824,8 +1858,109 @@ mod tests {
             finished_phase: PreparationPhase::WcashCandidate,
             wcash_height: Some(38_789),
             zcash_height: None,
+            failure_context: None,
+            rpc_subreason: None,
             result: PreparationResult::Failed("rpc_error"),
         }
+    }
+
+    #[test]
+    fn preparation_observability_serializes_only_fixed_roles_heights_and_subreasons() {
+        use crate::preparation_timing::{PreparationFailureContext, PreparationNodeRole};
+        let error = MinerError::RpcError {
+            endpoint: "https://PRIVATE_USER:PRIVATE_PASSWORD@PRIVATE_HOST/PRIVATE_COOKIE".into(),
+            code: Some(-32_001),
+            message: "PRIVATE_PAYOUT_AND_RESPONSE".into(),
+        };
+        let now = Instant::now();
+        let mut output = Vec::new();
+        Reporter::new(now)
+            .record(
+                &mut output,
+                runtime_retry_event(
+                    "backend_preparation_retry",
+                    &error,
+                    Duration::from_millis(250),
+                ),
+                now,
+                0,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            value["runtime"]["rpc_subreason"],
+            "unrecognized_candidate_retry"
+        );
+        assert_eq!(value["runtime"]["rpc_error_code"], -32_001);
+        assert!(!String::from_utf8(output).unwrap().contains("PRIVATE"));
+
+        let mut report = preparation_fixture();
+        report.failure_context = Some(PreparationFailureContext {
+            role: Some(PreparationNodeRole::Validator),
+            index: Some(0),
+            expected_hash: Some([0xab; 32]),
+            expected_height: Some(3548858),
+            actual_hash: Some([0xcd; 32]),
+            actual_height: Some(3548856),
+        });
+        report.rpc_subreason = Some("proposal_timeout");
+        let mut output = Vec::new();
+        Reporter::new(now)
+            .record(&mut output, preparation_event(report), now, 0)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            value["preparation"]["parent_failure"]["node_role"],
+            "validator"
+        );
+        assert_eq!(
+            value["preparation"]["parent_failure"]["expected_tip_height"],
+            3548858
+        );
+        assert_eq!(
+            value["preparation"]["parent_failure"]["actual_tip_height"],
+            3548856
+        );
+        assert_eq!(value["preparation"]["rpc_subreason"], "proposal_timeout");
+        assert!(!String::from_utf8(output).unwrap().contains("PRIVATE"));
+    }
+
+    #[test]
+    fn submission_attempt_snapshot_is_bounded_nonblocking_and_not_proof_loss_evidence() {
+        let mut stats = NativeSubmissionStats {
+            attempts: 3,
+            late: [2, 0, 1, 0, 0, 1],
+            fresh_durable_receipts: 1,
+            replayed_durable_receipts: 1,
+            ..NativeSubmissionStats::default()
+        };
+        stats.responses[0] = 1;
+        stats.responses[1] = 1;
+        stats.responses[10] = 1;
+        let event = runtime_event(NativeBackendRuntimeEvent::SubmissionObservation(stats));
+        let now = Instant::now();
+        let mut output = Vec::new();
+        Reporter::new(now)
+            .record(&mut output, event, now, 0)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["runtime"]["attempts"], 3);
+        assert_eq!(value["runtime"]["responses"]["recovery_deferred"], 1);
+        assert_eq!(
+            value["runtime"]["late_zcash_target_prefilter_attempts"]["target_prefilter_passed"],
+            2
+        );
+        assert_eq!(value["runtime"]["fresh_durable_receipts_observed"], 1);
+        assert_eq!(value["runtime"]["asserts_error_means_proof_lost"], false);
+        assert!(output.len() < 4096);
+        let (sink, receiver) = Diagnostics::channel(1);
+        for _ in 0..1000 {
+            sink.record(event);
+        }
+        assert_eq!(sink.dropped.load(Ordering::Relaxed), 999);
+        drop(receiver);
+        sink.record(event);
+        assert_eq!(sink.dropped.load(Ordering::Relaxed), 1000);
     }
 
     #[test]

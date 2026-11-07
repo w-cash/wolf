@@ -34,6 +34,7 @@ mod pool_backend_workers;
 mod preparation_timing;
 pub mod protocol;
 pub mod rpc;
+mod submission_observation;
 pub mod zcash_recovery;
 pub mod zip301;
 pub mod zip301_client;
@@ -78,6 +79,7 @@ pub use pool_backend_workers::{
     is_retryable_winner_reconciliation_error, PoolBackendWinnerWorkers,
 };
 pub use preparation_timing::{NativePreparationTiming, PreparationPhase};
+pub use submission_observation::NativeSubmissionStats;
 pub use zcash_recovery::{
     NativePoolZcashRecoveryAuthority, PoolBackendZcashRecoveryAuthority,
     PoolBackendZcashWorkObservation, PoolBackendZcashWorkStats,

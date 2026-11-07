@@ -1,0 +1,4 @@
+project: zebrad
+kind: Changed
+body: "The native pool backend reports fixed configured node roles and public tip heights for identified catch-up failures, exact candidate-retry subreasons, and bounded process-cumulative submission and late-target-prefilter attempt counters. Response failures remain distinct from observed durable receipts; diagnostic changes do not alter mining, retry, journal or payout authority."
+time: 2026-11-07T18:54:21.681823Z

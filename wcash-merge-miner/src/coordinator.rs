@@ -863,7 +863,10 @@ impl NativeMiningSupervisor {
         self.retry_pending_candidate_retirement()?;
         zcash_identity?;
         timing.enter(PreparationPhase::ObserverCatchup);
-        zcash.relay_observer_blocks_to_work_nodes()?;
+        if let Err(error) = zcash.relay_observer_blocks_to_work_nodes() {
+            timing.set_failure_context(zcash.preparation_failure_context(&error));
+            return Err(error);
+        }
         self.initial_outbox_recovery_complete
             .store(true, Ordering::Release);
 

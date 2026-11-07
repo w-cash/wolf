@@ -11,6 +11,91 @@ use crate::MinerError;
 const SLOW_PREPARATION: Duration = Duration::from_secs(1);
 pub(crate) const PHASE_COUNT: usize = 13;
 
+#[derive(Clone, Copy)]
+pub(crate) enum PreparationNodeRole {
+    Template,
+    Validator,
+    Observer,
+}
+
+impl PreparationNodeRole {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Template => "template",
+            Self::Validator => "validator",
+            Self::Observer => "observer",
+        }
+    }
+}
+
+/// Only compiled role names and public tip metadata; never an endpoint or error body.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PreparationFailureContext {
+    pub(crate) role: Option<PreparationNodeRole>,
+    pub(crate) index: Option<usize>,
+    pub(crate) expected_hash: Option<[u8; 32]>,
+    pub(crate) expected_height: Option<u32>,
+    pub(crate) actual_hash: Option<[u8; 32]>,
+    pub(crate) actual_height: Option<u32>,
+}
+
+pub(crate) fn public_tip(value: &str) -> Option<([u8; 32], Option<u32>)> {
+    const PREFIX: &str = " at height ";
+    if !(64..=64 + PREFIX.len() + 10).contains(&value.len()) {
+        return None;
+    }
+    let height = match value.get(64..)? {
+        "" => None,
+        suffix => {
+            let height = suffix.strip_prefix(PREFIX)?;
+            if height.is_empty()
+                || (height.len() > 1 && height.starts_with('0'))
+                || !height.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            Some(height.parse().ok()?)
+        }
+    };
+    let mut hash = [0; 32];
+    hex::decode_to_slice(value.get(..64)?, &mut hash).ok()?;
+    Some((hash, height))
+}
+
+pub(crate) fn candidate_rpc_subreason(error: &MinerError) -> Option<&'static str> {
+    let MinerError::RpcError {
+        code: Some(-32_001),
+        message,
+        ..
+    } = error
+    else {
+        return None;
+    };
+    Some(match message.as_str() {
+        "Wcash candidate construction is pending; retry createauxblock" => "construction_pending",
+        "Wcash candidate proposal validation timed out; retry createauxblock" => "proposal_timeout",
+        "Wcash candidate was accepted during proposal validation; retry createauxblock" => {
+            "accepted_during_proposal"
+        }
+        "Wcash tip changed while constructing the candidate; retry createauxblock" => {
+            "tip_changed_constructing"
+        }
+        "Wcash tip changed during proposal validation; retry createauxblock" => {
+            "tip_changed_during_proposal"
+        }
+        "Wcash tip changed while validating the candidate; retry createauxblock" => {
+            "tip_changed_validating"
+        }
+        "Wcash tip changed before publishing the candidate; retry createauxblock" => {
+            "tip_changed_before_publish"
+        }
+        "Wcash tip changed while publishing the candidate; retry createauxblock" => {
+            "tip_changed_publishing"
+        }
+        _ => "unrecognized_candidate_retry",
+    })
+}
+
 /// Exclusive preparation phases; repeated entries accumulate without overlap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreparationPhase {
@@ -107,6 +192,8 @@ pub struct NativePreparationTiming {
     phases: [Duration; PHASE_COUNT],
     wcash_height: Option<u32>,
     zcash_height: Option<u32>,
+    failure_context: Option<PreparationFailureContext>,
+    rpc_subreason: Option<&'static str>,
 }
 
 impl Default for NativePreparationTiming {
@@ -129,6 +216,8 @@ impl NativePreparationTiming {
             phases: [Duration::ZERO; PHASE_COUNT],
             wcash_height: None,
             zcash_height: None,
+            failure_context: None,
+            rpc_subreason: None,
         }
     }
 
@@ -162,15 +251,20 @@ impl NativePreparationTiming {
         self.set_zcash_height(zcash);
     }
 
+    pub(crate) fn set_failure_context(&mut self, context: PreparationFailureContext) {
+        self.failure_context = Some(context);
+    }
+
     /// Finishes a successfully activated attempt; fast success emits nothing.
     pub fn finish_ok(self) {
         self.finish(PreparationResult::Activated);
     }
 
-    /// Finishes a failed attempt using only a fixed error-class label.
+    /// Finishes a failed attempt using fixed public labels and captured context.
     ///
     /// Error bodies, endpoint labels, credentials and payout data are discarded.
-    pub fn finish_error(self, error: &MinerError) {
+    pub fn finish_error(mut self, error: &MinerError) {
+        self.rpc_subreason = candidate_rpc_subreason(error);
         self.finish(PreparationResult::Failed(preparation_error_class(error)));
     }
 
@@ -207,6 +301,8 @@ impl NativePreparationTiming {
             finished_phase: self.phase,
             wcash_height: self.wcash_height,
             zcash_height: self.zcash_height,
+            failure_context: self.failure_context,
+            rpc_subreason: self.rpc_subreason,
             result,
         })
     }
@@ -242,6 +338,8 @@ pub(crate) struct PreparationReport {
     pub(crate) finished_phase: PreparationPhase,
     pub(crate) wcash_height: Option<u32>,
     pub(crate) zcash_height: Option<u32>,
+    pub(crate) failure_context: Option<PreparationFailureContext>,
+    pub(crate) rpc_subreason: Option<&'static str>,
     pub(crate) result: PreparationResult,
 }
 
@@ -271,6 +369,83 @@ pub(crate) fn preparation_error_class(error: &MinerError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_rpc_subreasons_are_exact_compiled_labels_not_error_payloads() {
+        let cases = [
+            (
+                "Wcash candidate construction is pending; retry createauxblock",
+                "construction_pending",
+            ),
+            (
+                "Wcash candidate proposal validation timed out; retry createauxblock",
+                "proposal_timeout",
+            ),
+            (
+                "Wcash candidate was accepted during proposal validation; retry createauxblock",
+                "accepted_during_proposal",
+            ),
+            (
+                "Wcash tip changed while constructing the candidate; retry createauxblock",
+                "tip_changed_constructing",
+            ),
+            (
+                "Wcash tip changed during proposal validation; retry createauxblock",
+                "tip_changed_during_proposal",
+            ),
+            (
+                "Wcash tip changed while validating the candidate; retry createauxblock",
+                "tip_changed_validating",
+            ),
+            (
+                "Wcash tip changed before publishing the candidate; retry createauxblock",
+                "tip_changed_before_publish",
+            ),
+            (
+                "Wcash tip changed while publishing the candidate; retry createauxblock",
+                "tip_changed_publishing",
+            ),
+        ];
+        for (message, label) in cases {
+            let error = MinerError::RpcError {
+                endpoint: "PRIVATE_ENDPOINT".into(),
+                code: Some(-32_001),
+                message: message.into(),
+            };
+            assert_eq!(candidate_rpc_subreason(&error), Some(label));
+            let (_, rows) = crate::diagnostics::capture_preparation_timings(|| {
+                let mut timing = NativePreparationTiming::new();
+                timing.enter(PreparationPhase::WcashCandidate);
+                timing.finish_error(&error);
+            });
+            assert_eq!(rows[0]["preparation"]["rpc_subreason"], label);
+            assert!(!serde_json::to_string(&rows).unwrap().contains("PRIVATE"));
+        }
+        for (code, message, expected) in [
+            (
+                -32_001,
+                "PRIVATE_RESPONSE",
+                Some("unrecognized_candidate_retry"),
+            ),
+            (
+                -32_001,
+                "Wcash candidate construction is pending; retry createauxblock PRIVATE",
+                Some("unrecognized_candidate_retry"),
+            ),
+            (
+                -32_002,
+                "Wcash candidate construction is pending; retry createauxblock",
+                None,
+            ),
+        ] {
+            let error = MinerError::RpcError {
+                endpoint: "PRIVATE_ENDPOINT".into(),
+                code: Some(code),
+                message: message.into(),
+            };
+            assert_eq!(candidate_rpc_subreason(&error), expected);
+        }
+    }
 
     #[test]
     fn exclusive_repeated_phases_account_for_the_complete_attempt() {

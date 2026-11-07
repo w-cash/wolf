@@ -311,6 +311,10 @@ pub struct PoolBackendHandlerError {
 }
 
 impl PoolBackendHandlerError {
+    pub(crate) fn code(&self) -> &BackendErrorCode {
+        &self.code
+    }
+
     /// Creates a stable, secret-free wire failure.
     pub const fn new(code: BackendErrorCode, message: &'static str, fatal: bool) -> Self {
         Self {
