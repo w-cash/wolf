@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "The native pool backend keeps separate retry deadlines and backoff for speculative Wcash child acquisition and demanded job preparation. A failed background acquisition no longer delays a replacement needed after a chain-tip change, generation expiry or normal rotation; demanded failures retain paced retries on the existing single worker and six candidate slots."
+time: 2026-11-07T15:37:16.000000000Z

@@ -922,8 +922,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     drop(listener_failure_tx);
 
     let slots = Arc::new(AtomicUsize::new(0));
-    let mut preparation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
-    let mut next_preparation = Instant::now();
+    let mut preparation_schedule = PoolBackendPreparationSchedule::new(Instant::now());
     let mut request_id = 0u64;
     let mut expected_preparation: Option<(u64, Instant)> = None;
     let mut active: Option<ActivePoolBackendGeneration> = None;
@@ -1023,6 +1022,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                                 )
                                 .into());
                             }
+                            preparation_schedule.prefetch_succeeded(Instant::now());
                             ready_child = Some(child);
                         } else {
                             prefetch_stats.expired = prefetch_stats.expired.saturating_add(1);
@@ -1043,7 +1043,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                             result.timing.finish_activation_failed();
                             retirement_worker
                                 .enqueue(unpublished.take().expect("owned prepared candidate"))?;
-                            next_preparation = Instant::now();
+                            preparation_schedule.generation_rejected(Instant::now());
                             continue;
                         }
                         let candidate = unpublished.as_ref().expect("owned prepared candidate");
@@ -1064,7 +1064,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                         record_native_backend_runtime(NativeBackendRuntimeEvent::JobActivated(
                             &descriptor,
                         ));
-                        preparation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
+                        preparation_schedule.generation_activated();
                         let replacement = ActivePoolBackendGeneration {
                             job_id,
                             candidate: unpublished.take().expect("activated prepared candidate"),
@@ -1110,13 +1110,11 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                         if !valid_request || !is_retryable_native_preparation_error(&error) {
                             return Err(error.into());
                         }
-                        let delay = native_preparation_retry_delay(&error, preparation_backoff);
+                        let delay =
+                            preparation_schedule.failed(result.prefetch, &error, Instant::now());
                         record_native_backend_runtime(NativeBackendRuntimeEvent::PreparationRetry(
                             &error, delay,
                         ));
-                        next_preparation = Instant::now() + delay;
-                        preparation_backoff =
-                            next_native_preparation_backoff(&error, preparation_backoff);
                     }
                 }
             }
@@ -1149,12 +1147,12 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                 prefetch_stats.demand_waits = prefetch_stats.demand_waits.saturating_add(1);
                 demand_wait_started = Some(Instant::now());
             }
-            if let Some(choice) = pool_backend_preparation_choice(
+            if let Some(choice) = preparation_schedule.choice(
                 replacement_needed,
                 active.is_some(),
                 ready_child.is_some(),
                 preparation_worker.is_busy(),
-                Instant::now() >= next_preparation,
+                Instant::now(),
             ) {
                 let next_request_id = request_id.checked_add(1).ok_or_else(|| {
                     MinerError::InvalidRequest("preparation request identity exhausted".to_string())
@@ -1270,26 +1268,75 @@ enum PoolBackendPreparationChoice {
     Prefetch,
 }
 
-fn pool_backend_preparation_choice(
-    replacement_needed: bool,
-    active: bool,
-    ready: bool,
-    busy: bool,
-    retry_due: bool,
-) -> Option<PoolBackendPreparationChoice> {
-    if busy || !retry_due {
-        return None;
+struct PoolBackendPreparationSchedule {
+    generation_backoff: Duration,
+    next_generation: Instant,
+    prefetch_backoff: Duration,
+    next_prefetch: Instant,
+}
+
+impl PoolBackendPreparationSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            generation_backoff: INITIAL_NATIVE_PREPARATION_BACKOFF,
+            next_generation: now,
+            prefetch_backoff: INITIAL_NATIVE_PREPARATION_BACKOFF,
+            next_prefetch: now,
+        }
     }
-    if replacement_needed {
-        Some(if ready {
-            PoolBackendPreparationChoice::ParentFromReady
+
+    fn failed(&mut self, prefetch: bool, error: &MinerError, now: Instant) -> Duration {
+        let (backoff, next_attempt) = if prefetch {
+            (&mut self.prefetch_backoff, &mut self.next_prefetch)
         } else {
-            PoolBackendPreparationChoice::Baseline
-        })
-    } else if active && !ready {
-        Some(PoolBackendPreparationChoice::Prefetch)
-    } else {
-        None
+            (&mut self.generation_backoff, &mut self.next_generation)
+        };
+        let delay = native_preparation_retry_delay(error, *backoff);
+        *next_attempt = now + delay;
+        *backoff = next_native_preparation_backoff(error, *backoff);
+        delay
+    }
+
+    fn prefetch_succeeded(&mut self, now: Instant) {
+        self.prefetch_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
+        self.next_prefetch = now;
+    }
+
+    fn generation_activated(&mut self) {
+        self.generation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
+    }
+
+    fn generation_rejected(&mut self, now: Instant) {
+        self.next_generation = now;
+    }
+
+    fn choice(
+        &self,
+        replacement_needed: bool,
+        active: bool,
+        ready: bool,
+        busy: bool,
+        now: Instant,
+    ) -> Option<PoolBackendPreparationChoice> {
+        if busy {
+            return None;
+        }
+        // A needed replacement never inherits speculative cooldown or starts
+        // another prefetch while its own failed attempt is backing off.
+        if replacement_needed {
+            if now < self.next_generation {
+                return None;
+            }
+            Some(if ready {
+                PoolBackendPreparationChoice::ParentFromReady
+            } else {
+                PoolBackendPreparationChoice::Baseline
+            })
+        } else if active && !ready && now >= self.next_prefetch {
+            Some(PoolBackendPreparationChoice::Prefetch)
+        } else {
+            None
+        }
     }
 }
 
@@ -3370,6 +3417,189 @@ mod tests {
     }
 
     #[test]
+    fn failed_background_prefetch_does_not_delay_tip_replacement_or_expiry() {
+        let now = Instant::now();
+        for (code, expected_delay) in [
+            (-28, INITIAL_NATIVE_PREPARATION_BACKOFF),
+            (
+                WCASH_AUX_CAPACITY_ERROR_CODE,
+                INITIAL_NATIVE_PREPARATION_BACKOFF,
+            ),
+            (WCASH_AUX_TIP_CHANGED_ERROR_CODE, TIP_RACE_RETRY_DELAY),
+        ] {
+            let mut schedule = PoolBackendPreparationSchedule::new(now);
+            assert_eq!(
+                schedule.failed(true, &rpc_error(Some(code)), now),
+                expected_delay
+            );
+            // Either chain's probe or normal rotation requests replacement
+            // through this same flag, independently of speculative failures.
+            assert_eq!(
+                schedule.choice(true, true, false, false, now),
+                Some(PoolBackendPreparationChoice::Baseline)
+            );
+            assert_eq!(
+                schedule.choice(true, true, true, false, now),
+                Some(PoolBackendPreparationChoice::ParentFromReady)
+            );
+            // Expiry removes the active generation before making the same demand.
+            assert_eq!(
+                schedule.choice(true, false, false, false, now),
+                Some(PoolBackendPreparationChoice::Baseline)
+            );
+            assert_eq!(schedule.choice(false, true, false, false, now), None);
+            assert_eq!(
+                schedule.choice(false, true, true, false, now + expected_delay),
+                None,
+                "a retained ready child still suppresses additional prefetch"
+            );
+        }
+    }
+
+    #[test]
+    fn speculative_retry_is_paced_and_capped_without_suppressing_demand() {
+        let mut now = Instant::now();
+        let mut schedule = PoolBackendPreparationSchedule::new(now);
+        let unavailable = rpc_error(Some(-28));
+        let mut observed = Vec::new();
+        for _ in 0..10 {
+            assert_eq!(
+                schedule.choice(false, true, false, false, now),
+                Some(PoolBackendPreparationChoice::Prefetch)
+            );
+            let delay = schedule.failed(true, &unavailable, now);
+            observed.push(delay.as_secs());
+            let before_deadline = now + delay - Duration::from_nanos(1);
+            assert_eq!(
+                schedule.choice(false, true, false, false, before_deadline),
+                None
+            );
+            assert_eq!(
+                schedule.choice(true, true, false, false, now),
+                Some(PoolBackendPreparationChoice::Baseline)
+            );
+            now += delay;
+        }
+        assert_eq!(observed, [1, 2, 4, 8, 16, 32, 60, 60, 60, 60]);
+    }
+
+    #[test]
+    fn demanded_failure_keeps_its_deadline_after_prefetch_success_or_failure() {
+        let now = Instant::now();
+        let mut schedule = PoolBackendPreparationSchedule::new(now);
+        let unavailable = rpc_error(Some(-28));
+        let demand_deadline = now + schedule.failed(false, &unavailable, now);
+        schedule.prefetch_succeeded(now);
+        let speculative_failure_at = now + Duration::from_millis(100);
+        schedule.failed(true, &unavailable, speculative_failure_at);
+        for active in [true, false] {
+            for ready in [true, false] {
+                assert_eq!(
+                    schedule.choice(
+                        true,
+                        active,
+                        ready,
+                        false,
+                        demand_deadline - Duration::from_nanos(1),
+                    ),
+                    None,
+                    "demanded retry must not fall back to speculative work"
+                );
+                assert_eq!(
+                    schedule.choice(true, active, ready, false, demand_deadline),
+                    Some(if ready {
+                        PoolBackendPreparationChoice::ParentFromReady
+                    } else {
+                        PoolBackendPreparationChoice::Baseline
+                    })
+                );
+            }
+        }
+        assert_eq!(
+            schedule.failed(false, &unavailable, demand_deadline),
+            Duration::from_secs(2),
+            "speculative transitions cannot reset or increase demanded backoff"
+        );
+        schedule.generation_rejected(demand_deadline);
+        assert_eq!(
+            schedule.choice(true, true, false, false, demand_deadline),
+            Some(PoolBackendPreparationChoice::Baseline)
+        );
+        assert_eq!(
+            schedule.failed(false, &unavailable, demand_deadline),
+            Duration::from_secs(4),
+            "rejecting an unactivatable generation preserves its backoff level"
+        );
+    }
+
+    #[test]
+    fn successful_child_resets_only_speculative_retry_backoff() {
+        let mut now = Instant::now();
+        let mut schedule = PoolBackendPreparationSchedule::new(now);
+        let unavailable = rpc_error(Some(-28));
+        for expected in [1, 2, 4] {
+            let delay = schedule.failed(true, &unavailable, now);
+            assert_eq!(delay.as_secs(), expected);
+            now += delay;
+        }
+        schedule.prefetch_succeeded(now);
+        assert_eq!(
+            schedule.failed(true, &unavailable, now),
+            INITIAL_NATIVE_PREPARATION_BACKOFF
+        );
+        schedule.generation_activated();
+        assert_eq!(
+            schedule.failed(true, &unavailable, now + Duration::from_secs(1)),
+            Duration::from_secs(2),
+            "generation activation resets only demanded retry state"
+        );
+    }
+
+    #[test]
+    fn failed_prefetch_worker_releases_slot_and_new_demand_obeys_busy_and_capacity() {
+        let slots = Arc::new(AtomicUsize::new(0));
+        let mut schedule = PoolBackendPreparationSchedule::new(Instant::now());
+        let mut worker = PoolBackendControlWorker::spawn(
+            "fixture-failed-child-prefetch",
+            |slot: PoolBackendCandidateSlot| {
+                drop(slot);
+                rpc_error(Some(-28))
+            },
+            drop,
+        )
+        .unwrap();
+        assert!(worker
+            .request(PoolBackendCandidateSlot::acquire(&slots).unwrap())
+            .unwrap());
+        assert_eq!(
+            schedule.choice(true, true, false, worker.is_busy(), Instant::now()),
+            None
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let error = loop {
+            if let Some(error) = worker.poll().unwrap() {
+                break error;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        };
+        let now = Instant::now();
+        schedule.failed(true, &error, now);
+        let choice = schedule.choice(true, true, false, worker.is_busy(), now);
+        worker.request_shutdown().unwrap();
+        assert_eq!(slots.load(Ordering::Acquire), 0);
+        assert_eq!(choice, Some(PoolBackendPreparationChoice::Baseline));
+
+        let owners = (0..POOL_BACKEND_CANDIDATE_LIMIT)
+            .map(|_| PoolBackendCandidateSlot::acquire(&slots).unwrap())
+            .collect::<Vec<_>>();
+        assert!(PoolBackendCandidateSlot::acquire(&slots).is_none());
+        assert_eq!(slots.load(Ordering::Acquire), POOL_BACKEND_CANDIDATE_LIMIT);
+        drop(owners);
+        assert_eq!(slots.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn stalled_child_prefetch_prioritizes_fresh_parent_without_duplicate_acquisition() {
         enum Work {
             Child(PoolBackendCandidateSlot),
@@ -3382,6 +3612,7 @@ mod tests {
         let slots = Arc::new(AtomicUsize::new(0));
         let creates = Arc::new(AtomicUsize::new(0));
         let parent_epoch = Arc::new(AtomicUsize::new(0));
+        let schedule = PoolBackendPreparationSchedule::new(Instant::now());
         let (entered_tx, entered) = mpsc::channel();
         let (release, wait) = mpsc::channel();
         let worker_creates = Arc::clone(&creates);
@@ -3409,7 +3640,7 @@ mod tests {
         entered.recv_timeout(Duration::from_secs(1)).unwrap();
         parent_epoch.store(1, Ordering::Release);
         assert_eq!(
-            pool_backend_preparation_choice(true, true, false, worker.is_busy(), true),
+            schedule.choice(true, true, false, worker.is_busy(), Instant::now()),
             None
         );
         // The independent parent-currentness lane can finish while child RPC is
@@ -3443,7 +3674,7 @@ mod tests {
             thread::yield_now();
         };
         assert_eq!(
-            pool_backend_preparation_choice(true, true, true, worker.is_busy(), true),
+            schedule.choice(true, true, true, worker.is_busy(), Instant::now()),
             Some(PoolBackendPreparationChoice::ParentFromReady)
         );
         assert!(worker.request_owned(Work::Parent(slot)).is_ok());
