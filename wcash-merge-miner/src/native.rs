@@ -154,6 +154,9 @@ mod catchup_tests;
 #[cfg(test)]
 #[path = "native/nu7_tests.rs"]
 mod nu7_tests;
+#[cfg(test)]
+#[path = "native/observability_tests.rs"]
+mod observability_tests;
 
 /// Strict local projection of the parent fields used to build an exact job.
 ///
@@ -792,6 +795,64 @@ impl NativeZcashProvider {
         );
 
         Ok(prepared)
+    }
+
+    pub(crate) fn preparation_failure_context(
+        &self,
+        error: &MinerError,
+    ) -> crate::preparation_timing::PreparationFailureContext {
+        use crate::preparation_timing::{
+            public_tip, PreparationFailureContext, PreparationNodeRole,
+        };
+
+        let mut context = PreparationFailureContext::default();
+        let endpoint = match error {
+            MinerError::ParentTipMismatch {
+                expected,
+                endpoint,
+                actual,
+            } => {
+                if let Some((hash, height)) = public_tip(expected) {
+                    context.expected_hash = Some(hash);
+                    context.expected_height = height;
+                }
+                if let Some((hash, height)) = public_tip(actual) {
+                    context.actual_hash = Some(hash);
+                    context.actual_height = height;
+                }
+                endpoint
+            }
+            MinerError::RpcError { endpoint, .. } => endpoint,
+            _ => return context,
+        };
+        let nodes = std::iter::once((PreparationNodeRole::Template, 0, &self.template_node))
+            .chain(
+                self.proposal_validators
+                    .iter()
+                    .enumerate()
+                    .map(|(index, node)| (PreparationNodeRole::Validator, index, node)),
+            )
+            .chain(
+                self.observer_nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, node)| (PreparationNodeRole::Observer, index, node)),
+            );
+        let mut found = None;
+        for (role, index, node) in nodes {
+            if node.label() == endpoint.as_str() {
+                if found.is_some() {
+                    // Aliased configured roles cannot identify a unique failing role.
+                    return context;
+                }
+                found = Some((role, index));
+            }
+        }
+        if let Some((role, index)) = found {
+            context.role = Some(role);
+            context.index = Some(index);
+        }
+        context
     }
 
     /// Relays already-validated public blocks from the read-only observer to
@@ -2069,7 +2130,7 @@ fn parent_tip_mismatch(
 /// the relay. The observer can publish the new tip through
 /// `getblockchaininfo` just before the indexed block becomes available, so a
 /// second tip query can legitimately return the same snapshot. Retrying these
-/// these call-specific lookup failures is safe: no block bytes are accepted
+/// call-specific lookup failures is safe: no block bytes are accepted
 /// without their hash, canonical-prefix, and independent-node checks.
 fn reclassify_observer_lookup_tip_race(
     observer: &ZebraRpcClient,

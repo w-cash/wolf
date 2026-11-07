@@ -34,6 +34,7 @@ use crate::{
         PoolBackendAuthority, PoolBackendHandlerError, PoolBackendListenerError,
         PoolBackendRequestContext, PoolBackendRequestHandler,
     },
+    submission_observation::{LateSubmissionOutcome, NativeSubmissionStats},
     zcash_recovery::{
         PoolBackendZcashRecoveryAuthority, PoolBackendZcashWorkObservation,
         PoolBackendZcashWorkStats,
@@ -879,6 +880,7 @@ struct ActorState {
     zcash_winner_snapshots: HashMap<Hex32, RetainedZcashWinner>,
     zcash_snapshot_bytes: usize,
     zcash_work: PoolBackendZcashWorkStats,
+    submission_stats: NativeSubmissionStats,
 }
 
 /// Single serialized authority for durable pool jobs and accepted shares.
@@ -941,6 +943,7 @@ impl PoolBackendActor {
             zcash_winner_snapshots: HashMap::new(),
             zcash_snapshot_bytes: 0,
             zcash_work: PoolBackendZcashWorkStats::default(),
+            submission_stats: NativeSubmissionStats::default(),
         };
         close_abandoned_jobs(&mut state)?;
 
@@ -971,6 +974,14 @@ impl PoolBackendActor {
     /// These counters are not a second accounting ledger or ASIC timing evidence.
     pub fn try_zcash_work_observation(&self) -> Option<PoolBackendZcashWorkStats> {
         self.state.try_lock().ok().map(|state| state.zcash_work)
+    }
+
+    /// Copies shape-validated submit request observations without waiting for ingress.
+    pub fn try_submission_observation(&self) -> Option<NativeSubmissionStats> {
+        self.state
+            .try_lock()
+            .ok()
+            .map(|state| state.submission_stats)
     }
 
     /// Registers one compatibility reconciliation worker for durable wakeups.
@@ -1470,18 +1481,22 @@ impl PoolBackendActor {
                 nonce,
                 solution,
                 ..
-            } => self.handle_submit(
-                &mut state,
-                after_live_event_seq,
-                id,
-                job_id,
-                identity,
-                target_le,
-                time,
-                nonce,
-                *solution,
-                now,
-            ),
+            } => {
+                let result = self.handle_submit(
+                    &mut state,
+                    after_live_event_seq,
+                    id,
+                    job_id,
+                    identity,
+                    target_le,
+                    time,
+                    nonce,
+                    *solution,
+                    now,
+                );
+                state.submission_stats.record_response(&result);
+                result
+            }
             BackendRequest::ReadEvents {
                 id,
                 after_event_seq,
@@ -1609,6 +1624,7 @@ impl PoolBackendActor {
                 receipt: existing.receipt.clone(),
                 replayed: true,
             };
+            state.submission_stats.record_durable_receipt(true);
             return live_response(&state.journal, cursor, response);
         }
 
@@ -1697,11 +1713,17 @@ impl PoolBackendActor {
             {
                 return Err(stale_job());
             }
+            state
+                .submission_stats
+                .record_late(LateSubmissionOutcome::TargetPrefilterPassed);
             if let Some(authority) = self.zcash_recovery_authority.as_ref() {
                 work_observation = authority.observe(&descriptor);
                 match work_observation {
                     PoolBackendZcashWorkObservation::Current => {}
                     PoolBackendZcashWorkObservation::Stale => {
+                        state
+                            .submission_stats
+                            .record_late(LateSubmissionOutcome::ParentChanged);
                         crate::diagnostics::late_zcash_candidate(
                             &descriptor,
                             &parent_hash_le,
@@ -1711,6 +1733,9 @@ impl PoolBackendActor {
                         return Err(stale_job());
                     }
                     PoolBackendZcashWorkObservation::Unknown => {
+                        state
+                            .submission_stats
+                            .record_late(LateSubmissionOutcome::AuthorityDeferred);
                         crate::diagnostics::late_zcash_candidate(
                             &descriptor,
                             &parent_hash_le,
@@ -1724,6 +1749,9 @@ impl PoolBackendActor {
             match snapshot.validate_zcash_winner(request) {
                 Ok(block) => PoolBackendValidatedShare::with_winners(None, Some(block)),
                 Err(error) => {
+                    state
+                        .submission_stats
+                        .record_late(LateSubmissionOutcome::ValidationFailed);
                     crate::diagnostics::late_zcash_candidate(
                         &descriptor,
                         &parent_hash_le,
@@ -1771,6 +1799,9 @@ impl PoolBackendActor {
             )
             .map_err(|error| {
                 if recovered {
+                    state
+                        .submission_stats
+                        .record_late(LateSubmissionOutcome::JournalAppendError);
                     crate::diagnostics::late_zcash_candidate(
                         &descriptor,
                         &parent_hash_le,
@@ -1781,6 +1812,14 @@ impl PoolBackendActor {
                 journal_handler_error(error)
             })?;
         let wake_winner_worker = !commit.replayed && !commit.receipt.winners.is_empty();
+        state
+            .submission_stats
+            .record_durable_receipt(commit.replayed);
+        if recovered && !commit.replayed {
+            state
+                .submission_stats
+                .record_late(LateSubmissionOutcome::DurableReceiptObserved);
+        }
         if !commit.replayed {
             state
                 .zcash_work

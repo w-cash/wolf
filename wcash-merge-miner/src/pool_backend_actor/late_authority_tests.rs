@@ -343,6 +343,11 @@ fn unknown_authority_defers_without_credit_then_same_exact_proof_commits_once() 
     );
     assert!(fixture.actor.lock_state().unwrap().shares.is_empty());
     assert_eq!(stats(&fixture.actor).0, [0; 3]);
+    let attempts = fixture.actor.try_submission_observation().unwrap();
+    assert_eq!(attempts.attempts, 1);
+    assert_eq!(attempts.responses[10], 1);
+    assert_eq!(attempts.late, [1, 0, 1, 0, 0, 0]);
+    assert_eq!(attempts.fresh_durable_receipts, 0);
     authority.bind(&descriptor);
     let response = submit(&fixture.actor, request.clone()).unwrap();
     assert!(matches!(
@@ -355,6 +360,54 @@ fn unknown_authority_defers_without_credit_then_same_exact_proof_commits_once() 
     assert_eq!(stats(&fixture.actor).0, [1, 0, 0]);
     submit(&fixture.actor, request).unwrap();
     assert_eq!(stats(&fixture.actor).0, [1, 0, 0]);
+    let attempts = fixture.actor.try_submission_observation().unwrap();
+    assert_eq!(attempts.attempts, 3);
+    assert_eq!(attempts.responses[0], 1);
+    assert_eq!(attempts.responses[1], 1);
+    assert_eq!(attempts.responses[10], 1);
+    assert_eq!(attempts.late, [2, 0, 1, 0, 0, 1]);
+    assert_eq!(attempts.fresh_durable_receipts, 1);
+    assert_eq!(attempts.replayed_durable_receipts, 1);
+}
+
+#[test]
+fn submission_observations_preserve_durable_winner_when_later_wakeup_fails() {
+    let clock = Arc::new(TestClock::new());
+    let authority = Arc::new(Authority::new());
+    let (fixture, descriptor, request, retained) =
+        independent_submission::late_authority_fixture(clock.clone(), Some(authority.clone()));
+    authority.bind(&descriptor);
+    fixture.actor.activate_job(retained, Duration::ZERO).unwrap();
+    clock.set(Duration::from_millis(45_001));
+    // Poison only the wakeup mutex. The real proof, actor and durable journal
+    // remain intact, so this fault occurs after a successful share commit.
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = fixture.actor.winner_worker.lock().unwrap();
+            panic!("isolated wakeup fixture");
+        }))
+        .is_err()
+    );
+    assert_eq!(
+        submit(&fixture.actor, request.clone()).unwrap_err().code(),
+        &BackendErrorCode::BackendUnhealthy
+    );
+    let observations = fixture.actor.try_submission_observation().unwrap();
+    assert_eq!(observations.attempts, 1);
+    assert_eq!(observations.responses[9], 1);
+    assert_eq!(observations.fresh_durable_receipts, 1);
+    assert_eq!(observations.late, [1, 0, 0, 0, 0, 1]);
+    assert_eq!(fixture.actor.lock_state().unwrap().shares.len(), 1);
+    let replay = submit(&fixture.actor, request).unwrap();
+    assert!(matches!(
+        replay.last(),
+        Some(BackendMessage::ShareCommitted { replayed: true, .. })
+    ));
+    let observations = fixture.actor.try_submission_observation().unwrap();
+    assert_eq!(observations.responses[1], 1);
+    assert_eq!(observations.fresh_durable_receipts, 1);
+    assert_eq!(observations.replayed_durable_receipts, 1);
+    assert_eq!(observations.late, [1, 0, 0, 0, 0, 1]);
 }
 
 #[test]
