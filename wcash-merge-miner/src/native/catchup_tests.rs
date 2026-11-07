@@ -1,5 +1,8 @@
 //! Local RPC dispatch fixtures. These do not emulate consensus fork choice.
 
+#[path = "catchup_tests/fork_fault_tests.rs"]
+mod fork_fault_tests;
+
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
@@ -25,6 +28,12 @@ struct FixtureState {
     raw_override: Option<String>,
     tip_reads: usize,
     change_tip_on_read: Option<(usize, NativeChainTip)>,
+    relay_chain: Vec<(u32, Block)>,
+    adopt_relay_at_height: Option<u32>,
+    raw_delay: Duration,
+    fork_submission_error: Option<Value>,
+    observer_change_on_submission: Option<(Arc<Mutex<FixtureState>>, NativeChainTip)>,
+    lookup_error_at: Option<(u32, Value)>,
     requests: Vec<Value>,
 }
 
@@ -60,6 +69,12 @@ impl FixtureState {
             raw_override: None,
             tip_reads: 0,
             change_tip_on_read: None,
+            relay_chain: Vec::new(),
+            adopt_relay_at_height: None,
+            raw_delay: Duration::ZERO,
+            fork_submission_error: None,
+            observer_change_on_submission: None,
+            lookup_error_at: None,
             requests: Vec::new(),
         }
     }
@@ -73,7 +88,7 @@ impl FixtureState {
 
     fn dispatch(&mut self, request: &Value) -> Result<Value, Value> {
         self.requests.push(request.clone());
-        assert!(self.requests.len() <= 64, "bounded fixture RPC count");
+        assert!(self.requests.len() <= 512, "bounded fixture RPC count");
         let params = &request["params"];
         match request["method"].as_str().expect("RPC method") {
             "getblockchaininfo" => {
@@ -88,15 +103,22 @@ impl FixtureState {
                     "bestblockhash": display_hex(self.tip.block_hash_le),
                 }))
             }
-            "getblockhash" => self
-                .canonical
-                .get(&u32::try_from(params[0].as_u64().expect("height")).unwrap())
-                .map(|hash| json!(hash))
-                .ok_or_else(|| {
-                    self.missing_height_error
-                        .clone()
-                        .unwrap_or_else(|| json!({"code": -1, "message": "height unavailable"}))
-                }),
+            "getblockhash" => {
+                let height = u32::try_from(params[0].as_u64().expect("height")).unwrap();
+                if let Some((failed_height, error)) = &self.lookup_error_at {
+                    if height == *failed_height {
+                        return Err(error.clone());
+                    }
+                }
+                self.canonical
+                    .get(&height)
+                    .map(|hash| json!(hash))
+                    .ok_or_else(|| {
+                        self.missing_height_error
+                            .clone()
+                            .unwrap_or_else(|| json!({"code": -1, "message": "height unavailable"}))
+                    })
+            }
             "getblockstatus" => {
                 let hash = params[0].as_str().expect("exact block hash");
                 Ok(match self.membership.get(hash) {
@@ -120,6 +142,7 @@ impl FixtureState {
                 };
                 if request["method"] == "getblock" {
                     assert_eq!(params[1], 0, "relay requests exact raw bytes");
+                    thread::sleep(self.raw_delay);
                     if let Some(raw) = &self.raw_override {
                         return Ok(json!(raw));
                     }
@@ -139,6 +162,39 @@ impl FixtureState {
             }
             "submitblock" => {
                 assert_eq!(params.as_array().unwrap().len(), 1);
+                if !self.relay_chain.is_empty() {
+                    if let Some(error) = &self.fork_submission_error {
+                        return Err(error.clone());
+                    }
+                    let (height, block) = self
+                        .relay_chain
+                        .iter()
+                        .find(|(_, block)| {
+                            params[0] == hex::encode(block.zcash_serialize_to_vec().unwrap())
+                        })
+                        .cloned()
+                        .expect("fork catch-up submits exact observer block bytes");
+                    let hash = display_hex(block.hash().0);
+                    self.blocks.insert(hash.clone(), (height, block));
+                    self.membership
+                        .insert(hash, ParentCommittedMembership::SideChain);
+                    if let Some((observer, changed)) = self.observer_change_on_submission.take() {
+                        observer.lock().unwrap().tip = changed;
+                    }
+                    if self.adopt_relay_at_height == Some(height) {
+                        for (height, block) in &self.relay_chain {
+                            let hash = display_hex(block.hash().0);
+                            self.canonical.insert(*height, hash.clone());
+                            self.membership
+                                .insert(hash, ParentCommittedMembership::BestChain);
+                        }
+                        self.tip = NativeChainTip {
+                            block_hash_le: self.relay_chain.last().unwrap().1.hash().0,
+                            height,
+                        };
+                    }
+                    return Ok(self.submission_reply.clone());
+                }
                 assert_eq!(
                     params[0],
                     hex::encode(self.observed.zcash_serialize_to_vec().unwrap()),
@@ -190,6 +246,7 @@ impl FixtureState {
 }
 
 struct FixtureRpc {
+    endpoint: RpcEndpoint,
     client: ZebraRpcClient,
     state: Arc<Mutex<FixtureState>>,
     stop: Arc<AtomicBool>,
@@ -229,8 +286,14 @@ impl FixtureRpc {
                         stream
                             .set_write_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
-                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
-                        stream.write_all(&response).unwrap();
+                        let written = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len())
+                            .and_then(|()| stream.write_all(&response));
+                        if let Err(error) = written {
+                            assert!(
+                                matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset),
+                                "only an intentionally timed-out client may close the fixture response: {error}"
+                            );
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(1));
@@ -240,6 +303,7 @@ impl FixtureRpc {
             }
         });
         Self {
+            endpoint: endpoint.clone(),
             client: ZebraRpcClient::new(endpoint, Duration::from_secs(2)).unwrap(),
             state,
             stop,
@@ -297,6 +361,7 @@ fn public_block(height: u32) -> Block {
         0 => include_str!("../../../zebra-test/src/vectors/block-main-0-000-000.txt"),
         1 => include_str!("../../../zebra-test/src/vectors/block-main-0-000-001.txt"),
         2 => include_str!("../../../zebra-test/src/vectors/block-main-0-000-002.txt"),
+        3 => include_str!("../../../zebra-test/src/vectors/block-main-0-000-003.txt"),
         _ => panic!("unsupported public fixture height"),
     };
     hex::decode(encoded.trim())
@@ -341,6 +406,77 @@ fn relay(
 ) -> Result<(), MinerError> {
     let observed_tip = observer.state.lock().unwrap().tip;
     provider.relay_observer_blocks_to_node(&observer.client, observed_tip, &node.client)
+}
+
+fn fork_observer_state() -> FixtureState {
+    let mut state = FixtureState::new(public_block(3), 3);
+    for height in 1..=3 {
+        let block = public_block(height);
+        let hash = display_hex(block.hash().0);
+        state.canonical.insert(height, hash.clone());
+        state.blocks.insert(hash.clone(), (height, block));
+        state
+            .membership
+            .insert(hash, ParentCommittedMembership::BestChain);
+    }
+    state
+}
+
+fn diverged_fork_state(known_first_observer_block: bool) -> FixtureState {
+    let mut state = FixtureState::new(competing_fixture_block(false), 1);
+    state.relay_chain = (1..=3)
+        .map(|height| (height, public_block(height)))
+        .collect();
+    state.adopt_relay_at_height = Some(3);
+    if known_first_observer_block {
+        state.mark_observed_side_chain();
+    }
+    state
+}
+
+#[test]
+fn fork_catchup_observer_descendants_recover_diverged_validator() {
+    // The fixture programs the recipient's independent view: A and B remain
+    // side chain, then C makes that branch canonical. It does not emulate or
+    // bypass consensus verification; real submitblock remains the only write.
+    let observer = FixtureRpc::new(fork_observer_state());
+    let template = FixtureRpc::new(fork_observer_state());
+    let validator = FixtureRpc::new(diverged_fork_state(false));
+    let network = NativeZcashNetwork::Mainnet;
+    let config = NativeZcashConfig::from_encoded_payout(
+        template.endpoint.clone(),
+        vec![validator.endpoint.clone()],
+        network,
+        network.consensus_parameters().genesis_hash().to_string(),
+        ZcashAddress::from_transparent_p2pkh(NetworkType::Main, [0; 20]),
+    )
+    .unwrap()
+    .with_observer_nodes(vec![observer.endpoint.clone()])
+    .unwrap();
+    let provider = NativeZcashProvider::connect(config).unwrap();
+
+    provider
+        .relay_observer_blocks_to_work_nodes()
+        .expect("observer descendants must reach a diverged lower validator");
+
+    assert_eq!(validator.state.lock().unwrap().submissions(), 3);
+    assert_eq!(template.state.lock().unwrap().submissions(), 0);
+    assert_eq!(observer.state.lock().unwrap().submissions(), 0);
+    assert_eq!(
+        validator.state.lock().unwrap().tip,
+        observer.state.lock().unwrap().tip
+    );
+}
+
+#[test]
+fn fork_catchup_known_side_chain_prefix_does_not_block_descendants() {
+    let observer = FixtureRpc::new(fork_observer_state());
+    let node = FixtureRpc::new(diverged_fork_state(true));
+    relay(&fixture_provider(), &observer, &node)
+        .expect("known side-chain A must not prevent ordinary delivery of B and C");
+    let state = node.state.lock().unwrap();
+    assert_eq!(state.submissions(), 2, "known A is not resubmitted");
+    assert_eq!(state.tip, observer.state.lock().unwrap().tip);
 }
 
 #[test]

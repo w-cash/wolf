@@ -434,6 +434,36 @@ zero stale work, zero propagation delay, or guaranteed public acceptance of the
 next winner. The exact-byte winner journal, independent per-chain delivery,
 retry rules, payout authority and detached late-Zcash rescue remain unchanged.
 
+### Catching up Zcash work nodes after a recent fork
+
+Before preparing a parent job, the backend can relay exact public canonical
+blocks from its read-only observer to the template and proposal-validation
+nodes. If a work node trails the observer on a competing branch, the backend
+finds a recent common ancestor and validates the complete missing branch before
+the first submission. Every block must reproduce its canonical serialization,
+hash, height and predecessor. A changed observer snapshot rejects the attempt.
+
+The recipient checks each block through ordinary `submitblock` consensus
+validation. An intermediate block already committed to a side chain needs no
+repeat submission; its missing descendants can still be offered. The node
+chooses its best chain. New work still requires exact tip convergence and the
+independent proposal checks. A work node ahead of the observer is not rewound.
+
+One catch-up attempt shares a 32-block and 8 MiB decoded-block budget across
+all work nodes, including ordinary forward and same-height relays. Ancestor
+discovery cannot exceed the branch span that fits that block budget. The attempt
+also shares a ten-second deadline: each RPC uses the shorter of its configured
+timeout and the remaining attempt time. Parsing and short polling waits check
+this deadline at bounded operation boundaries; it is not a preemptive CPU limit.
+The existing per-response JSON bound applies separately to raw RPC data.
+
+During fork repair, each unknown block is paced by exact recipient and hash
+before submission. Ambiguous fork-submission results end that attempt; a later
+attempt checks exact committed membership before another paced write. Known side
+chains never authorize work by themselves. None of these relays changes node
+fork choice, peer policy, payout authority, journal recovery or a generation's
+original lease.
+
 ### Late Zcash winners from a retired pool job
 
 Ordinary admission still uses the original 45-second native lease and two-second
