@@ -1,6 +1,7 @@
 //! Types and functions for the `getblocktemplate` RPC.
 
 mod auxiliary_precompute;
+mod coinbase_diagnostics;
 pub mod constants;
 mod gossip_log;
 pub mod parameters;
@@ -16,6 +17,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt::{self},
     sync::{Arc, Condvar, Mutex},
+    time::Instant,
 };
 
 use derive_getters::Getters;
@@ -402,10 +404,22 @@ impl BlockTemplateResponse {
 
         // Reuse the cached coinbase for this height and fee. Concurrent requests share one
         // builder so a shielded payout never starts duplicate proofs for the same template.
-        let coinbase_txn = coinbase_cache.get_or_build(height, txs_fee, || {
-            TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                .expect("valid coinbase tx")
-        });
+        let coinbase_txn = {
+            let _phase = coinbase_diagnostics::phase(coinbase_diagnostics::Phase::SelectedCoinbase);
+            let mut inputs = coinbase_cache.diagnostic(
+                coinbase_diagnostics::Event::CacheCall,
+                coinbase_diagnostics::Outcome::Started,
+                height,
+                txs_fee,
+                0,
+            );
+            inputs.selected_txs = Some(u64::try_from(mempool_txs.len()).unwrap_or(u64::MAX));
+            coinbase_diagnostics::emit(inputs);
+            coinbase_cache.get_or_build(height, txs_fee, || {
+                TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
+                    .expect("valid coinbase tx")
+            })
+        };
 
         // Always cache the proof-complete, child-independent coinbase above.
         // A Wcash request gets its own cheap authenticated-data mutation, so a
@@ -736,8 +750,18 @@ impl From<zcash_address::ConversionError<&'static str>> for MinerParamsError {
 /// Each `getblocktemplate` call needs two coinbase transactions at the same height: a zero-fee
 /// "fake" coinbase for ZIP-317 weight estimation, and the real coinbase with actual fees. Adjacent
 /// heights are retained so next-height precomputation never evicts the job miners are still using.
-#[derive(Clone, Default)]
-pub(crate) struct CoinbaseCache(Arc<Mutex<CoinbaseCacheStorage>>);
+#[derive(Clone)]
+pub(crate) struct CoinbaseCache(Arc<Mutex<CoinbaseCacheStorage>>, u64);
+
+impl Default for CoinbaseCache {
+    fn default() -> Self {
+        coinbase_diagnostics::initialize();
+        Self(
+            Arc::new(Mutex::new(CoinbaseCacheStorage::default())),
+            coinbase_diagnostics::next_id(),
+        )
+    }
+}
 
 type CoinbaseKey = (block::Height, Amount<NonNegative>);
 
@@ -754,11 +778,13 @@ struct CoinbaseCacheStorage {
 }
 
 #[derive(Clone)]
-pub(super) struct WeakCoinbaseCache(std::sync::Weak<Mutex<CoinbaseCacheStorage>>);
+pub(super) struct WeakCoinbaseCache(std::sync::Weak<Mutex<CoinbaseCacheStorage>>, u64);
 
 impl WeakCoinbaseCache {
     fn upgrade(&self) -> Option<CoinbaseCache> {
-        self.0.upgrade().map(CoinbaseCache)
+        self.0
+            .upgrade()
+            .map(|storage| CoinbaseCache(storage, self.1))
     }
 
     fn ptr_eq(&self, cache: &CoinbaseCache) -> bool {
@@ -767,6 +793,7 @@ impl WeakCoinbaseCache {
 }
 
 struct CoinbaseCacheEntry {
+    diagnostic_id: u64,
     state: Mutex<CoinbaseCacheState>,
     ready: Condvar,
 }
@@ -780,6 +807,7 @@ enum CoinbaseCacheState {
 impl CoinbaseCacheEntry {
     fn ready(coinbase: TransactionTemplate<amount::NegativeOrZero>) -> Self {
         Self {
+            diagnostic_id: coinbase_diagnostics::next_id(),
             state: Mutex::new(CoinbaseCacheState::Ready(coinbase)),
             ready: Condvar::new(),
         }
@@ -787,6 +815,7 @@ impl CoinbaseCacheEntry {
 
     fn building() -> Self {
         Self {
+            diagnostic_id: coinbase_diagnostics::next_id(),
             state: Mutex::new(CoinbaseCacheState::Building),
             ready: Condvar::new(),
         }
@@ -795,7 +824,23 @@ impl CoinbaseCacheEntry {
 
 impl CoinbaseCache {
     fn downgrade(&self) -> WeakCoinbaseCache {
-        WeakCoinbaseCache(Arc::downgrade(&self.0))
+        WeakCoinbaseCache(Arc::downgrade(&self.0), self.1)
+    }
+
+    fn diagnostic(
+        &self,
+        event: coinbase_diagnostics::Event,
+        outcome: coinbase_diagnostics::Outcome,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+        entry_id: u64,
+    ) -> coinbase_diagnostics::Record {
+        let mut record = coinbase_diagnostics::Record::new(event, outcome);
+        record.cache_id = self.1;
+        record.entry_id = entry_id;
+        record.height = Some(height.0);
+        record.fee_zat = Some(u64::from(fee));
+        record
     }
 
     /// Returns the cached coinbase transaction if it was built for `height` and `fee`.
@@ -845,7 +890,8 @@ impl CoinbaseCache {
             .get(&(height, fee))
             .cloned()
             .or_else(|| storage.reserve.get(&(height, fee)).cloned());
-        if let Some(entry) = entry {
+        let entry_id = if let Some(entry) = entry {
+            let entry_id = entry.diagnostic_id;
             let mut state = entry
                 .state
                 .lock()
@@ -857,13 +903,24 @@ impl CoinbaseCache {
             if storage.reserve_keys.contains(&(height, fee)) {
                 storage.reserve.insert((height, fee), entry);
             }
+            entry_id
         } else {
             let entry = Arc::new(CoinbaseCacheEntry::ready(coinbase));
+            let entry_id = entry.diagnostic_id;
             storage.foreground.insert((height, fee), Arc::clone(&entry));
             if storage.reserve_keys.contains(&(height, fee)) {
                 storage.reserve.insert((height, fee), entry);
             }
-        }
+            entry_id
+        };
+        drop(storage);
+        coinbase_diagnostics::emit(self.diagnostic(
+            coinbase_diagnostics::Event::CacheLookup,
+            coinbase_diagnostics::Outcome::Ready,
+            height,
+            fee,
+            entry_id,
+        ));
     }
 
     /// Returns one cached value or performs exactly one build for this key.
@@ -891,48 +948,105 @@ impl CoinbaseCache {
         fee: Amount<NonNegative>,
         build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, E>,
     ) -> Result<TransactionTemplate<amount::NegativeOrZero>, E> {
-        let (entry, is_builder) = {
+        let started = Instant::now();
+        let result = self.try_get_or_build_inner(height, fee, build);
+        let mut record = self.diagnostic(
+            coinbase_diagnostics::Event::CacheCall,
+            if result.is_ok() {
+                coinbase_diagnostics::Outcome::Ok
+            } else {
+                coinbase_diagnostics::Outcome::Error
+            },
+            height,
+            fee,
+            0,
+        );
+        record.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        coinbase_diagnostics::emit(record);
+        result
+    }
+
+    fn try_get_or_build_inner<E>(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+        build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, E>,
+    ) -> Result<TransactionTemplate<amount::NegativeOrZero>, E> {
+        use coinbase_diagnostics::{Event, Outcome};
+
+        let (entry, is_builder, origin, key_reserved) = {
             let mut storage = self
                 .0
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             retain_adjacent_coinbase_heights(&mut storage.foreground, height);
-            let (entry, is_builder) = match storage.foreground.get(&(height, fee)) {
-                Some(entry) => (Arc::clone(entry), false),
+            let (entry, is_builder, origin) = match storage.foreground.get(&(height, fee)) {
+                Some(entry) => (Arc::clone(entry), false, Outcome::ExistingForeground),
                 None => {
                     bound_coinbase_fee_entries(&mut storage.foreground, height, fee);
                     if let Some(entry) = storage.reserve.get(&(height, fee)).cloned() {
                         // A Building reserve entry always has an already-claimed
                         // synchronous builder. Promotion retains its singleflight.
                         storage.foreground.insert((height, fee), Arc::clone(&entry));
-                        (entry, false)
+                        (entry, false, Outcome::ExistingReserve)
                     } else {
                         let entry = Arc::new(CoinbaseCacheEntry::building());
                         storage.foreground.insert((height, fee), Arc::clone(&entry));
-                        (entry, true)
+                        (entry, true, Outcome::NewBuild)
                     }
                 }
             };
-            if storage.reserve_keys.contains(&(height, fee)) {
+            let key_reserved = storage.reserve_keys.contains(&(height, fee));
+            if key_reserved {
                 // Normal foreground pruning cannot destroy an independently
                 // reserved proof, including one first claimed by the foreground.
                 storage.reserve.insert((height, fee), Arc::clone(&entry));
             }
-            (entry, is_builder)
+            (entry, is_builder, origin, key_reserved)
         };
+
+        let mut lookup =
+            self.diagnostic(Event::CacheLookup, origin, height, fee, entry.diagnostic_id);
+        lookup.lookup_key_reserved = Some(key_reserved);
+        coinbase_diagnostics::emit(lookup);
 
         if is_builder {
             return self.build_entry(height, fee, &entry, build);
         }
 
+        let wait_started = Instant::now();
+        let mut joined = false;
         let mut state = entry
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
             match &*state {
-                CoinbaseCacheState::Ready(coinbase) => return Ok(coinbase.clone()),
+                CoinbaseCacheState::Ready(coinbase) => {
+                    let coinbase = coinbase.clone();
+                    drop(state);
+                    let mut record = self.diagnostic(
+                        Event::CacheLookup,
+                        if joined {
+                            Outcome::JoinBuilding
+                        } else if origin == Outcome::ExistingReserve {
+                            Outcome::ReserveReady
+                        } else {
+                            Outcome::ForegroundReady
+                        },
+                        height,
+                        fee,
+                        entry.diagnostic_id,
+                    );
+                    // Includes entry-lock/condition-variable waiting, not proof-only time.
+                    record.elapsed_ms =
+                        u64::try_from(wait_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    record.lookup_key_reserved = Some(key_reserved);
+                    coinbase_diagnostics::emit(record);
+                    return Ok(coinbase);
+                }
                 CoinbaseCacheState::Building => {
+                    joined = true;
                     state = entry
                         .ready
                         .wait(state)
@@ -941,7 +1055,7 @@ impl CoinbaseCache {
                 CoinbaseCacheState::Failed => {
                     drop(state);
                     self.remove_entry_if_same(height, fee, &entry);
-                    return self.try_get_or_build(height, fee, build);
+                    return self.try_get_or_build_inner(height, fee, build);
                 }
             }
         }
@@ -995,6 +1109,11 @@ impl CoinbaseCache {
         fee: Amount<NonNegative>,
         build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, E>,
     ) -> Result<Option<TransactionTemplate<amount::NegativeOrZero>>, E> {
+        use coinbase_diagnostics::{Event, Outcome};
+
+        let _phase = coinbase_diagnostics::phase(coinbase_diagnostics::Phase::Prewarm);
+        let record =
+            |outcome, entry_id| self.diagnostic(Event::ReserveWork, outcome, height, fee, entry_id);
         let entry = {
             let mut storage = self
                 .0
@@ -1002,21 +1121,33 @@ impl CoinbaseCache {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let key = (height, fee);
             if !storage.reserve_keys.contains(&key) {
+                drop(storage);
+                coinbase_diagnostics::emit(record(Outcome::OutsideWindow, 0));
                 return Ok(None);
             }
             if let Some(entry) = storage.foreground.get(&key).cloned() {
+                let entry_id = entry.diagnostic_id;
                 storage.reserve.insert(key, entry);
+                drop(storage);
+                coinbase_diagnostics::emit(record(Outcome::ExistingForeground, entry_id));
                 return Ok(None);
             }
-            if storage.reserve.contains_key(&key)
-                || storage.reserve.len() >= MAX_AUXILIARY_RESERVE_ENTRIES
-            {
+            if let Some(entry) = storage.reserve.get(&key) {
+                let entry_id = entry.diagnostic_id;
+                drop(storage);
+                coinbase_diagnostics::emit(record(Outcome::ExistingReserve, entry_id));
+                return Ok(None);
+            }
+            if storage.reserve.len() >= MAX_AUXILIARY_RESERVE_ENTRIES {
+                drop(storage);
+                coinbase_diagnostics::emit(record(Outcome::Capacity, 0));
                 return Ok(None);
             }
             let entry = Arc::new(CoinbaseCacheEntry::building());
             storage.reserve.insert(key, Arc::clone(&entry));
             entry
         };
+        coinbase_diagnostics::emit(record(Outcome::NewBuild, entry.diagnostic_id));
         self.build_entry(height, fee, &entry, build).map(Some)
     }
 
@@ -1027,6 +1158,16 @@ impl CoinbaseCache {
         entry: &Arc<CoinbaseCacheEntry>,
         build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, E>,
     ) -> Result<TransactionTemplate<amount::NegativeOrZero>, E> {
+        use coinbase_diagnostics::{Event, Outcome};
+
+        let started = Instant::now();
+        coinbase_diagnostics::emit(self.diagnostic(
+            Event::Constructor,
+            Outcome::Started,
+            height,
+            fee,
+            entry.diagnostic_id,
+        ));
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
         if let Ok(Ok(coinbase)) = &built {
             let mut state = entry
@@ -1045,6 +1186,20 @@ impl CoinbaseCache {
             drop(state);
             self.remove_entry_if_same(height, fee, entry);
         }
+        let mut record = self.diagnostic(
+            Event::Constructor,
+            match &built {
+                Ok(Ok(_)) => Outcome::Ok,
+                Ok(Err(_)) => Outcome::Error,
+                Err(_) => Outcome::Panic,
+            },
+            height,
+            fee,
+            entry.diagnostic_id,
+        );
+        // Constructor elapsed time includes output setup and serialization.
+        record.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        coinbase_diagnostics::emit(record);
         match built {
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),

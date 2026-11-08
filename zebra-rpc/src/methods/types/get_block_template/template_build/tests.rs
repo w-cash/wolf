@@ -327,3 +327,173 @@ async fn template_build_real_coinbase_wait_does_not_block_async_heartbeat() {
     );
     assert_eq!(warmer.join().unwrap().unwrap(), expected);
 }
+
+#[test]
+fn template_diagnostics_link_busy_deadline_and_late_singleflight_completion() {
+    use super::super::{coinbase_diagnostics as diagnostics, MinerParams, TransactionTemplate};
+    use diagnostics::{Event, Outcome, Phase};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let network = consensus_profile_network();
+    let height = Height(2_000_000);
+    let fee = Amount::zero();
+    let address =
+        default_miner_address_for_network(&network, &MinerAddressType::Transparent).unwrap();
+    let miner = MinerParams::new(
+        &network,
+        Config {
+            miner_address: Some(address.parse().unwrap()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let expected = TransactionTemplate::new_coinbase(&network, height, &miner, fee).unwrap();
+    let cache = CoinbaseCache::default();
+    let owner_cache = cache.clone();
+    let owner_coinbase = expected.clone();
+    let owner_id = diagnostics::next_id();
+    let (owner_entered_tx, owner_entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (owner_records_tx, owner_records_rx) = mpsc::channel();
+    let owner = thread::spawn(move || {
+        let records = diagnostics::capture_records(|| {
+            let _context = diagnostics::enter(owner_id, Phase::Prewarm);
+            owner_cache.get_or_build(height, fee, || {
+                owner_entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(TEST_LIMIT)
+                    .expect("test releases the original proof");
+                owner_coinbase
+            });
+        });
+        owner_records_tx.send(records).unwrap();
+    });
+    let owner_entered = owner_entered_rx.recv_timeout(TEST_LIMIT);
+    let executor = TemplateBuildExecutor::default();
+    // One explicit owned permit plus the joining request exercises the real busy path.
+    let reserved_permit = executor.permits.clone().try_acquire_owned().unwrap();
+    let request_executor = executor.clone();
+    let joining_cache = cache.clone();
+    let joining_expected = expected.clone();
+    let (joining_tx, joining_rx) = oneshot::channel();
+    let (completion_tx, completion_rx) = mpsc::channel();
+    let mut observed = None;
+    let records = diagnostics::capture_records(|| {
+        runtime.block_on(async {
+            let request = tokio::spawn(async move {
+                request_executor
+                    .run(move || {
+                        let records = diagnostics::capture_records(|| {
+                            let _phase = diagnostics::phase(Phase::Sizing);
+                            let _ = joining_tx.send(diagnostics::current());
+                            let actual = joining_cache.get_or_build(height, fee, || {
+                                panic!("the detached waiter cannot construct a duplicate proof")
+                            });
+                            assert_eq!(actual, joining_expected);
+                        });
+                        completion_tx.send(records).unwrap();
+                        Ok(7)
+                    })
+                    .await
+            });
+            let context = timeout(TEST_LIMIT, joining_rx).await.unwrap().unwrap();
+            let busy = executor
+                .run(|| -> RpcResult<usize> {
+                    panic!("the saturated executor must not run another constructor")
+                })
+                .await;
+            let deadline = timeout(TEST_LIMIT, request).await.unwrap().unwrap();
+            let permits_after_deadline = executor.permits.available_permits();
+            let completion_before_release = completion_rx.try_recv().is_ok();
+            let _ = release_tx.send(());
+            owner.join().unwrap();
+            let owner_records = owner_records_rx.recv_timeout(TEST_LIMIT).unwrap();
+            let joined_records = completion_rx.recv_timeout(TEST_LIMIT).unwrap();
+            timeout(TEST_LIMIT, async {
+                while executor.permits.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            observed = Some((
+                context,
+                busy,
+                deadline,
+                permits_after_deadline,
+                completion_before_release,
+                owner_records,
+                joined_records,
+            ));
+        })
+    });
+    drop(reserved_permit);
+    let (
+        context,
+        busy,
+        deadline,
+        permits_after_deadline,
+        completed_early,
+        owner_records,
+        joined_records,
+    ) = observed.unwrap();
+    assert!(owner_entered.is_ok());
+    assert_eq!(busy.unwrap_err().message(), TEMPLATE_BUILD_BUSY);
+    assert_eq!(deadline.unwrap_err().message(), TEMPLATE_BUILD_PENDING);
+    assert_eq!(permits_after_deadline, 0);
+    assert!(!completed_early);
+    assert_eq!(executor.permits.available_permits(), 2);
+    assert_eq!(context.phase, Phase::Sizing);
+    let busy = records
+        .iter()
+        .find(|record| record.event == Event::TemplateWorker && record.outcome == Outcome::Busy)
+        .unwrap();
+    let deadline = records
+        .iter()
+        .find(|record| record.event == Event::TemplateWorker && record.outcome == Outcome::Deadline)
+        .unwrap();
+    assert_eq!(deadline.request_id, context.request_id);
+    assert_ne!(busy.request_id, deadline.request_id);
+    assert_eq!(
+        (busy.phase, deadline.phase),
+        (Phase::Template, Phase::Template)
+    );
+    assert!(deadline.elapsed_ms > 0);
+    let constructor_started = owner_records
+        .iter()
+        .find(|record| record.event == Event::Constructor && record.outcome == Outcome::Started)
+        .unwrap();
+    let constructor_completed = owner_records
+        .iter()
+        .find(|record| record.event == Event::Constructor && record.outcome == Outcome::Ok)
+        .unwrap();
+    assert_eq!(
+        (
+            constructor_started.request_id,
+            constructor_completed.request_id
+        ),
+        (owner_id, owner_id)
+    );
+    assert_eq!(constructor_started.entry_id, constructor_completed.entry_id);
+    assert_eq!(constructor_completed.phase, Phase::Prewarm);
+    assert!(constructor_completed.elapsed_ms >= deadline.elapsed_ms);
+    let joined = joined_records
+        .iter()
+        .find(|record| {
+            record.event == Event::CacheLookup && record.outcome == Outcome::JoinBuilding
+        })
+        .unwrap();
+    assert_eq!(
+        (joined.request_id, joined.phase),
+        (context.request_id, Phase::Sizing)
+    );
+    assert_eq!(joined.entry_id, constructor_completed.entry_id);
+    assert_eq!(joined.cache_id, constructor_completed.cache_id);
+    assert!(!joined_records
+        .iter()
+        .any(|record| record.event == Event::Constructor));
+    assert_eq!((joined.height, joined.fee_zat), (Some(height.0), Some(0)));
+}

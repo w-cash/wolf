@@ -73,9 +73,12 @@ pub fn select_mempool_transactions(
     // so it's constant per block. Reuse the same per-block cache as the real coinbase to avoid
     // re-proving a shielded coinbase on every `getblocktemplate` call just to read its size.
     let build = || TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero());
-    let fake_coinbase_tx = match coinbase_cache {
-        Some(cache) => cache.try_get_or_build(height, Amount::zero(), build)?,
-        None => build()?,
+    let fake_coinbase_tx = {
+        let _phase = super::coinbase_diagnostics::phase(super::coinbase_diagnostics::Phase::Sizing);
+        match coinbase_cache {
+            Some(cache) => cache.try_get_or_build(height, Amount::zero(), build)?,
+            None => build()?,
+        }
     };
     // Charge the exact child-specific coinbase bytes and sigops before selecting
     // transactions. The v2 carrier is a raw 44-byte script suffix, so its

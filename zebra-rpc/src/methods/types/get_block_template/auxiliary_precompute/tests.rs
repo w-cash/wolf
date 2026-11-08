@@ -971,3 +971,79 @@ async fn actual_private_recipient_two_tip_burst_is_warmed_and_reused_without_rep
     assert!(cache.get(Height(3), fee(12_346)).is_none());
     eprintln!("actual_private_two_tip_burst current_build_ms={current_ms} next_height_warm_ms={warm_ms} exact_future_consume_ms={consumption_ms:?} worker_builds=4");
 }
+
+#[test]
+fn reserve_registration_lock_skips_are_diagnosed_before_held_locks_are_released() {
+    use super::super::coinbase_diagnostics::{self as diagnostics, Event, Outcome, Phase};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let network = Network::new_wcash_regtest();
+    let miner = params(&network, 0x7a);
+    let cache = CoinbaseCache::default();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&builds);
+    let worker = AuxiliaryPrecomputer::with_builder(Arc::new(move |net, height, miner, fee| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        TransactionTemplate::new_coinbase(net, height, miner, fee)
+    }));
+    let mut observations = Vec::new();
+    for hold_scheduler in [true, false] {
+        let state_guard = hold_scheduler.then(|| worker.0.state.lock().unwrap());
+        let cache_guard = (!hold_scheduler).then(|| cache.0.lock().unwrap());
+        let registering = worker.clone();
+        let selected_cache = cache.clone();
+        let selected_miner = miner.clone();
+        let selected_network = network.clone();
+        let handle = runtime.handle().clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let registration = std::thread::spawn(move || {
+            let _runtime = handle.enter();
+            let _context = diagnostics::enter(701, Phase::Template);
+            let mut accepted = true;
+            let records = diagnostics::capture_records(|| {
+                accepted = registering.register(
+                    &selected_network,
+                    &selected_miner,
+                    selected_cache,
+                    Height(10),
+                    fee(17),
+                );
+            });
+            result_tx.send((accepted, records)).unwrap();
+        });
+        let before_release = result_rx.recv_timeout(Duration::from_secs(2));
+        drop(cache_guard);
+        drop(state_guard);
+        registration.join().unwrap();
+        observations.push((hold_scheduler, before_release));
+    }
+    assert_eq!(builds.load(Ordering::SeqCst), 0);
+    assert!(cache.0.lock().unwrap().reserve_keys.is_empty());
+    assert!(worker.0.state.lock().unwrap().namespaces.is_empty());
+    for (scheduler, observation) in observations {
+        let (accepted, records) = observation.expect("registration cannot wait for a held lock");
+        assert!(!accepted);
+        assert_eq!(records.len(), 1);
+        let record = records[0];
+        assert_eq!(record.event, Event::ReserveRegistration);
+        assert_eq!(
+            record.outcome,
+            if scheduler {
+                Outcome::StateContended
+            } else {
+                Outcome::CacheContended
+            }
+        );
+        assert_eq!((record.request_id, record.phase), (701, Phase::Prewarm));
+        assert_eq!(record.cache_id, cache.1);
+        assert_eq!(record.height, Some(10));
+        assert_eq!(record.observed_fee_zat, Some(17));
+        assert_eq!(
+            (record.reserve_start, record.reserve_end),
+            (Some(11), Some(12))
+        );
+    }
+}

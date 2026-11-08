@@ -8,6 +8,8 @@ use tokio::sync::Semaphore;
 
 use crate::server::error::LegacyCode;
 
+use super::coinbase_diagnostics::{self as diagnostics, Event, Outcome, Phase, Record};
+
 // A builder and one same-proof waiter may run together. Saturation must not
 // turn short-polling into an unbounded queue of blocking proof workers.
 const MAX_FOREGROUND_TEMPLATE_BUILDS: usize = 2;
@@ -31,6 +33,7 @@ pub(super) struct TemplateBuildExecutor {
 
 impl Default for TemplateBuildExecutor {
     fn default() -> Self {
+        diagnostics::initialize();
         Self {
             permits: Arc::new(Semaphore::new(MAX_FOREGROUND_TEMPLATE_BUILDS)),
         }
@@ -45,7 +48,13 @@ impl TemplateBuildExecutor {
     {
         let deadline = tokio::time::Instant::now() + TEMPLATE_BUILD_WAIT_LIMIT;
         let started = std::time::Instant::now();
+        let request_id = diagnostics::next_id();
         let permit = Arc::clone(&self.permits).try_acquire_owned().map_err(|_| {
+            let mut record = Record::new(Event::TemplateWorker, Outcome::Busy);
+            record.request_id = request_id;
+            record.phase = Phase::Template;
+            record.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            diagnostics::emit(record);
             ErrorObject::borrowed(LegacyCode::InWarmup.into(), TEMPLATE_BUILD_BUSY, None)
         })?;
         let span = tracing::Span::current();
@@ -54,16 +63,25 @@ impl TemplateBuildExecutor {
             // a proof or a singleflight cache wait is still running.
             let _permit = permit;
             let _span = span.enter();
+            let _context = diagnostics::enter(request_id, Phase::Template);
+            let dispatch_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let mut record = Record::new(Event::TemplateWorker, Outcome::Started);
+            record.dispatch_ms = Some(dispatch_ms);
+            diagnostics::emit(record);
             let result = build();
-            match &result {
-                Err(error) if started.elapsed() >= TEMPLATE_BUILD_WAIT_LIMIT => {
-                    tracing::warn!(
-                        rpc_error_code = error.code(),
-                        "delayed foreground block template construction failed"
-                    );
-                }
-                _ => {}
-            }
+            drop(_permit);
+            let mut record = Record::new(
+                Event::TemplateWorker,
+                if result.is_ok() {
+                    Outcome::Finished
+                } else {
+                    Outcome::Error
+                },
+            );
+            record.dispatch_ms = Some(dispatch_ms);
+            // Includes blocking dispatch, all cache calls, and remaining assembly.
+            record.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            diagnostics::emit(record);
             result
         });
         // A pending proof has not created a candidate or a retirement token.
@@ -71,6 +89,11 @@ impl TemplateBuildExecutor {
         // the detached worker keeps its permit and warms the exact cache key.
         let result = tokio::time::timeout_at(deadline, build).await;
         if tokio::time::Instant::now() >= deadline {
+            let mut record = Record::new(Event::TemplateWorker, Outcome::Deadline);
+            record.request_id = request_id;
+            record.phase = Phase::Template;
+            record.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            diagnostics::emit(record);
             return Err(ErrorObject::borrowed(
                 LegacyCode::InWarmup.into(),
                 TEMPLATE_BUILD_PENDING,
@@ -82,6 +105,12 @@ impl TemplateBuildExecutor {
                 ErrorObject::borrowed(LegacyCode::InWarmup.into(), TEMPLATE_BUILD_PENDING, None)
             })?
             .map_err(|_| {
+                let mut record = Record::new(Event::TemplateWorker, Outcome::Error);
+                record.request_id = request_id;
+                record.phase = Phase::Template;
+                record.elapsed_ms =
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                diagnostics::emit(record);
                 ErrorObject::borrowed(
                     ErrorCode::InternalError.code(),
                     "block template worker failed",

@@ -1,0 +1,4 @@
+project: zebrad
+kind: Added
+body: Add bounded off-thread INFO diagnostics for auxiliary coinbase cache keys, construction, reserve work and template worker deadlines, without changing proof reuse or candidate validation.
+time: 2026-11-08T14:00:00Z
