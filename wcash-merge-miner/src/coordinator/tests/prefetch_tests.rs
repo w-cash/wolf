@@ -1,4 +1,27 @@
 use super::*;
+use hex::ToHex;
+
+use wcash_zec_parent::{
+    address::ToAddress,
+    chain::{
+        block::{
+            merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash,
+        },
+        parameters::{
+            subsidy::{
+                block_subsidy as parent_block_subsidy, funding_stream_address,
+                funding_stream_values, miner_subsidy as parent_miner_subsidy,
+                FundingStreamReceiver,
+            },
+            testnet::{ConfiguredActivationHeights, RegtestParameters},
+            Network as ParentNetwork, NetworkUpgrade as ParentNetworkUpgrade,
+        },
+        serialization::ZcashSerialize as ParentZcashSerialize,
+        transaction::{LockTime as ParentLockTime, Transaction as ParentTransaction},
+        transparent as parent_transparent,
+    },
+    NetworkType as ParentNetworkType, ZcashAddress as ParentAddress,
+};
 
 struct PrefetchRpcFixture {
     endpoint: RpcEndpoint,
@@ -322,5 +345,488 @@ fn prefetched_child_failed_retirement_retains_its_exact_owner_until_retry() {
     assert_eq!(requests.len(), 2);
     for request in requests {
         assert_eq!(request["params"], json!([lease.hash, lease.retire_token]));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ParentRetryAction {
+    Accept,
+    AcceptChildReorg,
+    Advance,
+    Reorg,
+    ReorgChild,
+    ReorgPayout,
+    UnprovenRejection,
+}
+
+struct ParentRetryTip {
+    height: u32,
+    hash: String,
+    corrupt_payout: bool,
+}
+
+fn parent_retry_address() -> ParentAddress {
+    ParentAddress::from_transparent_p2pkh(ParentNetworkType::Regtest, [0x11; 20])
+}
+
+// These canonical, unsolved templates exercise the real native parser and RPC
+// proposal gates. The fixture validator supplies responses; it is not a node
+// consensus test and does not establish that a solved block would be accepted.
+fn parent_retry_template(request: &serde_json::Value, tip: &ParentRetryTip) -> serde_json::Value {
+    let network = ParentNetwork::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let height = wcash_zec_parent::chain::block::Height(tip.height + 1);
+    let subsidy = parent_block_subsidy(height, &network).unwrap();
+    let reward = parent_miner_subsidy(height, &network, subsidy).unwrap();
+    let script =
+        parent_transparent::Address::from_pub_key_hash(network.kind(), [0x11; 20]).script();
+    let mut outputs = vec![parent_transparent::Output::new(reward, script)];
+    for (receiver, value) in funding_stream_values(height, &network, subsidy).unwrap() {
+        if receiver != FundingStreamReceiver::Deferred {
+            let address = funding_stream_address(height, &network, receiver).unwrap();
+            outputs.push(parent_transparent::Output::new(value, address.script()));
+        }
+    }
+    let child = parse_display_hash(
+        request["params"][0]["wcashaux"]["blockhash"]
+            .as_str()
+            .unwrap(),
+        "fixture child hash",
+    )
+    .unwrap();
+    let nonce = u32::try_from(request["params"][0]["wcashaux"]["nonce"].as_u64().unwrap()).unwrap();
+    let coinbase = ParentTransaction::test_v5(
+        ParentNetworkUpgrade::Nu6_3,
+        vec![parent_transparent::Input::Coinbase {
+            height,
+            data: wcash_zcash_aux::miner_data_commitment(child, &[], 0, nonce)
+                .unwrap()
+                .to_vec(),
+            sequence: u32::MAX,
+        }],
+        outputs,
+        ParentLockTime::unlocked(),
+        height,
+    );
+    let transactions = [Arc::new(coinbase.clone())];
+    let merkle: wcash_zec_parent::chain::block::merkle::Root = transactions.iter().collect();
+    let auth: AuthDataRoot = transactions.iter().collect();
+    let history: ChainHistoryMmrRootHash = [0x22; 32].into();
+    let commitment = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(&history, &auth);
+    let mut template: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../zebra-rpc/tests/vectors/getblocktemplate_response_template.json"
+    ))
+    .unwrap();
+    template["height"] = json!(height.0);
+    template["previousblockhash"] = json!(tip.hash);
+    template["transactions"] = json!([]);
+    template["coinbasetxn"] = json!({
+        "data": hex::encode(coinbase.zcash_serialize_to_vec().unwrap()),
+        "hash": coinbase.hash().encode_hex::<String>(),
+        "authdigest": coinbase.auth_digest().unwrap().encode_hex::<String>(),
+        "fee": 0,
+    });
+    template["defaultroots"] = json!({
+        "merkleroot": merkle.encode_hex::<String>(),
+        "authdataroot": auth.encode_hex::<String>(),
+        "chainhistoryroot": history.encode_hex::<String>(),
+        "blockcommitmentshash": commitment.encode_hex::<String>(),
+    });
+    template["blockcommitmentshash"] = json!(commitment.encode_hex::<String>());
+    template["wcashparentpayoutcommitment"] = json!(hex::encode(
+        wcash_zcash_aux::parent_payout_address_commitment(&parent_retry_address().to_string())
+    ));
+    if tip.corrupt_payout {
+        template["wcashparentpayoutcommitment"] = json!("00".repeat(32));
+    }
+    template["longpollid"] = serde_json::Value::Null;
+    template
+}
+
+fn parent_retry_rpcs(
+    actions: Vec<ParentRetryAction>,
+    child_tip: Arc<Mutex<String>>,
+) -> (
+    PrefetchRpcFixture,
+    PrefetchRpcFixture,
+    Arc<Mutex<ParentRetryTip>>,
+) {
+    let genesis = Network::new_regtest(Default::default())
+        .genesis_hash()
+        .to_string();
+    let tip = Arc::new(Mutex::new(ParentRetryTip {
+        height: 0,
+        hash: genesis.clone(),
+        corrupt_payout: false,
+    }));
+    let template_tip = Arc::clone(&tip);
+    let template_genesis = genesis.clone();
+    let template = PrefetchRpcFixture::spawn(move |request| {
+        Ok(match request["method"].as_str().unwrap() {
+            "getblockhash" => json!(template_genesis),
+            "getblockstatus" => json!({
+                "state":"best_chain", "hash":template_genesis, "height":0, "confirmations":1
+            }),
+            "getblockchaininfo" => {
+                let tip = template_tip.lock().unwrap();
+                json!({"blocks":tip.height,"bestblockhash":tip.hash})
+            }
+            "getblocktemplate" => {
+                assert_eq!(request["params"][0]["mode"], "template");
+                parent_retry_template(request, &template_tip.lock().unwrap())
+            }
+            _ => return Err(json!({"code":-32601,"message":"unexpected template fixture method"})),
+        })
+    });
+    let validator_tip = Arc::clone(&tip);
+    let mut actions = std::collections::VecDeque::from(actions);
+    let validator = PrefetchRpcFixture::spawn(move |request| {
+        Ok(match request["method"].as_str().unwrap() {
+            "getblockhash" => json!(genesis),
+            "getblockstatus" => json!({
+                "state":"best_chain", "hash":genesis, "height":0, "confirmations":1
+            }),
+            "getblockchaininfo" => {
+                let tip = validator_tip.lock().unwrap();
+                json!({"blocks":tip.height,"bestblockhash":tip.hash})
+            }
+            "getblocktemplate" => {
+                assert_eq!(request["params"][0]["mode"], "proposal");
+                let Some(action) = actions.pop_front() else {
+                    return Err(
+                        json!({"code":-32603,"message":"parent retry exceeded fixture bound"}),
+                    );
+                };
+                match action {
+                    ParentRetryAction::Accept => serde_json::Value::Null,
+                    ParentRetryAction::AcceptChildReorg => {
+                        *child_tip.lock().unwrap() = "77".repeat(32);
+                        serde_json::Value::Null
+                    }
+                    ParentRetryAction::UnprovenRejection => {
+                        json!("proposal-is-not-based-on-the-current-best-chain-tip")
+                    }
+                    ParentRetryAction::Advance
+                    | ParentRetryAction::Reorg
+                    | ParentRetryAction::ReorgChild
+                    | ParentRetryAction::ReorgPayout => {
+                        let mut tip = validator_tip.lock().unwrap();
+                        if matches!(action, ParentRetryAction::Advance) {
+                            tip.height += 1;
+                        }
+                        tip.hash = if tip.hash == "32".repeat(32) {
+                            "33".repeat(32)
+                        } else {
+                            "32".repeat(32)
+                        };
+                        if matches!(action, ParentRetryAction::ReorgChild) {
+                            *child_tip.lock().unwrap() = "77".repeat(32);
+                        }
+                        if matches!(action, ParentRetryAction::ReorgPayout) {
+                            tip.corrupt_payout = true;
+                        }
+                        json!("proposal-is-not-based-on-the-current-best-chain-tip")
+                    }
+                }
+            }
+            _ => {
+                return Err(json!({"code":-32601,"message":"unexpected validator fixture method"}))
+            }
+        })
+    });
+    (template, validator, tip)
+}
+
+fn parent_retry_supervisor(
+    directory: &Path,
+    child: &PrefetchRpcFixture,
+    template: &PrefetchRpcFixture,
+    validator: &PrefetchRpcFixture,
+) -> Arc<NativeMiningSupervisor> {
+    let (_, payout) = transparent_wcash_candidate([0x71; 20], 625_000_000);
+    Arc::new(
+        NativeMiningSupervisor::open(
+            CoordinatorConfig {
+                wcash_node: child.endpoint.clone(),
+                expected_wcash_genesis_hash: Network::new_wcash_regtest()
+                    .genesis_hash()
+                    .to_string(),
+                zcash: NativeZcashConfig::new(
+                    template.endpoint.clone(),
+                    vec![validator.endpoint.clone()],
+                    NativeZcashNetwork::Regtest,
+                    Network::new_regtest(Default::default())
+                        .genesis_hash()
+                        .to_string(),
+                    parent_retry_address().to_string().parse().unwrap(),
+                )
+                .unwrap(),
+                wcash_payout_address: payout.encode(),
+                wcash_payout_incoming_viewing_key: None,
+                auxiliary_nonce: 0,
+            },
+            directory.join("native-share-journal.jsonl"),
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn parent_tip_race_retries_one_full_native_parent_without_reacquiring_the_child() {
+    for race in [ParentRetryAction::Advance, ParentRetryAction::Reorg] {
+        for prefetched in [false, true] {
+            let directory = tempdir().unwrap();
+            let (child_rpc, child_tip) = prefetch_child_rpc([0x71; 20], 0, Duration::ZERO);
+            let (template_rpc, validator_rpc, parent_tip) =
+                parent_retry_rpcs(vec![race, ParentRetryAction::Accept], child_tip);
+            let supervisor = parent_retry_supervisor(
+                directory.path(),
+                &child_rpc,
+                &template_rpc,
+                &validator_rpc,
+            );
+            let mut timing = NativePreparationTiming::new();
+            let mut generation = if prefetched {
+                supervisor
+                    .prepare_child_candidate_timed(&mut timing)
+                    .unwrap()
+                    .prepare_generation_timed(&mut timing)
+            } else {
+                supervisor.prepare_generation_timed(&mut timing)
+            }
+            .expect("one proven parent race reuses the already validated child");
+            let templates = template_rpc.requests("getblocktemplate");
+            let proposals = validator_rpc.requests("getblocktemplate");
+            assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+            assert!(child_rpc.requests("retireauxblock").is_empty());
+            assert_eq!(templates.len(), 2);
+            assert_eq!(proposals.len(), 2);
+            assert_eq!(templates[0]["params"][0]["wcashaux"]["nonce"], 0);
+            assert_eq!(templates[1]["params"][0]["wcashaux"]["nonce"], 1);
+            assert_eq!(
+                templates[0]["params"][0]["wcashaux"]["blockhash"],
+                templates[1]["params"][0]["wcashaux"]["blockhash"]
+            );
+            assert_ne!(
+                proposals[0]["params"][0]["data"],
+                proposals[1]["params"][0]["data"]
+            );
+            assert_eq!(
+                generation.job().parent_tip_display(),
+                parent_tip.lock().unwrap().hash
+            );
+            assert_eq!(supervisor.journal.generation_count().unwrap(), 1);
+            assert_eq!(supervisor.next_auxiliary_nonce.load(Ordering::Acquire), 2);
+            assert_eq!(
+                generation.retire_generation().unwrap(),
+                GenerationRetirement::Retired
+            );
+            assert_eq!(child_rpc.requests("retireauxblock").len(), 1);
+        }
+    }
+}
+
+#[test]
+fn second_parent_tip_race_retires_the_same_child_without_an_unbounded_retry() {
+    let directory = tempdir().unwrap();
+    let (child_rpc, child_tip) = prefetch_child_rpc([0x71; 20], 0, Duration::ZERO);
+    let (template_rpc, validator_rpc, _) = parent_retry_rpcs(
+        vec![ParentRetryAction::Advance, ParentRetryAction::Reorg],
+        child_tip,
+    );
+    let supervisor =
+        parent_retry_supervisor(directory.path(), &child_rpc, &template_rpc, &validator_rpc);
+    let child = supervisor
+        .prepare_child_candidate_timed(&mut NativePreparationTiming::new())
+        .unwrap();
+    let lease = child.child.as_ref().unwrap().lease.clone();
+    assert!(matches!(
+        child.prepare_generation_timed(&mut NativePreparationTiming::new()),
+        Err(MinerError::ParentTipMismatch { .. })
+    ));
+    assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+    assert_eq!(template_rpc.requests("getblocktemplate").len(), 2);
+    assert_eq!(validator_rpc.requests("getblocktemplate").len(), 2);
+    let retirements = child_rpc.requests("retireauxblock");
+    assert_eq!(retirements.len(), 1);
+    assert_eq!(
+        retirements[0]["params"],
+        json!([lease.hash, lease.retire_token])
+    );
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+}
+
+#[test]
+fn parent_retry_rechecks_same_height_child_reorg_before_constructing_another_parent() {
+    let directory = tempdir().unwrap();
+    let (child_rpc, child_tip) = prefetch_child_rpc([0x71; 20], 0, Duration::ZERO);
+    let (template_rpc, validator_rpc, _) =
+        parent_retry_rpcs(vec![ParentRetryAction::ReorgChild], child_tip);
+    let supervisor =
+        parent_retry_supervisor(directory.path(), &child_rpc, &template_rpc, &validator_rpc);
+    assert!(matches!(
+        supervisor.prepare_generation_timed(&mut NativePreparationTiming::new()),
+        Err(MinerError::ChildTipMismatch { .. })
+    ));
+    assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+    assert_eq!(template_rpc.requests("getblocktemplate").len(), 1);
+    assert_eq!(validator_rpc.requests("getblocktemplate").len(), 1);
+    assert_eq!(child_rpc.requests("retireauxblock").len(), 1);
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+}
+
+#[test]
+fn parent_proposal_rejection_without_a_proven_tip_change_never_retries() {
+    let directory = tempdir().unwrap();
+    let (child_rpc, child_tip) = prefetch_child_rpc([0x71; 20], 0, Duration::ZERO);
+    let (template_rpc, validator_rpc, _) =
+        parent_retry_rpcs(vec![ParentRetryAction::UnprovenRejection], child_tip);
+    let supervisor =
+        parent_retry_supervisor(directory.path(), &child_rpc, &template_rpc, &validator_rpc);
+    assert!(matches!(
+        supervisor.prepare_generation_timed(&mut NativePreparationTiming::new()),
+        Err(MinerError::ParentProposalRejected { .. })
+    ));
+    assert_eq!(template_rpc.requests("getblocktemplate").len(), 1);
+    assert_eq!(validator_rpc.requests("getblocktemplate").len(), 1);
+    assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+    assert_eq!(child_rpc.requests("retireauxblock").len(), 1);
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+}
+
+#[test]
+fn parent_retry_revalidates_the_parent_payout_commitment_before_a_second_proposal() {
+    let directory = tempdir().unwrap();
+    let (child_rpc, child_tip) = prefetch_child_rpc([0x71; 20], 0, Duration::ZERO);
+    let (template_rpc, validator_rpc, _) =
+        parent_retry_rpcs(vec![ParentRetryAction::ReorgPayout], child_tip);
+    let supervisor =
+        parent_retry_supervisor(directory.path(), &child_rpc, &template_rpc, &validator_rpc);
+    assert!(matches!(
+        supervisor.prepare_generation_timed(&mut NativePreparationTiming::new()),
+        Err(MinerError::InvalidParentTemplate(message))
+            if message.contains("payout commitment")
+    ));
+    assert_eq!(template_rpc.requests("getblocktemplate").len(), 2);
+    assert_eq!(validator_rpc.requests("getblocktemplate").len(), 1);
+    assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+    assert_eq!(child_rpc.requests("retireauxblock").len(), 1);
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+}
+
+#[test]
+fn original_baseline_acquisition_deadline_stops_retry_and_retires_the_exact_child() {
+    let directory = tempdir().unwrap();
+    let (child_rpc, child_tip) = prefetch_child_rpc([0x71; 20], 0, Duration::ZERO);
+    let (template_rpc, validator_rpc, _) =
+        parent_retry_rpcs(vec![ParentRetryAction::Advance], child_tip);
+    let supervisor =
+        parent_retry_supervisor(directory.path(), &child_rpc, &template_rpc, &validator_rpc);
+    let mut child = supervisor
+        .prepare_child_candidate_timed(&mut NativePreparationTiming::new())
+        .unwrap();
+    let mut prepared = *child.child.take().unwrap();
+    let lease = prepared.lease.clone();
+    // Model baseline acquisition that consumed its entire retry lifetime. An
+    // original baseline attempt is permitted; an immediate retry is not.
+    prepared.acquired_at = Instant::now() - MAX_PREFETCHED_CHILD_AGE;
+    prepared.ready_deadline = None;
+    assert!(matches!(
+        supervisor.prepare_generation_with_child_timed(
+            Some(prepared),
+            &mut NativePreparationTiming::new(),
+        ),
+        Err(MinerError::PrefetchedChildExpired)
+    ));
+    assert_eq!(template_rpc.requests("getblocktemplate").len(), 1);
+    assert_eq!(validator_rpc.requests("getblocktemplate").len(), 1);
+    assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+    let retirements = child_rpc.requests("retireauxblock");
+    assert_eq!(retirements.len(), 1);
+    assert_eq!(
+        retirements[0]["params"],
+        json!([lease.hash, lease.retire_token])
+    );
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+}
+
+#[test]
+fn parent_retry_keeps_the_final_child_fence_after_the_second_independent_proposal() {
+    let directory = tempdir().unwrap();
+    let (child_rpc, child_tip) = prefetch_child_rpc([0x71; 20], 0, Duration::ZERO);
+    let (template_rpc, validator_rpc, _) = parent_retry_rpcs(
+        vec![
+            ParentRetryAction::Advance,
+            ParentRetryAction::AcceptChildReorg,
+        ],
+        child_tip,
+    );
+    let supervisor =
+        parent_retry_supervisor(directory.path(), &child_rpc, &template_rpc, &validator_rpc);
+    assert!(matches!(
+        supervisor.prepare_generation_timed(&mut NativePreparationTiming::new()),
+        Err(MinerError::ChildTipMismatch { .. })
+    ));
+    assert_eq!(template_rpc.requests("getblocktemplate").len(), 2);
+    assert_eq!(validator_rpc.requests("getblocktemplate").len(), 2);
+    assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+    assert_eq!(child_rpc.requests("retireauxblock").len(), 1);
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+}
+
+#[test]
+fn parent_retry_deadline_preserves_the_original_acquisition_and_prefetch_bounds() {
+    let directory = tempdir().unwrap();
+    let (child_rpc, _) = prefetch_child_rpc([0x71; 20], 0, Duration::ZERO);
+    let parent_rpc = prefetch_parent_identity_rpc();
+    let (supervisor, _validator_rpc) =
+        prefetch_supervisor(directory.path(), &child_rpc, &parent_rpc);
+    let mut child = supervisor
+        .prepare_child_candidate_timed(&mut NativePreparationTiming::new())
+        .unwrap();
+    let prepared = child.child.as_mut().unwrap();
+    let original_acquired_at = prepared.acquired_at;
+    let acquisition_deadline = original_acquired_at + MAX_PREFETCHED_CHILD_AGE;
+    let original_ready_deadline = prepared.ready_deadline;
+    assert!(prepared
+        .ensure_parent_retry_fresh_at(acquisition_deadline - Duration::from_nanos(1))
+        .is_ok());
+    assert!(matches!(
+        prepared.ensure_parent_retry_fresh_at(acquisition_deadline),
+        Err(MinerError::PrefetchedChildExpired)
+    ));
+    // Baseline children have no ready-cache deadline, but a parent retry cannot
+    // acquire a fresh lifetime by removing that optional prefetch marker.
+    prepared.ready_deadline = None;
+    assert!(matches!(
+        prepared.ensure_parent_retry_fresh_at(acquisition_deadline),
+        Err(MinerError::PrefetchedChildExpired)
+    ));
+    prepared.ready_deadline = original_ready_deadline;
+    assert_eq!(prepared.acquired_at, original_acquired_at);
+    assert_eq!(prepared.ready_deadline, original_ready_deadline);
+    assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+    assert!(parent_rpc.requests("getblocktemplate").is_empty());
+    child.retire().unwrap();
+}
+
+#[test]
+fn parent_retry_publication_deadline_is_strict_without_renewing_the_original_bound() {
+    let deadline = Instant::now() + MAX_PREFETCHED_CHILD_AGE;
+    assert!(ensure_parent_retry_deadline_at(None, deadline).is_ok());
+    assert!(
+        ensure_parent_retry_deadline_at(Some(deadline), deadline - Duration::from_nanos(1),)
+            .is_ok()
+    );
+    for now in [deadline, deadline + Duration::from_nanos(1)] {
+        assert!(matches!(
+            ensure_parent_retry_deadline_at(Some(deadline), now),
+            Err(MinerError::PrefetchedChildExpired)
+        ));
     }
 }

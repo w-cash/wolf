@@ -330,6 +330,16 @@ impl ValidatedNativeChild {
         }
         Ok(())
     }
+
+    fn ensure_parent_retry_fresh_at(&self, now: Instant) -> Result<(), MinerError> {
+        self.ensure_fresh_at(now)?;
+        // Baseline acquisition has no ready-cache deadline. Its optional parent
+        // retry still gets the same bound, measured before the original RPC.
+        if now >= self.acquired_at + MAX_PREFETCHED_CHILD_AGE {
+            return Err(MinerError::PrefetchedChildExpired);
+        }
+        Ok(())
+    }
 }
 
 struct OutboxRetryState {
@@ -876,10 +886,22 @@ impl NativeMiningSupervisor {
         };
         preparation_guard.lease = Some(prepared.lease.clone());
         prepared.ensure_fresh_at(Instant::now())?;
+        timing.set_wcash_height(prepared.child.height);
+        let (job, parent_retry_deadline) = self.prepare_parent_job_for_child_timed(
+            &prepared,
+            timing,
+            |auxiliary_nonce, timing, parent_rules| {
+                zcash.prepare_job_timed_with_parent_rules(
+                    prepared.child_hash,
+                    prepared.child_target,
+                    auxiliary_nonce,
+                    timing,
+                    parent_rules,
+                )
+            },
+        )?;
         let ValidatedNativeChild {
             child,
-            child_hash,
-            child_target,
             child_previous_hash,
             child_candidate_bytes,
             child_payout,
@@ -888,27 +910,6 @@ impl NativeMiningSupervisor {
             ready_deadline,
             ..
         } = prepared;
-        timing.set_wcash_height(child.height);
-        // A prefetched child can outlive its predecessor. Reject it before
-        // constructing the fresh parent, and retain the final fence below.
-        if ready_deadline.is_some() {
-            require_child_candidate_tip(&wcash_node, &child)?;
-        }
-
-        let auxiliary_nonce = reserve_auxiliary_nonce(&self.next_auxiliary_nonce)?;
-        let parent_rules = ParentCoinbaseRules::for_candidate_height(
-            child.height,
-            self.wcash_network
-                .wcash_nu7_parent_activation_height()
-                .map(u32::from),
-        );
-        let job = zcash.prepare_job_timed_with_parent_rules(
-            child_hash,
-            child_target,
-            auxiliary_nonce,
-            timing,
-            parent_rules,
-        )?;
         let generation_descriptor = job.generation_descriptor(
             child_previous_hash,
             child_coinbase_txid_le,
@@ -925,6 +926,7 @@ impl NativeMiningSupervisor {
         if ready_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(MinerError::PrefetchedChildExpired);
         }
+        ensure_parent_retry_deadline_at(parent_retry_deadline, Instant::now())?;
         timing.enter(PreparationPhase::GenerationJournal);
         journal.activate_job(ActiveJournalJob {
             job_id: job.job().job_id().to_string(),
@@ -961,6 +963,62 @@ impl NativeMiningSupervisor {
         Ok(coordinator)
     }
 
+    fn prepare_parent_job_for_child_timed<F>(
+        &self,
+        prepared: &ValidatedNativeChild,
+        timing: &mut NativePreparationTiming,
+        mut prepare_parent: F,
+    ) -> Result<(NativePreparedJob, Option<Instant>), MinerError>
+    where
+        F: FnMut(
+            u32,
+            &mut NativePreparationTiming,
+            ParentCoinbaseRules,
+        ) -> Result<NativePreparedJob, MinerError>,
+    {
+        let retry_deadline = prepared.acquired_at + MAX_PREFETCHED_CHILD_AGE;
+        let parent_rules = ParentCoinbaseRules::for_candidate_height(
+            prepared.child.height,
+            self.wcash_network
+                .wcash_nu7_parent_activation_height()
+                .map(u32::from),
+        );
+        let mut retried = false;
+        loop {
+            prepared.ensure_fresh_at(Instant::now())?;
+            if retried {
+                prepared.ensure_parent_retry_fresh_at(Instant::now())?;
+            }
+            // A child can outlive its predecessor while waiting for a parent.
+            // Keep the exact Wcash fence before every full parent attempt.
+            timing.enter(PreparationPhase::CurrentnessFences);
+            require_child_candidate_tip(&self.wcash_node, &prepared.child)?;
+            let auxiliary_nonce = reserve_auxiliary_nonce(&self.next_auxiliary_nonce)?;
+            match prepare_parent(auxiliary_nonce, timing, parent_rules) {
+                Err(MinerError::ParentTipMismatch { .. }) if !retried => {
+                    // Native parent validation only reports this variant after
+                    // proving an exact tip race. Keep this one validated child
+                    // instead of retiring it and repeating createauxblock.
+                    // No template, proposal result, nonce or lifetime is reused.
+                    prepared.ensure_parent_retry_fresh_at(Instant::now())?;
+                    retried = true;
+                    timing.enter(PreparationPhase::ObserverCatchup);
+                    if let Err(error) = self.zcash.relay_observer_blocks_to_work_nodes() {
+                        timing.set_failure_context(self.zcash.preparation_failure_context(&error));
+                        return Err(error);
+                    }
+                }
+                Ok(job) => {
+                    if retried {
+                        prepared.ensure_parent_retry_fresh_at(Instant::now())?;
+                    }
+                    return Ok((job, retried.then_some(retry_deadline)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Reconciles one exact backend winner against its own chain only.
     ///
     /// Exact block bytes are already durable before this method can obtain a
@@ -988,6 +1046,16 @@ impl NativeMiningSupervisor {
             MergedChain::Zcash => reconcile_zcash_pool_winner(&self.zcash, snapshot),
         }
     }
+}
+
+fn ensure_parent_retry_deadline_at(
+    deadline: Option<Instant>,
+    now: Instant,
+) -> Result<(), MinerError> {
+    if deadline.is_some_and(|deadline| now >= deadline) {
+        return Err(MinerError::PrefetchedChildExpired);
+    }
+    Ok(())
 }
 
 fn require_child_candidate_tip(
