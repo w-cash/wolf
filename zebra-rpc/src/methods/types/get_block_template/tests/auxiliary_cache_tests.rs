@@ -291,7 +291,7 @@ fn auxiliary_prewarm_capacity_skips_without_evicting_any_existing_proof() {
                     Ok::<_, ()>(expected.clone())
                 })
                 .unwrap();
-            if height == Height(base.0 + 2) && value == Amount::zero() {
+            if height == Height(base.0 + 2) && value == Amount::<NonNegative>::zero() {
                 assert!(warmed.is_none(), "an exact foreground proof is shared");
             } else {
                 assert_eq!(warmed, Some(expected));
