@@ -248,6 +248,7 @@ fn auxiliary_cache_fee_churn_is_bounded_on_the_real_build_insertion_path() {
                 .0
                 .lock()
                 .unwrap()
+                .foreground
                 .keys()
                 .filter(|(h, _)| *h == height)
                 .count()
@@ -268,40 +269,84 @@ fn auxiliary_prewarm_capacity_skips_without_evicting_any_existing_proof() {
     let base = Height(2_000_000);
     let builds = AtomicUsize::new(0);
     let mut retained = Vec::new();
-    for height in [base, Height(base.0 + 1), Height(base.0 + 2)] {
+    // Fill two reachable adjacent heights at the four-fee foreground bound.
+    for height in [Height(base.0 + 1), Height(base.0 + 2)] {
         for amount in 0i64..4 {
-            let fee = Amount::try_from(amount).unwrap();
-            let expected = coinbase(&recipient, height, fee);
+            let amount = Amount::try_from(amount).unwrap();
+            let value = coinbase(&recipient, height, amount);
+            cache.store(height, amount, value.clone());
+            retained.push((height, amount, value));
+        }
+    }
+    assert_eq!(cache.0.lock().unwrap().foreground.len(), 8);
+    let current = Height(base.0 + 1);
+    let amount = Amount::try_from(19i64).unwrap();
+    assert!(cache.configure_auxiliary_reserve(current, amount));
+    for height in [Height(base.0 + 2), Height(base.0 + 3)] {
+        for value in [Amount::zero(), amount] {
+            let expected = coinbase(&recipient, height, value);
             let warmed = cache
-                .try_prewarm(height, fee, || {
+                .try_prewarm_reserved(height, value, || {
                     builds.fetch_add(1, Ordering::SeqCst);
                     Ok::<_, ()>(expected.clone())
                 })
                 .unwrap();
-            assert_eq!(warmed, Some(expected.clone()));
-            retained.push((height, fee, expected));
+            if height == Height(base.0 + 2)
+                && value == Amount::<zebra_chain::amount::NonNegative>::zero()
+            {
+                assert!(warmed.is_none(), "an exact foreground proof is shared");
+            } else {
+                assert_eq!(warmed, Some(expected));
+            }
         }
     }
-    assert_eq!(builds.load(Ordering::SeqCst), 12);
-    // A fourth height, fifth fee, and already-ready key must all leave the
-    // bounded cache intact without calling even a cheap speculative builder.
-    for (height, fee) in [
-        (Height(base.0 + 3), Amount::zero()),
-        (base, Amount::try_from(4i64).unwrap()),
-        (base, Amount::zero()),
+    assert_eq!(builds.load(Ordering::SeqCst), 3);
+    // Unknown heights/fees and already-ready keys cannot allocate another proof.
+    for (height, value) in [
+        (Height(base.0 + 4), Amount::zero()),
+        (Height(base.0 + 2), Amount::try_from(20i64).unwrap()),
+        (Height(base.0 + 3), amount),
     ] {
-        let skipped = cache
-            .try_prewarm(height, fee, || {
+        assert!(cache
+            .try_prewarm_reserved(height, value, || {
                 builds.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, ()>(coinbase(&recipient, height, fee))
+                Ok::<_, ()>(coinbase(&recipient, height, value))
             })
-            .unwrap();
-        assert!(skipped.is_none());
+            .unwrap()
+            .is_none());
     }
-    assert_eq!(builds.load(Ordering::SeqCst), 12);
-    assert_eq!(cache.0.lock().unwrap().len(), 12);
-    for (height, fee, expected) in retained {
-        assert_eq!(cache.get(height, fee), Some(expected));
+    assert_eq!(builds.load(Ordering::SeqCst), 3);
+    {
+        let storage = cache.0.lock().unwrap();
+        assert_eq!(storage.foreground.len(), 8);
+        assert_eq!(storage.reserve.len(), 4);
+        assert_eq!(storage.reserve_keys.len(), 4);
+    }
+    for (height, value, expected) in retained {
+        assert_eq!(cache.get(height, value), Some(expected));
+    }
+    // Fee/tip churn replaces the same bounded four-key reserve without growing
+    // or pruning the independent foreground map.
+    for offset in 1..=16 {
+        let current = Height(base.0 + offset);
+        let amount = Amount::try_from(i64::from(offset)).unwrap();
+        assert!(cache.configure_auxiliary_reserve(current, amount));
+        for height in [Height(current.0 + 1), Height(current.0 + 2)] {
+            for value in [Amount::zero(), amount] {
+                cache
+                    .try_prewarm_reserved(height, value, || {
+                        Ok::<_, ()>(coinbase(&recipient, height, value))
+                    })
+                    .unwrap();
+            }
+        }
+        let storage = cache.0.lock().unwrap();
+        assert!(storage.reserve.len() <= 4 && storage.reserve_keys.len() <= 4);
+        assert!(storage
+            .reserve
+            .keys()
+            .all(|key| storage.reserve_keys.contains(key)));
+        assert_eq!(storage.foreground.len(), 8);
     }
 }
 
@@ -356,7 +401,8 @@ fn auxiliary_cache_fee_eviction_preserves_active_builders_and_their_waiters() {
     let mut all_waiting = false;
     while std::time::Instant::now() < deadline {
         all_waiting = {
-            let map = cache.0.lock().unwrap();
+            let storage = cache.0.lock().unwrap();
+            let map = &storage.foreground;
             expected.iter().take(4).all(|(fee, _)| {
                 map.get(&(height, *fee))
                     .is_some_and(|entry| Arc::strong_count(entry) >= 3)
@@ -370,7 +416,8 @@ fn auxiliary_cache_fee_eviction_preserves_active_builders_and_their_waiters() {
     let (new_fee, new_value) = expected[4].clone();
     let fifth = cache.get_or_build(height, new_fee, || new_value.clone());
     let (evicted, count, zero_retained) = {
-        let map = cache.0.lock().unwrap();
+        let storage = cache.0.lock().unwrap();
+        let map = &storage.foreground;
         (
             expected
                 .iter()
@@ -421,7 +468,7 @@ fn auxiliary_cache_fee_eviction_preserves_active_builders_and_their_waiters() {
         1,
         "a new request may rebuild an evicted fee without redirecting existing waiters"
     );
-    assert_eq!(cache.0.lock().unwrap().len(), 4);
+    assert_eq!(cache.0.lock().unwrap().foreground.len(), 4);
 }
 
 #[cfg(feature = "wcash-consensus")]

@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: Keep a bounded two-height proof reserve for alternate Wcash auxiliary payouts so a second nearby tip can reuse its exact coinbase without evicting foreground work. Preserve recipient and fee isolation, single-worker proving, and full candidate validation.
+time: 2026-11-08T12:00:00Z

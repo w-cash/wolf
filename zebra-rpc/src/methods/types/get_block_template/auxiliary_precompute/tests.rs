@@ -145,7 +145,7 @@ async fn future_coinbases_use_exact_recipient_height_and_fee_without_touching_cu
     )
     .await;
     idle(&worker).await;
-    assert_eq!(builds.load(Ordering::SeqCst), 2);
+    assert_eq!(builds.load(Ordering::SeqCst), 4);
     let cloned_cache = actual_cache.clone();
     for amount in [0, 12_345] {
         let warmed = cloned_cache.get_or_build(Height(2), fee(amount), || {
@@ -179,7 +179,7 @@ async fn future_coinbases_use_exact_recipient_height_and_fee_without_touching_cu
     idle(&worker).await;
     assert_eq!(
         builds.load(Ordering::SeqCst),
-        2,
+        4,
         "clones deduplicate completed exact keys"
     );
 }
@@ -233,7 +233,7 @@ async fn a_held_proof_does_not_block_registration_and_namespaces_stay_bounded() 
         let state = worker.0.state.lock().unwrap();
         (
             state.namespaces.len(),
-            state.namespaces.iter().all(|entry| entry.slots.len() <= 2),
+            state.namespaces.iter().all(|entry| entry.slots.len() <= 4),
         )
     };
     let builds_before_release = proof_count.load(Ordering::SeqCst);
@@ -328,7 +328,7 @@ async fn evicted_recipient_cache_does_not_keep_queued_proof_work_alive() {
         queued_cache_released,
         "registration retains no evicted recipient cache"
     );
-    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
     assert!(first_cache.get(Height(2), fee(0)).is_some());
 }
 
@@ -350,14 +350,15 @@ async fn failed_speculation_is_not_spun_and_retries_only_after_registration() {
     }));
     register(&worker, &network, &miner, &cache, Height(1), fee(19)).await;
     idle(&worker).await;
-    assert_eq!(zero_count.load(Ordering::SeqCst), 1);
-    assert_eq!(fee_count.load(Ordering::SeqCst), 1);
+    assert_eq!(zero_count.load(Ordering::SeqCst), 2);
+    assert_eq!(fee_count.load(Ordering::SeqCst), 2);
     assert!(cache.get(Height(2), fee(0)).is_some());
     assert!(cache.get(Height(2), fee(19)).is_none());
+    assert!(cache.get(Height(3), fee(19)).is_some());
     register(&worker, &network, &miner, &cache, Height(1), fee(19)).await;
     idle(&worker).await;
-    assert_eq!(zero_count.load(Ordering::SeqCst), 1);
-    assert_eq!(fee_count.load(Ordering::SeqCst), 2);
+    assert_eq!(zero_count.load(Ordering::SeqCst), 2);
+    assert_eq!(fee_count.load(Ordering::SeqCst), 3);
     check_public_coinbase(
         &cache.get(Height(2), fee(19)).unwrap(),
         &network,
@@ -378,6 +379,489 @@ fn warming_is_optional_without_runtime_or_valid_next_height() {
     assert!(worker.0.state.lock().unwrap().worker.is_none());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alternate_two_tip_burst_consumes_prepared_third_candidate_without_reproving() {
+    let network = Network::new_wcash_regtest();
+    let miner = params(&network, 0x73);
+    let cache = CoinbaseCache::default();
+    let current = coinbase(&network, Height(1), &miner, fee(29));
+    cache.store(Height(1), fee(29), current.clone());
+    let builds = Arc::new(Mutex::new(Vec::new()));
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(Gate::default());
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (recorded, building, max_seen, held) = (
+        Arc::clone(&builds),
+        Arc::clone(&active),
+        Arc::clone(&maximum),
+        Arc::clone(&gate),
+    );
+    let worker = AuxiliaryPrecomputer::with_builder(Arc::new(move |net, height, miner, amount| {
+        let now = building.fetch_add(1, Ordering::SeqCst) + 1;
+        max_seen.fetch_max(now, Ordering::SeqCst);
+        recorded.lock().unwrap().push((height, amount));
+        if height == Height(4) && amount == fee(0) {
+            entered_tx.send(()).unwrap();
+            held.wait();
+        }
+        let result = TransactionTemplate::new_coinbase(net, height, miner, amount);
+        building.fetch_sub(1, Ordering::SeqCst);
+        result
+    }));
+    register(&worker, &network, &miner, &cache, Height(1), fee(29)).await;
+    idle(&worker).await;
+
+    // This is a behavioral prerequisite: the third candidate must have been
+    // prepared before either new tip arrives. A new foreground proof at H3
+    // cannot be disguised as a successful lookahead hit.
+    let before_burst = builds.lock().unwrap().clone();
+    for amount in [fee(0), fee(29)] {
+        assert_eq!(
+            before_burst
+                .iter()
+                .filter(|&&(height, value)| height == Height(3) && value == amount)
+                .count(),
+            1,
+            "the alternate recipient must prepare the third candidate before a two-tip burst"
+        );
+    }
+
+    // Ordinary same-height requests retain only the three adjacent foreground
+    // heights. They must not prune the independently retained future H3 proof.
+    assert_eq!(
+        cache.get_or_build(Height(1), fee(29), || {
+            panic!("the current exact coinbase was already cached")
+        }),
+        current
+    );
+    for amount in [0, 29] {
+        let second = cache.get_or_build(Height(2), fee(amount), || {
+            panic!("the second candidate must use its already prepared proof")
+        });
+        check_public_coinbase(&second, &network, Height(2), 0x73, 625_000_000 + amount);
+    }
+    register(&worker, &network, &miner, &cache, Height(2), fee(29)).await;
+    let later_build_started = entered_rx.recv_timeout(DEADLINE);
+    let foreground_builds = Arc::new(AtomicUsize::new(0));
+    let mut third_candidates = Vec::new();
+    for amount in [0, 29] {
+        let fallback = Arc::clone(&foreground_builds);
+        third_candidates.push(cache.get_or_build(Height(3), fee(amount), || {
+            fallback.fetch_add(1, Ordering::SeqCst);
+            coinbase(&network, Height(3), &miner, fee(amount))
+        }));
+    }
+    let worker_still_held = active.load(Ordering::SeqCst);
+    // Registration for the next tip is optional bookkeeping and cannot wait
+    // for the unrelated H4 proof held above.
+    register(&worker, &network, &miner, &cache, Height(3), fee(29)).await;
+    gate.release();
+    idle(&worker).await;
+
+    assert!(later_build_started.is_ok());
+    assert_eq!(worker_still_held, 1);
+    assert_eq!(foreground_builds.load(Ordering::SeqCst), 0);
+    for (template, amount) in third_candidates.iter().zip([0, 29]) {
+        check_public_coinbase(template, &network, Height(3), 0x73, 625_000_000 + amount);
+    }
+    let after_burst = builds.lock().unwrap();
+    for amount in [fee(0), fee(29)] {
+        assert_eq!(
+            after_burst
+                .iter()
+                .filter(|&&(height, value)| height == Height(3) && value == amount)
+                .count(),
+            1,
+            "tip rotation must consume the exact reserve instead of proving it again"
+        );
+    }
+    assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alternate_future_reserve_reorg_and_recipient_fee_keys_stay_exact() {
+    let network = Network::new_wcash_regtest();
+    let first = params(&network, 0x74);
+    let second = params(&network, 0x75);
+    let first_cache = CoinbaseCache::default();
+    let second_cache = CoinbaseCache::default();
+    let worker = AuxiliaryPrecomputer::default();
+    for (miner, cache, amount) in [(&first, &first_cache, 17), (&second, &second_cache, 19)] {
+        cache.store(
+            Height(10),
+            fee(amount),
+            coinbase(&network, Height(10), miner, fee(amount)),
+        );
+        register(&worker, &network, miner, cache, Height(10), fee(amount)).await;
+    }
+    idle(&worker).await;
+    let fallback = Arc::new(AtomicUsize::new(0));
+    for (miner, cache, tag, amount) in [
+        (&first, &first_cache, 0x74, 17),
+        (&second, &second_cache, 0x75, 19),
+    ] {
+        // Re-read the current foreground height before the two-height jump.
+        // Its ordinary cache pruning must leave the independent H12 reserve.
+        cache.get_or_build(Height(10), fee(amount), || {
+            panic!("the exact current recipient coinbase was stored")
+        });
+        let counted = Arc::clone(&fallback);
+        let third = cache.get_or_build(Height(12), fee(amount), || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            coinbase(&network, Height(12), miner, fee(amount))
+        });
+        check_public_coinbase(&third, &network, Height(12), tag, 625_000_000 + amount);
+    }
+    assert_eq!(
+        fallback.load(Ordering::SeqCst),
+        0,
+        "each third candidate must come from its own exact recipient/fee reserve"
+    );
+
+    let wrong_fee_builds = AtomicUsize::new(0);
+    let changed = first_cache.get_or_build(Height(12), fee(19), || {
+        wrong_fee_builds.fetch_add(1, Ordering::SeqCst);
+        coinbase(&network, Height(12), &first, fee(19))
+    });
+    assert_eq!(wrong_fee_builds.load(Ordering::SeqCst), 1);
+    check_public_coinbase(&changed, &network, Height(12), 0x74, 625_000_019);
+
+    // A backward reorg changes the desired height range. It must preserve a
+    // newly installed current proof and never redirect another namespace.
+    let reorg_current = coinbase(&network, Height(8), &first, fee(0));
+    first_cache.store(Height(8), fee(0), reorg_current.clone());
+    register(&worker, &network, &first, &first_cache, Height(8), fee(23)).await;
+    idle(&worker).await;
+    assert_eq!(first_cache.get(Height(8), fee(0)), Some(reorg_current));
+    for height in [Height(9), Height(10)] {
+        let template = first_cache.get_or_build(height, fee(23), || {
+            panic!("the reorg reserve must prepare the exact new height and fee")
+        });
+        check_public_coinbase(&template, &network, height, 0x74, 625_000_023);
+    }
+    let untouched_second = second_cache.get_or_build(Height(12), fee(19), || {
+        panic!("another recipient's reorg cannot discard this exact candidate")
+    });
+    check_public_coinbase(&untouched_second, &network, Height(12), 0x75, 625_000_019);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alternate_future_reserve_cancelled_registration_keeps_one_bounded_creator() {
+    let network = Network::new_wcash_regtest();
+    let miner = params(&network, 0x76);
+    let cache = CoinbaseCache::default();
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let builds = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let (counted, building, max_seen) = (
+        Arc::clone(&builds),
+        Arc::clone(&active),
+        Arc::clone(&maximum),
+    );
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let worker = AuxiliaryPrecomputer::with_builder(Arc::new(move |net, height, miner, amount| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        let now = building.fetch_add(1, Ordering::SeqCst) + 1;
+        max_seen.fetch_max(now, Ordering::SeqCst);
+        assert_eq!((height, amount), (Height(21), fee(0)));
+        entered_tx.send(()).unwrap();
+        held.wait();
+        let result = TransactionTemplate::new_coinbase(net, height, miner, amount);
+        building.fetch_sub(1, Ordering::SeqCst);
+        result
+    }));
+    register(&worker, &network, &miner, &cache, Height(20), fee(0)).await;
+    let entered = entered_rx.recv_timeout(DEADLINE);
+    for _ in 0..64 {
+        register(
+            &worker.clone(),
+            &network,
+            &miner,
+            &cache,
+            Height(20),
+            fee(0),
+        )
+        .await;
+    }
+    let registration = {
+        let worker = worker.clone();
+        let network = network.clone();
+        let miner = miner.clone();
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            register(&worker, &network, &miner, &cache, Height(20), fee(0)).await;
+            std::future::pending::<()>().await;
+        })
+    };
+    tokio::task::yield_now().await;
+    registration.abort();
+    assert!(registration.await.unwrap_err().is_cancelled());
+
+    let foreground_cache = cache.clone();
+    let foreground_network = network.clone();
+    let foreground_miner = miner.clone();
+    let fallback = Arc::new(AtomicUsize::new(0));
+    let counted_fallback = Arc::clone(&fallback);
+    let foreground = tokio::task::spawn_blocking(move || {
+        foreground_cache.get_or_build(Height(21), fee(0), || {
+            counted_fallback.fetch_add(1, Ordering::SeqCst);
+            coinbase(&foreground_network, Height(21), &foreground_miner, fee(0))
+        })
+    });
+    let joined = tokio::time::timeout(DEADLINE, async {
+        loop {
+            if cache
+                .0
+                .lock()
+                .unwrap()
+                .foreground
+                .contains_key(&(Height(21), fee(0)))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let builds_before_release = builds.load(Ordering::SeqCst);
+    let maximum_before_release = maximum.load(Ordering::SeqCst);
+    // Removing every optional scheduler owner cancels queued lookahead, while
+    // an already running proof still has one exact completion responsibility.
+    drop(worker);
+    gate.release();
+    let result = tokio::time::timeout(DEADLINE, foreground).await;
+    assert!(entered.is_ok());
+    assert!(joined.is_ok());
+    let result = result.unwrap().unwrap();
+    check_public_coinbase(&result, &network, Height(21), 0x76, 625_000_000);
+    assert_eq!(builds_before_release, 1);
+    assert_eq!(maximum_before_release, 1);
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(fallback.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_future_proof_foreground_promotion_survives_tip_reorg_and_worker_drop() {
+    let network = Network::new_wcash_regtest();
+    let miner = params(&network, 0x77);
+    let cache = CoinbaseCache::default();
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let background_keys = Arc::new(Mutex::new(Vec::new()));
+    let observed_keys = Arc::clone(&background_keys);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let worker = AuxiliaryPrecomputer::with_builder(Arc::new(move |net, height, miner, amount| {
+        observed_keys.lock().unwrap().push((height, amount));
+        if height == Height(11) && amount == fee(0) {
+            entered_tx.send(()).unwrap();
+            held.wait();
+        }
+        TransactionTemplate::new_coinbase(net, height, miner, amount)
+    }));
+    register(&worker, &network, &miner, &cache, Height(10), fee(0)).await;
+    let entered = entered_rx.recv_timeout(DEADLINE);
+
+    let foreground_builds = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&foreground_builds);
+    let foreground_cache = cache.clone();
+    let foreground_network = network.clone();
+    let foreground_miner = miner.clone();
+    let (foreground_tx, mut foreground_rx) = tokio::sync::oneshot::channel();
+    let foreground = std::thread::spawn(move || {
+        let built = foreground_cache.get_or_build(Height(12), fee(0), || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            coinbase(&foreground_network, Height(12), &foreground_miner, fee(0))
+        });
+        let _ = foreground_tx.send(built);
+    });
+    // This bounds the ordering check, not proof performance: H11 remains held
+    // until this wait completes. The fixture proof itself is transparent.
+    let before_release = tokio::time::timeout(Duration::from_secs(2), &mut foreground_rx).await;
+    let finished_before_release = matches!(&before_release, Ok(Ok(_)));
+    if !finished_before_release {
+        // Failure cleanup only: complete the exact promoted foreground entry,
+        // cancel optional queued work and release the held real builder before
+        // reporting the ordering failure. Never leave a held blocking proof.
+        drop(worker);
+        cache.store(
+            Height(12),
+            fee(0),
+            coinbase(&network, Height(12), &miner, fee(0)),
+        );
+        gate.release();
+        let settled = tokio::time::timeout(DEADLINE, foreground_rx).await;
+        if settled.is_ok() {
+            foreground.join().unwrap();
+        } else {
+            drop(foreground);
+        }
+        assert!(
+            finished_before_release,
+            "foreground H12 cannot wait behind the unrelated optional H11 proof"
+        );
+        return;
+    }
+    let completed = before_release.unwrap().unwrap();
+    foreground.join().unwrap();
+
+    // Foreground claimed H12 before the optional worker reached it. Its same
+    // reserved EntryArc must survive a lower current-height lookup and an
+    // unchanged registration window, without another proof or worker release.
+    let claimed_entry = cache.0.lock().unwrap().foreground[&(Height(12), fee(0))].clone();
+    cache.get_or_build(Height(10), fee(0), || {
+        coinbase(&network, Height(10), &miner, fee(0))
+    });
+    register(&worker, &network, &miner, &cache, Height(10), fee(0)).await;
+    let retained = cache.get_or_build(Height(12), fee(0), || {
+        foreground_builds.fetch_add(1, Ordering::SeqCst);
+        coinbase(&network, Height(12), &miner, fee(0))
+    });
+    let retained_entry = cache.0.lock().unwrap().foreground[&(Height(12), fee(0))].clone();
+    let same_entry_after_pruning = Arc::ptr_eq(&claimed_entry, &retained_entry);
+
+    // H12 became current while optional H11 is still running. Further
+    // registration cannot authorize a duplicate queued H12 creator.
+    register(&worker, &network, &miner, &cache, Height(12), fee(0)).await;
+    let reorg_current = coinbase(&network, Height(8), &miner, fee(0));
+    cache.store(Height(8), fee(0), reorg_current.clone());
+    register(&worker, &network, &miner, &cache, Height(8), fee(0)).await;
+    let before_drop_keys = background_keys.lock().unwrap().clone();
+    let weak_owner = Arc::downgrade(&worker.0);
+    drop(worker);
+    let optional_owner_dropped = weak_owner.upgrade().is_none();
+    gate.release();
+
+    // The detached in-flight proof may finish, but queued reserve work is not
+    // kept alive by foreground entry ownership after the scheduler is gone.
+    tokio::time::timeout(DEADLINE, async {
+        while Arc::strong_count(&background_keys) > 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the released optional builder drops its last observer clone");
+    assert!(entered.is_ok());
+    assert!(optional_owner_dropped);
+    assert!(same_entry_after_pruning);
+    assert_eq!(retained, completed);
+    assert_eq!(before_drop_keys, vec![(Height(11), fee(0))]);
+    assert_eq!(*background_keys.lock().unwrap(), vec![(Height(11), fee(0))]);
+    assert_eq!(foreground_builds.load(Ordering::SeqCst), 1);
+    check_public_coinbase(&completed, &network, Height(12), 0x77, 625_000_000);
+    assert_eq!(cache.get(Height(8), fee(0)), Some(reorg_current));
+    assert!(cache.get(Height(11), fee(0)).is_none());
+    assert!(cache.get(Height(12), fee(0)).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consumed_future_reserve_entry_survives_same_window_foreground_pruning() {
+    let network = Network::new_wcash_regtest();
+    let miner = params(&network, 0x78);
+    let cache = CoinbaseCache::default();
+    let current = coinbase(&network, Height(1), &miner, fee(17));
+    cache.store(Height(1), fee(17), current.clone());
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&builds);
+    let worker = AuxiliaryPrecomputer::with_builder(Arc::new(move |net, height, miner, amount| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        TransactionTemplate::new_coinbase(net, height, miner, amount)
+    }));
+    register(&worker, &network, &miner, &cache, Height(1), fee(17)).await;
+    idle(&worker).await;
+    let fallback = AtomicUsize::new(0);
+    for amount in [0, 17] {
+        let first = cache.get_or_build(Height(3), fee(amount), || {
+            fallback.fetch_add(1, Ordering::SeqCst);
+            coinbase(&network, Height(3), &miner, fee(amount))
+        });
+        let first_entry = cache.0.lock().unwrap().foreground[&(Height(3), fee(amount))].clone();
+        // This valid lower-height foreground request prunes H3 from the
+        // ordinary adjacent-height map. The unchanged reserve window still
+        // owns it and registration must not leave a Done-but-missing key.
+        cache.get_or_build(Height(1), fee(17), || current.clone());
+        assert!(!cache
+            .0
+            .lock()
+            .unwrap()
+            .foreground
+            .contains_key(&(Height(3), fee(amount))));
+        register(&worker, &network, &miner, &cache, Height(1), fee(17)).await;
+        idle(&worker).await;
+        let again = cache.get_or_build(Height(3), fee(amount), || {
+            fallback.fetch_add(1, Ordering::SeqCst);
+            coinbase(&network, Height(3), &miner, fee(amount))
+        });
+        let again_entry = cache.0.lock().unwrap().foreground[&(Height(3), fee(amount))].clone();
+        assert!(Arc::ptr_eq(&first_entry, &again_entry));
+        assert_eq!(first, again);
+        check_public_coinbase(&again, &network, Height(3), 0x78, 625_000_000 + amount);
+    }
+    assert_eq!(fallback.load(Ordering::SeqCst), 0);
+    assert_eq!(builds.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removed_then_reintroduced_running_key_requires_fresh_slot_ownership() {
+    let network = Network::new_wcash_regtest();
+    let miner = params(&network, 0x79);
+    let cache = CoinbaseCache::default();
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&builds);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let worker = AuxiliaryPrecomputer::with_builder(Arc::new(move |net, height, miner, amount| {
+        if height == Height(101) && counted.fetch_add(1, Ordering::SeqCst) == 0 {
+            entered_tx.send(()).unwrap();
+            held.wait();
+        }
+        TransactionTemplate::new_coinbase(net, height, miner, amount)
+    }));
+    register(&worker, &network, &miner, &cache, Height(100), fee(0)).await;
+    let entered = entered_rx.recv_timeout(DEADLINE);
+    let old_entry = cache
+        .0
+        .lock()
+        .unwrap()
+        .reserve
+        .get(&(Height(101), fee(0)))
+        .cloned();
+    register(&worker, &network, &miner, &cache, Height(98), fee(0)).await;
+    let removed = !cache
+        .0
+        .lock()
+        .unwrap()
+        .reserve
+        .contains_key(&(Height(101), fee(0)));
+    register(&worker, &network, &miner, &cache, Height(100), fee(0)).await;
+    let absent_before_release = cache.get(Height(101), fee(0)).is_none();
+    gate.release();
+    idle(&worker).await;
+
+    assert!(entered.is_ok());
+    assert!(removed && absent_before_release);
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        2,
+        "the old completion cannot mark the newly introduced H101 slot Done"
+    );
+    let current_entry = cache.0.lock().unwrap().reserve[&(Height(101), fee(0))].clone();
+    assert!(
+        !Arc::ptr_eq(&old_entry.unwrap(), &current_entry),
+        "an old pruned EntryArc must not be reinserted for the new slot"
+    );
+    let ready = cache.get_or_build(Height(101), fee(0), || {
+        panic!("the newly owned H101 proof is complete")
+    });
+    check_public_coinbase(&ready, &network, Height(101), 0x79, 625_000_000);
+}
+
 #[cfg(feature = "wcash-consensus")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "real private Ironwood proofs; run this exact test explicitly off the VPS"]
@@ -385,7 +869,7 @@ fn warming_is_optional_without_runtime_or_valid_next_height() {
     clippy::print_stderr,
     reason = "Expose real proof measurements only in the explicitly selected offline regression"
 )]
-async fn actual_private_recipient_future_coinbase_is_warmed_and_reused_without_reproving() {
+async fn actual_private_recipient_two_tip_burst_is_warmed_and_reused_without_reproving() {
     use std::time::Instant;
 
     use orchard::keys::{FullViewingKey, Scope, SpendingKey};
@@ -431,47 +915,59 @@ async fn actual_private_recipient_future_coinbase_is_warmed_and_reused_without_r
     register(&worker, &network, &miner, &cache, Height(1), fee(12_345)).await;
     tokio::time::timeout(Duration::from_secs(120), worker.wait_for_idle())
         .await
-        .expect("the two explicit private fixture proofs finish off the VPS");
+        .expect("the four explicit future private proofs finish off the VPS");
     let warm_ms = warm_started.elapsed().as_millis();
     let request_cache = cache.clone();
     let mut consumption_ms = Vec::new();
-    for amount in [0, 12_345] {
-        let started = Instant::now();
-        let warmed = request_cache.get_or_build(Height(2), fee(amount), || {
-            panic!("the future private proof must be reused")
-        });
-        consumption_ms.push(started.elapsed().as_millis());
-        let tx: Transaction = warmed.data.as_ref().zcash_deserialize_into().unwrap();
-        assert!(
-            matches!(&tx.inputs()[0], transparent::Input::Coinbase { height, .. } if *height == Height(2))
-        );
-        assert!(tx.outputs().is_empty());
-        assert_eq!(tx.version(), 6);
-        zebra_consensus::transaction::check::wcash_coinbase_outputs_are_private(
-            &tx,
-            &network,
-            Height(2),
-        )
-        .unwrap();
-        let bundle = tx.ironwood_bundle().unwrap();
-        let notes = bundle.decrypt_outputs_with_keys(std::slice::from_ref(&ivk));
-        assert!(!notes.is_empty());
-        assert!(notes
-            .iter()
-            .all(|(_, _, _, address, _)| *address == receiver));
+    for height in [Height(2), Height(3)] {
+        // A normal current-height request must not discard the independent H3
+        // proof before the second rapid tip arrives.
         assert_eq!(
-            notes
-                .iter()
-                .map(|(_, _, note, _, _)| note.value().inner())
-                .sum::<u64>(),
-            u64::try_from(625_000_000 + amount).unwrap()
+            request_cache.get_or_build(Height(1), fee(12_345), || current.clone()),
+            current
         );
-        assert!(bundle
-            .decrypt_outputs_with_keys(std::slice::from_ref(&wrong_ivk))
-            .is_empty());
+        for amount in [0, 12_345] {
+            let started = Instant::now();
+            let warmed = request_cache.get_or_build(height, fee(amount), || {
+                panic!("the future private proof must be reused")
+            });
+            consumption_ms.push(started.elapsed().as_millis());
+            let tx: Transaction = warmed.data.as_ref().zcash_deserialize_into().unwrap();
+            assert!(
+                matches!(&tx.inputs()[0], transparent::Input::Coinbase { height: actual, .. } if *actual == height)
+            );
+            assert!(tx.outputs().is_empty());
+            assert_eq!(tx.version(), 6);
+            zebra_consensus::transaction::check::wcash_coinbase_outputs_are_private(
+                &tx, &network, height,
+            )
+            .unwrap();
+            let bundle = tx.ironwood_bundle().unwrap();
+            let notes = bundle.decrypt_outputs_with_keys(std::slice::from_ref(&ivk));
+            assert!(!notes.is_empty());
+            assert!(notes
+                .iter()
+                .all(|(_, _, _, address, _)| *address == receiver));
+            assert_eq!(
+                notes
+                    .iter()
+                    .map(|(_, _, note, _, _)| note.value().inner())
+                    .sum::<u64>(),
+                u64::try_from(625_000_000 + amount).unwrap()
+            );
+            assert!(bundle
+                .decrypt_outputs_with_keys(std::slice::from_ref(&wrong_ivk))
+                .is_empty());
+        }
     }
-    assert_eq!(builds.load(Ordering::SeqCst), 2);
-    assert_eq!(cache.get(Height(1), fee(12_345)), Some(current));
-    assert!(cache.get(Height(2), fee(12_346)).is_none());
-    eprintln!("actual_private_future_prewarm current_build_ms={current_ms} next_height_warm_ms={warm_ms} exact_future_consume_ms={consumption_ms:?} worker_builds=2");
+    // Reconsume H3 after a lower-height request prunes its foreground copy.
+    request_cache.get_or_build(Height(1), fee(12_345), || current.clone());
+    for amount in [0, 12_345] {
+        request_cache.get_or_build(Height(3), fee(amount), || {
+            panic!("consumed private reserve entries must survive foreground pruning")
+        });
+    }
+    assert_eq!(builds.load(Ordering::SeqCst), 4);
+    assert!(cache.get(Height(3), fee(12_346)).is_none());
+    eprintln!("actual_private_two_tip_burst current_build_ms={current_ms} next_height_warm_ms={warm_ms} exact_future_consume_ms={consumption_ms:?} worker_builds=4");
 }

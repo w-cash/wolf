@@ -98,13 +98,24 @@ existing height/fee limits, single-builder behavior, proposal verification and
 tip fences still apply.
 
 After successfully issuing a candidate for an alternate payout, the node also
-prewarms that recipient's next-height coinbases: zero fees for transaction
-sizing, and the last selected fee total when nonzero. This uses one bounded
-background worker, isolated from the configured payout's template reserve,
-candidate leases and block submission. Matching requests share in-progress
-proofs rather than starting duplicate sizing proofs. The prewarmer keeps at
-most four recipient requests and only warms the adjacent height, preserving
-the current job's cached proof.
+reserves coinbase proofs for that recipient's next two heights: zero fees for
+transaction sizing and the last selected fee total when nonzero. This uses the
+same single background worker and one proving thread. It remains isolated from
+the configured payout's template reserve, candidate leases and block submission.
+Each of the four recipient namespaces keeps at most four reserved entries.
+The foreground cache still retains only adjacent heights and at most four fee
+entries per height; the future reserve does not evict its current proof.
+
+A foreground request promotes or joins only its exact recipient, height and fee
+entry. Queued work has no builder entry. A foreground builder can claim that
+exact key before the prewarmer starts it. While a key remains reserved, the
+reserve retains the same entry through normal foreground cache pruning.
+Once a worker claims an entry,
+it finishes or reports failure to that entry's waiters even after a reorg or
+foreground promotion. New registrations coalesce the desired window and drop
+stale reserve ownership; late results never reinsert pruned entries. Between
+proofs the worker chooses the nearer height first and rotates equally urgent
+recipients. An already running farther-height proof cannot be preempted.
 
 Prewarming is best effort. The first request, a new fee total, recipient-cache
 eviction, restart, reorg, or blocks arriving before the next proof is ready can
@@ -121,8 +132,8 @@ code `-32001`, before publishing any candidate or retirement token; unrelated
 node warmup errors keep their original codes. The worker continues filling its
 exact coinbase cache entry for a later retry. Cancelling or timing out the
 request does not free its slot until the blocking build finishes. Prewarming
-and its existing limits are unchanged. This bounds the foreground wait and
-isolates RPC scheduling; it does not shorten the proof itself.
+does not add foreground build slots or shorten the proof itself. The foreground
+wait remains bounded independently of proving and optional reserve work.
 
 `createauxblock.coinbasevalue` is the miner's **net** payout including all fees:
 `subsidy - foundation + fees`. It excludes the compulsory transparent foundation

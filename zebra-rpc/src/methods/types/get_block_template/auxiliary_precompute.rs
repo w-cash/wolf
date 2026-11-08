@@ -1,8 +1,8 @@
-//! Bounded, optional next-height coinbase work for alternate auxiliary payouts.
+//! Bounded, optional two-height coinbase reserve for alternate auxiliary payouts.
 //!
 //! A successful `createauxblock` has already built its current-height coinbase. It only records
 //! the exact recipient/cache namespace and last selected fee here. One lazy worker may prepare
-//! the next height's zero-fee sizing proof and that exact fee total. It does not create candidates,
+//! the next two heights' zero-fee sizing proofs and that exact fee total. It does not create candidates,
 //! acquire leases, read chain state, or change any submission path.
 
 use std::{
@@ -21,7 +21,10 @@ use zebra_consensus::error::TransactionError;
 
 use crate::methods::types::transaction::TransactionTemplate;
 
-use super::{CoinbaseCache, MinerParams, WeakCoinbaseCache, MAX_AUXILIARY_COINBASE_RECIPIENTS};
+use super::{
+    CoinbaseCache, MinerParams, WeakCoinbaseCache, AUXILIARY_COINBASE_RESERVE_DEPTH,
+    MAX_AUXILIARY_COINBASE_RECIPIENTS, MAX_AUXILIARY_RESERVE_ENTRIES,
+};
 
 #[cfg(test)]
 mod tests;
@@ -60,12 +63,13 @@ struct Namespace {
     params: MinerParams,
     cache: WeakCoinbaseCache,
     current_height: Height,
-    target_height: Height,
     observed_fee: Amount<NonNegative>,
     slots: Vec<FeeSlot>,
 }
 
 struct FeeSlot {
+    id: Arc<()>,
+    height: Height,
     fee: Amount<NonNegative>,
     state: WorkState,
 }
@@ -81,6 +85,7 @@ enum WorkState {
 #[derive(Clone)]
 struct Work {
     namespace: Arc<()>,
+    slot: Arc<()>,
     network: Network,
     params: MinerParams,
     cache: CoinbaseCache,
@@ -131,9 +136,9 @@ impl AuxiliaryPrecomputer {
         if !network.uses_wcash_consensus() {
             return false;
         }
-        let Some(next_height) = current_height.0.checked_add(1).map(Height) else {
+        if current_height.0.checked_add(1).is_none() {
             return false;
-        };
+        }
         let Ok(runtime) = Handle::try_current() else {
             return false;
         };
@@ -143,6 +148,11 @@ impl AuxiliaryPrecomputer {
             Err(std::sync::TryLockError::WouldBlock) => return false,
         };
 
+        // This is a try-lock metadata operation only. No proof entry is locked
+        // and no builder or waiter runs while scheduler state is held.
+        if !cache.configure_auxiliary_reserve(current_height, observed_fee) {
+            return false;
+        }
         let existing = state.namespaces.iter().position(|namespace| {
             namespace.network == *network
                 && namespace.cache.ptr_eq(&cache)
@@ -164,12 +174,11 @@ impl AuxiliaryPrecomputer {
                 params: params.clone(),
                 cache: cache.downgrade(),
                 current_height,
-                target_height: next_height,
                 observed_fee,
-                slots: Vec::with_capacity(2),
+                slots: Vec::with_capacity(MAX_AUXILIARY_RESERVE_ENTRIES),
             }
         };
-        namespace.update(current_height, next_height, observed_fee);
+        namespace.update(current_height, observed_fee);
         state.namespaces.push_back(namespace);
 
         // A terminal task failure must not permanently disable later best-effort registrations.
@@ -225,34 +234,42 @@ impl AuxiliaryPrecomputer {
 }
 
 impl Namespace {
-    fn update(
-        &mut self,
-        current_height: Height,
-        target_height: Height,
-        observed_fee: Amount<NonNegative>,
-    ) {
+    fn update(&mut self, current_height: Height, observed_fee: Amount<NonNegative>) {
         let zero = Amount::<NonNegative>::zero();
-        let fees = [zero, observed_fee];
-        let same_height = self.target_height == target_height;
-        let mut slots = Vec::with_capacity(2);
-        for fee in fees {
-            if slots.iter().any(|slot: &FeeSlot| slot.fee == fee) {
+        let mut slots = Vec::with_capacity(MAX_AUXILIARY_RESERVE_ENTRIES);
+        for distance in 1..=AUXILIARY_COINBASE_RESERVE_DEPTH {
+            let Some(height) = current_height.0.checked_add(distance).map(Height) else {
                 continue;
+            };
+            for fee in [zero, observed_fee] {
+                if slots
+                    .iter()
+                    .any(|slot: &FeeSlot| slot.height == height && slot.fee == fee)
+                {
+                    continue;
+                }
+                let prior = self
+                    .slots
+                    .iter()
+                    .find(|slot| slot.height == height && slot.fee == fee);
+                slots.push(FeeSlot {
+                    // Removing then reintroducing a key creates new ownership.
+                    // An old completion must not mark this new slot Done.
+                    id: prior
+                        .filter(|slot| slot.state != WorkState::Failed)
+                        .map(|slot| Arc::clone(&slot.id))
+                        .unwrap_or_else(|| Arc::new(())),
+                    height,
+                    fee,
+                    state: match prior.map(|slot| slot.state) {
+                        // Retry a failed key only after another successful request.
+                        None | Some(WorkState::Failed) => WorkState::Pending,
+                        Some(state) => state,
+                    },
+                });
             }
-            let prior = same_height
-                .then(|| self.slots.iter().find(|slot| slot.fee == fee))
-                .flatten();
-            slots.push(FeeSlot {
-                fee,
-                state: match prior.map(|slot| slot.state) {
-                    // Retry an actual failure only after another explicit successful request.
-                    None | Some(WorkState::Failed) => WorkState::Pending,
-                    Some(state) => state,
-                },
-            });
         }
         self.current_height = current_height;
-        self.target_height = target_height;
         self.observed_fee = observed_fee;
         self.slots = slots;
     }
@@ -281,12 +298,23 @@ fn next_work(shared: &Weak<Shared>) -> Option<(Work, Arc<CoinbaseBuilder>)> {
     #[cfg(test)]
     shared.changed.notify_waiters();
     let (mut namespace, cache) = loop {
-        let index = state.namespaces.iter().position(|namespace| {
-            namespace
-                .slots
-                .iter()
-                .any(|slot| slot.state == WorkState::Pending)
-        })?;
+        // Nearest future height wins between proofs. Equal-distance work keeps
+        // the existing recipient round robin; a running proof is not preempted.
+        let index = state
+            .namespaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, namespace)| {
+                namespace
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.state == WorkState::Pending)
+                    .map(|slot| slot.height.0.saturating_sub(namespace.current_height.0))
+                    .min()
+                    .map(|distance| (distance, index))
+            })
+            .min()
+            .map(|(_, index)| index)?;
         let namespace = state.namespaces.remove(index)?;
         // The foreground bank can drop its last owner after retain's temporary upgrade. Continue
         // past that entry rather than parking while another live namespace has pending work.
@@ -299,14 +327,16 @@ fn next_work(shared: &Weak<Shared>) -> Option<(Work, Arc<CoinbaseBuilder>)> {
     let slot = namespace
         .slots
         .iter_mut()
-        .find(|slot| slot.state == WorkState::Pending)?;
+        .filter(|slot| slot.state == WorkState::Pending)
+        .min_by_key(|slot| slot.height)?;
     slot.state = WorkState::Running;
     let work = Work {
         namespace: Arc::clone(&namespace.id),
+        slot: Arc::clone(&slot.id),
         network: namespace.network.clone(),
         params: namespace.params.clone(),
         cache,
-        height: namespace.target_height,
+        height: slot.height,
         fee: slot.fee,
     };
     // Rotate serviced namespaces so a busy recipient cannot starve another registered recipient.
@@ -325,10 +355,15 @@ fn is_current(shared: &Weak<Shared>, work: &Work) -> bool {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     state.namespaces.iter().any(|namespace| {
         Arc::ptr_eq(&namespace.id, &work.namespace)
-            && namespace.target_height == work.height
-            && namespace.current_height.0.checked_add(1) == Some(work.height.0)
+            && (1..=AUXILIARY_COINBASE_RESERVE_DEPTH).any(|distance| {
+                namespace.current_height.0.checked_add(distance) == Some(work.height.0)
+            })
             && (work.fee == Amount::<NonNegative>::zero() || work.fee == namespace.observed_fee)
-            && namespace.slots.iter().any(|slot| slot.fee == work.fee)
+            && namespace.slots.iter().any(|slot| {
+                Arc::ptr_eq(&slot.id, &work.slot)
+                    && slot.height == work.height
+                    && slot.fee == work.fee
+            })
     })
 }
 
@@ -341,10 +376,14 @@ fn finish_work(shared: &Weak<Shared>, work: &Work, outcome: &WorkOutcome) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     state.active = false;
-    if let Some(namespace) = state.namespaces.iter_mut().find(|namespace| {
-        Arc::ptr_eq(&namespace.id, &work.namespace) && namespace.target_height == work.height
-    }) {
-        if let Some(slot) = namespace.slots.iter_mut().find(|slot| slot.fee == work.fee) {
+    if let Some(namespace) = state
+        .namespaces
+        .iter_mut()
+        .find(|namespace| Arc::ptr_eq(&namespace.id, &work.namespace))
+    {
+        if let Some(slot) = namespace.slots.iter_mut().find(|slot| {
+            Arc::ptr_eq(&slot.id, &work.slot) && slot.height == work.height && slot.fee == work.fee
+        }) {
             slot.state = match outcome {
                 WorkOutcome::Built | WorkOutcome::Skipped => WorkState::Done,
                 WorkOutcome::Failed => WorkState::Failed,
@@ -396,16 +435,18 @@ async fn run(shared: Weak<Shared>, notify: Arc<Notify>) {
                 return WorkOutcome::Skipped;
             }
             pool.install(|| {
-                match worker_work
-                    .cache
-                    .try_prewarm(worker_work.height, worker_work.fee, || {
+                match worker_work.cache.try_prewarm_reserved(
+                    worker_work.height,
+                    worker_work.fee,
+                    || {
                         builder(
                             &worker_work.network,
                             worker_work.height,
                             &worker_work.params,
                             worker_work.fee,
                         )
-                    }) {
+                    },
+                ) {
                     Ok(Some(_)) => WorkOutcome::Built,
                     Ok(None) => WorkOutcome::Skipped,
                     Err(_) => WorkOutcome::Failed,
@@ -420,7 +461,7 @@ async fn run(shared: Weak<Shared>, notify: Arc<Notify>) {
             WorkOutcome::Built => tracing::debug!(
                 height = work.height.0,
                 proof_ms = started.elapsed().as_millis(),
-                "filled alternate auxiliary next-height coinbase proof"
+                "filled alternate auxiliary future-height coinbase proof"
             ),
             WorkOutcome::Failed => tracing::warn!(
                 height = work.height.0,

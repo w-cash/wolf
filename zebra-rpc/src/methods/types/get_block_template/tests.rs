@@ -1074,7 +1074,7 @@ fn coinbase_cache_fallible_builder_preserves_error_and_releases_waiter() {
     started_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("the proof builder starts");
-    let entry = cache.0.lock().expect("cache is not poisoned")[&(height, fee)].clone();
+    let entry = cache.0.lock().expect("cache is not poisoned").foreground[&(height, fee)].clone();
     let recovered_cache = cache.clone();
     let recovered_coinbase = expected.clone();
     let recovered = thread::spawn(move || {
@@ -1137,7 +1137,7 @@ fn zip317_sizing_waits_for_the_existing_prewarm_proof() {
     started_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("the prewarm builder starts");
-    let entry = cache.0.lock().expect("cache is not poisoned")[&(height, fee)].clone();
+    let entry = cache.0.lock().expect("cache is not poisoned").foreground[&(height, fee)].clone();
     let sizing_cache = cache.clone();
     let sizing = thread::spawn(move || {
         select_mempool_transactions(

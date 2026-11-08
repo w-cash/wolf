@@ -737,14 +737,24 @@ impl From<zcash_address::ConversionError<&'static str>> for MinerParamsError {
 /// "fake" coinbase for ZIP-317 weight estimation, and the real coinbase with actual fees. Adjacent
 /// heights are retained so next-height precomputation never evicts the job miners are still using.
 #[derive(Clone, Default)]
-pub(crate) struct CoinbaseCache(
-    Arc<Mutex<HashMap<(block::Height, Amount<NonNegative>), Arc<CoinbaseCacheEntry>>>>,
-);
+pub(crate) struct CoinbaseCache(Arc<Mutex<CoinbaseCacheStorage>>);
+
+type CoinbaseKey = (block::Height, Amount<NonNegative>);
+
+const AUXILIARY_COINBASE_RESERVE_DEPTH: u32 = 2;
+const MAX_AUXILIARY_RESERVE_ENTRIES: usize = AUXILIARY_COINBASE_RESERVE_DEPTH as usize * 2;
+
+/// Foreground retention and optional future proofs have independent bounds,
+/// but one mutex makes promotion and builder ownership atomic.
+#[derive(Default)]
+struct CoinbaseCacheStorage {
+    foreground: HashMap<CoinbaseKey, Arc<CoinbaseCacheEntry>>,
+    reserve_keys: Vec<CoinbaseKey>,
+    reserve: HashMap<CoinbaseKey, Arc<CoinbaseCacheEntry>>,
+}
 
 #[derive(Clone)]
-pub(super) struct WeakCoinbaseCache(
-    std::sync::Weak<Mutex<HashMap<(block::Height, Amount<NonNegative>), Arc<CoinbaseCacheEntry>>>>,
-);
+pub(super) struct WeakCoinbaseCache(std::sync::Weak<Mutex<CoinbaseCacheStorage>>);
 
 impl WeakCoinbaseCache {
     fn upgrade(&self) -> Option<CoinbaseCache> {
@@ -795,12 +805,17 @@ impl CoinbaseCache {
         height: block::Height,
         fee: Amount<NonNegative>,
     ) -> Option<TransactionTemplate<amount::NegativeOrZero>> {
-        let entry = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&(height, fee))
-            .cloned()?;
+        let entry = {
+            let storage = self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            storage
+                .foreground
+                .get(&(height, fee))
+                .or_else(|| storage.reserve.get(&(height, fee)))
+                .cloned()?
+        };
         let state = entry
             .state
             .lock()
@@ -818,22 +833,36 @@ impl CoinbaseCache {
         fee: Amount<NonNegative>,
         coinbase: TransactionTemplate<amount::NegativeOrZero>,
     ) {
-        let mut map = self
+        let mut storage = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        retain_adjacent_coinbase_heights(&mut map, height);
-        bound_coinbase_fee_entries(&mut map, height, fee);
-        if let Some(entry) = map.get(&(height, fee)) {
+        retain_adjacent_coinbase_heights(&mut storage.foreground, height);
+        bound_coinbase_fee_entries(&mut storage.foreground, height, fee);
+        let entry = storage
+            .foreground
+            .get(&(height, fee))
+            .cloned()
+            .or_else(|| storage.reserve.get(&(height, fee)).cloned());
+        if let Some(entry) = entry {
             let mut state = entry
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *state = CoinbaseCacheState::Ready(coinbase);
             entry.ready.notify_all();
+            drop(state);
+            storage.foreground.insert((height, fee), Arc::clone(&entry));
+            if storage.reserve_keys.contains(&(height, fee)) {
+                storage.reserve.insert((height, fee), entry);
+            }
         } else {
-            map.insert((height, fee), Arc::new(CoinbaseCacheEntry::ready(coinbase)));
+            let entry = Arc::new(CoinbaseCacheEntry::ready(coinbase));
+            storage.foreground.insert((height, fee), Arc::clone(&entry));
+            if storage.reserve_keys.contains(&(height, fee)) {
+                storage.reserve.insert((height, fee), entry);
+            }
         }
     }
 
@@ -863,20 +892,33 @@ impl CoinbaseCache {
         build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, E>,
     ) -> Result<TransactionTemplate<amount::NegativeOrZero>, E> {
         let (entry, is_builder) = {
-            let mut map = self
+            let mut storage = self
                 .0
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            retain_adjacent_coinbase_heights(&mut map, height);
-            match map.get(&(height, fee)) {
+            retain_adjacent_coinbase_heights(&mut storage.foreground, height);
+            let (entry, is_builder) = match storage.foreground.get(&(height, fee)) {
                 Some(entry) => (Arc::clone(entry), false),
                 None => {
-                    bound_coinbase_fee_entries(&mut map, height, fee);
-                    let entry = Arc::new(CoinbaseCacheEntry::building());
-                    map.insert((height, fee), Arc::clone(&entry));
-                    (entry, true)
+                    bound_coinbase_fee_entries(&mut storage.foreground, height, fee);
+                    if let Some(entry) = storage.reserve.get(&(height, fee)).cloned() {
+                        // A Building reserve entry always has an already-claimed
+                        // synchronous builder. Promotion retains its singleflight.
+                        storage.foreground.insert((height, fee), Arc::clone(&entry));
+                        (entry, false)
+                    } else {
+                        let entry = Arc::new(CoinbaseCacheEntry::building());
+                        storage.foreground.insert((height, fee), Arc::clone(&entry));
+                        (entry, true)
+                    }
                 }
+            };
+            if storage.reserve_keys.contains(&(height, fee)) {
+                // Normal foreground pruning cannot destroy an independently
+                // reserved proof, including one first claimed by the foreground.
+                storage.reserve.insert((height, fee), Arc::clone(&entry));
             }
+            (entry, is_builder)
         };
 
         if is_builder {
@@ -905,42 +947,74 @@ impl CoinbaseCache {
         }
     }
 
-    /// Claims missing background work without evicting any foreground proof.
-    /// A stale lookahead request must not prune the current height after a reorg.
-    /// Existing builders and full caches are skipped; foreground callers still
-    /// join a background entry through `try_get_or_build`.
-    pub(crate) fn try_prewarm<E>(
+    /// Coalesces a separate two-height reserve after a successful auxiliary RPC.
+    /// Optional registration never waits for the storage mutex or touches a
+    /// foreground entry. Planned work creates no Building entry.
+    fn configure_auxiliary_reserve(
+        &self,
+        current_height: block::Height,
+        observed_fee: Amount<NonNegative>,
+    ) -> bool {
+        let mut keys = Vec::with_capacity(MAX_AUXILIARY_RESERVE_ENTRIES);
+        for distance in 1..=AUXILIARY_COINBASE_RESERVE_DEPTH {
+            let Some(height) = current_height.0.checked_add(distance).map(block::Height) else {
+                continue;
+            };
+            for fee in [Amount::<NonNegative>::zero(), observed_fee] {
+                if !keys.contains(&(height, fee)) {
+                    keys.push((height, fee));
+                }
+            }
+        }
+        if keys.is_empty() {
+            return false;
+        }
+        let mut storage = match self.0.try_lock() {
+            Ok(storage) => storage,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        storage.reserve.retain(|key, _| keys.contains(key));
+        for key in &keys {
+            if let Some(entry) = storage.foreground.get(key).cloned() {
+                // This entry already has a foreground builder or value. Keep
+                // the same ownership without starting speculative work.
+                storage.reserve.insert(*key, entry);
+            }
+        }
+        storage.reserve_keys = keys;
+        true
+    }
+
+    /// Claims optional work only when its exact key is still reserved. There is
+    /// no await or skip after insertion: this owner completes or fails/notifies
+    /// its entry even after foreground promotion, reorg, or namespace removal.
+    fn try_prewarm_reserved<E>(
         &self,
         height: block::Height,
         fee: Amount<NonNegative>,
         build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, E>,
     ) -> Result<Option<TransactionTemplate<amount::NegativeOrZero>>, E> {
         let entry = {
-            let mut map = self
+            let mut storage = self
                 .0
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if map.contains_key(&(height, fee)) {
+            let key = (height, fee);
+            if !storage.reserve_keys.contains(&key) {
                 return Ok(None);
             }
-            let fee_entries = map
-                .keys()
-                .filter(|(entry_height, _)| *entry_height == height)
-                .count();
-            if fee_entries >= MAX_COINBASE_FEE_ENTRIES_PER_HEIGHT {
+            if let Some(entry) = storage.foreground.get(&key).cloned() {
+                storage.reserve.insert(key, entry);
                 return Ok(None);
             }
-            if fee_entries == 0 {
-                let heights = map
-                    .keys()
-                    .map(|(height, _)| *height)
-                    .collect::<std::collections::HashSet<_>>();
-                if heights.len() >= 3 {
-                    return Ok(None);
-                }
+            if storage.reserve.contains_key(&key)
+                || storage.reserve.len() >= MAX_AUXILIARY_RESERVE_ENTRIES
+            {
+                return Ok(None);
             }
             let entry = Arc::new(CoinbaseCacheEntry::building());
-            map.insert((height, fee), Arc::clone(&entry));
+            storage.reserve.insert(key, Arc::clone(&entry));
             entry
         };
         self.build_entry(height, fee, &entry, build).map(Some)
@@ -983,15 +1057,23 @@ impl CoinbaseCache {
         fee: Amount<NonNegative>,
         expected: &Arc<CoinbaseCacheEntry>,
     ) {
-        let mut map = self
+        let mut storage = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if map
+        if storage
+            .foreground
             .get(&(height, fee))
             .is_some_and(|current| Arc::ptr_eq(current, expected))
         {
-            map.remove(&(height, fee));
+            storage.foreground.remove(&(height, fee));
+        }
+        if storage
+            .reserve
+            .get(&(height, fee))
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            storage.reserve.remove(&(height, fee));
         }
     }
 }
@@ -1123,7 +1205,7 @@ where
     /// The configured payout's normal precompute/cache path remains separate.
     auxiliary_coinbase_caches: AuxiliaryCoinbaseCaches,
 
-    /// Optional, bounded next-height proof work for alternate auxiliary recipients.
+    /// Optional, bounded two-height proof reserve for alternate auxiliary recipients.
     auxiliary_precomputer: auxiliary_precompute::AuxiliaryPrecomputer,
 
     /// Bounded foreground CPU work, shared by configured and auxiliary handler clones.
