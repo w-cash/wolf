@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Retry a proven Zcash parent-tip race once with the same validated Wcash candidate and a fresh fully checked parent, avoiding repeated child construction while preserving exact predecessor fences, original candidate deadlines, and unused-candidate retirement."
+time: 2026-11-08T09:33:44.292219Z

@@ -310,6 +310,17 @@ and independently proposal-validating fresh work. A generation is limited to
 becomes stale. This avoids a rebind/`TIME_WAIT` failure and avoids presenting a
 frozen header as a fake refreshed job; clients must reconnect after rotation.
 
+If exact parent-tip checks prove that the Zcash predecessor changed during
+preparation, the backend retries the full parent template and proposal checks
+once immediately with the same validated Wcash candidate and a new auxiliary
+nonce. Both attempts check the exact Wcash predecessor, and the final Wcash tip
+check remains in place. This avoids repeating `createauxblock` for a Zcash-only
+race, without extending the candidate's original ready deadline or the active
+job's lease.
+The retry is also bounded by 45 seconds from the original child acquisition.
+Other failures retire the unused candidate as before. Initial Wcash candidate
+construction can still wait for the node's coinbase proof to finish.
+
 Each `createauxblock` response carries a random, candidate-specific retirement
 capability. After all generation connections and share handlers have joined,
 the coordinator calls `retireauxblock` for unsolved and parent-only work. It
