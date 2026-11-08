@@ -22,6 +22,7 @@ use zebra_consensus::error::TransactionError;
 use crate::methods::types::transaction::TransactionTemplate;
 
 use super::{
+    coinbase_diagnostics::{self as diagnostics, Event, Outcome, Phase},
     CoinbaseCache, MinerParams, WeakCoinbaseCache, AUXILIARY_COINBASE_RESERVE_DEPTH,
     MAX_AUXILIARY_COINBASE_RECIPIENTS, MAX_AUXILIARY_RESERVE_ENTRIES,
 };
@@ -136,21 +137,45 @@ impl AuxiliaryPrecomputer {
         if !network.uses_wcash_consensus() {
             return false;
         }
+        let mut record = cache.diagnostic(
+            Event::ReserveRegistration,
+            Outcome::Accepted,
+            current_height,
+            observed_fee,
+            0,
+        );
+        record.phase = Phase::Prewarm;
+        record.reserve_start = current_height.0.checked_add(1);
+        record.reserve_end = current_height
+            .0
+            .checked_add(AUXILIARY_COINBASE_RESERVE_DEPTH);
+        record.observed_fee_zat = Some(u64::from(observed_fee));
         if current_height.0.checked_add(1).is_none() {
+            record.outcome = Outcome::HeightLimit;
+            diagnostics::emit(record);
             return false;
         }
         let Ok(runtime) = Handle::try_current() else {
+            record.outcome = Outcome::NoRuntime;
+            diagnostics::emit(record);
             return false;
         };
         let mut state = match self.0.state.try_lock() {
             Ok(state) => state,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return false,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                record.outcome = Outcome::StateContended;
+                diagnostics::emit(record);
+                return false;
+            }
         };
 
         // This is a try-lock metadata operation only. No proof entry is locked
         // and no builder or waiter runs while scheduler state is held.
         if !cache.configure_auxiliary_reserve(current_height, observed_fee) {
+            drop(state);
+            record.outcome = Outcome::CacheContended;
+            diagnostics::emit(record);
             return false;
         }
         let existing = state.namespaces.iter().position(|namespace| {
@@ -199,6 +224,7 @@ impl AuxiliaryPrecomputer {
             state.worker = Some(runtime.spawn(run(shared, notify)));
         }
         drop(state);
+        diagnostics::emit(record);
         self.0.notify.notify_one();
         #[cfg(test)]
         self.0.changed.notify_waiters();
@@ -432,6 +458,15 @@ async fn run(shared: Weak<Shared>, notify: Arc<Notify>) {
         let worker_work = work.clone();
         let result = tokio::task::spawn_blocking(move || {
             if !is_current(&worker_shared, &worker_work) {
+                let mut record = worker_work.cache.diagnostic(
+                    Event::ReserveWork,
+                    Outcome::Stale,
+                    worker_work.height,
+                    worker_work.fee,
+                    0,
+                );
+                record.phase = Phase::Prewarm;
+                diagnostics::emit(record);
                 return WorkOutcome::Skipped;
             }
             pool.install(|| {
@@ -456,20 +491,21 @@ async fn run(shared: Weak<Shared>, notify: Arc<Notify>) {
         .await;
         let outcome = result.unwrap_or(WorkOutcome::Failed);
         finish_work(&shared, &work, &outcome);
-        // Never format recipient parameters, raw error strings, or transactions in diagnostics.
-        match outcome {
-            WorkOutcome::Built => tracing::debug!(
-                height = work.height.0,
-                proof_ms = started.elapsed().as_millis(),
-                "filled alternate auxiliary future-height coinbase proof"
-            ),
-            WorkOutcome::Failed => tracing::warn!(
-                height = work.height.0,
-                failure_class = "proof_worker",
-                "auxiliary coinbase prewarm attempt failed"
-            ),
-            WorkOutcome::Skipped => {}
-        }
+        let mut record = work.cache.diagnostic(
+            Event::ReserveWork,
+            match outcome {
+                WorkOutcome::Built => Outcome::Finished,
+                WorkOutcome::Failed => Outcome::Error,
+                WorkOutcome::Skipped => Outcome::Skipped,
+            },
+            work.height,
+            work.fee,
+            0,
+        );
+        record.phase = Phase::Prewarm;
+        // Includes blocking dispatch and constructor work; not a proof-only timer.
+        record.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        diagnostics::emit(record);
     }
 }
 

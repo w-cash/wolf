@@ -135,6 +135,37 @@ request does not free its slot until the blocking build finishes. Prewarming
 does not add foreground build slots or shorten the proof itself. The foreground
 wait remains bounded independently of proving and optional reserve work.
 
+The node's `auxiliary_coinbase_diagnostic` INFO records distinguish a busy
+executor from a two-second deadline, blocking dispatch, zero-fee sizing,
+selected-fee construction, exact cache hits or joins, and optional reserve
+registration or completion. Cache, entry and request IDs are process-local
+correlation values, with zero meaning unavailable. They are not candidate IDs,
+recipient identifiers, or evidence that a proof or block was accepted.
+Records contain numeric heights and fee totals, never addresses, transaction
+bytes, proofs, retirement tokens or raw error text.
+`lookup_key_reserved` reports desired reserve membership at lookup time. A
+reserved key can still be queued or building; it does not imply a ready proof.
+
+Producers only attempt a send into a 64-record queue. A separate logging thread
+uses fallible JSON writes to standard output and applies fixed process-wide
+limits: important events refill at one per second
+with a burst of four; routine events refill at one per five seconds with a burst
+of two. This permits at most 366 records in 300 seconds. An I/O failure disables
+the logger; a blocked sink cannot hold a cache lock, proof worker, RPC waiter or
+candidate publication. The release panic strategy remains `abort`: arbitrary
+internal panics are not isolated by `catch_unwind`.
+`dropped_total` and `suppressed_total` expose missing observations; absent
+records do not prove an absent build or registration. Queue and suppression
+totals are sampled at logging time.
+
+`observed_at_unix_ms` is the producer timestamp and `queue_wait_ms` separates
+logging delay from work timing. `elapsed_ms` on a constructor includes output
+setup and serialization, not just cryptographic proving. Template-worker timing
+includes dispatch, cache calls and remaining assembly. A `join_building` lookup
+is recorded after its wait completes. Match process identity and exact cache,
+entry, height, fee and phase before attributing a retry to a cold key or a lost
+reservation. These diagnostics do not change proof reuse or mining policy.
+
 `createauxblock.coinbasevalue` is the miner's **net** payout including all fees:
 `subsidy - foundation + fees`. It excludes the compulsory transparent foundation
 output. During Mainnet heights 33000–621454, pool accounting must credit miners

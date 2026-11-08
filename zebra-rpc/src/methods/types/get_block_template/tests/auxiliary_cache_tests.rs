@@ -595,3 +595,135 @@ fn auxiliary_private_wcash_proof_repro_rebuilds_twice_before_fix_and_once_with_s
     assert_eq!(builds.load(Ordering::SeqCst), 1);
     eprintln!("auxiliary_private_proof_repro legacy_builds=2 fixed_builds=1 legacy_request_ms={legacy_request_ms:?} fixed_request_ms={fixed_request_ms:?} legacy_total_ms={} fixed_total_ms={}", legacy_elapsed.as_millis(), fixed_elapsed.as_millis());
 }
+
+#[test]
+fn auxiliary_diagnostic_namespace_survives_clones_and_weak_upgrade_but_not_recreation() {
+    let handler = handler();
+    let original_params = params(0x81);
+    let mut first = handler.clone();
+    first.set_auxiliary_miner_params(original_params.clone());
+    let cache = first.coinbase_cache();
+    let clone = cache.clone();
+    let upgraded = cache.downgrade().upgrade().unwrap();
+    assert_ne!(cache.1, 0);
+    assert_eq!(cache.1, clone.1);
+    assert_eq!(cache.1, upgraded.1);
+    assert!(cache.downgrade().ptr_eq(&upgraded));
+    let mut same = handler.clone();
+    same.set_auxiliary_miner_params(original_params.clone());
+    assert_eq!(same.coinbase_cache().1, cache.1);
+    let mut distinct = handler.clone();
+    distinct.set_auxiliary_miner_params(params(0x82));
+    assert_ne!(distinct.coinbase_cache().1, cache.1);
+    for tag in 0x83..=0x86 {
+        let mut request = handler.clone();
+        request.set_auxiliary_miner_params(params(tag));
+    }
+    let mut recreated = handler.clone();
+    recreated.set_auxiliary_miner_params(original_params);
+    assert_ne!(recreated.coinbase_cache().1, cache.1);
+    assert!(!cache.downgrade().ptr_eq(&recreated.coinbase_cache()));
+    assert_eq!(
+        upgraded.1, cache.1,
+        "an old live cache retains its own identity"
+    );
+}
+
+#[test]
+fn auxiliary_diagnostics_distinguish_sizing_reserve_hits_from_a_new_selected_fee() {
+    use super::super::coinbase_diagnostics::{self as diagnostics, Event, Outcome, Phase};
+
+    let cache = CoinbaseCache::default();
+    let miner = params(0x87);
+    let height = Height(2_000_000);
+    let zero = Amount::<zebra_chain::amount::NonNegative>::zero();
+    let fee17 = Amount::try_from(17i64).unwrap();
+    let fee19 = Amount::try_from(19i64).unwrap();
+    assert!(cache.configure_auxiliary_reserve(Height(height.0 - 1), fee17));
+    let warmed = diagnostics::capture_records(|| {
+        for fee in [zero, fee17] {
+            assert!(cache
+                .try_prewarm_reserved(height, fee, || {
+                    Ok::<_, ()>(coinbase(&miner, height, fee))
+                })
+                .unwrap()
+                .is_some());
+        }
+    });
+    let builds = AtomicUsize::new(0);
+    let request_id = diagnostics::next_id();
+    let records = diagnostics::capture_records(|| {
+        let _request = diagnostics::enter(request_id, Phase::Template);
+        {
+            let _phase = diagnostics::phase(Phase::Sizing);
+            cache.get_or_build(height, zero, || panic!("reserved sizing proof is complete"));
+        }
+        let _phase = diagnostics::phase(Phase::SelectedCoinbase);
+        cache.get_or_build(height, fee17, || panic!("last observed fee is reserved"));
+        assert_eq!(
+            cache.get_or_build(height, fee19, || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                coinbase(&miner, height, fee19)
+            }),
+            coinbase(&miner, height, fee19)
+        );
+    });
+    let exact = |outcome, phase, fee| {
+        records
+            .iter()
+            .find(|record| {
+                record.event == Event::CacheLookup
+                    && record.outcome == outcome
+                    && record.phase == phase
+                    && record.fee_zat == Some(fee)
+            })
+            .unwrap()
+    };
+    let sizing = exact(Outcome::ReserveReady, Phase::Sizing, 0);
+    let selected = exact(Outcome::ReserveReady, Phase::SelectedCoinbase, 17);
+    let changed = exact(Outcome::NewBuild, Phase::SelectedCoinbase, 19);
+    for record in [sizing, selected, changed] {
+        assert_eq!(record.request_id, request_id);
+        assert_eq!(record.cache_id, cache.1);
+        assert_eq!(record.height, Some(height.0));
+        assert_ne!(record.entry_id, 0);
+    }
+    assert_eq!(changed.lookup_key_reserved, Some(false));
+    for record in [sizing, selected] {
+        assert_eq!(record.lookup_key_reserved, Some(true));
+        let original = warmed
+            .iter()
+            .find(|warm| {
+                warm.event == Event::Constructor
+                    && warm.outcome == Outcome::Ok
+                    && warm.fee_zat == record.fee_zat
+            })
+            .unwrap();
+        assert_eq!(record.entry_id, original.entry_id);
+        assert_eq!(original.phase, Phase::Prewarm);
+    }
+    let completed = records
+        .iter()
+        .find(|record| {
+            record.event == Event::Constructor
+                && record.outcome == Outcome::Ok
+                && record.fee_zat == Some(19)
+        })
+        .unwrap();
+    assert_eq!(completed.entry_id, changed.entry_id);
+    assert_eq!(
+        (completed.request_id, completed.phase),
+        (request_id, Phase::SelectedCoinbase)
+    );
+    assert_ne!(changed.entry_id, selected.entry_id);
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        records
+            .iter()
+            .filter(
+                |record| record.event == Event::Constructor && record.outcome == Outcome::Started
+            )
+            .count(),
+        1
+    );
+}
