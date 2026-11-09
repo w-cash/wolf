@@ -136,27 +136,29 @@ request does not free its slot until the blocking build finishes. Prewarming
 does not add foreground build slots or shorten the proof itself. The foreground
 wait remains bounded independently of proving and optional reserve work.
 
-An optional `{"mode": "speculative"}` second argument limits only the node's
-pre-publication template wait to 100 milliseconds. Omitting the argument or
-passing `null` preserves the normal two-second wait. A short pending response
-allocates no candidate or retirement token. The blocking template worker keeps
-its existing foreground permit and fills its exact cache entry after the caller
-has received that response. This option does not shorten the HTTP transport
+An optional `{"mode": "speculative"}` second argument keeps the normal
+two-second template wait, but can yield before publication when the exact Wcash
+snapshot being built becomes obsolete. It first requires that snapshot's hash
+to be observed on the tip watch, then a different hash; an initially lagging
+watch does not establish obsolescence. With an unchanged parent, successful
+prefetch keeps its existing fast path. Omitting the argument or passing `null`
+keeps ordinary behavior. Early yielding allocates no candidate or retirement
+token. The blocking template worker retains its foreground permit and exact
+cache entry until completion. This option does not shorten the HTTP transport
 deadline or cancel a candidate request after publication.
 
-Only one speculative blocking template worker may be outstanding per node RPC
-instance, including across handler clones. Its separate admission permit remains
-held until that worker finishes. Repeated speculative requests return retryable
-busy while it is running, leaving the other existing foreground slot available
-for normal demand. Ordinary calls can still occupy both foreground slots; this
-is not a guarantee that every fresh template can be returned immediately.
+The existing two foreground template permits remain shared across handler
+clones and remain held until blocking work finishes, including after early
+yield or cancellation. No additional speculative admission limit is imposed:
+a different warm candidate can use an existing free slot while obsolete work
+finishes. Both occupied slots still produce the normal retryable busy result.
 Neither foreground capacity nor proving parallelism is increased.
 
 The native pool backend uses this option only for child prefetch. Required job
 preparation keeps the normal request and all proposal, payout and currentness
 checks. Update the Wcash node before the matching backend. Older nodes can
 silently ignore an extra positional argument, so a successful RPC alone does
-not verify support for the short wait. Rollback reverses that order: restore
+not verify support for tip-triggered yielding. Rollback reverses that order: restore
 the previous backend before restoring the previous node.
 
 The wire-level one-argument call remains compatible. Rust callers of the
@@ -511,15 +513,20 @@ cache lifetime. No other child acquisition runs while this worker is busy. A
 miss uses the existing complete preparation path, and an in-flight acquisition
 must finish before fresh parent preparation starts.
 
-The speculative node-side wait makes that acquisition return earlier when its
-proof is not yet ready, without abandoning a successful response or its cleanup
-capability. A retryable speculative construction-pending result keeps the next
-speculative request no earlier than 2.25 seconds after the previous request
-started. Required replacement work uses its independent retry clock and is not
-held behind this speculative cooldown. A different, already warm child key can
-therefore serve a required replacement while the obsolete proof continues.
-When the required key is the same cold proof, it still has to finish; the short
-wait does not make cryptographic proving faster.
+The speculative node-side wait can return earlier after the fetched Wcash
+parent is observed changing, without abandoning a successful response or its
+cleanup capability. The existing tip-race retry and independent required-work
+retry clock remain unchanged. A different, already warm child key can then
+serve required replacement while the obsolete proof continues. A Zcash-only
+parent change does not cancel a healthy Wcash acquisition: the same cold proof
+still has to finish. This does not make cryptographic proving faster or remove
+metadata and proposal waits.
+
+An exact speculative Wcash tip-change response also requests normal replacement
+preparation while independent currentness probes catch up. Optional acquisition
+cannot get ahead of that replacement. This is a scheduling hint: existing share
+admission and job authority remain unchanged, demanded backoff still applies,
+and the hint clears only after a replacement is actually activated.
 
 The prefetched child freezes Wcash transaction selection and fee totals. Newly
 arriving Wcash transactions can wait for the next child; existing bytes and

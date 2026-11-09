@@ -1,4 +1,4 @@
 project: zebra-rpc
 kind: breaking
-body: Add optional speculative createauxblock template waiting with one retained speculative slot and a 100 ms pre-publication deadline. One-argument JSON-RPC calls keep their existing behavior; Rust create_aux_block callers must pass the new optional options argument.
+body: Add optional speculative createauxblock waiting that yields when its exact Wcash snapshot is observed becoming obsolete. Preserve the normal two-second wait and existing foreground capacity. One-argument JSON-RPC calls keep their existing behavior; Rust create_aux_block callers must pass the new optional options argument.
 time: 2026-11-09T18:45:00Z

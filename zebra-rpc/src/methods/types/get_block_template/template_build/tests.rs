@@ -498,98 +498,14 @@ fn template_diagnostics_link_busy_deadline_and_late_singleflight_completion() {
     assert_eq!((joined.height, joined.fee_zat), (Some(height.0), Some(0)));
 }
 
-async fn held_speculative_build(
-    executor: &TemplateBuildExecutor,
-) -> (mpsc::Sender<()>, JoinHandle<RpcResult<usize>>) {
-    let executor = executor.clone();
-    let (entered_tx, entered_rx) = oneshot::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let task = tokio::spawn(async move {
-        executor
-            .run_speculative(move || {
-                let _ = entered_tx.send(());
-                release_rx
-                    .recv_timeout(TEST_LIMIT)
-                    .expect("the test releases its owned speculative build");
-                Ok(7)
-            })
-            .await
-    });
-    timeout(TEST_LIMIT, entered_rx).await.unwrap().unwrap();
-    (release_tx, task)
-}
-
 async fn wait_for_all_template_capacity(executor: &TemplateBuildExecutor) {
     timeout(TEST_LIMIT, async {
-        while executor.permits.available_permits() != 2
-            || executor.speculative_permits.available_permits() != 1
-        {
+        while executor.permits.available_permits() != 2 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the released owned workers return their original capacity");
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn speculative_template_timeout_keeps_one_slot_for_demand() {
-    let executor = TemplateBuildExecutor::default();
-    let (release, task) = held_speculative_build(&executor).await;
-    let result = timeout(Duration::from_secs(1), task)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(result.unwrap_err().message(), TEMPLATE_BUILD_PENDING);
-    assert_eq!(executor.permits.available_permits(), 1);
-    assert_eq!(executor.speculative_permits.available_permits(), 0);
-    let repeated = executor
-        .clone()
-        .run_speculative(|| -> RpcResult<usize> {
-            panic!("a repeated speculative waiter must not consume the demand slot")
-        })
-        .await;
-    assert_eq!(repeated.unwrap_err().message(), TEMPLATE_BUILD_BUSY);
-    assert_eq!(executor.run(|| Ok(19)).await.unwrap(), 19);
-    release.send(()).unwrap();
-    wait_for_all_template_capacity(&executor).await;
-    assert_eq!(executor.run_speculative(|| Ok(23)).await.unwrap(), 23);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn speculative_template_global_busy_releases_optional_guard() {
-    let executor = TemplateBuildExecutor::default();
-    let (first_release, first) = held_build(&executor).await;
-    let (second_release, second) = held_build(&executor).await;
-    let result = executor
-        .run_speculative(|| -> RpcResult<usize> {
-            panic!("two occupied foreground slots cannot admit speculative work")
-        })
-        .await;
-    assert_eq!(result.unwrap_err().message(), TEMPLATE_BUILD_BUSY);
-    assert_eq!(executor.speculative_permits.available_permits(), 1);
-    finish_build(first_release, first).await;
-    assert_eq!(executor.run_speculative(|| Ok(31)).await.unwrap(), 31);
-    finish_build(second_release, second).await;
-    wait_for_all_template_capacity(&executor).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn speculative_template_cancelled_waiter_keeps_both_owned_guards() {
-    let executor = TemplateBuildExecutor::default();
-    let (release, task) = held_speculative_build(&executor).await;
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-    assert_eq!(executor.permits.available_permits(), 1);
-    assert_eq!(executor.speculative_permits.available_permits(), 0);
-    let result = executor
-        .run_speculative(|| -> RpcResult<usize> {
-            panic!("cancellation cannot reopen speculative ownership")
-        })
-        .await;
-    assert_eq!(result.unwrap_err().message(), TEMPLATE_BUILD_BUSY);
-    assert_eq!(executor.run(|| Ok(37)).await.unwrap(), 37);
-    release.send(()).unwrap();
-    wait_for_all_template_capacity(&executor).await;
+    .expect("released owned workers return the original two slots");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -610,7 +526,7 @@ async fn ordinary_template_waiter_does_not_inherit_speculative_deadline() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn speculative_old_key_cannot_block_demanded_warm_key_or_duplicate_proofs() {
+async fn template_old_key_cannot_block_demanded_warm_key_or_duplicate_proofs() {
     use super::super::{MinerParams, TransactionTemplate};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -649,7 +565,7 @@ async fn speculative_old_key_cannot_block_demanded_warm_key_or_duplicate_proofs(
     let (completed_tx, mut completed_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         working
-            .run_speculative(move || {
+            .run(move || {
                 let result = old_cache.get_or_build(old_height, fee, || {
                     building.fetch_add(1, Ordering::SeqCst);
                     let _ = entered_tx.send(());
@@ -663,7 +579,7 @@ async fn speculative_old_key_cannot_block_demanded_warm_key_or_duplicate_proofs(
     });
     timeout(TEST_LIMIT, entered_rx).await.unwrap().unwrap();
     assert_eq!(
-        timeout(Duration::from_secs(1), task)
+        timeout(Duration::from_secs(3), task)
             .await
             .unwrap()
             .unwrap()
@@ -672,12 +588,6 @@ async fn speculative_old_key_cannot_block_demanded_warm_key_or_duplicate_proofs(
         TEMPLATE_BUILD_PENDING
     );
     assert!(completed_rx.try_recv().is_err());
-    let repeated = executor
-        .run_speculative(|| -> RpcResult<usize> {
-            panic!("repeated speculative work must not consume a second slot")
-        })
-        .await;
-    assert_eq!(repeated.unwrap_err().message(), TEMPLATE_BUILD_BUSY);
     let next_cache = cache.clone();
     let ready = timeout(
         Duration::from_secs(1),
@@ -709,4 +619,50 @@ async fn speculative_old_key_cannot_block_demanded_warm_key_or_duplicate_proofs(
         .unwrap();
     assert_eq!(warmed, old_coinbase);
     assert_eq!(builds.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn speculative_obsolete_watch_requires_observed_snapshot_then_changed_hash() {
+    use zebra_chain::{block::Hash, chain_tip::mock::MockChainTip};
+
+    let (tip, sender) = MockChainTip::new();
+    let snapshot = Hash([0x31; 32]);
+    sender.send_best_tip_hash(Hash([0x30; 32]));
+    sender.send_best_tip_height(Height(1));
+    let obsolete = wait_for_obsolete_snapshot(tip, snapshot);
+    tokio::pin!(obsolete);
+    assert!(futures::poll!(obsolete.as_mut()).is_pending());
+    // A lagging watch naming another hash cannot cancel the newer read-state
+    // snapshot. Catching up arms the fence without declaring obsolescence.
+    sender.send_best_tip_hash(snapshot);
+    assert!(futures::poll!(obsolete.as_mut()).is_pending());
+    sender.send_best_tip_hash(snapshot);
+    sender.send_best_tip_height(Height(2));
+    assert!(futures::poll!(obsolete.as_mut()).is_pending());
+    // Updating before the next poll is not a lost wake; an exact-hash change
+    // proves a same-height reorg as well as a height advance.
+    sender.send_best_tip_hash(Hash([0x32; 32]));
+    assert!(futures::poll!(obsolete.as_mut()).is_ready());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn speculative_closed_tip_watch_keeps_normal_build_result() {
+    use zebra_chain::{block::Hash, chain_tip::mock::MockChainTip};
+
+    let (tip, sender) = MockChainTip::new();
+    let snapshot = Hash([0x41; 32]);
+    sender.send_best_tip_hash(snapshot);
+    let obsolete = wait_for_obsolete_snapshot(tip, snapshot);
+    tokio::pin!(obsolete);
+    assert!(futures::poll!(obsolete.as_mut()).is_pending());
+    drop(sender);
+    // Closed watch errors park once; they neither prove a changed tip nor
+    // spin, and the original bounded builder remains able to finish.
+    assert!(futures::poll!(obsolete.as_mut()).is_pending());
+    let executor = TemplateBuildExecutor::default();
+    tokio::select! {
+        result = executor.run(|| Ok(47)) => assert_eq!(result.unwrap(),47),
+        () = obsolete => panic!("a closed watch cannot manufacture obsolescence"),
+    }
+    wait_for_all_template_capacity(&executor).await;
 }

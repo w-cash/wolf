@@ -18,9 +18,9 @@ use super::long_poll::LongPollId;
 /// Optional node-owned construction policy for `createauxblock`.
 ///
 /// Omitting this object keeps the ordinary two-second template waiter. The
-/// speculative policy returns pending after 100 milliseconds if construction
-/// has not finished, without issuing a candidate. Its blocking worker still
-/// owns capacity until it finishes.
+/// speculative policy may yield early only when the exact fetched Wcash tip
+/// was observed and then replaced, without issuing a candidate. Its blocking
+/// worker still owns capacity until it finishes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateAuxBlockOptions {
@@ -66,7 +66,7 @@ impl<'de> Deserialize<'de> for CreateAuxBlockOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CreateAuxBlockMode {
-    /// Bound only the pre-publication template wait, preserving the owned worker.
+    /// Yield an obsolete pre-publication snapshot, preserving its owned worker.
     Speculative,
 }
 

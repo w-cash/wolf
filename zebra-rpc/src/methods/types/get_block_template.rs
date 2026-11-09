@@ -1459,10 +1459,35 @@ where
         T: Send + 'static,
         F: FnOnce() -> RpcResult<T> + Send + 'static,
     {
-        if self.speculative_template_wait {
-            self.template_builder.run_speculative(build).await
-        } else {
-            self.template_builder.run(build).await
+        self.template_builder.run(build).await
+    }
+
+    /// An optional speculative waiter yields only when its exact WEC snapshot
+    /// was observed on the tip watch and then replaced. The detached blocking
+    /// builder retains its existing foreground permit and warms its exact cache key.
+    pub(crate) async fn build_template_for_tip<T, F, Tip>(
+        &self,
+        latest_chain_tip: Tip,
+        snapshot: block::Hash,
+        build: F,
+    ) -> RpcResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> RpcResult<T> + Send + 'static,
+        Tip: ChainTip,
+    {
+        if !self.speculative_template_wait {
+            return self.build_template(build).await;
+        }
+        tokio::select! {
+            result = self.build_template(build) => result,
+            () = template_build::wait_for_obsolete_snapshot(latest_chain_tip, snapshot) => {
+                Err(ErrorObject::borrowed(
+                    crate::methods::WCASH_AUX_TIP_CHANGED_ERROR_CODE,
+                    "Wcash tip changed while constructing the candidate; retry createauxblock",
+                    None,
+                ))
+            }
         }
     }
 

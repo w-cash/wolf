@@ -837,18 +837,33 @@ fn parent_retry_publication_deadline_is_strict_without_renewing_the_original_bou
     }
 }
 
-// This fixture models the node's pre-publication wait boundary, not proving or consensus.
-// The node's real-cache fixtures independently check that a pending reply allocates no lease.
-struct SpeculativeWaitGate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+// This models a proven stale-snapshot event before publication, not a short timer or proving.
+// Actual node fixtures independently check the watch, cache permits and zero-lease yield.
+#[derive(Default)]
+struct SpeculativeProofState {
+    released: bool,
+    obsolete: bool,
+}
+
+struct SpeculativeWaitGate(Arc<(Mutex<SpeculativeProofState>, std::sync::Condvar)>);
 
 impl SpeculativeWaitGate {
     fn new() -> Self {
-        Self(Arc::new((Mutex::new(false), std::sync::Condvar::new())))
+        Self(Arc::new((
+            Mutex::new(SpeculativeProofState::default()),
+            std::sync::Condvar::new(),
+        )))
     }
 
     fn release(&self) {
-        let (released, changed) = &*self.0;
-        *released.lock().unwrap() = true;
+        let (state, changed) = &*self.0;
+        state.lock().unwrap().released = true;
+        changed.notify_all();
+    }
+
+    fn mark_obsolete(&self) {
+        let (state, changed) = &*self.0;
+        state.lock().unwrap().obsolete = true;
         changed.notify_all();
     }
 }
@@ -880,23 +895,24 @@ fn speculative_wait_fixture(
             "getblockcount" => json!(0),
             "getbestblockhash" => json!(*server_tip.lock().unwrap()),
             "createauxblock" => {
-                let (released, changed) = &*proof_gate;
-                if !warm_required_key.load(Ordering::Acquire) && !*released.lock().unwrap() {
-                    if request["params"].get(1) == Some(&json!({"mode":"speculative"})) {
-                        // No candidate or secret retirement token exists on this return path.
-                        return Err(
-                            json!({"code":-32001,"message":"Wcash candidate construction is pending; retry createauxblock"}),
-                        );
-                    }
+                let (state, changed) = &*proof_gate;
+                let speculative = request["params"].get(1) == Some(&json!({"mode":"speculative"}));
+                if !warm_required_key.load(Ordering::Acquire) && !state.lock().unwrap().released {
                     let _ = held_tx.send(());
-                    let (released, timeout) = changed
+                    let (state, timeout) = changed
                         .wait_timeout_while(
-                            released.lock().unwrap(),
+                            state.lock().unwrap(),
                             Duration::from_secs(3),
-                            |released| !*released,
+                            |state| !state.released && !(speculative && state.obsolete),
                         )
                         .unwrap();
-                    if !*released || timeout.timed_out() {
+                    if speculative && state.obsolete {
+                        // Only the explicit stale-snapshot event returns early. No lease exists.
+                        return Err(
+                            json!({"code":-32001,"message":"Wcash tip changed while constructing the candidate; retry createauxblock"}),
+                        );
+                    }
+                    if !state.released || timeout.timed_out() {
                         return Err(json!({"code":-9,"message":"fixture proof gate deadline"}));
                     }
                 }
@@ -919,7 +935,7 @@ fn obsolete_speculative_wait_yields_to_a_warm_required_key_before_old_proof_fini
     let directory = tempdir().unwrap();
     let gate = SpeculativeWaitGate::new();
     let warm_key = Arc::new(AtomicBool::new(false));
-    let (child_rpc, child_tip, _held) = speculative_wait_fixture(&gate, Arc::clone(&warm_key));
+    let (child_rpc, child_tip, held) = speculative_wait_fixture(&gate, Arc::clone(&warm_key));
     let (template_rpc, validator_rpc, parent_tip) =
         parent_retry_rpcs(vec![ParentRetryAction::Accept], child_tip);
     let supervisor =
@@ -931,6 +947,8 @@ fn obsolete_speculative_wait_yields_to_a_warm_required_key_before_old_proof_fini
             .send(preparing.prepare_child_candidate_timed(&mut NativePreparationTiming::new()))
             .unwrap();
     });
+    held.recv_timeout(Duration::from_secs(1)).unwrap();
+    gate.mark_obsolete();
     let result = result_rx.recv_timeout(Duration::from_millis(500));
     if result.is_err() {
         // Baseline red disposes of its owned RPC result before reporting the failure.
@@ -945,9 +963,8 @@ fn obsolete_speculative_wait_yields_to_a_warm_required_key_before_old_proof_fini
     assert!(matches!(
         result.unwrap(),
         Err(MinerError::RpcError {
-            code: Some(-32001),
-            ..
-        })
+            code: Some(-32001), message, ..
+        }) if message == "Wcash tip changed while constructing the candidate; retry createauxblock"
     ));
     assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
     assert!(child_rpc.requests("retireauxblock").is_empty());
@@ -963,7 +980,7 @@ fn obsolete_speculative_wait_yields_to_a_warm_required_key_before_old_proof_fini
         .prepare_generation_timed(&mut NativePreparationTiming::new())
         .unwrap();
     assert!(
-        !*gate.0 .0.lock().unwrap(),
+        !gate.0 .0.lock().unwrap().released,
         "fresh parent must not wait for the obsolete proof"
     );
     assert_eq!(generation.job().parent_tip_display(), "32".repeat(32));
@@ -988,50 +1005,67 @@ fn obsolete_speculative_wait_yields_to_a_warm_required_key_before_old_proof_fini
 }
 
 #[test]
-fn speculative_pending_cannot_make_the_same_cold_required_key_ready() {
+fn stable_speculative_wait_preserves_ready_child_before_zcash_refresh() {
     let directory = tempdir().unwrap();
     let gate = SpeculativeWaitGate::new();
     let (child_rpc, child_tip, held) =
         speculative_wait_fixture(&gate, Arc::new(AtomicBool::new(false)));
-    let (template_rpc, validator_rpc, _) =
+    let (template_rpc, validator_rpc, parent_tip) =
         parent_retry_rpcs(vec![ParentRetryAction::Accept], child_tip);
     let supervisor =
         parent_retry_supervisor(directory.path(), &child_rpc, &template_rpc, &validator_rpc);
-    assert!(matches!(
-        supervisor.prepare_child_candidate_timed(&mut NativePreparationTiming::new()),
-        Err(MinerError::RpcError {
-            code: Some(-32001),
-            ..
-        })
-    ));
     let preparing = Arc::clone(&supervisor);
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     let worker = thread::spawn(move || {
         result_tx
-            .send(preparing.prepare_generation_timed(&mut NativePreparationTiming::new()))
+            .send(preparing.prepare_child_candidate_timed(&mut NativePreparationTiming::new()))
             .unwrap();
     });
     held.recv_timeout(Duration::from_secs(1)).unwrap();
-    let before_release = result_rx.recv_timeout(Duration::from_millis(100));
+    // A stable150ms proof must keep its original successful owned result.
+    let before_release = result_rx.recv_timeout(Duration::from_millis(150));
     gate.release();
     worker.join().unwrap();
-    let mut generation = match before_release {
+    let child = match before_release {
         Ok(result) => {
-            if let Ok(mut generation) = result {
-                generation.retire_generation().unwrap();
+            if let Ok(mut child) = result {
+                child.retire().unwrap();
             }
-            panic!("a pending reply must not make the same cold key ready");
+            panic!("unchanged speculative work must retain its ordinary positive wait");
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => result_rx.try_recv().unwrap().unwrap(),
-        Err(error) => {
-            panic!("required-key fixture disconnected: {error}");
-        }
+        Err(error) => panic!("stable-key fixture disconnected: {error}"),
     };
+    assert!(child.ready_age().unwrap() >= Duration::from_millis(150));
+    assert!(child.is_fresh());
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+    assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+    let lease = child.child.as_ref().unwrap().lease.clone();
+    let original_deadline = child.child.as_ref().unwrap().ready_deadline;
+    assert!(original_deadline.unwrap() > Instant::now());
+    // This demand arrives after the successful prefetch, rather than after a new cooldown.
+    {
+        let mut tip = parent_tip.lock().unwrap();
+        tip.height = 1;
+        tip.hash = "32".repeat(32);
+    }
+    let mut generation = child
+        .prepare_generation_timed(&mut NativePreparationTiming::new())
+        .unwrap();
+    assert_eq!(generation.job().parent_tip_display(), "32".repeat(32));
+    assert_eq!(
+        child_rpc.requests("createauxblock").len(),
+        1,
+        "fresh ZEC parent must consume the ready child without another WEC acquisition"
+    );
+    assert_eq!(template_rpc.requests("getblocktemplate").len(), 1);
+    assert_eq!(validator_rpc.requests("getblocktemplate").len(), 1);
     assert_eq!(supervisor.journal.generation_count().unwrap(), 1);
-    let creates = child_rpc.requests("createauxblock");
-    assert_eq!(creates.len(), 2);
-    assert_eq!(creates[0]["params"][1], json!({"mode":"speculative"}));
-    assert_eq!(creates[1]["params"].as_array().unwrap().len(), 1);
     generation.retire_generation().unwrap();
-    assert_eq!(child_rpc.requests("retireauxblock").len(), 1);
+    let retirements = child_rpc.requests("retireauxblock");
+    assert_eq!(retirements.len(), 1);
+    assert_eq!(
+        retirements[0]["params"],
+        json!([lease.hash, lease.retire_token])
+    );
 }

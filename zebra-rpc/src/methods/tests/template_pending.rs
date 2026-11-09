@@ -31,6 +31,50 @@ use crate::{
 
 const TEST_LIMIT: Duration = Duration::from_secs(8);
 
+// Keep each test-owned blocking proof bounded and join it even when an
+// assertion or a mock expectation unwinds before the normal cleanup path.
+struct OwnedWarmer<T> {
+    release: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<T>>,
+}
+
+impl<T> OwnedWarmer<T> {
+    fn new(release: mpsc::Sender<()>, thread: thread::JoinHandle<T>) -> Self {
+        Self {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .expect("owned worker exists until joined")
+            .is_finished()
+    }
+
+    fn join(mut self) -> thread::Result<T> {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        self.thread
+            .take()
+            .expect("owned worker is joined once")
+            .join()
+    }
+}
+
+impl<T> Drop for OwnedWarmer<T> {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn template_build_pending_createauxblock_issues_no_candidate_or_retirement_token() {
     let network = Network::new_wcash_regtest();
@@ -197,7 +241,7 @@ async fn template_build_pending_createauxblock_issues_no_candidate_or_retirement
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn speculative_createauxblock_deadline_returns_pending_without_candidate() {
+async fn speculative_createauxblock_yields_obsolete_snapshot_without_candidate() {
     let network = Network::new_wcash_regtest();
     let configured = WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, [1; 20]);
     let alternate = WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, [2; 20]);
@@ -263,7 +307,9 @@ async fn speculative_createauxblock_deadline_returns_pending_without_candidate()
             Ok::<_, &'static str>(warming_coinbase)
         })
     });
+    let warmer = OwnedWarmer::new(release_tx.clone(), warmer);
     timeout(TEST_LIMIT, entered_rx).await.unwrap().unwrap();
+    let old_entered = tokio::time::Instant::now();
 
     let module = rpc.clone().into_rpc();
     let request = serde_json::json!({
@@ -293,6 +339,11 @@ async fn speculative_createauxblock_deadline_returns_pending_without_candidate()
                 transaction_dependencies: Default::default(),
                 last_seen_tip_hash: tip_hash,
             });
+        // Only this real exact-hash watch change may end the speculative
+        // wait early; the original proof remains held until explicit cleanup.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        tip_sender.send_best_tip_hash(zebra_chain::block::Hash([0x42; 32]));
+        tip_sender.send_best_tip_height(Height(1));
     };
     // Drive both local futures without requiring raw_json_request's borrowed
     // dispatch future to be Send. This bound is below the legacy two seconds.
@@ -309,6 +360,7 @@ async fn speculative_createauxblock_deadline_returns_pending_without_candidate()
         let next_height = Height(2);
         let next_coinbase =
             TransactionTemplate::new_coinbase(&network, next_height, &params, fee).unwrap();
+        let expected_next_coinbase = next_coinbase.clone();
         cache.get_or_build(next_height, fee, || next_coinbase);
         let next_tip = zebra_chain::block::Hash([0x42; 32]);
         tip_sender.send_best_tip_hash(next_tip);
@@ -364,6 +416,77 @@ async fn speculative_createauxblock_deadline_returns_pending_without_candidate()
             .as_str()
             .is_some_and(|token| token.len() == 64));
         assert_eq!(rpc.wcash_aux_blocks.allocation_counts(), (1, 1, 0));
+        // A later optional prefetch still has the other ORIGINAL foreground
+        // slot after the old proof has outlived the legacy retry opportunity.
+        // No additional speculative admission semaphore may block this hit.
+        tokio::time::sleep_until(old_entered + Duration::from_millis(2300)).await;
+        assert!(!warmer.is_finished());
+        let followon_rpc = rpc.clone();
+        let followon_address = alternate.to_string();
+        let followon = tokio::spawn(async move {
+            followon_rpc
+                .create_aux_block(
+                    followon_address,
+                    Some(crate::CreateAuxBlockOptions {
+                        mode: crate::CreateAuxBlockMode::Speculative,
+                    }),
+                )
+                .await
+        });
+        read_state
+            .expect_request(ReadRequest::ChainInfo)
+            .await
+            .respond(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                tip_hash: next_tip,
+                tip_height: Height(1),
+                expected_difficulty: wcash_regtest_genesis_block().header.difficulty_threshold,
+                cur_time: now,
+                min_time: now,
+                max_time: now,
+                chain_history_root: Some([0x44; 32].into()),
+            }));
+        mempool
+            .expect_request(mempool::Request::FullTransactions)
+            .await
+            .respond(mempool::Response::FullTransactions {
+                transactions: vec![],
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: next_tip,
+            });
+        verifier
+            .expect_request_that(|request| {
+                matches!(request, zebra_consensus::Request::CheckProposal(_))
+            })
+            .await
+            .respond_with(|request| match request {
+                zebra_consensus::Request::CheckProposal(block) => block.hash(),
+                _ => unreachable!("the follow-on candidate requires proposal validation"),
+            });
+        let followon = timeout(Duration::from_millis(750), followon)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let followon = serde_json::to_value(followon).unwrap();
+        // Fresh candidate nonces deliberately give the two requests distinct
+        // IDs while they consume the same new-parent coinbase cache key.
+        assert_ne!(followon["hash"], demanded["hash"]);
+        assert_eq!(followon["height"], demanded["height"]);
+        assert_eq!(followon["previousblockhash"], demanded["previousblockhash"]);
+        assert_eq!(followon["coinbasevalue"], demanded["coinbasevalue"]);
+        assert_eq!(followon["target"], demanded["target"]);
+        assert_ne!(followon["retiretoken"], demanded["retiretoken"]);
+        assert_eq!(
+            cache.get_or_build(next_height, fee, || {
+                panic!("the follow-on request preserves the exact warmed coinbase key")
+            }),
+            expected_next_coinbase
+        );
+        assert_eq!(rpc.wcash_aux_blocks.allocation_counts(), (2, 2, 0));
+        assert!(
+            !warmer.is_finished(),
+            "the obsolete proof is still owned and held"
+        );
         for options in [
             serde_json::json!({}),
             serde_json::json!({"mode": "unknown"}),
@@ -429,7 +552,7 @@ async fn speculative_createauxblock_deadline_returns_pending_without_candidate()
             .unwrap()
             .expect_err("the same-height changed parent must reject publication");
         assert_eq!(reorg.code(), WCASH_AUX_TIP_CHANGED_ERROR_CODE);
-        assert_eq!(rpc.wcash_aux_blocks.allocation_counts(), (1, 1, 0));
+        assert_eq!(rpc.wcash_aux_blocks.allocation_counts(), (2, 2, 0));
     }
     // Clean up the owned blocking proof before asserting the baseline failure.
     release_tx.send(()).unwrap();
@@ -444,9 +567,188 @@ async fn speculative_createauxblock_deadline_returns_pending_without_candidate()
     assert!(response["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("construction is pending"));
+        .contains("tip changed while constructing"));
     assert!(response.get("result").is_none());
-    // Only the new demanded candidate was published; completion of the old
-    // detached template cannot allocate or publish a late candidate.
+    // Only the two independently nonced new-parent candidates were published;
+    // completion of the old detached template cannot allocate a late candidate.
+    assert_eq!(rpc.wcash_aux_blocks.allocation_counts(), (2, 2, 0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn speculative_stable_tip_preserves_ready_candidate_after_150ms() {
+    assert_stable_speculative_candidate(Duration::from_millis(150), false, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn speculative_stable_tip_preserves_ready_candidate_after_1900ms() {
+    assert_stable_speculative_candidate(Duration::from_millis(1900), false, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn speculative_lagging_watch_and_same_hash_preserve_ready_candidate() {
+    assert_stable_speculative_candidate(Duration::from_millis(150), true, true).await;
+}
+
+async fn assert_stable_speculative_candidate(
+    ready_after: Duration,
+    lagging_watch: bool,
+    same_hash_notification: bool,
+) {
+    let network = Network::new_wcash_regtest();
+    let configured = WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, [1; 20]);
+    let alternate = WcashAddress::from_transparent_p2pkh(NetworkType::Regtest, [2; 20]);
+    let params = MinerParams::new(
+        &network,
+        mining::Config {
+            miner_address: Some(alternate.clone().into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let height = Height(1);
+    let fee = Amount::zero();
+    let expected = TransactionTemplate::new_coinbase(&network, height, &params, fee)
+        .expect("the transparent fixture requires no private proof");
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut verifier: MockService<_, _, _, BoxError> = MockService::build()
+        .with_max_request_delay(Duration::from_secs(4))
+        .for_unit_tests();
+    let (tip, tip_sender) = MockChainTip::new();
+    let tip_hash = network.genesis_hash();
+    tip_sender.send_best_tip_hash(if lagging_watch {
+        zebra_chain::block::Hash([0x61; 32])
+    } else {
+        tip_hash
+    });
+    tip_sender.send_best_tip_height(Height(0));
+    tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    let mut synced = MockSyncStatus::default();
+    synced.set_is_close_to_tip(true);
+    let (_log_tx, log_rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = RpcImpl::new(
+        network.clone(),
+        mining::Config {
+            miner_address: Some(configured.into()),
+            ..Default::default()
+        },
+        Default::default(),
+        "0.0.1",
+        "pending template fixture",
+        Buffer::new(mempool.clone(), 1),
+        state,
+        Buffer::new(read_state.clone(), 1),
+        verifier.clone(),
+        synced,
+        tip,
+        MockAddressBookPeers::default(),
+        log_rx,
+        None,
+    );
+    assert_eq!(rpc.wcash_aux_blocks.allocation_counts(), (0, 0, 0));
+
+    let mut alternate_handler = rpc.gbt.clone();
+    alternate_handler.set_auxiliary_miner_params(params.clone());
+    let cache = alternate_handler.coinbase_cache();
+    let warming_cache = cache.clone();
+    let warming_coinbase = expected.clone();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let warmer = thread::spawn(move || {
+        warming_cache.try_get_or_build(height, fee, || {
+            let _ = entered_tx.send(());
+            release_rx
+                .recv_timeout(TEST_LIMIT)
+                .expect("the pending RPC test releases the held proof");
+            Ok::<_, &'static str>(warming_coinbase)
+        })
+    });
+    let warmer = OwnedWarmer::new(release_tx.clone(), warmer);
+    timeout(TEST_LIMIT, entered_rx).await.unwrap().unwrap();
+
+    let module = rpc.clone().into_rpc();
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "createauxblock",
+        "params": [alternate.to_string(), {"mode": "speculative"}]
+    })
+    .to_string();
+    let (rpc_done_tx, rpc_done_rx) = oneshot::channel();
+    let response = async {
+        let response = module.raw_json_request(&request, 1).await;
+        let _ = rpc_done_tx.send(());
+        response
+    };
+    let now = DateTime32::now();
+    let responses = async {
+        read_state
+            .expect_request(ReadRequest::ChainInfo)
+            .await
+            .respond(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                tip_hash,
+                tip_height: Height(0),
+                expected_difficulty: wcash_regtest_genesis_block().header.difficulty_threshold,
+                cur_time: now,
+                min_time: now,
+                max_time: now,
+                chain_history_root: None,
+            }));
+        mempool
+            .expect_request(mempool::Request::FullTransactions)
+            .await
+            .respond(mempool::Response::FullTransactions {
+                transactions: vec![],
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: tip_hash,
+            });
+        tokio::select! {
+            request = verifier.expect_request_that(|request| {
+                matches!(request, zebra_consensus::Request::CheckProposal(_))
+            }) => {
+                request.respond_with(|request| match request {
+                    zebra_consensus::Request::CheckProposal(block) => block.hash(),
+                    _ => unreachable!("the stable candidate requires proposal validation"),
+                });
+                true
+            }
+            _ = rpc_done_rx => false,
+        }
+    };
+    // No WEC tip or later parent-demand event occurs. A proof completing
+    // inside the existing two-second budget must remain a usable prefetch.
+    let release = async {
+        let release_at = tokio::time::Instant::now() + ready_after;
+        if lagging_watch {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tip_sender.send_best_tip_hash(tip_hash);
+        }
+        if same_hash_notification {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tip_sender.send_best_tip_hash(tip_hash);
+        }
+        tokio::time::sleep_until(release_at).await;
+        release_tx.send(()).unwrap();
+    };
+    let (response, proposal_checked, ()) = timeout(TEST_LIMIT, async {
+        tokio::join!(response, responses, release)
+    })
+    .await
+    .expect("all owned fixture operations finish within their bound");
+    assert_eq!(warmer.join().unwrap().unwrap(), expected);
+    let (response, _) = response.unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert!(
+        response.get("error").is_none(),
+        "a stable speculative request must preserve a proof ready inside two seconds: {response}"
+    );
+    assert!(
+        proposal_checked,
+        "a successful candidate requires independent proposal validation"
+    );
+    assert_eq!(response["result"]["height"], 1);
+    assert!(response["result"]["retiretoken"]
+        .as_str()
+        .is_some_and(|token| token.len() == 64));
     assert_eq!(rpc.wcash_aux_blocks.allocation_counts(), (1, 1, 0));
 }

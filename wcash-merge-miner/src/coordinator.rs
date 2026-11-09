@@ -678,7 +678,7 @@ impl NativeMiningSupervisor {
         let acquired_at = Instant::now();
         let ready_deadline = prefetched.then_some(acquired_at + MAX_PREFETCHED_CHILD_AGE);
         timing.enter(PreparationPhase::WcashCandidate);
-        // This is a node-owned, pre-publication wait budget, not a shorter
+        // This is a node-owned, pre-publication stale-tip policy, not a shorter
         // transport timeout. Always consume its complete response: a successful
         // reply owns an exact candidate and retirement capability.
         let params = if prefetched {

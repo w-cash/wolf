@@ -32,7 +32,7 @@ impl NativePreparationOrigin {
     }
 }
 
-/// Cached controller reason, not proof of when a network tip or ASIC changed.
+/// Process-local controller reason, not proof of when a network tip or ASIC changed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativePreparationCause {
     /// No generation has been activated.
@@ -49,6 +49,8 @@ pub enum NativePreparationCause {
     BothUnavailable,
     /// Healthy work has no unused ready child.
     PrefetchRefill,
+    /// An exact speculative stale-parent response requested a refresh, without changing admission.
+    PrefetchParentChanged,
 }
 
 impl NativePreparationCause {
@@ -61,6 +63,7 @@ impl NativePreparationCause {
             Self::ZcashUnavailable => "zcash_unavailable",
             Self::BothUnavailable => "both_unavailable",
             Self::PrefetchRefill => "prefetch_refill",
+            Self::PrefetchParentChanged => "prefetch_parent_changed",
         }
     }
 }
