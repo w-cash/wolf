@@ -120,5 +120,31 @@ impl TemplateBuildExecutor {
     }
 }
 
+/// Wait until the exact fetched snapshot has been observed and then replaced.
+///
+/// Read-state can publish a committed tip before the tip watch catches up, so
+/// an initial different hash does not prove that the fetched snapshot is old.
+/// Watch failure falls back to the existing bounded template build, without
+/// repeatedly polling a closed watch.
+pub(super) async fn wait_for_obsolete_snapshot<Tip: zebra_chain::chain_tip::ChainTip>(
+    mut latest_chain_tip: Tip,
+    snapshot: zebra_chain::block::Hash,
+) {
+    let mut observed_snapshot = false;
+    loop {
+        // Mark first, then inspect: an update between inspection and waiting
+        // stays unseen and wakes best_tip_changed instead of being lost.
+        latest_chain_tip.mark_best_tip_seen();
+        match latest_chain_tip.best_tip_hash() {
+            Some(hash) if hash == snapshot => observed_snapshot = true,
+            Some(_) if observed_snapshot => return,
+            _ => {}
+        }
+        if latest_chain_tip.best_tip_changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

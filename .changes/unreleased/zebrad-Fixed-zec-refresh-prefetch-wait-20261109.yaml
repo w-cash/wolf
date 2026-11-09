@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: Yield speculative Wcash template waits only after their exact parent becomes obsolete, allowing required merged jobs to use a different warm key. Preserve healthy positive prefetch, demanded requests, proof ownership and capacity, and report preparation origin and blocked demand without logging private candidate material.
+time: 2026-11-09T18:45:00Z

@@ -20,7 +20,7 @@ use wcash_pool_protocol::{Hex32, MergedChain, WinnerDescriptor};
 
 use crate::{
     pool_backend_journal::PoolBackendJournalError,
-    preparation_timing::{PreparationPhase, PreparationReport},
+    preparation_timing::{NativePreparationContext, PreparationPhase, PreparationReport},
     MinerError, NativeSubmissionStats, PoolBackendWinnerSnapshot, PoolBackendZcashWorkStats,
     PoolWinnerReconciliationError,
 };
@@ -98,6 +98,11 @@ pub enum NativeBackendRuntimeEvent<'a> {
     SubmissionObservation(NativeSubmissionStats),
     /// An authoritative job was activated; this is not an ASIC-notification receipt.
     JobActivated(&'a wcash_pool_protocol::JobDescriptor),
+    /// The same activation with fixed controller request correlation.
+    JobActivatedForRequest(
+        &'a wcash_pool_protocol::JobDescriptor,
+        NativePreparationContext,
+    ),
     /// Shutdown cleanup completed.
     Stopped,
     /// A nonfatal listener connection ended with a fixed protocol reason.
@@ -151,6 +156,7 @@ enum RuntimeMetadata {
         wcash_height: u32,
         zcash_height: u32,
         max_age_ms: u64,
+        context: Option<NativePreparationContext>,
     },
     Failure(RuntimeFailure),
     Outbox {
@@ -215,6 +221,7 @@ pub fn record_native_backend_runtime(event: NativeBackendRuntimeEvent<'_>) {
     if matches!(
         &event,
         NativeBackendRuntimeEvent::JobActivated(_)
+            | NativeBackendRuntimeEvent::JobActivatedForRequest(_, _)
             | NativeBackendRuntimeEvent::Stopped
             | NativeBackendRuntimeEvent::ZcashWorkObservation(_)
             | NativeBackendRuntimeEvent::SubmissionObservation(_)
@@ -256,7 +263,15 @@ fn runtime_event(event: NativeBackendRuntimeEvent<'_>) -> Event {
                 wcash_height: job.wcash_height,
                 zcash_height: job.zcash_height,
                 max_age_ms: u64::from(job.max_age_ms),
+                context: None,
             });
+            event
+        }
+        NativeBackendRuntimeEvent::JobActivatedForRequest(job, context) => {
+            let mut event = runtime_event(NativeBackendRuntimeEvent::JobActivated(job));
+            if let Some(RuntimeMetadata::Activated { context: slot, .. }) = event.runtime.as_mut() {
+                *slot = Some(context);
+            }
             event
         }
         NativeBackendRuntimeEvent::Stopped => Event::new(None, "backend_runtime", "stopped"),
@@ -803,6 +818,18 @@ fn preparation_event(report: PreparationReport) -> Event {
     event
 }
 
+fn preparation_context_json(context: NativePreparationContext) -> serde_json::Value {
+    json!({
+        "request_id":context.request_id,
+        "origin":context.origin.name(),
+        "replacement_cause":context.cause.name(),
+        "blocked_demand_wait_ms":context.blocked_demand_wait_ms,
+        "blocked_replacement_cause":context.blocked_replacement_cause.map(|cause| cause.name()),
+        "scope":"process_local_controller_observation",
+        "asserts_asic_notify_time":false
+    })
+}
+
 fn record(event: Event) {
     #[cfg(test)]
     if TEST_SINK.with(|sink| {
@@ -1255,7 +1282,9 @@ impl Reporter {
                 })
                 .collect();
             json!({
-                "scope":"backend_preparation_through_activation",
+                "scope":if report.context.is_some_and(|context| context.origin == crate::NativePreparationOrigin::SpeculativePrefetch) {
+                    "backend_speculative_child_acquisition"
+                } else { "backend_preparation_through_activation" },
                 "outcome":report.result.label(),
                 "elapsed_ms":report.elapsed_ms,
                 "phase_ms":phases,
@@ -1264,6 +1293,7 @@ impl Reporter {
                 "wcash_candidate_height":report.wcash_height,
                 "zcash_candidate_height":report.zcash_height,
                 "rpc_subreason":report.rpc_subreason,
+                "controller":report.context.map(preparation_context_json),
                 "parent_failure":report.failure_context.map(|context| json!({
                     "node_role":context.role.map(|role| role.name()),
                     "node_index":context.index,
@@ -1345,9 +1375,11 @@ impl Reporter {
                 wcash_height,
                 zcash_height,
                 max_age_ms,
+                context,
             } => json!({
                 "job_id":hex::encode(job), "wcash_height":wcash_height,
                 "zcash_height":zcash_height, "max_age_ms":max_age_ms,
+                "preparation_controller":context.map(preparation_context_json),
                 "asserts_asic_notify_time":false
             }),
             RuntimeMetadata::Failure(metadata) => json!({
@@ -1860,8 +1892,72 @@ mod tests {
             zcash_height: None,
             failure_context: None,
             rpc_subreason: None,
+            context: None,
             result: PreparationResult::Failed("rpc_error"),
         }
+    }
+
+    #[test]
+    fn preparation_controller_metadata_is_fixed_public_and_linked_to_activation() {
+        use crate::{NativePreparationCause, NativePreparationOrigin};
+        let context = NativePreparationContext {
+            request_id: 42,
+            origin: NativePreparationOrigin::ParentFromReady,
+            cause: NativePreparationCause::ZcashUnavailable,
+            blocked_demand_wait_ms: None,
+            blocked_replacement_cause: None,
+        };
+        let mut output = Vec::new();
+        let now = Instant::now();
+        Reporter::new(now)
+            .record(
+                &mut output,
+                runtime_event(NativeBackendRuntimeEvent::JobActivatedForRequest(
+                    &runtime_job(),
+                    context,
+                )),
+                now,
+                0,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["runtime"]["preparation_controller"]["request_id"], 42);
+        assert_eq!(
+            value["runtime"]["preparation_controller"]["origin"],
+            "parent_from_ready"
+        );
+        assert_eq!(
+            value["runtime"]["preparation_controller"]["replacement_cause"],
+            "zcash_unavailable"
+        );
+        assert_eq!(value["runtime"]["asserts_asic_notify_time"], false);
+        let mut report = preparation_fixture();
+        report.context = Some(NativePreparationContext {
+            origin: NativePreparationOrigin::SpeculativePrefetch,
+            cause: NativePreparationCause::PrefetchRefill,
+            blocked_demand_wait_ms: Some(100),
+            blocked_replacement_cause: Some(NativePreparationCause::WcashUnavailable),
+            ..context
+        });
+        let mut output = Vec::new();
+        Reporter::new(now)
+            .record(&mut output, preparation_event(report), now, 0)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            value["preparation"]["scope"],
+            "backend_speculative_child_acquisition"
+        );
+        assert_eq!(value["preparation"]["controller"]["request_id"], 42);
+        assert_eq!(
+            value["preparation"]["controller"]["blocked_demand_wait_ms"],
+            100
+        );
+        assert_eq!(
+            value["preparation"]["controller"]["blocked_replacement_cause"],
+            "wcash_unavailable"
+        );
+        assert!(!String::from_utf8(output).unwrap().contains("PRIVATE"));
     }
 
     #[test]

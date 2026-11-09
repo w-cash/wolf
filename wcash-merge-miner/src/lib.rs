@@ -78,7 +78,10 @@ pub use pool_backend_actor::{
 pub use pool_backend_workers::{
     is_retryable_winner_reconciliation_error, PoolBackendWinnerWorkers,
 };
-pub use preparation_timing::{NativePreparationTiming, PreparationPhase};
+pub use preparation_timing::{
+    NativePreparationCause, NativePreparationContext, NativePreparationOrigin,
+    NativePreparationTiming, PreparationPhase,
+};
 pub use submission_observation::NativeSubmissionStats;
 pub use zcash_recovery::{
     NativePoolZcashRecoveryAuthority, PoolBackendZcashRecoveryAuthority,

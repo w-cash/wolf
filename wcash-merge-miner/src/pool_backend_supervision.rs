@@ -167,6 +167,12 @@ impl NativePoolCurrentnessProbe {
         self.state.live_bits() != BOTH_CURRENT
     }
 
+    /// Copies one cached atomic observation for diagnostics, without a probe or mutation.
+    pub fn currentness_for_diagnostics(&self) -> (bool, bool) {
+        let bits = self.state.live_bits();
+        (bits & WCASH_CURRENT != 0, bits & ZCASH_CURRENT != 0)
+    }
+
     /// Permanently closes this state before its candidate enters retirement.
     pub fn close(&self) {
         self.state.bits.fetch_or(CLOSED, Ordering::AcqRel);

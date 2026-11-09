@@ -190,7 +190,9 @@ fn prefetch_supervisor(
 #[test]
 fn prefetched_child_is_validated_without_starting_a_parent_job_or_journal() {
     let directory = tempdir().unwrap();
-    let (child_rpc, _) = prefetch_child_rpc([0x71; 20], 0, Duration::from_millis(25));
+    // Older nodes can ignore the extra argument. Their successful late reply
+    // must still be fully consumed and its exact lease retained, not timed out.
+    let (child_rpc, _) = prefetch_child_rpc([0x71; 20], 0, Duration::from_millis(150));
     let parent_rpc = prefetch_parent_identity_rpc();
     let (supervisor, _validator_rpc) =
         prefetch_supervisor(directory.path(), &child_rpc, &parent_rpc);
@@ -204,7 +206,7 @@ fn prefetched_child_is_validated_without_starting_a_parent_job_or_journal() {
         inner.ready_deadline,
         Some(inner.acquired_at + MAX_PREFETCHED_CHILD_AGE)
     );
-    assert!(child.ready_age().unwrap() >= Duration::from_millis(25));
+    assert!(child.ready_age().unwrap() >= Duration::from_millis(150));
     assert!(child.is_fresh());
     assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
     assert!(!supervisor
@@ -216,6 +218,10 @@ fn prefetched_child_is_validated_without_starting_a_parent_job_or_journal() {
     assert!(!redacted.contains(&expected_lease.retire_token));
     assert_eq!(child.retire().unwrap(), GenerationRetirement::Retired);
     assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+    assert_eq!(
+        child_rpc.requests("createauxblock")[0]["params"][1],
+        json!({"mode":"speculative"})
+    );
     assert_eq!(
         child_rpc.requests("retireauxblock")[0]["params"],
         json!([expected_lease.hash, expected_lease.retire_token])
@@ -829,4 +835,237 @@ fn parent_retry_publication_deadline_is_strict_without_renewing_the_original_bou
             Err(MinerError::PrefetchedChildExpired)
         ));
     }
+}
+
+// This models a proven stale-snapshot event before publication, not a short timer or proving.
+// Actual node fixtures independently check the watch, cache permits and zero-lease yield.
+#[derive(Default)]
+struct SpeculativeProofState {
+    released: bool,
+    obsolete: bool,
+}
+
+struct SpeculativeWaitGate(Arc<(Mutex<SpeculativeProofState>, std::sync::Condvar)>);
+
+impl SpeculativeWaitGate {
+    fn new() -> Self {
+        Self(Arc::new((
+            Mutex::new(SpeculativeProofState::default()),
+            std::sync::Condvar::new(),
+        )))
+    }
+
+    fn release(&self) {
+        let (state, changed) = &*self.0;
+        state.lock().unwrap().released = true;
+        changed.notify_all();
+    }
+
+    fn mark_obsolete(&self) {
+        let (state, changed) = &*self.0;
+        state.lock().unwrap().obsolete = true;
+        changed.notify_all();
+    }
+}
+
+impl Drop for SpeculativeWaitGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn speculative_wait_fixture(
+    gate: &SpeculativeWaitGate,
+    warm_required_key: Arc<AtomicBool>,
+) -> (
+    PrefetchRpcFixture,
+    Arc<Mutex<String>>,
+    std::sync::mpsc::Receiver<()>,
+) {
+    let tip = Arc::new(Mutex::new(
+        Network::new_wcash_regtest().genesis_hash().to_string(),
+    ));
+    let server_tip = Arc::clone(&tip);
+    let proof_gate = Arc::clone(&gate.0);
+    let mut allocated = 0u8;
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let fixture = PrefetchRpcFixture::spawn(move |request| {
+        Ok(match request["method"].as_str().unwrap() {
+            "getblockhash" => json!(Network::new_wcash_regtest().genesis_hash().to_string()),
+            "getblockcount" => json!(0),
+            "getbestblockhash" => json!(*server_tip.lock().unwrap()),
+            "createauxblock" => {
+                let (state, changed) = &*proof_gate;
+                let speculative = request["params"].get(1) == Some(&json!({"mode":"speculative"}));
+                if !warm_required_key.load(Ordering::Acquire) && !state.lock().unwrap().released {
+                    let _ = held_tx.send(());
+                    let (state, timeout) = changed
+                        .wait_timeout_while(
+                            state.lock().unwrap(),
+                            Duration::from_secs(3),
+                            |state| !(state.released || speculative && state.obsolete),
+                        )
+                        .unwrap();
+                    if speculative && state.obsolete {
+                        // Only the explicit stale-snapshot event returns early. No lease exists.
+                        return Err(
+                            json!({"code":-32001,"message":"Wcash tip changed while constructing the candidate; retry createauxblock"}),
+                        );
+                    }
+                    if !state.released || timeout.timed_out() {
+                        return Err(json!({"code":-9,"message":"fixture proof gate deadline"}));
+                    }
+                }
+                allocated = allocated.checked_add(1).unwrap();
+                prefetch_child_response([0x71; 20], allocated)
+            }
+            "retireauxblock" => json!({"state":"retired"}),
+            _ => {
+                return Err(
+                    json!({"code":-32601,"message":"unexpected speculative fixture method"}),
+                )
+            }
+        })
+    });
+    (fixture, tip, held_rx)
+}
+
+#[test]
+fn obsolete_speculative_wait_yields_to_a_warm_required_key_before_old_proof_finishes() {
+    let directory = tempdir().unwrap();
+    let gate = SpeculativeWaitGate::new();
+    let warm_key = Arc::new(AtomicBool::new(false));
+    let (child_rpc, child_tip, held) = speculative_wait_fixture(&gate, Arc::clone(&warm_key));
+    let (template_rpc, validator_rpc, parent_tip) =
+        parent_retry_rpcs(vec![ParentRetryAction::Accept], child_tip);
+    let supervisor =
+        parent_retry_supervisor(directory.path(), &child_rpc, &template_rpc, &validator_rpc);
+    let preparing = Arc::clone(&supervisor);
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        result_tx
+            .send(preparing.prepare_child_candidate_timed(&mut NativePreparationTiming::new()))
+            .unwrap();
+    });
+    held.recv_timeout(Duration::from_secs(1)).unwrap();
+    gate.mark_obsolete();
+    let result = result_rx.recv_timeout(Duration::from_millis(500));
+    if result.is_err() {
+        // Baseline red disposes of its owned RPC result before reporting the failure.
+        gate.release();
+        worker.join().unwrap();
+        if let Ok(Ok(mut child)) = result_rx.try_recv() {
+            child.retire().unwrap();
+        }
+        panic!("speculative pre-publication wait held the only preparation worker");
+    }
+    worker.join().unwrap();
+    assert!(matches!(
+        result.unwrap(),
+        Err(MinerError::RpcError {
+            code: Some(-32001), message, ..
+        }) if message == "Wcash tip changed while constructing the candidate; retry createauxblock"
+    ));
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+    assert!(child_rpc.requests("retireauxblock").is_empty());
+
+    // The held proof belongs to an obsolete selection; the new required exact key is ready.
+    warm_key.store(true, Ordering::Release);
+    {
+        let mut tip = parent_tip.lock().unwrap();
+        tip.height = 1;
+        tip.hash = "32".repeat(32);
+    }
+    let mut generation = supervisor
+        .prepare_generation_timed(&mut NativePreparationTiming::new())
+        .unwrap();
+    assert!(
+        !gate.0 .0.lock().unwrap().released,
+        "fresh parent must not wait for the obsolete proof"
+    );
+    assert_eq!(generation.job().parent_tip_display(), "32".repeat(32));
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 1);
+    let creates = child_rpc.requests("createauxblock");
+    assert_eq!(creates.len(), 2);
+    assert_eq!(creates[0]["params"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        creates[1]["params"].as_array().unwrap().len(),
+        1,
+        "demand keeps the ordinary RPC contract"
+    );
+    assert_eq!(template_rpc.requests("getblocktemplate").len(), 1);
+    assert_eq!(validator_rpc.requests("getblocktemplate").len(), 1);
+    generation.retire_generation().unwrap();
+    assert_eq!(
+        child_rpc.requests("retireauxblock").len(),
+        1,
+        "only the published demanded candidate has a lease"
+    );
+    gate.release();
+}
+
+#[test]
+fn stable_speculative_wait_preserves_ready_child_before_zcash_refresh() {
+    let directory = tempdir().unwrap();
+    let gate = SpeculativeWaitGate::new();
+    let (child_rpc, child_tip, held) =
+        speculative_wait_fixture(&gate, Arc::new(AtomicBool::new(false)));
+    let (template_rpc, validator_rpc, parent_tip) =
+        parent_retry_rpcs(vec![ParentRetryAction::Accept], child_tip);
+    let supervisor =
+        parent_retry_supervisor(directory.path(), &child_rpc, &template_rpc, &validator_rpc);
+    let preparing = Arc::clone(&supervisor);
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        result_tx
+            .send(preparing.prepare_child_candidate_timed(&mut NativePreparationTiming::new()))
+            .unwrap();
+    });
+    held.recv_timeout(Duration::from_secs(1)).unwrap();
+    // A stable150ms proof must keep its original successful owned result.
+    let before_release = result_rx.recv_timeout(Duration::from_millis(150));
+    gate.release();
+    worker.join().unwrap();
+    let child = match before_release {
+        Ok(result) => {
+            if let Ok(mut child) = result {
+                child.retire().unwrap();
+            }
+            panic!("unchanged speculative work must retain its ordinary positive wait");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => result_rx.try_recv().unwrap().unwrap(),
+        Err(error) => panic!("stable-key fixture disconnected: {error}"),
+    };
+    assert!(child.ready_age().unwrap() >= Duration::from_millis(150));
+    assert!(child.is_fresh());
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+    assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+    let lease = child.child.as_ref().unwrap().lease.clone();
+    let original_deadline = child.child.as_ref().unwrap().ready_deadline;
+    assert!(original_deadline.unwrap() > Instant::now());
+    // This demand arrives after the successful prefetch, rather than after a new cooldown.
+    {
+        let mut tip = parent_tip.lock().unwrap();
+        tip.height = 1;
+        tip.hash = "32".repeat(32);
+    }
+    let mut generation = child
+        .prepare_generation_timed(&mut NativePreparationTiming::new())
+        .unwrap();
+    assert_eq!(generation.job().parent_tip_display(), "32".repeat(32));
+    assert_eq!(
+        child_rpc.requests("createauxblock").len(),
+        1,
+        "fresh ZEC parent must consume the ready child without another WEC acquisition"
+    );
+    assert_eq!(template_rpc.requests("getblocktemplate").len(), 1);
+    assert_eq!(validator_rpc.requests("getblocktemplate").len(), 1);
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 1);
+    generation.retire_generation().unwrap();
+    let retirements = child_rpc.requests("retireauxblock");
+    assert_eq!(retirements.len(), 1);
+    assert_eq!(
+        retirements[0]["params"],
+        json!([lease.hash, lease.retire_token])
+    );
 }

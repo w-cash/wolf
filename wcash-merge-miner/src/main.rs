@@ -34,11 +34,12 @@ use wcash_merge_miner::{
     },
     CoordinatorConfig, GenerationRetirement, JobConfig, MinerError, NativeBackendRuntimeEvent,
     NativeMiningCoordinator, NativeMiningSupervisor, NativePoolBackendRetainedJob,
-    NativePoolZcashRecoveryAuthority, NativePreparationTiming, NativePreparedChild,
-    NativeZcashConfig, NativeZcashNetwork, PoolBackendActor, PoolBackendActorError,
-    PoolBackendRetainedJob, PoolBackendWinnerWorkers, PreparationPhase, PreparedJob,
-    ShareProcessor, WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config,
-    Zip301LoopbackListener, NATIVE_JOB_MAX_AGE_SECONDS,
+    NativePoolZcashRecoveryAuthority, NativePreparationCause, NativePreparationContext,
+    NativePreparationOrigin, NativePreparationTiming, NativePreparedChild, NativeZcashConfig,
+    NativeZcashNetwork, PoolBackendActor, PoolBackendActorError, PoolBackendRetainedJob,
+    PoolBackendWinnerWorkers, PreparationPhase, PreparedJob, ShareProcessor,
+    WcashIncomingViewingKey, Zip301ClientConfig, Zip301Config, Zip301LoopbackListener,
+    NATIVE_JOB_MAX_AGE_SECONDS,
 };
 use wcash_pool_protocol::{Hex32, JobInvalidationReason, TargetBe, TargetLe};
 use wcash_zcash_aux::{Target, WCASH_AUXILIARY_CHAIN_ID};
@@ -408,6 +409,7 @@ enum PoolBackendCleanup {
 struct PoolBackendPreparationRequest {
     id: u64,
     requested_at: Instant,
+    context: NativePreparationContext,
     work: PoolBackendPreparationWork,
 }
 
@@ -850,6 +852,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
         "wcash-job-preparation",
         move |request: PoolBackendPreparationRequest| {
             let mut timing = NativePreparationTiming::new();
+            timing.set_context(request.context);
             let prefetch = matches!(&request.work, PoolBackendPreparationWork::Prefetch(_));
             let result = match request.work {
                 PoolBackendPreparationWork::Baseline(slot) => preparation_supervisor
@@ -931,7 +934,8 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
     let mut ready_child: Option<PoolBackendPrefetchedChild> = None;
     let mut prefetch_stats = wcash_merge_miner::NativeChildPrefetchStats::default();
     let mut prefetch_in_flight = false;
-    let mut demand_wait_started: Option<Instant> = None;
+    let mut demand_wait_started: Option<(Instant, NativePreparationCause)> = None;
+    let mut inactive_preparation_cause = NativePreparationCause::Startup;
     let mut next_work_observation = Instant::now() + Duration::from_secs(15);
 
     // All runtime errors leave ownership in these outer slots for the common
@@ -992,12 +996,13 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                 retirement_worker
                     .enqueue_child(ready_child.take().expect("expired ready child"))?;
             }
-            if let Some(result) = preparation_worker.poll()? {
+            if let Some(mut result) = preparation_worker.poll()? {
                 prefetch_in_flight = false;
-                if let Some(started) = demand_wait_started.take() {
-                    prefetch_stats.last_demand_wait_ms = Some(duration_milliseconds(
-                        Instant::now().saturating_duration_since(started),
-                    ));
+                if let Some((started, cause)) = demand_wait_started.take() {
+                    let waited =
+                        duration_milliseconds(Instant::now().saturating_duration_since(started));
+                    prefetch_stats.last_demand_wait_ms = Some(waited);
+                    result.timing.set_blocked_demand_wait(waited, cause);
                 }
                 let expected = expected_preparation.take();
                 let valid_request = pool_backend_preparation_response_matches(
@@ -1028,6 +1033,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                                 .into());
                             }
                             preparation_schedule.prefetch_succeeded(Instant::now());
+                            result.timing.finish_prefetch_ok();
                             ready_child = Some(child);
                         } else {
                             prefetch_stats.expired = prefetch_stats.expired.saturating_add(1);
@@ -1065,10 +1071,15 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                             timing.finish_activation_failed();
                             return Err(error.into());
                         }
+                        let context = timing.context();
                         timing.finish_ok();
-                        record_native_backend_runtime(NativeBackendRuntimeEvent::JobActivated(
-                            &descriptor,
-                        ));
+                        record_native_backend_runtime(match context {
+                            Some(context) => NativeBackendRuntimeEvent::JobActivatedForRequest(
+                                &descriptor,
+                                context,
+                            ),
+                            None => NativeBackendRuntimeEvent::JobActivated(&descriptor),
+                        });
                         preparation_schedule.generation_activated();
                         let replacement = ActivePoolBackendGeneration {
                             job_id,
@@ -1131,6 +1142,7 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                 .is_some_and(|current| current.candidate.retained.remaining_lifetime().is_none())
             {
                 let current = active.take().expect("expired active generation");
+                inactive_preparation_cause = NativePreparationCause::LeaseExpiry;
                 match actor.invalidate_job(
                     &current.job_id,
                     JobInvalidationReason::Age,
@@ -1144,13 +1156,23 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                 }
                 retirement_worker.enqueue(current.candidate)?;
             }
-            let replacement_needed = active.as_ref().is_none_or(|current| {
-                Instant::now() >= current.rotation_deadline
-                    || current.candidate.retained.replacement_requested()
-            });
+            let replacement_needed =
+                preparation_schedule.replacement_needed(active.as_ref().is_none_or(|current| {
+                    Instant::now() >= current.rotation_deadline
+                        || current.candidate.retained.replacement_requested()
+                }));
+            // The speculative stale-tip hint schedules work without changing admission authority.
+            let replacement_cause = preparation_schedule.replacement_cause(active.as_ref().map_or(
+                inactive_preparation_cause,
+                |current| {
+                    preparation_cause_from_cached_currentness(
+                        current.candidate.retained.currentness_for_diagnostics(),
+                    )
+                },
+            ));
             if replacement_needed && prefetch_in_flight && demand_wait_started.is_none() {
                 prefetch_stats.demand_waits = prefetch_stats.demand_waits.saturating_add(1);
-                demand_wait_started = Some(Instant::now());
+                demand_wait_started = Some((Instant::now(), replacement_cause));
             }
             if let Some(choice) = preparation_schedule.choice(
                 replacement_needed,
@@ -1188,11 +1210,33 @@ fn run_native_pool_backend(arguments: impl Iterator<Item = String>) -> Result<()
                 if let Some(work) = work {
                     let is_prefetch = matches!(&work, PoolBackendPreparationWork::Prefetch(_));
                     request_id = next_request_id;
+                    let context = NativePreparationContext {
+                        request_id,
+                        origin: match &work {
+                            PoolBackendPreparationWork::Baseline(_) => {
+                                NativePreparationOrigin::Baseline
+                            }
+                            PoolBackendPreparationWork::Prefetch(_) => {
+                                NativePreparationOrigin::SpeculativePrefetch
+                            }
+                            PoolBackendPreparationWork::FromChild(_) => {
+                                NativePreparationOrigin::ParentFromReady
+                            }
+                        },
+                        cause: if is_prefetch {
+                            NativePreparationCause::PrefetchRefill
+                        } else {
+                            replacement_cause
+                        },
+                        blocked_demand_wait_ms: None,
+                        blocked_replacement_cause: None,
+                    };
                     let requested_at = Instant::now();
                     if let Err((request, error)) =
                         preparation_worker.request_owned(PoolBackendPreparationRequest {
                             id: request_id,
                             requested_at,
+                            context,
                             work,
                         })
                     {
@@ -1274,6 +1318,7 @@ enum PoolBackendPreparationChoice {
 }
 
 struct PoolBackendPreparationSchedule {
+    required_refresh: bool,
     generation_backoff: Duration,
     next_generation: Instant,
     prefetch_backoff: Duration,
@@ -1283,6 +1328,7 @@ struct PoolBackendPreparationSchedule {
 impl PoolBackendPreparationSchedule {
     fn new(now: Instant) -> Self {
         Self {
+            required_refresh: false,
             generation_backoff: INITIAL_NATIVE_PREPARATION_BACKOFF,
             next_generation: now,
             prefetch_backoff: INITIAL_NATIVE_PREPARATION_BACKOFF,
@@ -1291,6 +1337,12 @@ impl PoolBackendPreparationSchedule {
     }
 
     fn failed(&mut self, prefetch: bool, error: &MinerError, now: Instant) -> Duration {
+        if prefetch
+            && matches!(error, MinerError::RpcError { code: Some(-32001), message, .. }
+            if message == "Wcash tip changed while constructing the candidate; retry createauxblock")
+        {
+            self.required_refresh = true;
+        }
         let (backoff, next_attempt) = if prefetch {
             (&mut self.prefetch_backoff, &mut self.next_prefetch)
         } else {
@@ -1308,7 +1360,20 @@ impl PoolBackendPreparationSchedule {
     }
 
     fn generation_activated(&mut self) {
+        self.required_refresh = false;
         self.generation_backoff = INITIAL_NATIVE_PREPARATION_BACKOFF;
+    }
+
+    fn replacement_needed(&self, cached: bool) -> bool {
+        cached || self.required_refresh
+    }
+
+    fn replacement_cause(&self, cached: NativePreparationCause) -> NativePreparationCause {
+        if self.required_refresh && cached == NativePreparationCause::Rotation {
+            NativePreparationCause::PrefetchParentChanged
+        } else {
+            cached
+        }
     }
 
     fn generation_rejected(&mut self, now: Instant) {
@@ -1328,7 +1393,7 @@ impl PoolBackendPreparationSchedule {
         }
         // A needed replacement never inherits speculative cooldown or starts
         // another prefetch while its own failed attempt is backing off.
-        if replacement_needed {
+        if self.replacement_needed(replacement_needed) {
             if now < self.next_generation {
                 return None;
             }
@@ -1342,6 +1407,17 @@ impl PoolBackendPreparationSchedule {
         } else {
             None
         }
+    }
+}
+
+fn preparation_cause_from_cached_currentness(
+    (wcash, zcash): (bool, bool),
+) -> NativePreparationCause {
+    match (wcash, zcash) {
+        (true, true) => NativePreparationCause::Rotation,
+        (false, true) => NativePreparationCause::WcashUnavailable,
+        (true, false) => NativePreparationCause::ZcashUnavailable,
+        (false, false) => NativePreparationCause::BothUnavailable,
     }
 }
 
@@ -3419,6 +3495,114 @@ mod tests {
         drop(replacement);
         drop(owners);
         assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn speculative_tip_event_retry_remains_short_without_delaying_demand() {
+        let start = Instant::now();
+        let tip_changed = MinerError::RpcError {
+            endpoint: "fixture".into(),
+            code: Some(-32001),
+            message: "Wcash tip changed while constructing the candidate; retry createauxblock"
+                .into(),
+        };
+        let mut schedule = PoolBackendPreparationSchedule::new(start);
+        assert_eq!(
+            schedule.failed(true, &tip_changed, start),
+            TIP_RACE_RETRY_DELAY
+        );
+        // Both probes can still report current while the next probe is in flight.
+        // The exact speculative response is only a scheduling hint, not admission authority.
+        let cached_cause = preparation_cause_from_cached_currentness((true, true));
+        assert_eq!(cached_cause, NativePreparationCause::Rotation);
+        assert!(schedule.replacement_needed(false));
+        assert_eq!(
+            schedule.replacement_cause(cached_cause),
+            NativePreparationCause::PrefetchParentChanged
+        );
+        assert_eq!(
+            schedule.replacement_cause(NativePreparationCause::BothUnavailable),
+            NativePreparationCause::BothUnavailable
+        );
+        for now in [start, start + TIP_RACE_RETRY_DELAY] {
+            assert_eq!(
+                schedule.choice(false, true, false, false, now),
+                Some(PoolBackendPreparationChoice::Baseline)
+            );
+            assert_eq!(
+                schedule.choice(false, true, true, false, now),
+                Some(PoolBackendPreparationChoice::ParentFromReady)
+            );
+            assert_eq!(schedule.choice(false, true, false, true, now), None);
+        }
+        // Demanded errors retain the hint and their independent cooldown; no optional
+        // retry can steal the worker when its own250ms cooldown has elapsed.
+        let demanded_delay = schedule.failed(false, &rpc_error(Some(-28)), start);
+        assert_eq!(demanded_delay, INITIAL_NATIVE_PREPARATION_BACKOFF);
+        assert_eq!(
+            schedule.choice(false, true, false, false, start + TIP_RACE_RETRY_DELAY),
+            None
+        );
+        assert_eq!(
+            schedule.choice(false, true, false, false, start + demanded_delay),
+            Some(PoolBackendPreparationChoice::Baseline)
+        );
+        schedule.prefetch_succeeded(start);
+        schedule.generation_rejected(start + demanded_delay);
+        assert!(schedule.replacement_needed(false));
+        schedule.generation_activated();
+        assert!(!schedule.replacement_needed(false));
+        assert_eq!(
+            schedule.choice(false, true, false, false, start + demanded_delay),
+            Some(PoolBackendPreparationChoice::Prefetch)
+        );
+
+        let pending = MinerError::RpcError {
+            endpoint: "fixture".into(),
+            code: Some(-32001),
+            message: "Wcash candidate construction is pending; retry createauxblock".into(),
+        };
+        // Generic pending, busy, transport/other RPC errors and near-match text do
+        // not promote optional work. Neither does the exact error on demanded work.
+        for error in [
+            pending,
+            rpc_error(Some(-28)),
+            rpc_error(Some(WCASH_AUX_CAPACITY_ERROR_CODE)),
+            MinerError::RpcError { endpoint: "fixture".into(), code: None, message: "transport failed".into() },
+            MinerError::RpcError { endpoint: "fixture".into(), code: Some(-1), message: "Wcash tip changed while constructing the candidate; retry createauxblock".into() },
+            MinerError::RpcError { endpoint: "fixture".into(), code: Some(-32001), message: "Wcash tip changed while constructing the candidate; retry createauxblock suffix".into() },
+        ] {
+            let mut schedule = PoolBackendPreparationSchedule::new(start);
+            let delay = schedule.failed(true, &error, start);
+            assert!(!schedule.replacement_needed(false));
+            assert_eq!(schedule.choice(false, true, false, false, start + delay), Some(PoolBackendPreparationChoice::Prefetch));
+        }
+        let mut schedule = PoolBackendPreparationSchedule::new(start);
+        assert_eq!(
+            schedule.failed(false, &tip_changed, start),
+            TIP_RACE_RETRY_DELAY
+        );
+        assert!(!schedule.replacement_needed(false));
+    }
+
+    #[test]
+    fn preparation_replacement_causes_are_fixed_cached_observations() {
+        assert_eq!(
+            preparation_cause_from_cached_currentness((true, true)),
+            NativePreparationCause::Rotation
+        );
+        assert_eq!(
+            preparation_cause_from_cached_currentness((false, true)),
+            NativePreparationCause::WcashUnavailable
+        );
+        assert_eq!(
+            preparation_cause_from_cached_currentness((true, false)),
+            NativePreparationCause::ZcashUnavailable
+        );
+        assert_eq!(
+            preparation_cause_from_cached_currentness((false, false)),
+            NativePreparationCause::BothUnavailable
+        );
     }
 
     #[test]

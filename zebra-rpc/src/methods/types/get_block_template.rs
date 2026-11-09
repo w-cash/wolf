@@ -1366,6 +1366,9 @@ where
     /// Bounded foreground CPU work, shared by configured and auxiliary handler clones.
     template_builder: template_build::TemplateBuildExecutor,
 
+    /// Clone-local opt-in; ordinary template calls retain their normal waiter.
+    speculative_template_wait: bool,
+
     /// A block template for the current chain tip, kept up to date by the task spawned by
     /// `RpcImpl::spawn_block_template_updater()`, so `getblocktemplate` can answer without reading
     /// the state and the mempool.
@@ -1405,6 +1408,7 @@ where
             auxiliary_coinbase_caches: AuxiliaryCoinbaseCaches::default(),
             auxiliary_precomputer: auxiliary_precompute::AuxiliaryPrecomputer::default(),
             template_builder: template_build::TemplateBuildExecutor::default(),
+            speculative_template_wait: false,
             template_cache: Some(precompute::TemplateCache::default()),
         }
     }
@@ -1456,6 +1460,40 @@ where
         F: FnOnce() -> RpcResult<T> + Send + 'static,
     {
         self.template_builder.run(build).await
+    }
+
+    /// An optional speculative waiter yields only when its exact WEC snapshot
+    /// was observed on the tip watch and then replaced. The detached blocking
+    /// builder retains its existing foreground permit and warms its exact cache key.
+    pub(crate) async fn build_template_for_tip<T, F, Tip>(
+        &self,
+        latest_chain_tip: Tip,
+        snapshot: block::Hash,
+        build: F,
+    ) -> RpcResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> RpcResult<T> + Send + 'static,
+        Tip: ChainTip,
+    {
+        if !self.speculative_template_wait {
+            return self.build_template(build).await;
+        }
+        tokio::select! {
+            result = self.build_template(build) => result,
+            () = template_build::wait_for_obsolete_snapshot(latest_chain_tip, snapshot) => {
+                Err(ErrorObject::borrowed(
+                    crate::methods::WCASH_AUX_TIP_CHANGED_ERROR_CODE,
+                    "Wcash tip changed while constructing the candidate; retry createauxblock",
+                    None,
+                ))
+            }
+        }
+    }
+
+    /// Applies only to this request's clone, never the shared default handler.
+    pub(crate) fn use_speculative_template_wait(&mut self) {
+        self.speculative_template_wait = true;
     }
 
     /// Schedules optional next-height proof work only after an auxiliary candidate is published.

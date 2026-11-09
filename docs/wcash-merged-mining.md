@@ -57,6 +57,7 @@ The Wcash child node exposes an exact-candidate mining API:
 
 ```text
 createauxblock("<Wcash payout address>")
+createauxblock("<Wcash payout address>", {"mode": "speculative"})
 submitauxblock("<candidate hash in display order>", "<AuxPoW v2 hex>")
 getauxblockstatus("<candidate hash in display order>", "<AuxPoW v2 hex>")
 retireauxblock("<candidate hash in display order>", "<retire token>")
@@ -134,6 +135,35 @@ exact coinbase cache entry for a later retry. Cancelling or timing out the
 request does not free its slot until the blocking build finishes. Prewarming
 does not add foreground build slots or shorten the proof itself. The foreground
 wait remains bounded independently of proving and optional reserve work.
+
+An optional `{"mode": "speculative"}` second argument keeps the normal
+two-second template wait, but can yield before publication when the exact Wcash
+snapshot being built becomes obsolete. It first requires that snapshot's hash
+to be observed on the tip watch, then a different hash; an initially lagging
+watch does not establish obsolescence. With an unchanged parent, successful
+prefetch keeps its existing fast path. Omitting the argument or passing `null`
+keeps ordinary behavior. Early yielding allocates no candidate or retirement
+token. The blocking template worker retains its foreground permit and exact
+cache entry until completion. This option does not shorten the HTTP transport
+deadline or cancel a candidate request after publication.
+
+The existing two foreground template permits remain shared across handler
+clones and remain held until blocking work finishes, including after early
+yield or cancellation. No additional speculative admission limit is imposed:
+a different warm candidate can use an existing free slot while obsolete work
+finishes. Both occupied slots still produce the normal retryable busy result.
+Neither foreground capacity nor proving parallelism is increased.
+
+The native pool backend uses this option only for child prefetch. Required job
+preparation keeps the normal request and all proposal, payout and currentness
+checks. Update the Wcash node before the matching backend. Older nodes can
+silently ignore an extra positional argument, so a successful RPC alone does
+not verify support for tip-triggered yielding. Rollback reverses that order: restore
+the previous backend before restoring the previous node.
+
+The wire-level one-argument call remains compatible. Rust callers of the
+generated `RpcServer::create_aux_block` method must supply the new optional
+options argument, using `None` for the normal path.
 
 The node's `auxiliary_coinbase_diagnostic` INFO records distinguish a busy
 executor from a two-second deadline, blocking dispatch, zero-fee sizing,
@@ -482,6 +512,21 @@ prefetch does not restart any existing job lease or the node's ten-minute child
 cache lifetime. No other child acquisition runs while this worker is busy. A
 miss uses the existing complete preparation path, and an in-flight acquisition
 must finish before fresh parent preparation starts.
+
+The speculative node-side wait can return earlier after the fetched Wcash
+parent is observed changing, without abandoning a successful response or its
+cleanup capability. The existing tip-race retry and independent required-work
+retry clock remain unchanged. A different, already warm child key can then
+serve required replacement while the obsolete proof continues. A Zcash-only
+parent change does not cancel a healthy Wcash acquisition: the same cold proof
+still has to finish. This does not make cryptographic proving faster or remove
+metadata and proposal waits.
+
+An exact speculative Wcash tip-change response also requests normal replacement
+preparation while independent currentness probes catch up. Optional acquisition
+cannot get ahead of that replacement. This is a scheduling hint: existing share
+admission and job authority remain unchanged, demanded backoff still applies,
+and the hint clears only after a replacement is actually activated.
 
 The prefetched child freezes Wcash transaction selection and fee totals. Newly
 arriving Wcash transactions can wait for the next child; existing bytes and

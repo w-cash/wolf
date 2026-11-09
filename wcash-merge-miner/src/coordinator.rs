@@ -678,10 +678,15 @@ impl NativeMiningSupervisor {
         let acquired_at = Instant::now();
         let ready_deadline = prefetched.then_some(acquired_at + MAX_PREFETCHED_CHILD_AGE);
         timing.enter(PreparationPhase::WcashCandidate);
-        let child: ChildTemplate = self.wcash_node.call(
-            "createauxblock",
-            json!([self.config.wcash_payout_address.clone()]),
-        )?;
+        // This is a node-owned, pre-publication stale-tip policy, not a shorter
+        // transport timeout. Always consume its complete response: a successful
+        // reply owns an exact candidate and retirement capability.
+        let params = if prefetched {
+            json!([self.config.wcash_payout_address.clone(), {"mode":"speculative"}])
+        } else {
+            json!([self.config.wcash_payout_address.clone()])
+        };
+        let child: ChildTemplate = self.wcash_node.call("createauxblock", params)?;
         timing.set_wcash_height(child.height);
         timing.enter(PreparationPhase::WcashDecode);
         let child_hash = parse_display_hash(&child.hash, "createauxblock hash")?;

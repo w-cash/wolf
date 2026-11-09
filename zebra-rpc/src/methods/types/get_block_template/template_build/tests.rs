@@ -497,3 +497,172 @@ fn template_diagnostics_link_busy_deadline_and_late_singleflight_completion() {
         .any(|record| record.event == Event::Constructor));
     assert_eq!((joined.height, joined.fee_zat), (Some(height.0), Some(0)));
 }
+
+async fn wait_for_all_template_capacity(executor: &TemplateBuildExecutor) {
+    timeout(TEST_LIMIT, async {
+        while executor.permits.available_permits() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("released owned workers return the original two slots");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ordinary_template_waiter_does_not_inherit_speculative_deadline() {
+    let executor = TemplateBuildExecutor::default();
+    let (release, mut task) = held_build(&executor).await;
+    let early = timeout(Duration::from_millis(250), &mut task).await;
+    release.send(()).unwrap();
+    assert!(
+        early.is_err(),
+        "ordinary work must retain its two-second wait"
+    );
+    assert_eq!(
+        timeout(TEST_LIMIT, task).await.unwrap().unwrap().unwrap(),
+        7
+    );
+    wait_for_all_template_capacity(&executor).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn template_old_key_cannot_block_demanded_warm_key_or_duplicate_proofs() {
+    use super::super::{MinerParams, TransactionTemplate};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let network = consensus_profile_network();
+    let old_height = Height(2_000_000);
+    let next_height = Height(2_000_001);
+    let fee = Amount::zero();
+    let address =
+        default_miner_address_for_network(&network, &MinerAddressType::Transparent).unwrap();
+    let params = MinerParams::new(
+        &network,
+        Config {
+            miner_address: Some(address.parse().unwrap()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let old_coinbase =
+        TransactionTemplate::new_coinbase(&network, old_height, &params, fee).unwrap();
+    let next_coinbase =
+        TransactionTemplate::new_coinbase(&network, next_height, &params, fee).unwrap();
+    let cache = CoinbaseCache::default();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let seeded = next_coinbase.clone();
+    cache.get_or_build(next_height, fee, || {
+        builds.fetch_add(1, Ordering::SeqCst);
+        seeded
+    });
+    let executor = TemplateBuildExecutor::default();
+    let working = executor.clone();
+    let old_cache = cache.clone();
+    let building = Arc::clone(&builds);
+    let old_expected = old_coinbase.clone();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (completed_tx, mut completed_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        working
+            .run(move || {
+                let result = old_cache.get_or_build(old_height, fee, || {
+                    building.fetch_add(1, Ordering::SeqCst);
+                    let _ = entered_tx.send(());
+                    release_rx.recv_timeout(TEST_LIMIT).unwrap();
+                    old_expected
+                });
+                let _ = completed_tx.send(result);
+                Ok(7)
+            })
+            .await
+    });
+    timeout(TEST_LIMIT, entered_rx).await.unwrap().unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .message(),
+        TEMPLATE_BUILD_PENDING
+    );
+    assert!(completed_rx.try_recv().is_err());
+    let next_cache = cache.clone();
+    let ready = timeout(
+        Duration::from_secs(1),
+        executor.run(move || {
+            Ok(next_cache.get_or_build(next_height, fee, || {
+                panic!("the demanded different key is already warm")
+            }))
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ready, next_coinbase);
+    assert!(completed_rx.try_recv().is_err());
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        timeout(TEST_LIMIT, completed_rx).await.unwrap().unwrap(),
+        old_coinbase
+    );
+    wait_for_all_template_capacity(&executor).await;
+    let warmed = executor
+        .run(move || {
+            Ok(cache.get_or_build(old_height, fee, || {
+                panic!("the detached constructor's exact key must stay warm")
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(warmed, old_coinbase);
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn speculative_obsolete_watch_requires_observed_snapshot_then_changed_hash() {
+    use zebra_chain::{block::Hash, chain_tip::mock::MockChainTip};
+
+    let (tip, sender) = MockChainTip::new();
+    let snapshot = Hash([0x31; 32]);
+    sender.send_best_tip_hash(Hash([0x30; 32]));
+    sender.send_best_tip_height(Height(1));
+    let obsolete = wait_for_obsolete_snapshot(tip, snapshot);
+    tokio::pin!(obsolete);
+    assert!(futures::poll!(obsolete.as_mut()).is_pending());
+    // A lagging watch naming another hash cannot cancel the newer read-state
+    // snapshot. Catching up arms the fence without declaring obsolescence.
+    sender.send_best_tip_hash(snapshot);
+    assert!(futures::poll!(obsolete.as_mut()).is_pending());
+    sender.send_best_tip_hash(snapshot);
+    sender.send_best_tip_height(Height(2));
+    assert!(futures::poll!(obsolete.as_mut()).is_pending());
+    // Updating before the next poll is not a lost wake; an exact-hash change
+    // proves a same-height reorg as well as a height advance.
+    sender.send_best_tip_hash(Hash([0x32; 32]));
+    assert!(futures::poll!(obsolete.as_mut()).is_ready());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn speculative_closed_tip_watch_keeps_normal_build_result() {
+    use zebra_chain::{block::Hash, chain_tip::mock::MockChainTip};
+
+    let (tip, sender) = MockChainTip::new();
+    let snapshot = Hash([0x41; 32]);
+    sender.send_best_tip_hash(snapshot);
+    let obsolete = wait_for_obsolete_snapshot(tip, snapshot);
+    tokio::pin!(obsolete);
+    assert!(futures::poll!(obsolete.as_mut()).is_pending());
+    drop(sender);
+    // Closed watch errors park once; they neither prove a changed tip nor
+    // spin, and the original bounded builder remains able to finish.
+    assert!(futures::poll!(obsolete.as_mut()).is_pending());
+    let executor = TemplateBuildExecutor::default();
+    tokio::select! {
+        result = executor.run(|| Ok(47)) => assert_eq!(result.unwrap(),47),
+        () = obsolete => panic!("a closed watch cannot manufacture obsolescence"),
+    }
+    wait_for_all_template_capacity(&executor).await;
+}

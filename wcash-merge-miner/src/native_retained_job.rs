@@ -71,6 +71,11 @@ impl NativePoolBackendRetainedJob {
         self.currentness.replacement_requested()
     }
 
+    /// Copies cached chain flags for controller diagnostics only; never refreshes authority.
+    pub fn currentness_for_diagnostics(&self) -> (bool, bool) {
+        self.currentness.currentness_for_diagnostics()
+    }
+
     /// Permanently closes cached admission before retirement is queued.
     pub fn close_currentness(&self) {
         self.currentness.close();
