@@ -1366,6 +1366,9 @@ where
     /// Bounded foreground CPU work, shared by configured and auxiliary handler clones.
     template_builder: template_build::TemplateBuildExecutor,
 
+    /// Clone-local opt-in; ordinary template calls retain their normal waiter.
+    speculative_template_wait: bool,
+
     /// A block template for the current chain tip, kept up to date by the task spawned by
     /// `RpcImpl::spawn_block_template_updater()`, so `getblocktemplate` can answer without reading
     /// the state and the mempool.
@@ -1405,6 +1408,7 @@ where
             auxiliary_coinbase_caches: AuxiliaryCoinbaseCaches::default(),
             auxiliary_precomputer: auxiliary_precompute::AuxiliaryPrecomputer::default(),
             template_builder: template_build::TemplateBuildExecutor::default(),
+            speculative_template_wait: false,
             template_cache: Some(precompute::TemplateCache::default()),
         }
     }
@@ -1455,7 +1459,16 @@ where
         T: Send + 'static,
         F: FnOnce() -> RpcResult<T> + Send + 'static,
     {
-        self.template_builder.run(build).await
+        if self.speculative_template_wait {
+            self.template_builder.run_speculative(build).await
+        } else {
+            self.template_builder.run(build).await
+        }
+    }
+
+    /// Applies only to this request's clone, never the shared default handler.
+    pub(crate) fn use_speculative_template_wait(&mut self) {
+        self.speculative_template_wait = true;
     }
 
     /// Schedules optional next-height proof work only after an auxiliary candidate is published.

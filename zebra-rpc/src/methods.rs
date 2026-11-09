@@ -140,8 +140,8 @@ use types::{
     unified_address::ZListUnifiedReceiversResponse,
     validate_address::ValidateAddressResponse,
     wcash_aux_block::{
-        AuxPowHex, CreateAuxBlockResponse, GetAuxBlockStatusResponse, RetireAuxBlockResponse,
-        RetireToken,
+        AuxPowHex, CreateAuxBlockMode, CreateAuxBlockOptions, CreateAuxBlockResponse,
+        GetAuxBlockStatusResponse, RetireAuxBlockResponse, RetireToken,
     },
     z_validate_address::ZValidateAddressResponse,
 };
@@ -175,6 +175,7 @@ pub(super) const PARAM_COMMAND_DESC: &str = "The command to execute.";
 pub(super) const PARAM__PARAMETERS_DESC: &str = "The parameters for the command.";
 pub(super) const PARAM_BLOCK_HASH_DESC: &str = "The hash of the block to return.";
 pub(super) const PARAM_ADDRESS_DESC: &str = "The address to return.";
+pub(super) const PARAM_OPTIONS_DESC: &str = "Optional candidate construction options. Set mode to speculative for a 100 ms pre-publication template wait; omit or use null to retain the normal two-second wait.";
 pub(super) const PARAM_ADDRESS_STRINGS_DESC: &str = "The addresses to return.";
 pub(super) const PARAM_ADDR_DESC: &str = "The address to return.";
 pub(super) const PARAM_HEX_DATA_DESC: &str = "The hex-encoded data to return.";
@@ -599,8 +600,14 @@ pub trait Rpc {
     /// with an Orchard receiver for an optional private Ironwood coinbase. A
     /// parent pool commits to the returned `hash`, then supplies the same hash and its AuxPoW to
     /// [`Self::submit_aux_block`]. This method is rejected on Zcash networks.
+    /// Optional `options.mode = "speculative"` shortens only the pre-publication
+    /// template wait. Omitted or null options retain the ordinary two seconds.
     #[method(name = "createauxblock")]
-    async fn create_aux_block(&self, address: String) -> Result<CreateAuxBlockResponse>;
+    async fn create_aux_block(
+        &self,
+        address: String,
+        options: Option<CreateAuxBlockOptions>,
+    ) -> Result<CreateAuxBlockResponse>;
 
     /// Authenticates retirement of an issued candidate that received no AuxPoW
     /// submission, releasing its bounded cache slot before the normal TTL.
@@ -3332,7 +3339,11 @@ where
         Ok(response.into())
     }
 
-    async fn create_aux_block(&self, address: String) -> Result<CreateAuxBlockResponse> {
+    async fn create_aux_block(
+        &self,
+        address: String,
+        options: Option<CreateAuxBlockOptions>,
+    ) -> Result<CreateAuxBlockResponse> {
         if !self.network.uses_wcash_consensus() {
             return Err(ErrorObject::borrowed(
                 ErrorCode::InvalidRequest.code(),
@@ -3376,6 +3387,14 @@ where
         // destinations use bounded, recipient-isolated caches shared across
         // clones, so repeated pool requests do not rebuild the private proof.
         let mut candidate_rpc = self.clone();
+        if matches!(
+            options,
+            Some(CreateAuxBlockOptions {
+                mode: CreateAuxBlockMode::Speculative
+            })
+        ) {
+            candidate_rpc.gbt.use_speculative_template_wait();
+        }
         let uses_configured_payout = candidate_rpc
             .gbt
             .miner_params()

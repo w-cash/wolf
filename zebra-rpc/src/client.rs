@@ -35,7 +35,10 @@ pub use crate::methods::{
         },
         unified_address::ZListUnifiedReceiversResponse,
         validate_address::ValidateAddressResponse,
-        wcash_aux_block::{AuxPowHex, AuxPowHexError, CreateAuxBlockResponse},
+        wcash_aux_block::{
+            AuxPowHex, AuxPowHexError, CreateAuxBlockMode, CreateAuxBlockOptions,
+            CreateAuxBlockResponse,
+        },
         z_validate_address::{ZValidateAddressResponse, ZValidateAddressType},
     },
     AddressStrings, BlockHeaderObject, BlockObject, EndOfService, GetAddressBalanceRequest,

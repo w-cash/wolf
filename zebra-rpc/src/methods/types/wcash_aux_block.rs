@@ -15,6 +15,61 @@ use wcash_zcash_aux::{MAX_PROOF_BYTES, WCASH_AUXILIARY_CHAIN_ID};
 
 use super::long_poll::LongPollId;
 
+/// Optional node-owned construction policy for `createauxblock`.
+///
+/// Omitting this object keeps the ordinary two-second template waiter. The
+/// speculative policy returns pending after 100 milliseconds if construction
+/// has not finished, without issuing a candidate. Its blocking worker still
+/// owns capacity until it finishes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateAuxBlockOptions {
+    /// The fixed speculative template-wait policy.
+    pub mode: CreateAuxBlockMode,
+}
+
+impl<'de> Deserialize<'de> for CreateAuxBlockOptions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OptionsVisitor;
+
+        impl<'de> Visitor<'de> for OptionsVisitor {
+            type Value = CreateAuxBlockOptions;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an object containing only the speculative mode")
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct StrictOptions {
+                    mode: CreateAuxBlockMode,
+                }
+
+                let options =
+                    StrictOptions::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(CreateAuxBlockOptions { mode: options.mode })
+            }
+        }
+
+        deserializer.deserialize_map(OptionsVisitor)
+    }
+}
+
+/// Supported optional `createauxblock` construction modes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CreateAuxBlockMode {
+    /// Bound only the pre-publication template wait, preserving the owned worker.
+    Speculative,
+}
+
 /// An unguessable, fixed-size capability for retiring one cached candidate.
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RetireToken(
@@ -362,6 +417,46 @@ mod tests {
         assert_eq!(json["height"], 42);
         assert!(json["longpollid"].is_string());
         assert_eq!(json["target"], target.to_string());
+    }
+
+    #[test]
+    fn create_aux_block_options_accept_only_the_fixed_speculative_policy() {
+        let expected = CreateAuxBlockOptions {
+            mode: CreateAuxBlockMode::Speculative,
+        };
+        assert_eq!(
+            serde_json::from_value::<CreateAuxBlockOptions>(serde_json::json!({
+                "mode": "speculative"
+            }))
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(expected).unwrap(),
+            serde_json::json!({
+                "mode": "speculative"
+            })
+        );
+        assert!(
+            serde_json::from_value::<Option<CreateAuxBlockOptions>>(serde_json::Value::Null)
+                .unwrap()
+                .is_none()
+        );
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"mode": "ordinary"}),
+            serde_json::json!({"mode": null}),
+            serde_json::json!({"mode": "speculative", "wait_ms": 1}),
+            serde_json::json!(true),
+            serde_json::json!(["speculative"]),
+            serde_json::json!({"mode": 100}),
+        ] {
+            assert!(serde_json::from_value::<CreateAuxBlockOptions>(value).is_err());
+        }
+        assert!(serde_json::from_str::<CreateAuxBlockOptions>(
+            r#"{"mode":"speculative","mode":"speculative"}"#,
+        )
+        .is_err());
     }
 
     #[test]

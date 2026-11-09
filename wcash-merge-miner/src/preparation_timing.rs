@@ -11,6 +11,75 @@ use crate::MinerError;
 const SLOW_PREPARATION: Duration = Duration::from_secs(1);
 pub(crate) const PHASE_COUNT: usize = 13;
 
+/// Fixed preparation ownership labels; these are not share or mining-efficiency claims.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativePreparationOrigin {
+    /// Full acquisition needed without a ready child.
+    Baseline,
+    /// Optional one-ahead child acquisition.
+    SpeculativePrefetch,
+    /// A ready owned child is consumed for a fresh parent.
+    ParentFromReady,
+}
+
+impl NativePreparationOrigin {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::SpeculativePrefetch => "speculative_prefetch",
+            Self::ParentFromReady => "parent_from_ready",
+        }
+    }
+}
+
+/// Cached controller reason, not proof of when a network tip or ASIC changed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativePreparationCause {
+    /// No generation has been activated.
+    Startup,
+    /// The original generation lease expired.
+    LeaseExpiry,
+    /// The normal early rotation deadline was reached.
+    Rotation,
+    /// Cached Wcash currentness is unavailable.
+    WcashUnavailable,
+    /// Cached Zcash currentness is unavailable.
+    ZcashUnavailable,
+    /// Neither cached chain remains current.
+    BothUnavailable,
+    /// Healthy work has no unused ready child.
+    PrefetchRefill,
+}
+
+impl NativePreparationCause {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::LeaseExpiry => "lease_expiry",
+            Self::Rotation => "rotation",
+            Self::WcashUnavailable => "wcash_unavailable",
+            Self::ZcashUnavailable => "zcash_unavailable",
+            Self::BothUnavailable => "both_unavailable",
+            Self::PrefetchRefill => "prefetch_refill",
+        }
+    }
+}
+
+/// Process-local controller correlation copied after an owned request is selected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativePreparationContext {
+    /// Nonwrapping controller request ID; it resets on process restart.
+    pub request_id: u64,
+    /// Exact work selected by the controller.
+    pub origin: NativePreparationOrigin,
+    /// Cached reason at dispatch.
+    pub cause: NativePreparationCause,
+    /// Controller-observed time demand waited for this prefetch result.
+    pub blocked_demand_wait_ms: Option<u64>,
+    /// Cached reason when that wait was first observed.
+    pub blocked_replacement_cause: Option<NativePreparationCause>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum PreparationNodeRole {
     Template,
@@ -194,6 +263,7 @@ pub struct NativePreparationTiming {
     zcash_height: Option<u32>,
     failure_context: Option<PreparationFailureContext>,
     rpc_subreason: Option<&'static str>,
+    context: Option<NativePreparationContext>,
 }
 
 impl Default for NativePreparationTiming {
@@ -218,6 +288,27 @@ impl NativePreparationTiming {
             zcash_height: None,
             failure_context: None,
             rpc_subreason: None,
+            context: None,
+        }
+    }
+
+    /// Sets fixed process-local ownership metadata without I/O or formatting.
+    pub fn set_context(&mut self, context: NativePreparationContext) {
+        self.context = Some(context);
+    }
+
+    /// Returns the same fixed context for the corresponding activation notice.
+    pub fn context(&self) -> Option<NativePreparationContext> {
+        self.context
+    }
+
+    /// Records an actual controller wait after this prefetch result returned.
+    pub fn set_blocked_demand_wait(&mut self, elapsed_ms: u64, cause: NativePreparationCause) {
+        if let Some(context) = self.context.as_mut() {
+            if context.origin == NativePreparationOrigin::SpeculativePrefetch {
+                context.blocked_demand_wait_ms = Some(elapsed_ms);
+                context.blocked_replacement_cause = Some(cause);
+            }
         }
     }
 
@@ -260,6 +351,11 @@ impl NativePreparationTiming {
         self.finish(PreparationResult::Activated);
     }
 
+    /// Finishes an optional acquisition without claiming a parent was activated.
+    pub fn finish_prefetch_ok(self) {
+        self.finish(PreparationResult::Prefetched);
+    }
+
     /// Finishes a failed attempt using fixed public labels and captured context.
     ///
     /// Error bodies, endpoint labels, credentials and payout data are discarded.
@@ -292,7 +388,14 @@ impl NativePreparationTiming {
     ) -> Option<PreparationReport> {
         self.close_phase(finished);
         let elapsed = finished.saturating_duration_since(self.started);
-        if matches!(result, PreparationResult::Activated) && elapsed < SLOW_PREPARATION {
+        if matches!(
+            result,
+            PreparationResult::Activated | PreparationResult::Prefetched
+        ) && elapsed < SLOW_PREPARATION
+            && self
+                .context
+                .is_none_or(|context| context.blocked_demand_wait_ms.is_none())
+        {
             return None;
         }
         Some(PreparationReport {
@@ -303,6 +406,7 @@ impl NativePreparationTiming {
             zcash_height: self.zcash_height,
             failure_context: self.failure_context,
             rpc_subreason: self.rpc_subreason,
+            context: self.context,
             result,
         })
     }
@@ -311,6 +415,7 @@ impl NativePreparationTiming {
 #[derive(Clone, Copy)]
 pub(crate) enum PreparationResult {
     Activated,
+    Prefetched,
     Failed(&'static str),
 }
 
@@ -318,13 +423,14 @@ impl PreparationResult {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Activated => "activated",
+            Self::Prefetched => "prefetched",
             Self::Failed(_) => "failed",
         }
     }
 
     pub(crate) const fn error_class(self) -> Option<&'static str> {
         match self {
-            Self::Activated => None,
+            Self::Activated | Self::Prefetched => None,
             Self::Failed(class) => Some(class),
         }
     }
@@ -340,6 +446,7 @@ pub(crate) struct PreparationReport {
     pub(crate) zcash_height: Option<u32>,
     pub(crate) failure_context: Option<PreparationFailureContext>,
     pub(crate) rpc_subreason: Option<&'static str>,
+    pub(crate) context: Option<NativePreparationContext>,
     pub(crate) result: PreparationResult,
 }
 
@@ -445,6 +552,51 @@ mod tests {
             };
             assert_eq!(candidate_rpc_subreason(&error), expected);
         }
+    }
+
+    #[test]
+    fn short_prefetch_reports_actual_blocked_demand_without_claiming_activation() {
+        let start = Instant::now();
+        let context = NativePreparationContext {
+            request_id: u64::MAX,
+            origin: NativePreparationOrigin::SpeculativePrefetch,
+            cause: NativePreparationCause::PrefetchRefill,
+            blocked_demand_wait_ms: None,
+            blocked_replacement_cause: None,
+        };
+        let mut timing = NativePreparationTiming::at(start);
+        timing.set_context(context);
+        assert!(timing
+            .report_at(
+                PreparationResult::Prefetched,
+                start + Duration::from_millis(100)
+            )
+            .is_none());
+        let mut timing = NativePreparationTiming::at(start);
+        timing.set_context(context);
+        timing.set_blocked_demand_wait(99, NativePreparationCause::ZcashUnavailable);
+        let report = timing
+            .report_at(
+                PreparationResult::Prefetched,
+                start + Duration::from_millis(100),
+            )
+            .unwrap();
+        assert_eq!(report.result.label(), "prefetched");
+        let observed = report.context.unwrap();
+        assert_eq!(observed.request_id, u64::MAX);
+        assert_eq!(observed.blocked_demand_wait_ms, Some(99));
+        assert_eq!(
+            observed.blocked_replacement_cause,
+            Some(NativePreparationCause::ZcashUnavailable)
+        );
+        // Demand attempts cannot acquire a misleading blocked-prefetch field.
+        let mut demand = NativePreparationTiming::at(start);
+        demand.set_context(NativePreparationContext {
+            origin: NativePreparationOrigin::Baseline,
+            ..context
+        });
+        demand.set_blocked_demand_wait(99, NativePreparationCause::BothUnavailable);
+        assert_eq!(demand.context().unwrap().blocked_demand_wait_ms, None);
     }
 
     #[test]

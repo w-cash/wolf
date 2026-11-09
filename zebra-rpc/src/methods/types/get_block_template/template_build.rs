@@ -14,6 +14,7 @@ use super::coinbase_diagnostics::{self as diagnostics, Event, Outcome, Phase, Re
 // turn short-polling into an unbounded queue of blocking proof workers.
 const MAX_FOREGROUND_TEMPLATE_BUILDS: usize = 2;
 const TEMPLATE_BUILD_WAIT_LIMIT: Duration = Duration::from_secs(2);
+const SPECULATIVE_TEMPLATE_WAIT_LIMIT: Duration = Duration::from_millis(100);
 const TEMPLATE_BUILD_BUSY: &str = "block template construction is busy; retry";
 const TEMPLATE_BUILD_PENDING: &str = "block template construction is pending; retry";
 
@@ -29,6 +30,9 @@ pub(super) fn is_pending_template_build(error: &ErrorObject<'_>) -> bool {
 #[derive(Clone)]
 pub(super) struct TemplateBuildExecutor {
     permits: Arc<Semaphore>,
+    // At most one speculative build may outlive its short async waiter. It
+    // cannot fill the other foreground slot with repeated same-key joins.
+    speculative_permits: Arc<Semaphore>,
 }
 
 impl Default for TemplateBuildExecutor {
@@ -36,6 +40,7 @@ impl Default for TemplateBuildExecutor {
         diagnostics::initialize();
         Self {
             permits: Arc::new(Semaphore::new(MAX_FOREGROUND_TEMPLATE_BUILDS)),
+            speculative_permits: Arc::new(Semaphore::new(1)),
         }
     }
 }
@@ -46,22 +51,56 @@ impl TemplateBuildExecutor {
         T: Send + 'static,
         F: FnOnce() -> RpcResult<T> + Send + 'static,
     {
-        let deadline = tokio::time::Instant::now() + TEMPLATE_BUILD_WAIT_LIMIT;
+        self.run_with_policy(build, false).await
+    }
+
+    pub(super) async fn run_speculative<T, F>(&self, build: F) -> RpcResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> RpcResult<T> + Send + 'static,
+    {
+        self.run_with_policy(build, true).await
+    }
+
+    async fn run_with_policy<T, F>(&self, build: F, speculative: bool) -> RpcResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> RpcResult<T> + Send + 'static,
+    {
+        let wait_limit = if speculative {
+            SPECULATIVE_TEMPLATE_WAIT_LIMIT
+        } else {
+            TEMPLATE_BUILD_WAIT_LIMIT
+        };
+        let deadline = tokio::time::Instant::now() + wait_limit;
         let started = std::time::Instant::now();
         let request_id = diagnostics::next_id();
-        let permit = Arc::clone(&self.permits).try_acquire_owned().map_err(|_| {
+        let busy = || {
             let mut record = Record::new(Event::TemplateWorker, Outcome::Busy);
             record.request_id = request_id;
             record.phase = Phase::Template;
             record.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             diagnostics::emit(record);
             ErrorObject::borrowed(LegacyCode::InWarmup.into(), TEMPLATE_BUILD_BUSY, None)
-        })?;
+        };
+        let speculative_permit = if speculative {
+            Some(
+                Arc::clone(&self.speculative_permits)
+                    .try_acquire_owned()
+                    .map_err(|_| busy())?,
+            )
+        } else {
+            None
+        };
+        let permit = Arc::clone(&self.permits)
+            .try_acquire_owned()
+            .map_err(|_| busy())?;
         let span = tracing::Span::current();
         let build = tokio::task::spawn_blocking(move || {
             // Cancellation of the async waiter cannot release capacity while
             // a proof or a singleflight cache wait is still running.
             let _permit = permit;
+            let _speculative_permit = speculative_permit;
             let _span = span.enter();
             let _context = diagnostics::enter(request_id, Phase::Template);
             let dispatch_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -70,6 +109,7 @@ impl TemplateBuildExecutor {
             diagnostics::emit(record);
             let result = build();
             drop(_permit);
+            drop(_speculative_permit);
             let mut record = Record::new(
                 Event::TemplateWorker,
                 if result.is_ok() {

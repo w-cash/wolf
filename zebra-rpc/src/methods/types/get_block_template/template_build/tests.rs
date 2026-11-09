@@ -497,3 +497,216 @@ fn template_diagnostics_link_busy_deadline_and_late_singleflight_completion() {
         .any(|record| record.event == Event::Constructor));
     assert_eq!((joined.height, joined.fee_zat), (Some(height.0), Some(0)));
 }
+
+async fn held_speculative_build(
+    executor: &TemplateBuildExecutor,
+) -> (mpsc::Sender<()>, JoinHandle<RpcResult<usize>>) {
+    let executor = executor.clone();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let task = tokio::spawn(async move {
+        executor
+            .run_speculative(move || {
+                let _ = entered_tx.send(());
+                release_rx
+                    .recv_timeout(TEST_LIMIT)
+                    .expect("the test releases its owned speculative build");
+                Ok(7)
+            })
+            .await
+    });
+    timeout(TEST_LIMIT, entered_rx).await.unwrap().unwrap();
+    (release_tx, task)
+}
+
+async fn wait_for_all_template_capacity(executor: &TemplateBuildExecutor) {
+    timeout(TEST_LIMIT, async {
+        while executor.permits.available_permits() != 2
+            || executor.speculative_permits.available_permits() != 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the released owned workers return their original capacity");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn speculative_template_timeout_keeps_one_slot_for_demand() {
+    let executor = TemplateBuildExecutor::default();
+    let (release, task) = held_speculative_build(&executor).await;
+    let result = timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.unwrap_err().message(), TEMPLATE_BUILD_PENDING);
+    assert_eq!(executor.permits.available_permits(), 1);
+    assert_eq!(executor.speculative_permits.available_permits(), 0);
+    let repeated = executor
+        .clone()
+        .run_speculative(|| -> RpcResult<usize> {
+            panic!("a repeated speculative waiter must not consume the demand slot")
+        })
+        .await;
+    assert_eq!(repeated.unwrap_err().message(), TEMPLATE_BUILD_BUSY);
+    assert_eq!(executor.run(|| Ok(19)).await.unwrap(), 19);
+    release.send(()).unwrap();
+    wait_for_all_template_capacity(&executor).await;
+    assert_eq!(executor.run_speculative(|| Ok(23)).await.unwrap(), 23);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn speculative_template_global_busy_releases_optional_guard() {
+    let executor = TemplateBuildExecutor::default();
+    let (first_release, first) = held_build(&executor).await;
+    let (second_release, second) = held_build(&executor).await;
+    let result = executor
+        .run_speculative(|| -> RpcResult<usize> {
+            panic!("two occupied foreground slots cannot admit speculative work")
+        })
+        .await;
+    assert_eq!(result.unwrap_err().message(), TEMPLATE_BUILD_BUSY);
+    assert_eq!(executor.speculative_permits.available_permits(), 1);
+    finish_build(first_release, first).await;
+    assert_eq!(executor.run_speculative(|| Ok(31)).await.unwrap(), 31);
+    finish_build(second_release, second).await;
+    wait_for_all_template_capacity(&executor).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn speculative_template_cancelled_waiter_keeps_both_owned_guards() {
+    let executor = TemplateBuildExecutor::default();
+    let (release, task) = held_speculative_build(&executor).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(executor.permits.available_permits(), 1);
+    assert_eq!(executor.speculative_permits.available_permits(), 0);
+    let result = executor
+        .run_speculative(|| -> RpcResult<usize> {
+            panic!("cancellation cannot reopen speculative ownership")
+        })
+        .await;
+    assert_eq!(result.unwrap_err().message(), TEMPLATE_BUILD_BUSY);
+    assert_eq!(executor.run(|| Ok(37)).await.unwrap(), 37);
+    release.send(()).unwrap();
+    wait_for_all_template_capacity(&executor).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ordinary_template_waiter_does_not_inherit_speculative_deadline() {
+    let executor = TemplateBuildExecutor::default();
+    let (release, mut task) = held_build(&executor).await;
+    let early = timeout(Duration::from_millis(250), &mut task).await;
+    release.send(()).unwrap();
+    assert!(
+        early.is_err(),
+        "ordinary work must retain its two-second wait"
+    );
+    assert_eq!(
+        timeout(TEST_LIMIT, task).await.unwrap().unwrap().unwrap(),
+        7
+    );
+    wait_for_all_template_capacity(&executor).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn speculative_old_key_cannot_block_demanded_warm_key_or_duplicate_proofs() {
+    use super::super::{MinerParams, TransactionTemplate};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let network = consensus_profile_network();
+    let old_height = Height(2_000_000);
+    let next_height = Height(2_000_001);
+    let fee = Amount::zero();
+    let address =
+        default_miner_address_for_network(&network, &MinerAddressType::Transparent).unwrap();
+    let params = MinerParams::new(
+        &network,
+        Config {
+            miner_address: Some(address.parse().unwrap()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let old_coinbase =
+        TransactionTemplate::new_coinbase(&network, old_height, &params, fee).unwrap();
+    let next_coinbase =
+        TransactionTemplate::new_coinbase(&network, next_height, &params, fee).unwrap();
+    let cache = CoinbaseCache::default();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let seeded = next_coinbase.clone();
+    cache.get_or_build(next_height, fee, || {
+        builds.fetch_add(1, Ordering::SeqCst);
+        seeded
+    });
+    let executor = TemplateBuildExecutor::default();
+    let working = executor.clone();
+    let old_cache = cache.clone();
+    let building = Arc::clone(&builds);
+    let old_expected = old_coinbase.clone();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (completed_tx, mut completed_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        working
+            .run_speculative(move || {
+                let result = old_cache.get_or_build(old_height, fee, || {
+                    building.fetch_add(1, Ordering::SeqCst);
+                    let _ = entered_tx.send(());
+                    release_rx.recv_timeout(TEST_LIMIT).unwrap();
+                    old_expected
+                });
+                let _ = completed_tx.send(result);
+                Ok(7)
+            })
+            .await
+    });
+    timeout(TEST_LIMIT, entered_rx).await.unwrap().unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .message(),
+        TEMPLATE_BUILD_PENDING
+    );
+    assert!(completed_rx.try_recv().is_err());
+    let repeated = executor
+        .run_speculative(|| -> RpcResult<usize> {
+            panic!("repeated speculative work must not consume a second slot")
+        })
+        .await;
+    assert_eq!(repeated.unwrap_err().message(), TEMPLATE_BUILD_BUSY);
+    let next_cache = cache.clone();
+    let ready = timeout(
+        Duration::from_secs(1),
+        executor.run(move || {
+            Ok(next_cache.get_or_build(next_height, fee, || {
+                panic!("the demanded different key is already warm")
+            }))
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ready, next_coinbase);
+    assert!(completed_rx.try_recv().is_err());
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        timeout(TEST_LIMIT, completed_rx).await.unwrap().unwrap(),
+        old_coinbase
+    );
+    wait_for_all_template_capacity(&executor).await;
+    let warmed = executor
+        .run(move || {
+            Ok(cache.get_or_build(old_height, fee, || {
+                panic!("the detached constructor's exact key must stay warm")
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(warmed, old_coinbase);
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+}

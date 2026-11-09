@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: Let speculative Wcash template waits yield before candidate publication so required merged jobs can use a different warm key. Preserve demanded requests, proof ownership and capacity, and report preparation origin and blocked demand without logging private candidate material.
+time: 2026-11-09T18:45:00Z

@@ -109,6 +109,12 @@ async fn openrpc_describes_network_neutral_and_wcash_mining_contracts() {
         method(name);
     }
 
+    let auxiliary_params = method("createauxblock")["params"].as_array().unwrap();
+    assert_eq!(auxiliary_params.len(), 2);
+    assert_eq!(auxiliary_params[0]["name"], "address");
+    assert_eq!(auxiliary_params[1]["name"], "options");
+    assert!(!auxiliary_params[1]["required"].as_bool().unwrap_or(false));
+
     let description = |name: &str| {
         method(name)["description"]
             .as_str()
