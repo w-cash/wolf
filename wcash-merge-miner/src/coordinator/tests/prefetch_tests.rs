@@ -903,7 +903,7 @@ fn speculative_wait_fixture(
                         .wait_timeout_while(
                             state.lock().unwrap(),
                             Duration::from_secs(3),
-                            |state| !state.released && !(speculative && state.obsolete),
+                            |state| !(state.released || speculative && state.obsolete),
                         )
                         .unwrap();
                     if speculative && state.obsolete {
