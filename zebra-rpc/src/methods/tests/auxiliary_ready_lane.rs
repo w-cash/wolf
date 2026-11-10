@@ -49,10 +49,12 @@ impl HeldWorkers {
         if let Some(release) = self.release.take() {
             let _ = release.send(());
         }
-        self.completed
-            .drain(..)
-            .map(|done| done.recv_timeout(CLEANUP_LIMIT).is_ok())
-            .fold(true, |all, done| all && done)
+        let mut all_completed = true;
+        for done in self.completed.drain(..) {
+            // Attempt every cleanup even if an earlier worker missed its bound.
+            all_completed &= done.recv_timeout(CLEANUP_LIMIT).is_ok();
+        }
+        all_completed
     }
 }
 impl Drop for HeldWorkers {
