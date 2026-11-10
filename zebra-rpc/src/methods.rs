@@ -2907,7 +2907,7 @@ where
     ) -> Result<GetBlockTemplateResponse> {
         use types::get_block_template::{
             check_parameters, check_synced_to_tip, fetch_chain_info, fetch_mempool_transactions,
-            validate_block_proposal, zip317::select_mempool_transactions,
+            validate_block_proposal, zip317::select_mempool_transactions_for_request,
         };
 
         // Validate extensions before proposal dispatch so `wcashaux` can never
@@ -3169,8 +3169,9 @@ where
         let miner_params = miner_params.clone();
         let response = self
             .gbt
-            .build_template_for_tip(self.latest_chain_tip.clone(), chain_info.tip_hash, move || {
-                let mempool_txs = select_mempool_transactions(
+            .build_template_for_tip(self.latest_chain_tip.clone(), chain_info.tip_hash,
+                network.uses_wcash_consensus(), move |context| {
+                let mempool_txs = select_mempool_transactions_for_request(
                     &network,
                     height,
                     &miner_params,
@@ -3178,11 +3179,9 @@ where
                     mempool_tx_deps,
                     Some(&coinbase_cache),
                     wcash_aux,
+                    context.as_ref(),
                 )
-                .map_error_with_prefix(
-                    ErrorCode::InvalidParams,
-                    "invalid wcashaux parent-template request",
-                )?;
+                .map_err(types::get_block_template::TemplateBuildError::into_rpc_error)?;
 
                 tracing::debug!(
                     selected_mempool_tx_hashes = ?mempool_txs
@@ -3192,7 +3191,7 @@ where
                     "selected transactions for the template from the mempool"
                 );
 
-                BlockTemplateResponse::new_internal(
+                BlockTemplateResponse::new_for_request(
                     &network,
                     &coinbase_cache,
                     &miner_params,
@@ -3201,11 +3200,9 @@ where
                     server_long_poll_id,
                     mempool_txs,
                     submit_old,
+                    context.as_ref(),
                 )
-                .map_error_with_prefix(
-                    ErrorCode::InvalidParams,
-                    "invalid wcashaux parent-template request",
-                )
+                .map_err(types::get_block_template::TemplateBuildError::into_rpc_error)
             })
             .await?;
 
@@ -3642,7 +3639,7 @@ where
         if !uses_configured_payout {
             candidate_rpc
                 .gbt
-                .prewarm_auxiliary_coinbase(&self.network, height, tx_fees);
+                .prewarm_after_auxiliary_publication(&self.network, height, tx_fees);
         }
 
         Ok(CreateAuxBlockResponse::new(
