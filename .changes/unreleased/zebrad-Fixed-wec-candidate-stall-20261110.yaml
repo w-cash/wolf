@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: "Wcash candidate requests can assemble exact ready sizing and selected-fee coinbases on one bounded assembly-only worker while two foreground proof workers finish old work. Cancelled, expired or observed-obsolete requests stop joining proofs or starting later proof phases; already-started constructors retain their exact cache ownership and complete for later retries. Transaction selection, payout, proposal validation and publication fences remain unchanged."
+time: 2026-11-10T15:26:20Z

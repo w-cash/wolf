@@ -25,7 +25,7 @@ use zebra_chain::{
 use zebra_consensus::{error::TransactionError, MAX_BLOCK_SIGOPS};
 use zebra_node_services::mempool::TransactionDependencies;
 
-use super::CoinbaseCache;
+use super::{CoinbaseCache, TemplateBuildContext, TemplateBuildError};
 use crate::methods::types::{
     get_block_template::WcashAuxRequest, transaction::TransactionTemplate,
 };
@@ -66,6 +66,31 @@ pub fn select_mempool_transactions(
     coinbase_cache: Option<&CoinbaseCache>,
     wcash_aux: Option<WcashAuxRequest>,
 ) -> Result<Vec<SelectedMempoolTx>, TransactionError> {
+    select_mempool_transactions_for_request(
+        net,
+        height,
+        miner_params,
+        mempool_txs,
+        mempool_tx_deps,
+        coinbase_cache,
+        wcash_aux,
+        None,
+    )
+    .map_err(TemplateBuildError::into_transaction_error)
+}
+
+/// Uses unchanged transaction selection with request-local proof lookup restrictions.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_mempool_transactions_for_request(
+    net: &Network,
+    height: Height,
+    miner_params: &MinerParams,
+    mempool_txs: Vec<VerifiedUnminedTx>,
+    mempool_tx_deps: TransactionDependencies,
+    coinbase_cache: Option<&CoinbaseCache>,
+    wcash_aux: Option<WcashAuxRequest>,
+    context: Option<&TemplateBuildContext>,
+) -> Result<Vec<SelectedMempoolTx>, TemplateBuildError> {
     // Use a fake coinbase transaction to break the dependency between transaction
     // selection, the miner fee, and the fee payment in the coinbase transaction.
     //
@@ -76,7 +101,7 @@ pub fn select_mempool_transactions(
     let fake_coinbase_tx = {
         let _phase = super::coinbase_diagnostics::phase(super::coinbase_diagnostics::Phase::Sizing);
         match coinbase_cache {
-            Some(cache) => cache.try_get_or_build(height, Amount::zero(), build)?,
+            Some(cache) => cache.get_for_request(height, Amount::zero(), context, build)?,
             None => build()?,
         }
     };

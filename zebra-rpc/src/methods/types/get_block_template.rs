@@ -79,6 +79,7 @@ pub use parameters::{
     WcashAuxRequest,
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
+pub(crate) use template_build::{TemplateBuildContext, TemplateBuildError};
 
 pub(crate) fn is_pending_template_build(error: &ErrorObject<'_>) -> bool {
     template_build::is_pending_template_build(error)
@@ -354,6 +355,34 @@ impl BlockTemplateResponse {
         #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
         submit_old: Option<bool>,
     ) -> Result<Self, TransactionError> {
+        Self::new_for_request(
+            net,
+            coinbase_cache,
+            miner_params,
+            wcash_aux,
+            chain_info,
+            long_poll_id,
+            mempool_txs,
+            submit_old,
+            None,
+        )
+        .map_err(TemplateBuildError::into_transaction_error)
+    }
+
+    /// Uses the same assembly path with request-local cache and snapshot restrictions.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_request(
+        net: &Network,
+        coinbase_cache: &CoinbaseCache,
+        miner_params: &MinerParams,
+        wcash_aux: Option<WcashAuxRequest>,
+        chain_info: &GetBlockTemplateChainInfo,
+        long_poll_id: LongPollId,
+        #[cfg(not(test))] mempool_txs: Vec<VerifiedUnminedTx>,
+        #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
+        submit_old: Option<bool>,
+        context: Option<&TemplateBuildContext>,
+    ) -> Result<Self, TemplateBuildError> {
         // Determine the next block height.
         let height = chain_info.tip_height.next().map_err(|error| {
             TransactionError::CoinbaseConstruction(format!(
@@ -415,10 +444,19 @@ impl BlockTemplateResponse {
             );
             inputs.selected_txs = Some(u64::try_from(mempool_txs.len()).unwrap_or(u64::MAX));
             coinbase_diagnostics::emit(inputs);
-            coinbase_cache.get_or_build(height, txs_fee, || {
-                TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                    .expect("valid coinbase tx")
-            })
+            if context.is_some() {
+                coinbase_cache.get_for_request(height, txs_fee, context, || {
+                    Ok(
+                        TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
+                            .expect("valid coinbase tx"),
+                    )
+                })?
+            } else {
+                coinbase_cache.get_or_build(height, txs_fee, || {
+                    TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
+                        .expect("valid coinbase tx")
+                })
+            }
         };
 
         // Always cache the proof-complete, child-independent coinbase above.
@@ -452,6 +490,9 @@ impl BlockTemplateResponse {
             chain_info.chain_history_root,
             &mempool_txs,
         );
+        if let Some(context) = context {
+            context.check()?;
+        }
 
         // Convert difficulty
         let target = chain_info
@@ -949,7 +990,7 @@ impl CoinbaseCache {
         build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, E>,
     ) -> Result<TransactionTemplate<amount::NegativeOrZero>, E> {
         let started = Instant::now();
-        let result = self.try_get_or_build_inner(height, fee, build);
+        let result = self.try_get_or_build_inner(height, fee, build, &|| Ok(()), false);
         let mut record = self.diagnostic(
             coinbase_diagnostics::Event::CacheCall,
             if result.is_ok() {
@@ -971,14 +1012,18 @@ impl CoinbaseCache {
         height: block::Height,
         fee: Amount<NonNegative>,
         build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, E>,
+        check: &impl Fn() -> Result<(), E>,
+        interruptible: bool,
     ) -> Result<TransactionTemplate<amount::NegativeOrZero>, E> {
         use coinbase_diagnostics::{Event, Outcome};
 
+        check()?;
         let (entry, is_builder, origin, key_reserved) = {
             let mut storage = self
                 .0
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            check()?;
             retain_adjacent_coinbase_heights(&mut storage.foreground, height);
             let (entry, is_builder, origin) = match storage.foreground.get(&(height, fee)) {
                 Some(entry) => (Arc::clone(entry), false, Outcome::ExistingForeground),
@@ -1011,6 +1056,21 @@ impl CoinbaseCache {
         coinbase_diagnostics::emit(lookup);
 
         if is_builder {
+            if let Err(error) = check() {
+                // No constructor has started, so retire only this unstarted owner.
+                // Existing builders always finish or fail their exact entry below.
+                let mut state = entry
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if matches!(*state, CoinbaseCacheState::Building) {
+                    *state = CoinbaseCacheState::Failed;
+                    entry.ready.notify_all();
+                    drop(state);
+                    self.remove_entry_if_same(height, fee, &entry);
+                }
+                return Err(error);
+            }
             return self.build_entry(height, fee, &entry, build);
         }
 
@@ -1021,6 +1081,7 @@ impl CoinbaseCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
+            check()?;
             match &*state {
                 CoinbaseCacheState::Ready(coinbase) => {
                     let coinbase = coinbase.clone();
@@ -1047,18 +1108,123 @@ impl CoinbaseCache {
                 }
                 CoinbaseCacheState::Building => {
                     joined = true;
-                    state = entry
-                        .ready
-                        .wait(state)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state = if interruptible {
+                        entry
+                            .ready
+                            .wait_timeout(state, template_build::CACHE_JOIN_POLL_INTERVAL)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .0
+                    } else {
+                        entry
+                            .ready
+                            .wait(state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    };
                 }
                 CoinbaseCacheState::Failed => {
                     drop(state);
                     self.remove_entry_if_same(height, fee, &entry);
-                    return self.try_get_or_build_inner(height, fee, build);
+                    return self.try_get_or_build_inner(height, fee, build, check, interruptible);
                 }
             }
         }
+    }
+
+    /// Looks up an exact proof under one request's policy. The assembly-only lane
+    /// never mutates retention, claims a builder, or joins an unfinished proof.
+    fn get_for_request(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+        context: Option<&TemplateBuildContext>,
+        build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, TransactionError>,
+    ) -> Result<TransactionTemplate<amount::NegativeOrZero>, TemplateBuildError> {
+        let Some(context) = context else {
+            return self
+                .try_get_or_build(height, fee, build)
+                .map_err(Into::into);
+        };
+        let started = Instant::now();
+        let result = self.get_controlled(height, fee, context, build);
+        let mut record = self.diagnostic(
+            coinbase_diagnostics::Event::CacheCall,
+            if result.is_ok() {
+                coinbase_diagnostics::Outcome::Ok
+            } else {
+                coinbase_diagnostics::Outcome::Error
+            },
+            height,
+            fee,
+            0,
+        );
+        record.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        coinbase_diagnostics::emit(record);
+        result
+    }
+
+    fn get_controlled(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+        context: &TemplateBuildContext,
+        build: impl FnOnce() -> Result<TransactionTemplate<amount::NegativeOrZero>, TransactionError>,
+    ) -> Result<TransactionTemplate<amount::NegativeOrZero>, TemplateBuildError> {
+        context.check()?;
+        if context.ready_only() {
+            let storage = match self.0.try_lock() {
+                Ok(storage) => storage,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(TemplateBuildError::Pending)
+                }
+            };
+            let (entry, outcome) = storage
+                .foreground
+                .get(&(height, fee))
+                .map(|entry| (entry, coinbase_diagnostics::Outcome::ForegroundReady))
+                .or_else(|| {
+                    storage
+                        .reserve
+                        .get(&(height, fee))
+                        .map(|entry| (entry, coinbase_diagnostics::Outcome::ReserveReady))
+                })
+                .map(|(entry, outcome)| (Arc::clone(entry), outcome))
+                .ok_or(TemplateBuildError::Pending)?;
+            let key_reserved = storage.reserve_keys.contains(&(height, fee));
+            drop(storage);
+            let state = match entry.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(TemplateBuildError::Pending)
+                }
+            };
+            let CoinbaseCacheState::Ready(coinbase) = &*state else {
+                return Err(TemplateBuildError::Pending);
+            };
+            let coinbase = coinbase.clone();
+            drop(state);
+            context.check()?;
+            let mut record = self.diagnostic(
+                coinbase_diagnostics::Event::CacheLookup,
+                outcome,
+                height,
+                fee,
+                entry.diagnostic_id,
+            );
+            record.lookup_key_reserved = Some(key_reserved);
+            coinbase_diagnostics::emit(record);
+            return Ok(coinbase);
+        }
+        let coinbase = self.try_get_or_build_inner(
+            height,
+            fee,
+            || build().map_err(TemplateBuildError::from),
+            &|| context.check(),
+            true,
+        )?;
+        context.check()?;
+        Ok(coinbase)
     }
 
     /// Coalesces a separate two-height reserve after a successful auxiliary RPC.
@@ -1097,6 +1263,61 @@ impl CoinbaseCache {
             }
         }
         storage.reserve_keys = keys;
+        true
+    }
+
+    /// Publication-only ownership handoff before optional reserve registration.
+    /// Try-lock failures leave both maps unchanged; the caller must then skip
+    /// registration, rather than slide away a proof this call just consumed.
+    fn retain_published_coinbases(&self, height: block::Height, fee: Amount<NonNegative>) -> bool {
+        let mut storage = match self.0.try_lock() {
+            Ok(storage) => storage,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        let mut entries = Vec::with_capacity(2);
+        for amount in [Amount::<NonNegative>::zero(), fee] {
+            let key = (height, amount);
+            if entries.iter().any(|(prior, _, _)| *prior == key) {
+                continue;
+            }
+            let Some(entry) = storage
+                .foreground
+                .get(&key)
+                .or_else(|| storage.reserve.get(&key))
+            else {
+                return false;
+            };
+            entries.push((
+                key,
+                Arc::clone(entry),
+                !storage.foreground.contains_key(&key),
+            ));
+        }
+        // Keep both ready states locked only for this bounded metadata transfer.
+        // Every acquisition is a try-lock, in the existing storage -> entry order.
+        let mut ready = Vec::with_capacity(2);
+        for (_, entry, _) in &entries {
+            let state = match entry.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+            };
+            if !matches!(*state, CoinbaseCacheState::Ready(_)) {
+                return false;
+            }
+            ready.push(state);
+        }
+        if entries.iter().any(|(_, _, adopt)| *adopt) {
+            retain_adjacent_coinbase_heights(&mut storage.foreground, height);
+            for (key, entry, adopt) in &entries {
+                if *adopt {
+                    bound_coinbase_fee_entries(&mut storage.foreground, height, key.1);
+                    storage.foreground.insert(*key, Arc::clone(entry));
+                }
+            }
+        }
+        drop(ready);
         true
     }
 
@@ -1462,31 +1683,35 @@ where
         self.template_builder.run(build).await
     }
 
-    /// An optional speculative waiter yields only when its exact WEC snapshot
-    /// was observed on the tip watch and then replaced. The detached blocking
-    /// builder retains its existing foreground permit and warms its exact cache key.
+    /// Runs production snapshot assembly with bounded ready-only fallback and
+    /// cooperative phase/join checks; an owned proof is never cancelled.
     pub(crate) async fn build_template_for_tip<T, F, Tip>(
         &self,
         latest_chain_tip: Tip,
         snapshot: block::Hash,
+        wcash: bool,
         build: F,
     ) -> RpcResult<T>
     where
         T: Send + 'static,
-        F: FnOnce() -> RpcResult<T> + Send + 'static,
-        Tip: ChainTip,
+        F: FnOnce(Option<TemplateBuildContext>) -> RpcResult<T> + Send + 'static,
+        Tip: ChainTip + Clone + Send + Sync + 'static,
     {
+        if !wcash {
+            return self.build_template(move || build(None)).await;
+        }
+        let run =
+            self.template_builder
+                .run_for_tip(latest_chain_tip.clone(), snapshot, move |context| {
+                    build(Some(context))
+                });
         if !self.speculative_template_wait {
-            return self.build_template(build).await;
+            return run.await;
         }
         tokio::select! {
-            result = self.build_template(build) => result,
+            result = run => result,
             () = template_build::wait_for_obsolete_snapshot(latest_chain_tip, snapshot) => {
-                Err(ErrorObject::borrowed(
-                    crate::methods::WCASH_AUX_TIP_CHANGED_ERROR_CODE,
-                    "Wcash tip changed while constructing the candidate; retry createauxblock",
-                    None,
-                ))
+                Err(TemplateBuildError::Obsolete.into_rpc_error())
             }
         }
     }
@@ -1511,6 +1736,19 @@ where
                 height,
                 fees,
             );
+        }
+    }
+
+    /// Preserve exact completed reserve entries only after candidate publication.
+    /// Failure skips optional work without changing the successful candidate.
+    pub(crate) fn prewarm_after_auxiliary_publication(
+        &self,
+        network: &Network,
+        height: block::Height,
+        fees: Amount<NonNegative>,
+    ) {
+        if self.coinbase_cache.retain_published_coinbases(height, fees) {
+            self.prewarm_auxiliary_coinbase(network, height, fees);
         }
     }
 

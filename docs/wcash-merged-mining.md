@@ -125,16 +125,41 @@ height and fees; a previous fee total is never substituted into a new candidate.
 
 Foreground template selection, coinbase construction and cache waits run on
 blocking workers so a cold proof cannot hold an async RPC worker. Configured
-and alternate-payout requests share two foreground build slots. Saturation
-returns retryable JSON-RPC `-28` without queuing more proof work. A build still
-pending after two seconds returns the same retryable result. `createauxblock`
+and alternate-payout requests share two foreground proof-capable build slots.
+For Wcash, a saturated executor may admit one additional assembly-only worker,
+shared across handler clones. That worker uses the same transaction selection
+and template assembly, but can only read completed coinbases for the exact
+recipient, height and fees. Both the zero-fee sizing entry and the selected-fee
+entry must be ready. An absent, building, failed or contended entry returns
+pending without building, waiting on a proof, pruning or inserting cache entries.
+It never substitutes a zero-fee candidate for selected transactions. Further
+saturation returns retryable JSON-RPC `-28` without queuing more work. A build
+still pending after two seconds returns the same retryable result. `createauxblock`
 maps only these two template-build conditions to its existing short-retry
 code `-32001`, before publishing any candidate or retirement token; unrelated
 node warmup errors keep their original codes. The worker continues filling its
-exact coinbase cache entry for a later retry. Cancelling or timing out the
-request does not free its slot until the blocking build finishes. Prewarming
-does not add foreground build slots or shorten the proof itself. The foreground
-wait remains bounded independently of proving and optional reserve work.
+exact coinbase cache entry for a later retry. A Wcash request checks its original
+two-second deadline, cancellation and observed snapshot replacement before
+claiming another proof phase and during cache joins. Joins check at 25-ms
+condition-variable intervals. An already-started proof always completes or
+fails its owned entry and wakes its waiters; cancellation never transfers its
+ownership or frees its worker permit early. Its completed entry can be used by
+a later current request. A slow sizing proof can therefore warm sizing on one
+request, then allow a fresh request to build the exact selected-fee proof.
+These cooperative checks do not preempt cryptographic work or make a cold proof
+fast. Prewarming and the configured template updater retain their existing
+separate workers; two foreground proof-capable slots are not a process-wide
+limit on proving concurrency. The Zcash foreground admission path is unchanged.
+
+After successful alternate-recipient publication, a separate try-lock handoff
+retains existing exact ready current-height sizing and selected-fee reserve
+entries under the normal foreground height and fee bounds. Only then can the
+existing optional registration slide its future window. A contended lock or
+unavailable exact entry skips that call's optional registration without changing
+its published candidate. Bare reserve registrations retain their existing
+foreground-preservation behavior. The handoff never waits for or constructs a
+proof. A later parent-job refresh at the same Wcash height can reuse completed
+proofs first consumed by assembly-only work.
 
 An optional `{"mode": "speculative"}` second argument keeps the normal
 two-second template wait, but can yield before publication when the exact Wcash
@@ -142,17 +167,18 @@ snapshot being built becomes obsolete. It first requires that snapshot's hash
 to be observed on the tip watch, then a different hash; an initially lagging
 watch does not establish obsolescence. With an unchanged parent, successful
 prefetch keeps its existing fast path. Omitting the argument or passing `null`
-keeps ordinary behavior. Early yielding allocates no candidate or retirement
+keeps the ordinary two-second RPC wait. Early yielding allocates no candidate or retirement
 token. The blocking template worker retains its foreground permit and exact
 cache entry until completion. This option does not shorten the HTTP transport
 deadline or cancel a candidate request after publication.
 
-The existing two foreground template permits remain shared across handler
-clones and remain held until blocking work finishes, including after early
-yield or cancellation. No additional speculative admission limit is imposed:
-a different warm candidate can use an existing free slot while obsolete work
-finishes. Both occupied slots still produce the normal retryable busy result.
-Neither foreground capacity nor proving parallelism is increased.
+The existing two proof-capable permits and the one Wcash assembly-only permit
+remain shared across handler clones and stay held until their blocking work
+finishes, including after early yield or cancellation. A different warm
+candidate can use an available assembly-only permit while both proof workers
+finish obsolete work. A cold exact fee still requires a proof-capable slot and
+honest proof completion. Proving capacity is not increased, and proposal
+validation, tip fences, payout checks and candidate publication are unchanged.
 
 The native pool backend uses this option only for child prefetch. Required job
 preparation keeps the normal request and all proposal, payout and currentness
