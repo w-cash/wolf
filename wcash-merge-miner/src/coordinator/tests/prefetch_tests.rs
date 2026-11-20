@@ -233,8 +233,7 @@ fn obsolete_wcash_proposal_retries_before_lease_and_revalidates_the_next_candida
         let error = if speculative {
             supervisor
                 .prepare_child_candidate_timed(&mut NativePreparationTiming::new())
-                .err()
-                .expect("fixture rejects the first Wcash candidate")
+                .expect_err("fixture rejects the first Wcash candidate")
         } else {
             supervisor
                 .prepare_generation_timed(&mut NativePreparationTiming::new())
@@ -297,8 +296,7 @@ fn unrelated_wcash_proposal_rejections_preserve_their_original_rpc_error() {
             prefetch_supervisor(directory.path(), &child_rpc, &parent_rpc);
         let error = supervisor
             .prepare_child_candidate_timed(&mut NativePreparationTiming::new())
-            .err()
-            .expect("fixture rejects the Wcash candidate");
+            .expect_err("fixture rejects the Wcash candidate");
         assert!(matches!(
             error,
             MinerError::RpcError {code: Some(actual_code), message: actual_message, ..}
