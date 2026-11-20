@@ -187,6 +187,189 @@ fn prefetch_supervisor(
     (supervisor, validator)
 }
 
+fn obsolete_proposal_rpc(
+    rejection: Option<(i64, String)>,
+    bad_subsidy: bool,
+) -> (PrefetchRpcFixture, Arc<Mutex<String>>) {
+    let tip = Arc::new(Mutex::new(
+        Network::new_wcash_regtest().genesis_hash().to_string(),
+    ));
+    let server_tip = Arc::clone(&tip);
+    let mut rejection = rejection;
+    let server = PrefetchRpcFixture::spawn(move |request| {
+        Ok(match request["method"].as_str().unwrap() {
+            "getblockhash" => json!(Network::new_wcash_regtest().genesis_hash().to_string()),
+            "getblockcount" => json!(0),
+            "getbestblockhash" => json!(*server_tip.lock().unwrap()),
+            "createauxblock" => {
+                if let Some((code, message)) = rejection.take() {
+                    return Err(json!({"code":code,"message":message}));
+                }
+                let mut response = prefetch_child_response([0x71; 20], 1);
+                if bad_subsidy {
+                    response["coinbasevalue"] = json!(1);
+                }
+                response
+            }
+            "retireauxblock" => json!({"state":"retired"}),
+            _ => return Err(json!({"code":-32601,"message":"unexpected fixture method"})),
+        })
+    });
+    (server, tip)
+}
+
+#[test]
+fn obsolete_wcash_proposal_retries_before_lease_and_revalidates_the_next_candidate() {
+    for speculative in [false, true] {
+        let directory = tempdir().unwrap();
+        let (child_rpc, child_tip) = obsolete_proposal_rpc(
+            Some((-32603, WCASH_OBSOLETE_PROPOSAL_ERROR.to_string())),
+            false,
+        );
+        let (template_rpc, validator_rpc, _) =
+            parent_retry_rpcs(vec![ParentRetryAction::Accept], child_tip);
+        let supervisor =
+            parent_retry_supervisor(directory.path(), &child_rpc, &template_rpc, &validator_rpc);
+        let error = if speculative {
+            supervisor
+                .prepare_child_candidate_timed(&mut NativePreparationTiming::new())
+                .err()
+                .expect("fixture rejects the first Wcash candidate")
+        } else {
+            supervisor
+                .prepare_generation_timed(&mut NativePreparationTiming::new())
+                .err()
+                .expect("fixture rejects the first Wcash candidate")
+        };
+        assert!(matches!(
+            error,
+            MinerError::RpcError { code: Some(-32_001), message, .. }
+                if message == "Wcash tip changed during proposal validation; retry createauxblock"
+        ));
+        assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+        assert_eq!(supervisor.next_auxiliary_nonce.load(Ordering::Acquire), 0);
+        assert!(child_rpc.requests("retireauxblock").is_empty());
+        assert!(template_rpc.requests("getblocktemplate").is_empty());
+        assert!(validator_rpc.requests("getblocktemplate").is_empty());
+
+        let mut generation = if speculative {
+            supervisor
+                .prepare_child_candidate_timed(&mut NativePreparationTiming::new())
+                .unwrap()
+                .prepare_generation_timed(&mut NativePreparationTiming::new())
+                .unwrap()
+        } else {
+            supervisor
+                .prepare_generation_timed(&mut NativePreparationTiming::new())
+                .unwrap()
+        };
+        assert_eq!(supervisor.journal.generation_count().unwrap(), 1);
+        let creates = child_rpc.requests("createauxblock");
+        assert_eq!(creates.len(), 2);
+        for request in creates {
+            assert_eq!(
+                request["params"].as_array().unwrap().len(),
+                if speculative { 2 } else { 1 }
+            );
+        }
+        assert_eq!(template_rpc.requests("getblocktemplate").len(), 1);
+        assert_eq!(validator_rpc.requests("getblocktemplate").len(), 1);
+        generation.retire_generation().unwrap();
+        assert_eq!(child_rpc.requests("retireauxblock").len(), 1);
+    }
+}
+
+#[test]
+fn unrelated_wcash_proposal_rejections_preserve_their_original_rpc_error() {
+    for (code, message) in [
+        (-1, WCASH_OBSOLETE_PROPOSAL_ERROR.to_string()),
+        (-32603, format!("{WCASH_OBSOLETE_PROPOSAL_ERROR} suffix")),
+        (-32603, WCASH_OBSOLETE_PROPOSAL_ERROR.replace("Wcash", "Zcash")),
+        (-32603, WCASH_OBSOLETE_PROPOSAL_ERROR.replace(
+            "proposal is not based on the current best chain tip: previous block hash must be the best chain tip",
+            "coinbase pays an invalid subsidy",
+        )),
+    ] {
+        let directory = tempdir().unwrap();
+        let (child_rpc, _) = obsolete_proposal_rpc(Some((code, message.clone())), false);
+        let parent_rpc = prefetch_parent_identity_rpc();
+        let (supervisor, _validator_rpc) =
+            prefetch_supervisor(directory.path(), &child_rpc, &parent_rpc);
+        let error = supervisor
+            .prepare_child_candidate_timed(&mut NativePreparationTiming::new())
+            .err()
+            .expect("fixture rejects the Wcash candidate");
+        assert!(matches!(
+            error,
+            MinerError::RpcError {code: Some(actual_code), message: actual_message, ..}
+                if actual_code == code && actual_message == message
+        ));
+        assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+        assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+        assert!(child_rpc.requests("retireauxblock").is_empty());
+        assert!(parent_rpc.requests("getblocktemplate").is_empty());
+    }
+}
+
+#[test]
+fn obsolete_wcash_proposal_retry_still_rejects_a_bad_next_subsidy() {
+    let directory = tempdir().unwrap();
+    let (child_rpc, _) = obsolete_proposal_rpc(
+        Some((-32603, WCASH_OBSOLETE_PROPOSAL_ERROR.to_string())),
+        true,
+    );
+    let parent_rpc = prefetch_parent_identity_rpc();
+    let (supervisor, _validator_rpc) =
+        prefetch_supervisor(directory.path(), &child_rpc, &parent_rpc);
+    assert!(matches!(
+        supervisor.prepare_child_candidate_timed(&mut NativePreparationTiming::new()),
+        Err(MinerError::RpcError {
+            code: Some(-32_001),
+            ..
+        })
+    ));
+    assert!(matches!(
+        supervisor.prepare_child_candidate_timed(&mut NativePreparationTiming::new()),
+        Err(MinerError::InvalidParentTemplate(_))
+    ));
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+    assert_eq!(child_rpc.requests("createauxblock").len(), 2);
+    assert_eq!(child_rpc.requests("retireauxblock").len(), 1);
+    assert!(parent_rpc.requests("getblocktemplate").is_empty());
+}
+
+#[test]
+fn exact_obsolete_wcash_proposal_error_from_parent_is_not_normalized() {
+    let directory = tempdir().unwrap();
+    let (child_rpc, _) = prefetch_child_rpc([0x71; 20], 0, Duration::ZERO);
+    let genesis = Network::new_regtest(Default::default())
+        .genesis_hash()
+        .to_string();
+    let parent_rpc = PrefetchRpcFixture::spawn(move |request| {
+        Ok(match request["method"].as_str().unwrap() {
+            "getblockhash" => json!(genesis),
+            "getblockstatus" => {
+                json!({"state":"best_chain","hash":genesis,"height":0,"confirmations":1})
+            }
+            "getblockchaininfo" => json!({"blocks":0,"bestblockhash":genesis}),
+            "getblocktemplate" => {
+                return Err(json!({"code":-32603,"message":WCASH_OBSOLETE_PROPOSAL_ERROR}))
+            }
+            _ => return Err(json!({"code":-32601,"message":"unexpected parent fixture method"})),
+        })
+    });
+    let (supervisor, _validator_rpc) =
+        prefetch_supervisor(directory.path(), &child_rpc, &parent_rpc);
+    assert!(matches!(
+        supervisor.prepare_generation_timed(&mut NativePreparationTiming::new()),
+        Err(MinerError::RpcError { code: Some(-32603), message, .. })
+            if message == WCASH_OBSOLETE_PROPOSAL_ERROR
+    ));
+    assert_eq!(supervisor.journal.generation_count().unwrap(), 0);
+    assert_eq!(child_rpc.requests("createauxblock").len(), 1);
+    assert_eq!(child_rpc.requests("retireauxblock").len(), 1);
+}
+
 #[test]
 fn prefetched_child_is_validated_without_starting_a_parent_job_or_journal() {
     let directory = tempdir().unwrap();

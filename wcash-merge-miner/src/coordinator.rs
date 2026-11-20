@@ -66,6 +66,30 @@ use crate::{
     ValidatedNativeShare, NATIVE_JOB_MAX_AGE_SECONDS,
 };
 
+const WCASH_OBSOLETE_PROPOSAL_ERROR: &str = concat!(
+    "generated Wcash candidate failed proposal validation: ",
+    "block could not be full-verified due to: unable to validate block proposal: ",
+    "failed semantic verification (proof of work is not checked for proposals): ",
+    "proposal is not based on the current best chain tip: ",
+    "previous block hash must be the best chain tip"
+);
+
+fn normalize_wcash_candidate_error(error: MinerError) -> MinerError {
+    match error {
+        MinerError::RpcError {
+            endpoint,
+            code: Some(-32603),
+            message,
+        } if message == WCASH_OBSOLETE_PROPOSAL_ERROR => MinerError::RpcError {
+            endpoint,
+            code: Some(-32_001),
+            message: "Wcash tip changed during proposal validation; retry createauxblock"
+                .to_string(),
+        },
+        error => error,
+    }
+}
+
 /// Complete native-node configuration for one frozen dual-mining job.
 #[derive(Clone)]
 pub struct CoordinatorConfig {
@@ -686,7 +710,13 @@ impl NativeMiningSupervisor {
         } else {
             json!([self.config.wcash_payout_address.clone()])
         };
-        let child: ChildTemplate = self.wcash_node.call("createauxblock", params)?;
+        // Semantic verification can observe a new state tip before the node's
+        // tip watch catches up. Only its exact obsolete-predecessor rejection
+        // is a retry, before any candidate lease is returned to this backend.
+        let child: ChildTemplate = self
+            .wcash_node
+            .call("createauxblock", params)
+            .map_err(normalize_wcash_candidate_error)?;
         timing.set_wcash_height(child.height);
         timing.enter(PreparationPhase::WcashDecode);
         let child_hash = parse_display_hash(&child.hash, "createauxblock hash")?;

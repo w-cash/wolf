@@ -1,0 +1,4 @@
+project: zebrad
+kind: Fixed
+body: Retry the exact obsolete-predecessor error from Wcash candidate proposal validation instead of stopping the merged-mining backend. Keep unrelated RPC failures fatal and fully validate every replacement candidate.
+time: 2026-11-20T14:49:00Z
