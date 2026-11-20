@@ -87,8 +87,12 @@ JSON-RPC error code `-32002`. This means temporary resource pressure, not an
 invalid template. Pools should retry with bounded backoff while retaining
 independently usable work and delivering recorded winners. Reclaim only their
 own unused candidates through `retireauxblock`; never discard another miner's
-active work. Other internal errors, including generic `-32603`, retain their
-existing failure policy.
+active work. The coordinator also retries one exact legacy `-32603` response:
+Wcash proposal validation rejected the candidate because its predecessor is no
+longer the best chain tip. This exception applies only to `createauxblock`,
+before any candidate lease is returned, and uses the existing `-32001` tip-race
+retry. The next candidate still passes all normal validation. Other internal
+errors, including generic `-32603`, retain their existing failure policy.
 
 When a caller selects a payout different from the node's configured recipient,
 the handler retains a bounded set of four recipient-isolated coinbase caches.
